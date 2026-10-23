@@ -72,12 +72,13 @@ test('scope denial occurs before storage is accessed', async () => {
   await assert.rejects(memory.ingest('foreign', {}), { code: 'scope_denied' });
 });
 
-for (const method of ['evidence', 'bundle']) {
+for (const method of ['evidence', 'bundle', 'showBundle']) {
   test(`${method} denies foreign scope before touching storage`, async () => {
     const store = new Proxy({}, { get: () => { throw new Error('storage touched'); } });
     const memory = new Memory({ scopes: { read: ['allowed'], write: [] } }, store);
     const args = method === 'evidence' ? [[{ turn: 'foreign', entry_id: 'u', start: 0, end: 1 }]]
-      : [{ kind: 'turn', id: 'foreign' }, 'query', 10, 2];
+      : method === 'showBundle' ? [{ seed: { kind: 'record', id: 'foreign' } }]
+        : [{ kind: 'turn', id: 'foreign' }, 'query', 10, 2];
     await assert.rejects(memory[method]('foreign', ...args), { code: 'scope_denied' });
   });
 }

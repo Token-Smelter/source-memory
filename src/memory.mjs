@@ -85,6 +85,7 @@ export class Memory {
 
   // Rebuilds one seed's relationship-closed bundle without a query, so a caller can detect changes since it last read it.
   async showBundle(scope, input) {
+    authorize(this.config, scope);
     const seed = input.seed;
     requireThat(seed && ['turn', 'record'].includes(seed.kind), 'invalid_kind');
     const id = text(seed.id, 256);
