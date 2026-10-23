@@ -1,8 +1,8 @@
 # Neo4j for Source Memory plus the CLI image.
-#   cp .env.example .env   # set NEO4J_PASSWORD
+#   create .env containing NEO4J_PASSWORD=<long random password> (git-ignored)
 #   docker compose up -d neo4j
 #   docker compose run --rm memory init --scope default
-# Neo4j is published on 127.0.0.1 only, for host-side CLI use with config/local.json.
+# Neo4j is published on 127.0.0.1 only, for host-side CLI use with config/host.json.
 services:
   neo4j:
     image: neo4j:5.26.14-community

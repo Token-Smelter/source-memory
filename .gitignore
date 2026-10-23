@@ -3,3 +3,5 @@ coverage/
 .memory-local/
 *.local.json
 .worktrees/
+.env
+.env.*

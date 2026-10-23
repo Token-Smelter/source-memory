@@ -22,7 +22,7 @@ Why source-first: compressed or extracted memories lose qualifications and the c
 
 ## Quick start (Docker)
 
-Requires Docker with Compose. Create a `.env` file beside `docker-compose.yml` containing one line, `NEO4J_PASSWORD=<a long random password>`. Never commit `.env`.
+Requires Docker with Compose. Create a `.env` file beside `docker-compose.yml` containing one line, `NEO4J_PASSWORD=<a long random password>`. `.env` is git-ignored; never commit it.
 
 ```sh
 docker compose up -d neo4j
