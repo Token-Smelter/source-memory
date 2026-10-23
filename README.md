@@ -79,6 +79,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `index` | Optional `{"limit":256}` | Embed missing or out-of-date chunks/records |
 | `recall` | `{"query":"...", "limit":8}` plus bounds | Search all channels, fuse, rerank, expand relationships, return evidence bundles |
 | `show` | `{"kind":"turn"\|"record","id":"..."}` | Full retained turn, or a record with its source evidence |
+| `show` | `{"kind":"bundle","seed":{"kind":"turn"\|"record","id":"..."},"max_nodes":48,"max_hops":4}` | One seed's relationship-closed bundle (same shape as a recall bundle), rebuilt without a query; hash it to detect later relationship changes |
 | `status` | None | Counts, unindexed items, configured models |
 
 ### Turn envelope

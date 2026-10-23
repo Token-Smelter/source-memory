@@ -104,10 +104,17 @@ export async function runIntegration(database, scratch) {
       const recalled = await memory.recall('demo', { query: 'blue', max_nodes: 1, limit: 1 });
       assert.equal(recalled.relationship_context_complete, false);
     });
+    await check('a seed bundle read without a query reveals a newly added relationship', async () => {
+      const before = await memory.show('demo', { kind: 'bundle', seed: { kind: 'record', id: 'old-decision' }, max_nodes: 8, max_hops: 2 });
+      await memory.enrich('demo', { records: [{ ...record('qualifier', newSource, newInput), status: 'proposed' }],
+        relations: [{ id: 'qualifies-old', type: 'qualifies', from: 'qualifier', to: 'old-decision', attribution: 'fixture', evidence: [span(newSource, newInput)] }] });
+      const after = await memory.show('demo', { kind: 'bundle', seed: { kind: 'record', id: 'old-decision' }, max_nodes: 8, max_hops: 2 });
+      assert.deepEqual([before.bundle.relations.length, after.bundle.relations.length, after.bundle.records.some(row => row.id === 'qualifier')], [1, 2, true]);
+    });
     await check('a cyclic relationship graph terminates', async () => {
       await memory.enrich('demo', { records: [], relations: [{ id: 'cycle', type: 'depends_on', from: 'old-decision', to: 'new-decision', attribution: 'fixture', evidence: [span(oldSource, oldInput)] }] });
       const recalled = await memory.recall('demo', { query: 'blue', limit: 1 });
-      assert.equal(recalled.bundles[0].relations.length, 2);
+      assert.equal(recalled.bundles[0].relations.length, 3);
     });
     await check('output budget omission never claims complete relationship context', async () => {
       const recalled = await memory.recall('demo', { query: 'blue', max_chars: 256 });

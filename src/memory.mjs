@@ -70,6 +70,7 @@ export class Memory {
 
   async show(scope, input) {
     authorize(this.config, scope);
+    if (input.kind === 'bundle') return this.showBundle(scope, input);
     const id = text(input.id, 256);
     requireThat(['turn', 'record'].includes(input.kind), 'invalid_kind');
     if (input.kind === 'turn') {
@@ -80,6 +81,20 @@ export class Memory {
     const record = await this.store.getRecord(scope, id);
     requireThat(record, 'not_found');
     return { kind: 'record', record, evidence: await this.evidence(scope, record.evidence) };
+  }
+
+  // Rebuilds one seed's relationship-closed bundle without a query, so a caller can detect changes since it last read it.
+  async showBundle(scope, input) {
+    authorize(this.config, scope);
+    const seed = input.seed;
+    requireThat(seed && ['turn', 'record'].includes(seed.kind), 'invalid_kind');
+    const id = text(seed.id, 256);
+    const maxNodes = integer(input.max_nodes, 48, 1, 256);
+    const maxHops = integer(input.max_hops, 4, 0, 12);
+    if (seed.kind === 'turn') requireThat(await this.store.getTurn(scope, id), 'not_found');
+    else requireThat(await this.store.getRecord(scope, id), 'not_found');
+    const bundle = await this.bundle(scope, { kind: seed.kind, id, score: null, channels: [] }, '', maxNodes, maxHops);
+    return { kind: 'bundle', bundle };
   }
 
   async evidence(scope, spans) {
