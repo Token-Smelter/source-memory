@@ -1,0 +1,28 @@
+api_version: sourcerer.project-checks/v1
+
+# Declared checks for agent harnesses that read this file. Each runs an existing
+# npm script. The Docker-backed integration suite (npm run test:integration) is
+# not declared: it needs a Docker daemon and the neo4j:5.26.14-community image.
+project_checks:
+  tests:
+    command: "npm ci --ignore-scripts && npm test"
+    proof_type: text
+    timeout_seconds: 300
+    input_paths:
+      - "src/**"
+      - "bin/**"
+      - "test/**"
+      - "package.json"
+      - "package-lock.json"
+  lint:
+    command: "npm ci --ignore-scripts && npm run check"
+    proof_type: text
+    timeout_seconds: 120
+    input_paths:
+      - "src/**"
+      - "bin/**"
+      - "scripts/**"
+      - "test/**"
+      - "config/**"
+      - "examples/**"
+      - "package.json"
