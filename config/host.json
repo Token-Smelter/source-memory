@@ -1,0 +1,18 @@
+{
+  "neo4j": {
+    "uri": "bolt://127.0.0.1:7687",
+    "database": "neo4j",
+    "user": "neo4j",
+    "password_env": "SOURCE_MEMORY_NEO4J_PASSWORD"
+  },
+  "scopes": { "read": ["default"], "write": ["default"] },
+  "chunking": { "words": 256, "overlap": 32 },
+  "index_on_write": false,
+  "vector_scan_limit": 10000,
+  "embedding": {
+    "url": "http://127.0.0.1:11434/v1/embeddings",
+    "model": "embeddinggemma",
+    "dimensions": 768,
+    "timeout_ms": 30000
+  }
+}

@@ -1,0 +1,5 @@
+node_modules/
+coverage/
+.memory-local/
+*.local.json
+.worktrees/

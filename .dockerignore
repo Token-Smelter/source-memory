@@ -1,0 +1,8 @@
+node_modules
+.git
+.env
+.memory-local
+test
+scripts
+design
+*.local.json

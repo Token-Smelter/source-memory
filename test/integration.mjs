@@ -1,0 +1,203 @@
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { Memory } from '../src/memory.mjs';
+
+const exec = promisify(execFile);
+
+export async function runIntegration(database, scratch) {
+  const results = [];
+  async function check(name, fn) {
+    await fn();
+    results.push({ name, pass: true });
+    console.log(`PASS ${name}`);
+  }
+  let modelDown = false;
+  const model = createServer(async (req, res) => {
+    let body = '';
+    for await (const part of req) body += part;
+    if (modelDown) { res.writeHead(503).end(); return; }
+    const input = JSON.parse(body);
+    if (req.url === '/embed') {
+      const vector = value => /aubergine|purple/i.test(value) ? [0, 1, 0] : /amber/i.test(value) ? [-1, 0, 0] : /blue/i.test(value) ? [1, 0, 0] : [0, 0, 1];
+      res.end(JSON.stringify({ model: 'fixture-only', data: input.input.map((value, index) => ({ index, embedding: vector(value) })) }));
+    } else res.end(JSON.stringify({ results: input.documents.map((_text, index) => ({ index, relevance_score: 1 / (index + 1) })) }));
+  });
+  model.listen(0, '127.0.0.1');
+  await once(model, 'listening');
+  const url = `http://127.0.0.1:${model.address().port}`;
+  const config = { neo4j: database, scopes: { read: ['demo', 'foreign'], write: ['demo', 'foreign'] },
+    embedding: { url: `${url}/embed`, model: 'fixture-only', dimensions: 3 },
+    reranker: { url: `${url}/rerank`, model: 'fixture-only' } };
+  const memory = new Memory(config);
+  const turn = (id, value) => ({ source: 'integration-fixture', conversation_id: 'conversation', turn_id: id,
+    entries: [{ id: `u-${id}`, role: 'user', text: value }] });
+  const oldInput = turn('old', 'Use blue for the dashboard.');
+  const newInput = { ...turn('new', 'Replace that choice with amber.'), parent_turn_id: 'old' };
+  let oldSource;
+  let newSource;
+  const span = (source, input) => ({ turn: source.id, entry_id: input.entries[0].id, start: 0, end: input.entries[0].text.length });
+  try {
+    await memory.init('demo');
+    await memory.init('foreign');
+    await check('concurrent source replay produces one retained turn', async () => {
+      const inserted = await Promise.all([memory.ingest('demo', oldInput), memory.ingest('demo', oldInput)]);
+      oldSource = inserted[0];
+      assert.deepEqual([new Set(inserted.map(row => row.id)).size, (await memory.status('demo')).turns], [1, 1]);
+    });
+    await check('changed bytes cannot overwrite an accepted source identity', async () => {
+      await assert.rejects(memory.ingest('demo', { ...oldInput, entries: [{ ...oldInput.entries[0], text: 'Changed' }] }), { code: 'source_identity_conflict' });
+    });
+    newSource = await memory.ingest('demo', newInput);
+    const record = (id, source, input) => ({ id, kind: 'decision', status: 'accepted', attribution: 'fixture operator', text: input.entries[0].text, evidence: [span(source, input)] });
+    const enrichment = { records: [record('old-decision', oldSource, oldInput), record('new-decision', newSource, newInput)],
+      relations: [{ id: 'replacement', type: 'supersedes', from: 'new-decision', to: 'old-decision', attribution: 'fixture operator', evidence: [span(newSource, newInput)] }] };
+    await check('structured enrichment replays without duplicate records or relations', async () => {
+      await memory.enrich('demo', enrichment);
+      await memory.enrich('demo', enrichment);
+      const counts = await memory.status('demo');
+      assert.deepEqual([counts.records, counts.relations], [2, 1]);
+    });
+    await check('an old lexical match includes the semantically dissimilar successor', async () => {
+      const recalled = await memory.recall('demo', { query: 'blue', limit: 1 });
+      assert.deepEqual(recalled.bundles[0].records.map(row => row.id).sort(), ['new-decision', 'old-decision']);
+    });
+    await check('source evidence is exact and survives independently of session files', async () => {
+      assert.deepEqual((await memory.show('demo', { kind: 'turn', id: oldSource.id })).turn.entries[0], { ...oldInput.entries[0], occurred_at: null });
+    });
+    await check('a turn without extracted memories is lexically retrievable', async () => {
+      const source = await memory.ingest('demo', turn('unextracted', 'The weather vane points east.'));
+      const recalled = await memory.recall('demo', { query: 'weather', limit: 8 });
+      assert.ok(recalled.bundles.some(bundle => bundle.source?.id === source.id && bundle.match.channels.some(channel => channel.channel === 'turn_lexical')));
+    });
+    await check('fixture vectors recover a source absent from lexical matches', async () => {
+      const source = await memory.ingest('demo', turn('semantic', 'The aubergine release is scheduled.'));
+      const recalled = await memory.recall('demo', { query: 'purple', limit: 8 });
+      const match = recalled.bundles.find(bundle => bundle.source?.id === source.id);
+      assert.deepEqual(match.match.channels.map(channel => channel.channel), ['chunk_vector']);
+    });
+    let foreign;
+    await check('scope-specific indexes and graph expansion exclude foreign source', async () => {
+      foreign = await memory.ingest('foreign', turn('private', 'Use blue FORBIDDEN_FIXTURE.'));
+      const recalled = await memory.recall('demo', { query: 'blue', limit: 32 });
+      assert.equal(JSON.stringify(recalled).includes('FORBIDDEN_FIXTURE'), false);
+    });
+    await check('foreign evidence is rejected atomically', async () => {
+      await assert.rejects(memory.enrich('demo', { records: [
+        record('must-not-persist', oldSource, oldInput),
+        record('foreign-record', foreign, turn('private', 'Use blue FORBIDDEN_FIXTURE.')),
+      ], relations: [] }), { code: 'evidence_unavailable' });
+      await assert.rejects(memory.show('demo', { kind: 'record', id: 'must-not-persist' }), { code: 'not_found' });
+    });
+    await check('a conflict late in enrichment rolls back earlier creates', async () => {
+      await assert.rejects(memory.enrich('demo', { records: [
+        record('rolled-back', oldSource, oldInput),
+        { ...record('old-decision', oldSource, oldInput), text: 'This would overwrite history.' },
+      ], relations: [] }), { code: 'record_identity_conflict' });
+      await assert.rejects(memory.show('demo', { kind: 'record', id: 'rolled-back' }), { code: 'not_found' });
+    });
+    await check('bounded expansion reports missing successor context', async () => {
+      const recalled = await memory.recall('demo', { query: 'blue', max_nodes: 1, limit: 1 });
+      assert.equal(recalled.relationship_context_complete, false);
+    });
+    await check('a cyclic relationship graph terminates', async () => {
+      await memory.enrich('demo', { records: [], relations: [{ id: 'cycle', type: 'depends_on', from: 'old-decision', to: 'new-decision', attribution: 'fixture', evidence: [span(oldSource, oldInput)] }] });
+      const recalled = await memory.recall('demo', { query: 'blue', limit: 1 });
+      assert.equal(recalled.bundles[0].relations.length, 2);
+    });
+    await check('output budget omission never claims complete relationship context', async () => {
+      const recalled = await memory.recall('demo', { query: 'blue', max_chars: 256 });
+      assert.deepEqual([recalled.status, recalled.bundles.length, recalled.relationship_context_complete, recalled.budget_omitted > 0], ['budget_limited', 0, false, true]);
+    });
+    await check('configured model failure preserves lexical recall and reports degradation', async () => {
+      modelDown = true;
+      const source = await memory.ingest('demo', turn('outage', 'Outage safety keeps this exact source.'));
+      const recalled = await memory.recall('demo', { query: 'Outage', limit: 1 });
+      assert.deepEqual([source.retained, source.indexing.status, recalled.status, recalled.bundles.length], [true, 'unavailable', 'degraded', 1]);
+      modelDown = false;
+    });
+    await check('index retries complete embeddings without another source occurrence', async () => {
+      const before = (await memory.status('demo')).turns;
+      const result = await memory.index('demo');
+      const after = await memory.status('demo');
+      assert.deepEqual([result.status, after.unindexed, after.turns], ['ready', 0, before]);
+    });
+    const attemptInput = turn('attempt', 'I ran the demonstration check. It passed. Should we run another?');
+    const attemptSource = await memory.ingest('demo', attemptInput);
+    const attemptEvidence = [span(attemptSource, attemptInput)];
+    const typedRecord = (id, kind) => ({ id, kind, text: kind, status: 'observed', attribution: 'fixture', evidence: attemptEvidence });
+    const outcomeEdge = (id, from, to) => ({ id, type: 'outcome_of', from, to, attribution: 'fixture', evidence: attemptEvidence });
+    await check('new outcome cannot use a new question as its referent', async () => {
+      await assert.rejects(memory.enrich('demo', { records: [typedRecord('bad-outcome', 'outcome'), typedRecord('new-question', 'question')],
+        relations: [outcomeEdge('bad-new', 'bad-outcome', 'new-question')] }), { code: 'invalid_outcome_relation' });
+      await assert.rejects(memory.show('demo', { kind: 'record', id: 'bad-outcome' }), { code: 'not_found' });
+    });
+    await check('outcome can refer to a new action and replay against its stored referent', async () => {
+      const outcome = typedRecord('good-outcome', 'outcome');
+      await memory.enrich('demo', { records: [outcome, typedRecord('good-action', 'action'), typedRecord('existing-question', 'question')],
+        relations: [outcomeEdge('good-new', 'good-outcome', 'good-action')] });
+      const replay = await memory.enrich('demo', { records: [outcome], relations: [] });
+      assert.deepEqual(replay.records, ['good-outcome']);
+    });
+    await check('new outcome cannot use an existing question as its referent', async () => {
+      await assert.rejects(memory.enrich('demo', { records: [typedRecord('bad-existing-outcome', 'outcome')],
+        relations: [outcomeEdge('bad-existing', 'bad-existing-outcome', 'existing-question')] }), { code: 'invalid_outcome_relation' });
+    });
+    await check('relation-only enrichment enforces an action target', async () => {
+      await assert.rejects(memory.enrich('demo', { records: [],
+        relations: [outcomeEdge('bad-target', 'good-outcome', 'existing-question')] }), { code: 'invalid_outcome_relation' });
+    });
+    await check('relation-only enrichment enforces an outcome source', async () => {
+      await assert.rejects(memory.enrich('demo', { records: [],
+        relations: [outcomeEdge('bad-source', 'existing-question', 'good-action')] }), { code: 'invalid_outcome_relation' });
+    });
+    await check('relation-only enrichment accepts existing outcome and action endpoints', async () => {
+      const result = await memory.enrich('demo', { records: [], relations: [outcomeEdge('good-existing', 'good-outcome', 'good-action')] });
+      assert.deepEqual(result.relations, ['good-existing']);
+    });
+    await check('CLI init, ingest, enrich, recall and show work across fresh processes', async () => {
+      const configPath = join(scratch, 'cli-config.json');
+      await writeFile(configPath, JSON.stringify({ neo4j: database, scopes: { read: ['cli'], write: ['cli'] } }), { mode: 0o600 });
+      const run = async (command, input) => {
+        const args = ['bin/memory.mjs', command, '--config', configPath, '--scope', 'cli'];
+        if (input) {
+          const path = join(scratch, `${command}.json`);
+          await writeFile(path, JSON.stringify(input));
+          args.push('--input', path);
+        }
+        return JSON.parse((await exec(process.execPath, args, { timeout: 30000, maxBuffer: 4_000_000 })).stdout);
+      };
+      await run('init');
+      const input = turn('cli', 'CLI preserves unabridged evidence.');
+      const source = await run('ingest', input);
+      await run('enrich', { records: [{ ...record('cli-record', source, input), kind: 'observation', status: 'observed' }], relations: [] });
+      const recalled = await run('recall', { query: 'unabridged' });
+      const shown = await run('show', { kind: 'turn', id: source.id });
+      assert.deepEqual([recalled.ok, recalled.bundles.length > 0, shown.turn.entries[0].text], [true, true, input.entries[0].text]);
+    });
+    if (process.env.SOURCE_MEMORY_REAL_EMBEDDING_URL) {
+      await check('a real local embedding endpoint indexes and recalls by meaning', async () => {
+        const real = new Memory({ neo4j: database, scopes: { read: ['real'], write: ['real'] },
+          embedding: { url: process.env.SOURCE_MEMORY_REAL_EMBEDDING_URL,
+            model: process.env.SOURCE_MEMORY_REAL_EMBEDDING_MODEL ?? 'embeddinggemma', dimensions: 768, timeout_ms: 60000 } });
+        try {
+          await real.init('real');
+          const target = await real.ingest('real', turn('real-1', 'We postponed the product launch because the payment provider failed certification.'));
+          await real.ingest('real', turn('real-2', 'The office plants need watering on Fridays.'));
+          const recalled = await real.recall('real', { query: 'Why was the release delayed?', limit: 2 });
+          const vector = recalled.bundles.find(bundle => bundle.match.channels.some(channel => channel.channel === 'chunk_vector'));
+          assert.deepEqual([recalled.channels.chunk_vector.status, vector?.source?.id], ['ready', target.id]);
+        } finally { await real.close(); }
+      });
+    }
+    return results;
+  } finally {
+    await memory.close();
+    model.closeAllConnections();
+    await new Promise(resolve => model.close(resolve));
+  }
+}
