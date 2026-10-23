@@ -1,0 +1,10 @@
+{
+  "source": "example",
+  "conversation_id": "demo-conversation",
+  "turn_id": "turn-1",
+  "occurred_at": "2026-10-23T12:00:00Z",
+  "entries": [
+    { "id": "user-1", "role": "user", "text": "Use blue for the demonstration dashboard." },
+    { "id": "assistant-1", "role": "assistant", "text": "I will use blue for this demonstration." }
+  ]
+}

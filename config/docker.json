@@ -1,0 +1,13 @@
+{
+  "neo4j": {
+    "uri": "bolt://neo4j:7687",
+    "allow_remote": true,
+    "database": "neo4j",
+    "user": "neo4j",
+    "password_env": "SOURCE_MEMORY_NEO4J_PASSWORD"
+  },
+  "scopes": { "read": ["default"], "write": ["default"] },
+  "chunking": { "words": 256, "overlap": 32 },
+  "index_on_write": true,
+  "vector_scan_limit": 10000
+}

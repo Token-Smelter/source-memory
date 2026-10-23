@@ -1,0 +1,20 @@
+{
+  "name": "source-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Source-first agent memory: retained turns, Neo4j full-text and vector recall, evidence-linked records",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/Token-Smelter/source-memory.git" },
+  "bin": { "source-memory": "bin/memory.mjs" },
+  "exports": "./src/memory.mjs",
+  "files": ["bin", "src", "skills", "examples", "config", "README.md", "LICENSE"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:integration": "node scripts/integration.mjs",
+    "check": "node scripts/check.mjs",
+    "memory": "node bin/memory.mjs"
+  },
+  "dependencies": { "neo4j-driver": "6.2.0" }
+}
