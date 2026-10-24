@@ -1,5 +1,5 @@
 import {
-  authorize, chunkEntries, cosine, fuse, integer, MemoryError,
+  authorize, chunkEntries, cosine, fuse, identity, integer, MemoryError,
   normalizeEnrichment, normalizeTurn, requireThat, sourceExcerpt, text,
 } from './core.mjs';
 import { embed, embeddingIdentity, rerank } from './models.mjs';
@@ -72,6 +72,7 @@ export class Memory {
     authorize(this.config, scope);
     if (input.kind === 'bundle') return this.showBundle(scope, input);
     if (input.kind === 'following') return this.showFollowing(scope, input);
+    if (input.kind === 'turn_by_key') return this.showTurnByKey(scope, input);
     const id = text(input.id, 256);
     requireThat(['turn', 'record'].includes(input.kind), 'invalid_kind');
     if (input.kind === 'turn') {
@@ -82,6 +83,20 @@ export class Memory {
     const record = await this.store.getRecord(scope, id);
     requireThat(record, 'not_found');
     return { kind: 'record', record, evidence: await this.evidence(scope, record.evidence) };
+  }
+
+  // Which of a caller's candidate keys already names a stored turn. More than one is reported, never resolved here.
+  async showTurnByKey(scope, input) {
+    authorize(this.config, scope);
+    const source = text(input.source, 256);
+    const conversation = text(input.conversation_id, 256);
+    requireThat(Array.isArray(input.turn_ids) && input.turn_ids.length > 0 && input.turn_ids.length <= 16);
+    const found = [];
+    for (const turnId of new Set(input.turn_ids.map(id => text(id, 256)))) {
+      const turn = await this.store.getTurn(scope, identity('turn', scope, source, conversation, turnId));
+      if (turn) found.push({ id: turn.id, turn_id: turn.turn_id });
+    }
+    return { kind: 'turn_by_key', found };
   }
 
   // Later turns of one conversation, by exact parent links only. Nothing here says a later turn replaces an earlier one.

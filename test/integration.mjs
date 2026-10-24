@@ -160,6 +160,11 @@ export async function runIntegration(database, scratch) {
       assert.deepEqual([rootRetry.id, rootRetry.replayed, nextRetry.id, nextRetry.replayed, read.turns.length, read.lineage],
         [root.id, true, next.id, true, 0, 'unknown']);
     });
+    await check('turn_by_key reports exactly the candidate keys that name stored turns, in this scope only', async () => {
+      const read = await memory.show('demo', { kind: 'turn_by_key', source: 'integration-fixture', conversation_id: 'upgrade', turn_ids: ['missing', 'v2', 'v1'] });
+      const foreign = await memory.show('foreign', { kind: 'turn_by_key', source: 'integration-fixture', conversation_id: 'upgrade', turn_ids: ['v1'] });
+      assert.deepEqual([read.found.map(row => row.turn_id), foreign.found.length], [['v2', 'v1'], 0]);
+    });
     await check('a changed source text is still a conflict even with lineage added', async () => {
       await assert.rejects(memory.ingest('demo', { source: 'integration-fixture', conversation_id: 'upgrade', turn_id: 'v1', lineage_root: true,
         entries: [{ id: 'u-v1', role: 'user', text: 'Rewritten.' }] }), { code: 'source_identity_conflict' });
