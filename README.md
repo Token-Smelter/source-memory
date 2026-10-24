@@ -81,6 +81,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `show` | `{"kind":"turn"\|"record","id":"..."}` | Full retained turn, or a record with its source evidence |
 | `show` | `{"kind":"bundle","seed":{"kind":"turn"\|"record","id":"..."},"max_nodes":48,"max_hops":4}` | One seed's relationship-closed bundle (same shape as a recall bundle), rebuilt without a query; hash it to detect later relationship changes |
 | `show` | `{"kind":"following","turn":"<turn id>","limit":2}` | Later turns of the same conversation by exact `parent_turn_id` links (see below) |
+| `show` | `{"kind":"turn_by_key","source":"...","conversation_id":"...","turn_ids":["..."]}` | Which of up to 16 caller turn keys already name stored turns (`found`, in request order); for callers that must reuse an existing identity |
 | `status` | None | Counts, unindexed items, configured models |
 
 ### Turn envelope
