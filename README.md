@@ -80,6 +80,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `recall` | `{"query":"...", "limit":8}` plus bounds | Search all channels, fuse, rerank, expand relationships, return evidence bundles |
 | `show` | `{"kind":"turn"\|"record","id":"..."}` | Full retained turn, or a record with its source evidence |
 | `show` | `{"kind":"bundle","seed":{"kind":"turn"\|"record","id":"..."},"max_nodes":48,"max_hops":4}` | One seed's relationship-closed bundle (same shape as a recall bundle), rebuilt without a query; hash it to detect later relationship changes |
+| `show` | `{"kind":"following","turn":"<turn id>","limit":2}` | Later turns of the same conversation by exact `parent_turn_id` links (see below) |
 | `status` | None | Counts, unindexed items, configured models |
 
 ### Turn envelope
@@ -99,6 +100,8 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 ```
 
 Roles: `user`, `assistant`, `tool`, `system`, `derived`. A `derived` entry (for example a compaction summary) is searchable but cannot serve as original evidence. Text is stored exactly; total source per turn is capped at 2 MB.
+
+`parent_turn_id` names the previous turn's `turn_id` in the same conversation and branch. Set `"lineage_root": true` only when the turn is known to be the first of its branch; otherwise a missing parent is treated as unknown. Neither field is inferred or backfilled.
 
 Identity is scope + `source` + `conversation_id` + `turn_id`. Identical retries return the same ID with `replayed: true`; different content under the same identity is refused (`source_identity_conflict`). A turn is retained and lexically searchable whether or not anything is ever extracted from it, and an embedding outage never rolls it back.
 
@@ -126,6 +129,19 @@ Chunks are word windows inside a single entry, recorded with exact UTF-16 offset
 - Evidence offsets are half-open UTF-16 offsets into an entry of a retained turn, may not split a surrogate pair, and are resolved from stored source; callers never supply quoted text.
 - Records and relations are append-only by identity. Record a correction as a new record with a `supersedes` or `qualifies` relation. Chronology and similarity never create relations automatically.
 - Limits: 128 records and 256 relations per call; 16 spans per item; 16,000 characters per span, 32,000 per item. Any invalid span, endpoint, or identity conflict rolls back the entire call.
+
+## Following a conversation
+
+`show {"kind":"following"}` walks exact parent links forward from one turn and returns up to `limit` later turns (default 2, at most 16) with their entries and roles.
+
+| Field | Meaning |
+|---|---|
+| `has_more` | More linked turns exist beyond `limit` |
+| `end` | `recorded_end` (last turn this store holds, not proof the conversation ended), `limit`, `branched`, or `cycle` |
+| `lineage` | `linked`; `branched` (two children: the active branch cannot be chosen from storage); `cycle`; or `unknown` when a same-conversation turn has no recorded place (stored before lineage existed, a non-root missing parent, or a parent this store does not hold) |
+| `unlinked_turns` | How many such turns make the lineage unknown |
+
+Later turns are context, not supersession: a later statement does not by itself replace an earlier decision.
 
 ## Recall
 

@@ -111,6 +111,50 @@ export async function runIntegration(database, scratch) {
       const after = await memory.show('demo', { kind: 'bundle', seed: { kind: 'record', id: 'old-decision' }, max_nodes: 8, max_hops: 2 });
       assert.deepEqual([before.bundle.relations.length, after.bundle.relations.length, after.bundle.records.some(row => row.id === 'qualifier')], [1, 2, true]);
     });
+    const lineageTurn = (id, parent, words) => ({ source: 'integration-fixture', conversation_id: 'lineage', turn_id: id,
+      ...(parent ? { parent_turn_id: parent } : { lineage_root: true }), entries: [{ id: `u-${id}`, role: 'user', text: words }] });
+    const first = await memory.ingest('demo', lineageTurn('l1', null, 'Use teal.'));
+    await memory.ingest('demo', lineageTurn('l2', 'l1', 'Actually use amber.'));
+    await memory.ingest('demo', lineageTurn('l3', 'l2', 'No, use violet.'));
+    await memory.ingest('demo', lineageTurn('l4', 'l3', 'Final answer: green.'));
+    await check('following returns later turns by parent link and reports more beyond the limit', async () => {
+      const read = await memory.show('demo', { kind: 'following', turn: first.id, limit: 2 });
+      assert.deepEqual([read.turns.map(row => row.turn_id), read.has_more, read.end, read.lineage], [['l2', 'l3'], true, 'limit', 'linked']);
+    });
+    await check('following to the last recorded turn reports a linked recorded end', async () => {
+      const read = await memory.show('demo', { kind: 'following', turn: first.id, limit: 3 });
+      assert.deepEqual([read.turns.map(row => row.turn_id), read.has_more, read.end, read.lineage], [['l2', 'l3', 'l4'], false, 'recorded_end', 'linked']);
+    });
+    await check('two children of one turn are reported as branched, not chosen', async () => {
+      await memory.ingest('demo', lineageTurn('l2b', 'l1', 'Regenerated: use amber.'));
+      const read = await memory.show('demo', { kind: 'following', turn: first.id, limit: 3 });
+      assert.deepEqual([read.turns.length, read.lineage, read.end], [0, 'branched', 'branched']);
+    });
+    await check('a same-conversation turn stored without lineage makes following unknown', async () => {
+      const lone = await memory.ingest('demo', { ...lineageTurn('m1', null, 'Use teal.'), conversation_id: 'legacy-conversation' });
+      // A turn written before lineage properties existed: same conversation, no parent recorded.
+      await memory.store.transaction('write', tx => tx.run('CREATE (t:SMTurn {uid:$uid, scope:$scope, body:$body})',
+        { uid: 'legacy-turn', scope: 'demo', body: JSON.stringify({ ...lineageTurn('m0', null, 'Earlier.'), conversation_id: 'legacy-conversation' }) }));
+      const read = await memory.show('demo', { kind: 'following', turn: lone.id });
+      assert.deepEqual([read.lineage, read.unlinked_turns], ['unknown', 1]);
+    });
+    await check('a later turn with an unknown parent makes an earlier turn\'s following unknown', async () => {
+      const root = await memory.ingest('demo', { ...lineageTurn('g1', null, 'Use teal.'), conversation_id: 'gap' });
+      await memory.ingest('demo', { ...lineageTurn('g3', 'g2-never-captured', 'Use amber.'), conversation_id: 'gap' });
+      const { lineage_root: _root, ...unrooted } = lineageTurn('g4', null, 'Use violet.');
+      await memory.ingest('demo', { ...unrooted, conversation_id: 'gap' });
+      const read = await memory.show('demo', { kind: 'following', turn: root.id });
+      assert.deepEqual([read.turns.length, read.end, read.lineage, read.unlinked_turns], [0, 'recorded_end', 'unknown', 2]);
+    });
+    await check('a declared root with a parent is refused', async () => {
+      await assert.rejects(memory.ingest('demo', { ...lineageTurn('bad', 'l1', 'x'), lineage_root: true }), { code: 'invalid_input' });
+    });
+    await check('an envelope without the new lineage field keeps its identity on replay', async () => {
+      const plain = { source: 'integration-fixture', conversation_id: 'plain', turn_id: 'p1', entries: [{ id: 'u-p1', role: 'user', text: 'Plain turn.' }] };
+      const once = await memory.ingest('demo', plain);
+      const again = await memory.ingest('demo', plain);
+      assert.deepEqual([again.id, again.replayed], [once.id, true]);
+    });
     await check('a cyclic relationship graph terminates', async () => {
       await memory.enrich('demo', { records: [], relations: [{ id: 'cycle', type: 'depends_on', from: 'old-decision', to: 'new-decision', attribution: 'fixture', evidence: [span(oldSource, oldInput)] }] });
       const recalled = await memory.recall('demo', { query: 'blue', limit: 1 });

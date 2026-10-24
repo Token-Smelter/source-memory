@@ -69,6 +69,9 @@ export function normalizeTurn(input) {
     conversation_id: text(input.conversation_id, 256),
     turn_id: text(input.turn_id, 256),
     parent_turn_id: input.parent_turn_id == null ? null : text(input.parent_turn_id, 256),
+    // Only a caller that knows this is the first turn of its branch says so; a missing parent is otherwise unknown.
+    // Absent unless true, so envelopes stored before this field existed keep their identity hash.
+    ...(input.lineage_root === undefined ? {} : (requireThat(input.lineage_root === true && input.parent_turn_id == null, 'invalid_input'), { lineage_root: true })),
     occurred_at: timestamp(input.occurred_at),
     entries,
   };

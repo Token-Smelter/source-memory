@@ -35,6 +35,7 @@ export class Neo4jStore {
     for (const label of ['SMTurn', 'SMChunk', 'SMRecord', 'SMRelation']) {
       await this.transaction('write', tx => tx.run(`CREATE CONSTRAINT ${label.toLowerCase()}_uid IF NOT EXISTS FOR (n:${label}) REQUIRE n.uid IS UNIQUE`));
     }
+    await this.transaction('write', tx => tx.run('CREATE INDEX smturn_lineage IF NOT EXISTS FOR (n:SMTurn) ON (n.scope, n.source, n.conversation_id, n.parent_turn_id)'));
     const ns = namespace(scope);
     const names = indexNames(scope);
     await this.transaction('write', tx => tx.run(`CREATE FULLTEXT INDEX ${names.turns} IF NOT EXISTS FOR (n:${ns}Turn) ON EACH [n.text]`));
@@ -48,11 +49,14 @@ export class Neo4jStore {
     const hash = digest(turn);
     const ns = namespace(scope);
     return this.transaction('write', async tx => {
+      // Lineage properties exist only on turns ingested with them; older turns are never backfilled.
       const result = await tx.run(`MERGE (t:SMTurn {uid:$uid})
-        ON CREATE SET t:${ns}Turn, t.scope=$scope, t.hash=$hash, t.body=$body, t.text=$text, t.created_at=datetime()
+        ON CREATE SET t:${ns}Turn, t.scope=$scope, t.hash=$hash, t.body=$body, t.text=$text, t.created_at=datetime(),
+          t.lineage=true, t.source=$source, t.conversation_id=$conversation, t.turn_key=$turnKey, t.parent_turn_id=$parent, t.lineage_root=$root
         RETURN t.hash AS hash, t.body AS body`, {
         uid, scope, hash, body: JSON.stringify(turn),
         text: turn.entries.map(entry => `[${entry.role}] ${entry.text}`).join('\n'),
+        source: turn.source, conversation: turn.conversation_id, turnKey: turn.turn_id, parent: turn.parent_turn_id, root: turn.lineage_root === true,
       });
       requireThat(result.records[0].get('hash') === hash, 'source_identity_conflict');
       // Chunk identity is stable for the first ingestion. Replays never add a second chunking scheme.
@@ -72,6 +76,33 @@ export class Neo4jStore {
     return this.transaction('read', async tx => {
       const result = await tx.run('MATCH (t:SMTurn {uid:$uid, scope:$scope}) RETURN t', { uid, scope });
       return decodeTurn(unwrap(result.records[0]?.get('t')));
+    });
+  }
+
+  async childTurns(scope, turn, limit) {
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`MATCH (t:SMTurn {scope:$scope, source:$source, conversation_id:$conversation, parent_turn_id:$parent})
+        RETURN t ORDER BY t.uid LIMIT $limit`, { scope, source: turn.source, conversation: turn.conversation_id, parent: turn.turn_id, limit: neo4j.int(limit) });
+      return result.records.map(row => decodeTurn(unwrap(row.get('t'))));
+    });
+  }
+
+  /**
+   * Same-conversation turns whose place in the history is unknown: stored before lineage existed, missing a parent
+   * without being a declared root, or naming a parent this store does not hold (a capture gap).
+   */
+  async unlinkedTurns(scope, turn) {
+    return this.transaction('read', async tx => {
+      const linked = await tx.run(`MATCH (t:SMTurn {scope:$scope, source:$source, conversation_id:$conversation})
+        RETURN t.uid AS uid, t.turn_key AS key, t.parent_turn_id AS parent, t.lineage_root AS root`,
+      { scope, source: turn.source, conversation: turn.conversation_id });
+      const legacy = await tx.run('MATCH (t:SMTurn {scope:$scope}) WHERE t.lineage IS NULL RETURN t.uid AS uid, t.body AS body', { scope });
+      const rows = linked.records.map(row => row.toObject());
+      const keys = new Set(rows.map(row => row.key));
+      const unknownParent = rows.filter(row => row.uid !== turn.id && (row.parent == null ? row.root !== true : !keys.has(row.parent))).length;
+      const unlinkedLegacy = legacy.records.filter(row => row.get('uid') !== turn.id).map(row => JSON.parse(row.get('body')))
+        .filter(body => body.source === turn.source && body.conversation_id === turn.conversation_id).length;
+      return unknownParent + unlinkedLegacy;
     });
   }
 
