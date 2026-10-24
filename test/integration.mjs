@@ -149,6 +149,21 @@ export async function runIntegration(database, scratch) {
     await check('a declared root with a parent is refused', async () => {
       await assert.rejects(memory.ingest('demo', { ...lineageTurn('bad', 'l1', 'x'), lineage_root: true }), { code: 'invalid_input' });
     });
+    await check('turns stored by an older caller replay when a newer caller adds lineage, keeping the first placement', async () => {
+      const plainRoot = { source: 'integration-fixture', conversation_id: 'upgrade', turn_id: 'v1', entries: [{ id: 'u-v1', role: 'user', text: 'First.' }] };
+      const plainNext = { ...plainRoot, turn_id: 'v2', entries: [{ id: 'u-v2', role: 'user', text: 'Second.' }] };
+      const root = await memory.ingest('demo', plainRoot);
+      const next = await memory.ingest('demo', plainNext);
+      const rootRetry = await memory.ingest('demo', { ...plainRoot, lineage_root: true });
+      const nextRetry = await memory.ingest('demo', { ...plainNext, parent_turn_id: 'v1' });
+      const read = await memory.show('demo', { kind: 'following', turn: root.id });
+      assert.deepEqual([rootRetry.id, rootRetry.replayed, nextRetry.id, nextRetry.replayed, read.turns.length, read.lineage],
+        [root.id, true, next.id, true, 0, 'unknown']);
+    });
+    await check('a changed source text is still a conflict even with lineage added', async () => {
+      await assert.rejects(memory.ingest('demo', { source: 'integration-fixture', conversation_id: 'upgrade', turn_id: 'v1', lineage_root: true,
+        entries: [{ id: 'u-v1', role: 'user', text: 'Rewritten.' }] }), { code: 'source_identity_conflict' });
+    });
     await check('an envelope without the new lineage field keeps its identity on replay', async () => {
       const plain = { source: 'integration-fixture', conversation_id: 'plain', turn_id: 'p1', entries: [{ id: 'u-p1', role: 'user', text: 'Plain turn.' }] };
       const once = await memory.ingest('demo', plain);

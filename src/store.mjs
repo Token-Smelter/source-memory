@@ -46,7 +46,11 @@ export class Neo4jStore {
 
   async ingest(scope, turn, chunks) {
     const uid = identity('turn', scope, turn.source, turn.conversation_id, turn.turn_id);
-    const hash = digest(turn);
+    // Lineage places a turn; it is not its content. A retry that now names a parent replays the turn first stored without one,
+    // and the first stored placement stays (no backfill). Hashes written before this rule covered the whole envelope.
+    const { lineage_root: _root, ...placed } = turn;
+    const hash = digest({ ...placed, parent_turn_id: null });
+    const accepted = [hash, digest(turn)];
     const ns = namespace(scope);
     return this.transaction('write', async tx => {
       // Lineage properties exist only on turns ingested with them; older turns are never backfilled.
@@ -58,7 +62,7 @@ export class Neo4jStore {
         text: turn.entries.map(entry => `[${entry.role}] ${entry.text}`).join('\n'),
         source: turn.source, conversation: turn.conversation_id, turnKey: turn.turn_id, parent: turn.parent_turn_id, root: turn.lineage_root === true,
       });
-      requireThat(result.records[0].get('hash') === hash, 'source_identity_conflict');
+      requireThat(accepted.includes(result.records[0].get('hash')), 'source_identity_conflict');
       // Chunk identity is stable for the first ingestion. Replays never add a second chunking scheme.
       const existing = await tx.run('MATCH (t:SMTurn {uid:$uid}) RETURN t.chunked AS chunked', { uid });
       const replayed = existing.records[0].get('chunked') === true;
