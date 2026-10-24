@@ -71,6 +71,7 @@ export class Memory {
   async show(scope, input) {
     authorize(this.config, scope);
     if (input.kind === 'bundle') return this.showBundle(scope, input);
+    if (input.kind === 'following') return this.showFollowing(scope, input);
     const id = text(input.id, 256);
     requireThat(['turn', 'record'].includes(input.kind), 'invalid_kind');
     if (input.kind === 'turn') {
@@ -81,6 +82,36 @@ export class Memory {
     const record = await this.store.getRecord(scope, id);
     requireThat(record, 'not_found');
     return { kind: 'record', record, evidence: await this.evidence(scope, record.evidence) };
+  }
+
+  // Later turns of one conversation, by exact parent links only. Nothing here says a later turn replaces an earlier one.
+  async showFollowing(scope, input) {
+    authorize(this.config, scope);
+    const start = await this.store.getTurn(scope, text(input.turn, 256));
+    requireThat(start, 'not_found');
+    const limit = integer(input.limit, 2, 1, 16);
+    const turns = [];
+    const seen = new Set([start.id]);
+    let current = start;
+    let end = 'recorded_end';
+    while (true) {
+      const children = await this.store.childTurns(scope, current, 2);
+      if (children.length === 0) break;
+      if (children.length > 1) { end = 'branched'; break; }
+      const [child] = children;
+      if (seen.has(child.id)) { end = 'cycle'; break; }
+      seen.add(child.id);
+      if (turns.length === limit) { end = 'limit'; break; }
+      turns.push(child);
+      current = child;
+    }
+    const unlinked = await this.store.unlinkedTurns(scope, start);
+    return {
+      // recorded_end is the last turn this store holds, not proof that the conversation ended there.
+      kind: 'following', turn: start.id, turns, has_more: end === 'limit', end,
+      lineage: end === 'branched' || end === 'cycle' ? end : unlinked ? 'unknown' : 'linked',
+      unlinked_turns: unlinked,
+    };
   }
 
   // Rebuilds one seed's relationship-closed bundle without a query, so a caller can detect changes since it last read it.
