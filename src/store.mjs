@@ -53,6 +53,7 @@ export class Neo4jStore {
     const names = indexNames(scope);
     await this.transaction('write', tx => tx.run(`CREATE FULLTEXT INDEX ${names.turns} IF NOT EXISTS FOR (n:${ns}Turn) ON EACH [n.text]`));
     await this.transaction('write', tx => tx.run(`CREATE FULLTEXT INDEX ${names.records} IF NOT EXISTS FOR (n:${ns}Record) ON EACH [n.text]`));
+    await this.transaction('write', tx => tx.run(`CREATE FULLTEXT INDEX ${names.chunks} IF NOT EXISTS FOR (n:${ns}Chunk) ON EACH [n.text]`));
     await this.transaction('read', tx => tx.run('CALL db.awaitIndexes(30)'));
     return { initialized: true, scope };
   }
@@ -218,6 +219,42 @@ export class Neo4jStore {
         const node = unwrap(row.get('node'));
         requireThat(node.scope === scope, 'index_scope_mismatch');
         return { kind, id: kind === 'turn' ? node.uid : node.record_id, text: node.text };
+      });
+    });
+  }
+
+  async chunkLexicalStatus(scope) {
+    return this.transaction('read', async tx => {
+      const result = await tx.run('SHOW FULLTEXT INDEXES YIELD name,state WHERE name=$name RETURN state', { name: indexNames(scope).chunks });
+      const state = result.records[0]?.get('state');
+      if (state === 'ONLINE') return { status: 'ready' };
+      if (state === 'POPULATING') return { status: 'pending' };
+      return { status: 'unavailable', reason: !state ? 'chunk_index_missing' : state === 'FAILED' ? 'chunk_index_failed' : 'chunk_index_unavailable' };
+    });
+  }
+
+  async chunkLexical(scope, query, limit, exclude = []) {
+    const lucene = lexicalQuery(query);
+    if (!lucene) return [];
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`CALL db.index.fulltext.queryNodes($index,$query) YIELD node,score WHERE ${eligible('node')}
+        MATCH (turn:SMTurn)-[:SM_HAS_CHUNK]->(node)
+        RETURN node,score,turn ORDER BY score DESC,node.uid LIMIT $limit`, {
+        index: indexNames(scope).chunks, query: lucene, limit: neo4j.int(limit), exclude,
+      });
+      return result.records.map(row => {
+        const node = unwrap(row.get('node'));
+        const parent = unwrap(row.get('turn'));
+        requireThat(node.scope === scope && parent.scope === scope, 'index_scope_mismatch');
+        const body = JSON.parse(parent.body);
+        const entries = body.entries.filter(entry => entry.id === node.entry_id);
+        // An inexact legacy entry join must not discard an otherwise valid lexical hit.
+        const role = entries.length === 1 ? node.role ?? entries[0].role : 'unknown';
+        const legacy = parent.source == null || parent.conversation_id == null;
+        return { kind: 'turn', id: parent.uid, text: node.text,
+          match: { turn: parent.uid, entry_id: node.entry_id, start: node.start, end: node.end, role },
+          conversation: { scope, source: parent.source ?? body.source, conversation_id: parent.conversation_id ?? body.conversation_id,
+            ...(legacy ? { legacy: true } : {}) } };
       });
     });
   }

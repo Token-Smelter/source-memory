@@ -171,11 +171,13 @@ export class Memory {
     const exclude = exclusions(input.exclude_conversations);
     const availability = {};
     const channels = {};
-    await Promise.all(['turn', 'record'].map(async kind => {
+    await Promise.all(['turn', 'record', 'chunk'].map(async kind => {
       const name = `${kind}_lexical`;
       try {
-        channels[name] = await this.store.lexical(scope, kind, query, candidates, exclude);
-        availability[name] = { status: 'ready' };
+        const state = kind === 'chunk' ? await this.store.chunkLexicalStatus(scope) : { status: 'ready' };
+        channels[name] = state.status !== 'ready' ? [] : kind === 'chunk' ? await this.store.chunkLexical(scope, query, candidates, exclude)
+          : await this.store.lexical(scope, kind, query, candidates, exclude);
+        availability[name] = state;
       } catch (error) {
         channels[name] = [];
         availability[name] = { status: 'unavailable', reason: safeCode(error) };

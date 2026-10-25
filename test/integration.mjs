@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Memory } from '../src/memory.mjs';
+import { indexNames, namespace } from '../src/core.mjs';
 
 const exec = promisify(execFile);
 
@@ -31,7 +32,7 @@ export async function runIntegration(database, scratch) {
   model.listen(0, '127.0.0.1');
   await once(model, 'listening');
   const url = `http://127.0.0.1:${model.address().port}`;
-  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion'], write: ['demo', 'foreign', 'exclusion'] },
+  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical'], write: ['demo', 'foreign', 'exclusion', 'lexical'] },
     embedding: { url: `${url}/embed`, model: 'fixture-only', dimensions: 3 },
     reranker: { url: `${url}/rerank`, model: 'fixture-only' } };
   const memory = new Memory(config);
@@ -46,6 +47,94 @@ export async function runIntegration(database, scratch) {
     await memory.init('demo');
     await memory.init('foreign');
     await memory.init('exclusion');
+    const lexical = new Memory({ neo4j: database, scopes: config.scopes });
+    try {
+      const input = { ...turn('long', ''), entries: ['system', 'user', 'tool', 'assistant'].map(role => ({
+        id: `${role}-entry`, role,
+        text: `${'context '.repeat(600)}${role === 'tool' ? 'lexicalneedle' : `${role}note`} ${'context '.repeat(40)}`,
+      })) };
+      const source = await lexical.ingest('lexical', input);
+      const entry = input.entries.find(row => row.role === 'tool');
+      const start = 'context '.repeat(448).length;
+      const end = entry.text.trimEnd().length;
+      const hit = { kind: 'turn', id: source.id, text: entry.text.slice(start, end),
+        match: { turn: source.id, entry_id: entry.id, start, end, role: entry.role },
+        conversation: { scope: 'lexical', source: input.source, conversation_id: input.conversation_id } };
+      await check('chunk lexical reports a missing index with a safe unavailable reason', async () => {
+        const recalled = await lexical.recall('lexical', { query: 'lexicalneedle' });
+        assert.deepEqual(recalled.channels.chunk_lexical, { status: 'unavailable', reason: 'chunk_index_missing' });
+      });
+      await check('init twice creates one scope chunk text index populated from existing chunks', async () => {
+        const first = await lexical.init('lexical');
+        const second = await lexical.init('lexical');
+        const indexes = await lexical.store.transaction('read', tx => tx.run(`SHOW FULLTEXT INDEXES YIELD name,labelsOrTypes,properties
+          WHERE name=$name RETURN labelsOrTypes,properties`, { name: indexNames('lexical').chunks }));
+        assert.deepEqual([first, second, indexes.records.map(row => row.toObject()),
+          await lexical.store.chunkLexicalStatus('lexical'), await lexical.store.chunkLexical('lexical', 'lexicalneedle', 1)],
+          [{ initialized: true, scope: 'lexical' }, { initialized: true, scope: 'lexical' },
+            [{ labelsOrTypes: [`${namespace('lexical')}Chunk`], properties: ['text'] }], { status: 'ready' }, [hit]]);
+      });
+      await check('new chunks store the role of every entry', async () => {
+        const roles = await lexical.store.transaction('read', tx => tx.run(`MATCH (c:SMChunk {turn_uid:$uid})
+          RETURN DISTINCT c.entry_id AS entry_id,c.role AS role ORDER BY entry_id`, { uid: source.id }));
+        assert.deepEqual(roles.records.map(row => row.toObject()), input.entries.map(row => ({ entry_id: row.id, role: row.role }))
+          .sort((a, b) => a.entry_id.localeCompare(b.entry_id)));
+      });
+      await check('chunk lexical returns the exact matching entry and span in a long multi-entry turn without embeddings', async () => {
+        const recalled = await lexical.recall('lexical', { query: 'lexicalneedle', limit: 1 });
+        const bundle = recalled.bundles[0];
+        assert.deepEqual([recalled.channels.chunk_lexical, recalled.channels.chunk_vector.status,
+          bundle?.match.channels.map(row => row.channel).sort(), bundle?.source.excerpts[0]],
+          [{ status: 'ready' }, 'unconfigured', ['chunk_lexical', 'turn_lexical'], { ...hit.match, text: hit.text }]);
+      });
+      await check('legacy chunk roles resolve from the exact parent entry without backfill writes', async () => {
+        await lexical.store.transaction('write', tx => tx.run('MATCH (c:SMChunk {turn_uid:$uid,entry_id:$entry}) REMOVE c.role',
+          { uid: source.id, entry: entry.id }));
+        const hits = await lexical.store.chunkLexical('lexical', 'lexicalneedle', 1);
+        const recalled = await lexical.recall('lexical', { query: 'lexicalneedle', limit: 1 });
+        const stored = await lexical.store.transaction('read', tx => tx.run('MATCH (c:SMChunk {turn_uid:$uid,entry_id:$entry}) RETURN count(c.role) AS roles',
+          { uid: source.id, entry: entry.id }));
+        assert.deepEqual([hits, recalled.bundles[0]?.source.excerpts[0], stored.records[0].get('roles')],
+          [[hit], { ...hit.match, text: hit.text }, 0]);
+      });
+      const stored = await lexical.store.transaction('read', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) RETURN t.body AS body', { uid: source.id }));
+      const body = stored.records[0].get('body');
+      const original = JSON.parse(body);
+      for (const [name, entries] of [['missing', original.entries.filter(row => row.id !== entry.id)],
+        ['ambiguous', [...original.entries, { ...entry, role: 'assistant' }]]]) {
+        await check(`${name} parent entry joins retain the chunk lexical hit with unknown role`, async () => {
+          try {
+            await lexical.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) SET t.body=$body',
+              { uid: source.id, body: JSON.stringify({ ...original, entries }) }));
+            assert.deepEqual(await lexical.store.chunkLexical('lexical', 'lexicalneedle', 1), [{ ...hit, match: { ...hit.match, role: 'unknown' } }]);
+          } finally {
+            await lexical.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) SET t.body=$body', { uid: source.id, body }));
+          }
+        });
+      }
+      await check('legacy chunk conversation keys come from the parent body and remain informational', async () => {
+        try {
+          await lexical.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) REMOVE t.source,t.conversation_id', { uid: source.id }));
+          const hits = await lexical.store.chunkLexical('lexical', 'lexicalneedle', 1, [{ source: input.source, conversation_id: input.conversation_id }]);
+          const properties = await lexical.store.transaction('read', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) RETURN t.source AS source,t.conversation_id AS conversation',
+            { uid: source.id }));
+          assert.deepEqual([hits, properties.records[0].toObject()],
+            [[{ ...hit, conversation: { ...hit.conversation, legacy: true } }], { source: null, conversation: null }]);
+        } finally {
+          await lexical.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) SET t.source=$source,t.conversation_id=$conversation',
+            { uid: source.id, source: input.source, conversation: input.conversation_id }));
+        }
+      });
+      await check('scope chunk indexes isolate identical source conversation and turn keys in both directions', async () => {
+        const foreignText = 'lexicalneedle belongs to another scope.';
+        const foreign = await lexical.ingest('foreign', { ...input, entries: [{ ...entry, text: foreignText }] });
+        const foreignHit = { kind: 'turn', id: foreign.id, text: foreignText,
+          match: { turn: foreign.id, entry_id: entry.id, start: 0, end: foreignText.length, role: entry.role },
+          conversation: { ...hit.conversation, scope: 'foreign' } };
+        assert.deepEqual([await lexical.store.chunkLexical('lexical', 'lexicalneedle', 32),
+          await lexical.store.chunkLexical('foreign', 'lexicalneedle', 32)], [[hit], [foreignHit]]);
+      });
+    } finally { await lexical.close(); }
     // The asker's own conversation outranks everything else in every channel; one other conversation holds the answer.
     const said = (conversation, id, value) => ({ source: 'integration-fixture', conversation_id: conversation, turn_id: id,
       entries: [{ id: `u-${id}`, role: 'user', text: value }] });
@@ -65,6 +154,14 @@ export async function runIntegration(database, scratch) {
     ], relations: [] });
     await memory.index('exclusion');
     const asker = [{ source: 'integration-fixture', conversation_id: 'asker' }];
+    await check('chunk lexical excludes dominating conversations before its candidate limit', async () => {
+      const plain = await memory.store.chunkLexical('exclusion', 'quartz backup window start', 1);
+      const excluded = await memory.store.chunkLexical('exclusion', 'quartz backup window start', 1, asker);
+      const recalled = await memory.recall('exclusion', { query: 'quartz backup window start', candidates: 1, limit: 1, exclude_conversations: asker });
+      assert.deepEqual([asked.some(row => row.source.id === plain[0]?.id), excluded.map(row => row.id),
+        recalled.bundles[0]?.source?.id, recalled.bundles[0]?.match.channels.some(row => row.channel === 'chunk_lexical')],
+        [true, [answer.id], answer.id, true], 'chunk lexical exclusion must precede the candidate limit');
+    });
     const conversationsOf = bundle => [...new Set([bundle.source?.conversation_id,
       ...bundle.records.flatMap(row => (row.supporting_evidence ?? []).map(span => span.conversation_id))].filter(Boolean))].sort();
     await check('without exclusion the asker\'s own conversation fills the first four in every channel', async () => {
@@ -80,7 +177,7 @@ export async function runIntegration(database, scratch) {
       const turn = recalled.bundles.find(bundle => bundle.match.kind === 'turn' && bundle.source.conversation_id === 'decider');
       const record = recalled.bundles.find(bundle => bundle.match.kind === 'record' && bundle.match.id === 'decider-decision');
       assert.deepEqual([channels(turn), channels(record), recalled.excluded_conversations],
-        [['chunk_vector', 'turn_lexical'], ['record_lexical', 'record_vector'], 1]);
+        [['chunk_lexical', 'chunk_vector', 'turn_lexical'], ['record_lexical', 'record_vector'], 1]);
     });
     await check('a record citing the asker and another conversation is still returned, for the caller to refuse', async () => {
       const recalled = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 32, exclude_conversations: asker });
@@ -111,7 +208,7 @@ export async function runIntegration(database, scratch) {
       const turn = recalled.bundles.find(bundle => bundle.match.kind === 'turn' && bundle.source.id === legacy.id);
       const records = new Set(recalled.bundles.flatMap(bundle => bundle.records.map(row => row.id)));
       assert.deepEqual([pending.channels.chunk_vector.status, turn?.match.channels.map(row => row.channel).sort(), records.has('legacy-claim'), records.has('asker-legacy-claim')],
-        ['partial', ['chunk_vector', 'turn_lexical'], true, true]);
+        ['partial', ['chunk_lexical', 'chunk_vector', 'turn_lexical'], true, true]);
     });
     await check('exclusion names a source and conversation exactly and is bounded', async () => {
       const otherSource = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 4, exclude_conversations: [{ source: 'other', conversation_id: 'asker' }] });

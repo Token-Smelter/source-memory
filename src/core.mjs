@@ -33,7 +33,7 @@ export function canonical(value) {
 export const digest = value => createHash('sha256').update(typeof value === 'string' ? value : canonical(value)).digest('hex');
 export const identity = (kind, scope, ...parts) => `${kind}_${digest([scope, ...parts])}`;
 export const namespace = scope => `SMN${digest(scope)}`;
-export const indexNames = scope => ({ turns: `smt_${digest(scope)}`, records: `smr_${digest(scope)}` });
+export const indexNames = scope => ({ turns: `smt_${digest(scope)}`, records: `smr_${digest(scope)}`, chunks: `smc_${digest(scope)}` });
 
 export function authorize(config, scope, operation = 'read') {
   text(scope, 256);
@@ -87,7 +87,7 @@ export function chunkEntries(turn, size = 256, overlap = 32) {
       const last = Math.min(first + size, words.length) - 1;
       const start = words[first].index;
       const end = words[last].index + words[last][0].length;
-      chunks.push({ entry_id: entry.id, ordinal: chunks.length, start, end, text: entry.text.slice(start, end) });
+      chunks.push({ entry_id: entry.id, role: entry.role, ordinal: chunks.length, start, end, text: entry.text.slice(start, end) });
       if (last === words.length - 1) break;
     }
   }
