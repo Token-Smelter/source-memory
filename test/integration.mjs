@@ -23,14 +23,15 @@ export async function runIntegration(database, scratch) {
     if (modelDown) { res.writeHead(503).end(); return; }
     const input = JSON.parse(body);
     if (req.url === '/embed') {
-      const vector = value => /aubergine|purple/i.test(value) ? [0, 1, 0] : /amber/i.test(value) ? [-1, 0, 0] : /blue/i.test(value) ? [1, 0, 0] : [0, 0, 1];
+      const vector = value => /aubergine|purple/i.test(value) ? [0, 1, 0] : /amber/i.test(value) ? [-1, 0, 0] : /blue/i.test(value) ? [1, 0, 0]
+        : /04:00/.test(value) ? [0, -1, 1] : /quartz/i.test(value) ? [0, -1, 0] : [0, 0, 1];
       res.end(JSON.stringify({ model: 'fixture-only', data: input.input.map((value, index) => ({ index, embedding: vector(value) })) }));
     } else res.end(JSON.stringify({ results: input.documents.map((_text, index) => ({ index, relevance_score: 1 / (index + 1) })) }));
   });
   model.listen(0, '127.0.0.1');
   await once(model, 'listening');
   const url = `http://127.0.0.1:${model.address().port}`;
-  const config = { neo4j: database, scopes: { read: ['demo', 'foreign'], write: ['demo', 'foreign'] },
+  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion'], write: ['demo', 'foreign', 'exclusion'] },
     embedding: { url: `${url}/embed`, model: 'fixture-only', dimensions: 3 },
     reranker: { url: `${url}/rerank`, model: 'fixture-only' } };
   const memory = new Memory(config);
@@ -44,6 +45,63 @@ export async function runIntegration(database, scratch) {
   try {
     await memory.init('demo');
     await memory.init('foreign');
+    await memory.init('exclusion');
+    // The asker's own conversation outranks everything else in every channel; one other conversation holds the answer.
+    const said = (conversation, id, value) => ({ source: 'integration-fixture', conversation_id: conversation, turn_id: id,
+      entries: [{ id: `u-${id}`, role: 'user', text: value }] });
+    const asked = [];
+    for (let index = 0; index < 6; index += 1) {
+      const input = said('asker', `q${index}`, `Quartz quartz quartz: when does the quartz backup window start? Question ${index}.`);
+      asked.push({ input, source: await memory.ingest('exclusion', input) });
+    }
+    const answerInput = said('decider', 'd1', `After a long review of the rota, the staffing plan, the storage costs and several unrelated scheduling notes, the decision is that the quartz backup window should start at 04:00 from now on. ${'Other notes follow. '.repeat(12)}`);
+    const answer = await memory.ingest('exclusion', answerInput);
+    const claim = (id, input, source, extra = []) => ({ id, kind: 'decision', status: 'proposed', attribution: 'fixture', text: input.entries[0].text,
+      evidence: [span(source, input), ...extra] });
+    await memory.enrich('exclusion', { records: [
+      ...asked.map(({ input, source }, index) => claim(`asker-claim-${index}`, input, source)),
+      claim('decider-decision', answerInput, answer),
+      claim('mixed-claim', asked[0].input, asked[0].source, [span(answer, answerInput)]),
+    ], relations: [] });
+    await memory.index('exclusion');
+    const asker = [{ source: 'integration-fixture', conversation_id: 'asker' }];
+    const conversationsOf = bundle => [...new Set([bundle.source?.conversation_id,
+      ...bundle.records.flatMap(row => (row.supporting_evidence ?? []).map(span => span.conversation_id))].filter(Boolean))].sort();
+    await check('without exclusion the asker\'s own conversation fills the first four in every channel', async () => {
+      const recalled = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 4 });
+      assert.deepEqual([recalled.excluded_conversations, recalled.bundles.every(bundle => conversationsOf(bundle).includes('asker'))], [0, true]);
+    });
+    await check('excluding the asker returns the other conversation\'s eligible matches through every channel', async () => {
+      const recalled = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 4, exclude_conversations: asker });
+      const seed = bundle => bundle.match.kind === 'turn' ? [bundle.source.conversation_id]
+        : bundle.records.find(row => row.id === bundle.match.id).supporting_evidence.map(span => span.conversation_id);
+      assert.equal(recalled.bundles.some(bundle => seed(bundle).every(conversation => conversation === 'asker')), false);
+      const channels = bundle => bundle?.match.channels.map(row => row.channel).sort();
+      const turn = recalled.bundles.find(bundle => bundle.match.kind === 'turn' && bundle.source.conversation_id === 'decider');
+      const record = recalled.bundles.find(bundle => bundle.match.kind === 'record' && bundle.match.id === 'decider-decision');
+      assert.deepEqual([channels(turn), channels(record), recalled.excluded_conversations],
+        [['chunk_vector', 'turn_lexical'], ['record_lexical', 'record_vector'], 1]);
+    });
+    await check('a record citing the asker and another conversation is still returned, for the caller to refuse', async () => {
+      const recalled = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 32, exclude_conversations: asker });
+      assert.ok(recalled.bundles.some(bundle => bundle.records.some(row => row.id === 'mixed-claim')));
+    });
+    await check('the asker\'s unindexed text does not hold back recall of the others', async () => {
+      // As the live pilot runs: the asker's current turn is stored at admission and indexed later.
+      const deferred = new Memory({ ...config, index_on_write: false });
+      await deferred.ingest('exclusion', said('asker', 'q-new', 'Quartz again: the quartz window?'));
+      await deferred.close?.();
+      const excluded = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 4, exclude_conversations: asker });
+      const plain = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 4 });
+      assert.deepEqual([excluded.channels.chunk_vector.status, plain.channels.chunk_vector.status], ['ready', 'partial']);
+      await memory.index('exclusion');
+    });
+    await check('exclusion names a source and conversation exactly and is bounded', async () => {
+      const otherSource = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 4, exclude_conversations: [{ source: 'other', conversation_id: 'asker' }] });
+      assert.equal(otherSource.bundles.every(bundle => conversationsOf(bundle).includes('asker')), true);
+      await assert.rejects(memory.recall('exclusion', { query: 'q', exclude_conversations: Array.from({ length: 17 }, () => asker[0]) }), { code: 'invalid_input' });
+      await assert.rejects(memory.recall('exclusion', { query: 'q', exclude_conversations: [{ ...asker[0], extra: 1 }] }), { code: 'invalid_input' });
+    });
     await check('concurrent source replay produces one retained turn', async () => {
       const inserted = await Promise.all([memory.ingest('demo', oldInput), memory.ingest('demo', oldInput)]);
       oldSource = inserted[0];

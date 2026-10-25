@@ -6,6 +6,18 @@ const decodeTurn = props => props ? { id: props.uid, scope: props.scope, ...JSON
 const decodeRecord = props => props ? { uid: props.uid, scope: props.scope, ...JSON.parse(props.body) } : null;
 const decodeRelation = props => props ? { uid: props.uid, ...JSON.parse(props.body) } : null;
 
+/**
+ * Cypher predicate over `$exclude` ([{source, conversation_id}]): false for a turn of an excluded conversation, a chunk of
+ * such a turn, and a record whose every evidence turn is in one. A record with any other evidence stays, so a mixed bundle
+ * still reaches the caller. Turns stored before lineage properties existed carry no conversation and are never excluded.
+ */
+const excludedTurn = turn => `any(x IN $exclude WHERE x.source = ${turn}.source AND x.conversation_id = ${turn}.conversation_id)`;
+const eligible = n => `(size($exclude) = 0
+  OR (${n}:SMTurn AND NOT ${excludedTurn(n)})
+  OR (${n}:SMChunk AND EXISTS { MATCH (t:SMTurn)-[:SM_HAS_CHUNK]->(${n}) WHERE NOT ${excludedTurn('t')} })
+  OR (${n}:SMRecord AND (NOT EXISTS { MATCH (${n})-[:SM_EVIDENCE]->(:SMTurn) }
+    OR EXISTS { MATCH (${n})-[:SM_EVIDENCE]->(t:SMTurn) WHERE NOT ${excludedTurn('t')} })))`;
+
 export class Neo4jStore {
   constructor(config) {
     requireThat(config && typeof config.uri === 'string', 'database_config_required');
@@ -191,13 +203,15 @@ export class Neo4jStore {
       WHERE n:SMChunk OR n:SMRecord SET n.embedding=row.vector, n.embedding_key=$model`, { scope, model, rows }));
   }
 
-  async lexical(scope, kind, query, limit) {
+  // The exclusion is applied before the limit, so excluded matches never take the place of eligible ones.
+  async lexical(scope, kind, query, limit, exclude = []) {
     const lucene = lexicalQuery(query);
     if (!lucene) return [];
     const index = indexNames(scope)[kind === 'turn' ? 'turns' : 'records'];
     return this.transaction('read', async tx => {
-      const result = await tx.run('CALL db.index.fulltext.queryNodes($index,$query,{limit:$limit}) YIELD node,score RETURN node,score ORDER BY score DESC,node.uid', {
-        index, query: lucene, limit: neo4j.int(limit),
+      const result = await tx.run(`CALL db.index.fulltext.queryNodes($index,$query) YIELD node,score WHERE ${eligible('node')}
+        RETURN node,score ORDER BY score DESC,node.uid LIMIT $limit`, {
+        index, query: lucene, limit: neo4j.int(limit), exclude,
       });
       return result.records.map(row => {
         const node = unwrap(row.get('node'));
@@ -207,10 +221,10 @@ export class Neo4jStore {
     });
   }
 
-  async vectors(scope, model, limit) {
+  async vectors(scope, model, limit, exclude = []) {
     return this.transaction('read', async tx => {
-      const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope AND n.embedding_key=$model
-        RETURN n ORDER BY n.uid LIMIT $limit`, { scope, model, limit: neo4j.int(limit) });
+      const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope AND n.embedding_key=$model AND ${eligible('n')}
+        RETURN n ORDER BY n.uid LIMIT $limit`, { scope, model, limit: neo4j.int(limit), exclude });
       return result.records.map(row => unwrap(row.get('n')));
     });
   }
@@ -234,14 +248,16 @@ export class Neo4jStore {
     });
   }
 
-  async status(scope, embeddingKey = null) {
+  // `unindexed` counts only what a recall with this exclusion could return.
+  async status(scope, embeddingKey = null, exclude = []) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n) WHERE n.scope=$scope AND (n:SMTurn OR n:SMChunk OR n:SMRecord OR n:SMRelation)
         RETURN count(CASE WHEN n:SMTurn THEN 1 END) AS turns,
           count(CASE WHEN n:SMChunk THEN 1 END) AS chunks,
           count(CASE WHEN n:SMRecord THEN 1 END) AS records,
           count(CASE WHEN n:SMRelation THEN 1 END) AS relations,
-          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) THEN 1 END) AS unindexed`, { scope, model: embeddingKey });
+          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed`,
+        { scope, model: embeddingKey, exclude });
       return result.records[0].toObject();
     });
   }
