@@ -317,6 +317,8 @@ function sourceView(turn, matches, query) {
     const key = `${span.entry_id}:${span.start}:${span.end}`;
     if (seen.has(key)) return;
     seen.add(key);
+    // Chunk lexical matches already carry exact text and an exact-or-unknown role; legacy entries may not resolve.
+    if (span.text !== undefined && span.role !== undefined) { spans.push({ ...span }); return; }
     const entry = turn.entries.find(row => row.id === span.entry_id);
     if (!entry || span.end > entry.text.length) return;
     spans.push({ ...span, role: entry.role, text: entry.text.slice(span.start, span.end) });

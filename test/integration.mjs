@@ -102,11 +102,15 @@ export async function runIntegration(database, scratch) {
       const original = JSON.parse(body);
       for (const [name, entries] of [['missing', original.entries.filter(row => row.id !== entry.id)],
         ['ambiguous', [...original.entries, { ...entry, role: 'assistant' }]]]) {
-        await check(`${name} parent entry joins retain the chunk lexical hit with unknown role`, async () => {
+        await check(`${name} parent entry joins retain the chunk lexical excerpt with unknown role in public recall`, async () => {
           try {
             await lexical.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) SET t.body=$body',
               { uid: source.id, body: JSON.stringify({ ...original, entries }) }));
-            assert.deepEqual(await lexical.store.chunkLexical('lexical', 'lexicalneedle', 1), [{ ...hit, match: { ...hit.match, role: 'unknown' } }]);
+            const hits = await lexical.store.chunkLexical('lexical', 'lexicalneedle', 1);
+            const recalled = await lexical.recall('lexical', { query: 'lexicalneedle', limit: 1 });
+            const bundle = recalled.bundles[0];
+            assert.deepEqual([hits, recalled.channels.chunk_lexical, bundle?.match.channels.some(row => row.channel === 'chunk_lexical'), bundle?.source.excerpts[0]],
+              [[{ ...hit, match: { ...hit.match, role: 'unknown' } }], { status: 'ready' }, true, { ...hit.match, role: 'unknown', text: hit.text }]);
           } finally {
             await lexical.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) SET t.body=$body', { uid: source.id, body }));
           }

@@ -187,7 +187,8 @@ export function fuse(channels) {
       const previous = hits.get(key) ?? { ...item, score: 0, channels: [] };
       previous.score += 1 / (60 + i + 1);
       previous.channels.push({ channel, rank: i + 1 });
-      if (item.match) previous.matches = [...(previous.matches ?? []), item.match];
+      if (item.match) previous.matches = [...(previous.matches ?? []),
+        item.match.role === undefined ? item.match : { ...item.match, text: item.text }];
       hits.set(key, previous);
     }
   }
