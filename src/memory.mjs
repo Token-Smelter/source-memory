@@ -5,6 +5,11 @@ import {
 import { embed, embeddingIdentity, rerank } from './models.mjs';
 import { Neo4jStore } from './store.mjs';
 
+const MODE_CONTRACTS = {
+  evidence_advice: 'Evidence advice: prioritizes extracted claims that cite user spans; a cited user span may be a question, so this is not user assertion or authority. May return no relevant history. Omitted material may correct shown claims. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
+  history_search: 'History search: retained conversations in search rank order. Not an answer to what is current. Omitted or later material may correct shown items. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
+};
+
 export class Memory {
   constructor(config, store = null) {
     this.config = config;
@@ -159,6 +164,11 @@ export class Memory {
 
   async recall(scope, input) {
     authorize(this.config, scope);
+    const mode = input.mode;
+    requireThat(mode === undefined || (typeof mode === 'string' && Object.hasOwn(MODE_CONTRACTS, mode)), 'invalid_input');
+    requireThat(input.group === undefined || input.group === 'conversation', 'invalid_input');
+    const grouped = input.group === 'conversation';
+    const perConversation = integer(input.per_conversation, 2, 1, 4);
     const query = text(input.query, 4000);
     const candidates = integer(input.candidates, 64, 1, 256);
     const limit = integer(input.limit, 8, 1, 32);
@@ -171,16 +181,27 @@ export class Memory {
     const exclude = exclusions(input.exclude_conversations);
     const availability = {};
     const channels = {};
+    const omitted = [];
+    const admissionFields = grouped ? { admitted_conversations: 0, exhausted: false } : {};
     await Promise.all(['turn', 'record', 'chunk'].map(async kind => {
       const name = `${kind}_lexical`;
       try {
-        const state = kind === 'chunk' ? await this.store.chunkLexicalStatus(scope) : { status: 'ready' };
-        channels[name] = state.status !== 'ready' ? [] : kind === 'chunk' ? await this.store.chunkLexical(scope, query, candidates, exclude)
-          : await this.store.lexical(scope, kind, query, candidates, exclude);
-        availability[name] = state;
+        if (grouped) {
+          const state = await this.store.lexicalStatus(scope, kind);
+          const result = state.status === 'ready' ? await this.store.admittedLexical(scope, kind, query, candidates, perConversation, exclude)
+            : { hits: [], omitted: [], ...admissionFields };
+          channels[name] = result.hits;
+          omitted.push(...result.omitted);
+          availability[name] = { ...state, admitted_conversations: result.admitted_conversations, exhausted: result.exhausted };
+        } else {
+          const state = kind === 'chunk' ? await this.store.chunkLexicalStatus(scope) : { status: 'ready' };
+          channels[name] = state.status !== 'ready' ? [] : kind === 'chunk' ? await this.store.chunkLexical(scope, query, candidates, exclude)
+            : await this.store.lexical(scope, kind, query, candidates, exclude);
+          availability[name] = state;
+        }
       } catch (error) {
         channels[name] = [];
-        availability[name] = { status: 'unavailable', reason: safeCode(error) };
+        availability[name] = { status: 'unavailable', reason: safeCode(error), ...admissionFields };
       }
     }));
     channels.chunk_vector = [];
@@ -191,27 +212,39 @@ export class Memory {
         const [queryVector] = await embed(this.config.embedding, [query]);
         const vectors = await this.store.vectors(scope, key, vectorLimit + 1, exclude);
         const counts = await this.store.status(scope, key, exclude);
-        const ranked = vectors.slice(0, vectorLimit).map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
-          .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid));
-        channels.chunk_vector = ranked.filter(row => row.turn_uid).slice(0, candidates).map(row => ({
-          kind: 'turn', id: row.turn_uid, text: row.text,
-          match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
-        }));
-        channels.record_vector = ranked.filter(row => row.record_id).slice(0, candidates)
-          .map(row => ({ kind: 'record', id: row.record_id, text: row.text }));
         const state = { status: vectors.length > vectorLimit || counts.unindexed > 0 ? 'partial' : 'ready',
           scan_truncated: vectors.length > vectorLimit, unindexed: counts.unindexed, embedding_key: key };
-        availability.chunk_vector = state;
-        availability.record_vector = { ...state };
+        if (grouped) {
+          const scanned = vectors.slice(0, vectorLimit).map(row => row.uid);
+          const results = await Promise.all(['chunk', 'record'].map(kind =>
+            this.store.admittedVectors(scope, kind, key, queryVector, scanned, candidates, perConversation, exclude)));
+          for (const [index, kind] of ['chunk', 'record'].entries()) {
+            const result = results[index];
+            channels[`${kind}_vector`] = result.hits;
+            omitted.push(...result.omitted);
+            availability[`${kind}_vector`] = { ...state, admitted_conversations: result.admitted_conversations, exhausted: result.exhausted };
+          }
+        } else {
+          const ranked = vectors.slice(0, vectorLimit).map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
+            .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid));
+          channels.chunk_vector = ranked.filter(row => row.turn_uid).slice(0, candidates).map(row => ({
+            kind: 'turn', id: row.turn_uid, text: row.text,
+            match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
+          }));
+          channels.record_vector = ranked.filter(row => row.record_id).slice(0, candidates)
+            .map(row => ({ kind: 'record', id: row.record_id, text: row.text }));
+          availability.chunk_vector = state;
+          availability.record_vector = { ...state };
+        }
       } catch (error) {
-        availability.chunk_vector = { status: 'unavailable', reason: safeCode(error) };
+        availability.chunk_vector = { status: 'unavailable', reason: safeCode(error), ...admissionFields };
         availability.record_vector = { ...availability.chunk_vector };
       }
     } else {
-      availability.chunk_vector = { status: 'unconfigured' };
-      availability.record_vector = { status: 'unconfigured' };
+      availability.chunk_vector = { status: 'unconfigured', ...admissionFields };
+      availability.record_vector = { status: 'unconfigured', ...admissionFields };
     }
-    let ranked = fuse(channels).slice(0, candidates);
+    let ranked = grouped ? fuse(channels) : fuse(channels).slice(0, candidates);
     if (this.config.reranker && ranked.length) {
       try {
         // This cut affects ranking only. Evidence is read independently from the retained source.
@@ -224,12 +257,20 @@ export class Memory {
     const bundles = [];
     let chars = 0;
     let budgetOmitted = 0;
-    for (const seed of ranked.slice(0, limit)) {
-      const bundle = await this.bundle(scope, seed, query, maxNodes, maxHops);
-      const size = JSON.stringify(bundle).length;
-      if (chars + size > maxChars) { budgetOmitted += 1; continue; }
-      bundles.push(bundle);
-      chars += size;
+    let groupedOutput = {};
+    if (grouped) {
+      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops);
+      budgetOmitted = result.budget_omitted;
+      groupedOutput = { units: result.units, pool_truncated: result.pool_truncated, budget_unit: 'utf8_bytes' };
+      bundles.push(...result.units.flatMap(unit => unit.seeds));
+    } else {
+      for (const seed of ranked.slice(0, limit)) {
+        const bundle = await this.bundle(scope, seed, query, maxNodes, maxHops);
+        const size = JSON.stringify(bundle).length;
+        if (chars + size > maxChars) { budgetOmitted += 1; continue; }
+        bundles.push(bundle);
+        chars += size;
+      }
     }
     const unavailable = Object.values(availability).some(row => row.status === 'unavailable');
     return {
@@ -243,7 +284,63 @@ export class Memory {
       excluded_conversations: exclude.length,
       bundles,
       authority: 'Evidence and attributed records; not execution permission or a guarantee of current state.',
+      ...groupedOutput,
+      ...(mode === undefined ? {} : { mode, mode_contract: MODE_CONTRACTS[mode] }),
     };
+  }
+
+  async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops) {
+    authorize(this.config, scope);
+    const priority = new Map();
+    for (const [rank, seed] of ranked.entries()) for (const context of seed.conversations) {
+      const token = conversationToken(context.key);
+      if (!priority.has(token)) priority.set(token, rank);
+    }
+    const admitted = new Set(Object.values(channels).flatMap(hits => hits.map(seedToken)));
+    const truncated = new Map();
+    for (const seed of omitted) {
+      if (admitted.has(seedToken(seed))) continue;
+      for (const key of seed.keys) {
+        const token = conversationToken(key);
+        if (!truncated.has(token)) truncated.set(token, new Set());
+        truncated.get(token).add(seedToken(seed));
+      }
+    }
+    const pool = new Map();
+    for (const seed of ranked) {
+      const contexts = [...seed.conversations].sort((a, b) => priority.get(conversationToken(a.key)) - priority.get(conversationToken(b.key))
+        || compareConversationKeys(a.key, b.key));
+      const owner = contexts[0];
+      const token = conversationToken(owner.key);
+      if (!pool.has(token)) pool.set(token, { key: owner.key, legacy: false, candidates: [], also: new Map() });
+      const unit = pool.get(token);
+      unit.legacy ||= owner.legacy === true;
+      unit.candidates.push(seed);
+      for (const context of contexts.slice(1)) unit.also.set(conversationToken(context.key), context.key);
+    }
+    const units = [];
+    let bytes = 0;
+    let budgetOmitted = 0;
+    for (const unit of [...pool.values()].slice(0, limit)) {
+      const seeds = [];
+      for (const candidate of unit.candidates) {
+        const bundle = await this.bundle(scope, candidate, query, maxNodes, maxHops);
+        seeds.push(bundle);
+        const evidence = [bundle.source, ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence)].filter(Boolean);
+        for (const span of evidence) {
+          const key = { scope, source: span.source, conversation_id: span.conversation_id };
+          if (conversationToken(key) !== conversationToken(unit.key)) unit.also.set(conversationToken(key), key);
+        }
+      }
+      const rendered = { key: unit.key, ...(unit.legacy ? { legacy: true } : {}), seeds,
+        seeds_truncated: truncated.get(conversationToken(unit.key))?.size ?? 0, also_cites: [...unit.also.values()].sort(compareConversationKeys) };
+      const size = Buffer.byteLength(JSON.stringify(rendered));
+      // Admission limits seeds; rendering budgets may only skip an entire unit, never a seed or part of its evidence.
+      if (bytes + size > maxBytes) { budgetOmitted += 1; continue; }
+      units.push(rendered);
+      bytes += size;
+    }
+    return { units, pool_truncated: Math.max(0, pool.size - limit), budget_omitted: budgetOmitted };
   }
 
   async bundle(scope, seed, query, maxNodes, maxHops) {
@@ -300,6 +397,10 @@ export class Memory {
     };
   }
 }
+
+const seedToken = seed => JSON.stringify([seed.kind, seed.id]);
+const conversationToken = key => JSON.stringify([key.scope, key.source, key.conversation_id]);
+const compareConversationKeys = (a, b) => a.scope.localeCompare(b.scope) || a.source.localeCompare(b.source) || a.conversation_id.localeCompare(b.conversation_id);
 
 function exclusions(value) {
   if (value === undefined) return [];

@@ -5,10 +5,16 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { Memory } from '../src/memory.mjs';
-import { indexNames, namespace } from '../src/core.mjs';
+import { identity, indexNames, namespace } from '../src/core.mjs';
+import { embeddingIdentity } from '../src/models.mjs';
 
 const exec = promisify(execFile);
+const contracts = {
+  evidence_advice: 'Evidence advice: prioritizes extracted claims that cite user spans; a cited user span may be a question, so this is not user assertion or authority. May return no relevant history. Omitted material may correct shown claims. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
+  history_search: 'History search: retained conversations in search rank order. Not an answer to what is current. Omitted or later material may correct shown items. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
+};
 
 export async function runIntegration(database, scratch) {
   const results = [];
@@ -27,12 +33,16 @@ export async function runIntegration(database, scratch) {
       const vector = value => /aubergine|purple/i.test(value) ? [0, 1, 0] : /amber/i.test(value) ? [-1, 0, 0] : /blue/i.test(value) ? [1, 0, 0]
         : /04:00/.test(value) ? [0, -1, 1] : /quartz/i.test(value) ? [0, -1, 0] : [0, 0, 1];
       res.end(JSON.stringify({ model: 'fixture-only', data: input.input.map((value, index) => ({ index, embedding: vector(value) })) }));
-    } else res.end(JSON.stringify({ results: input.documents.map((_text, index) => ({ index, relevance_score: 1 / (index + 1) })) }));
+    } else {
+      const favored = req.url === '/owner-rerank' ? 'B_OWNER_MARKER' : req.url === '/large-rerank' ? 'LARGE_OWNER_MARKER' : null;
+      res.end(JSON.stringify({ results: input.documents.map((value, index) => ({ index,
+        relevance_score: favored && value.includes(favored) ? 100 : 1 / (index + 1) })) }));
+    }
   });
   model.listen(0, '127.0.0.1');
   await once(model, 'listening');
   const url = `http://127.0.0.1:${model.address().port}`;
-  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical'], write: ['demo', 'foreign', 'exclusion', 'lexical'] },
+  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing'], write: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing'] },
     embedding: { url: `${url}/embed`, model: 'fixture-only', dimensions: 3 },
     reranker: { url: `${url}/rerank`, model: 'fixture-only' } };
   const memory = new Memory(config);
@@ -47,6 +57,235 @@ export async function runIntegration(database, scratch) {
     await memory.init('demo');
     await memory.init('foreign');
     await memory.init('exclusion');
+    await memory.init('modes');
+    await memory.init('packing');
+    const plain = new Memory({ ...config, embedding: undefined, reranker: undefined }, memory.store);
+    const key = embeddingIdentity(config.embedding);
+    const fiveChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'];
+    const modeTurn = (conversation, id, value) => ({ source: 'mode-fixture', conversation_id: conversation, turn_id: id,
+      entries: [{ id: `entry-${id}`, role: 'user', text: value }] });
+    const chunkUid = input => identity('chunk', 'modes', identity('turn', 'modes', input.source, input.conversation_id, input.turn_id), 0);
+    const withPrefix = (prefix, make, uid) => {
+      for (let index = 0; index < 10000; index += 1) {
+        const value = make(index);
+        if (uid(value).split('_')[1].startsWith(prefix)) return value;
+      }
+      throw new Error('fixture identity prefix unavailable');
+    };
+    const flood = [];
+    for (let index = 0; index < 8; index += 1) {
+      const input = withPrefix('0', suffix => modeTurn('flood', `flood-${index}-${suffix}`, `${'admissionneedle '.repeat(12)}quartz question ${index}`), chunkUid);
+      flood.push({ input, source: await memory.ingest('modes', input) });
+    }
+    const otherInput = withPrefix('f', suffix => modeTurn('other', `answer-${suffix}`, `${'context '.repeat(180)}admissionneedle quartz answer`), chunkUid);
+    const other = { input: otherInput, source: await memory.ingest('modes', otherInput) };
+    const modeClaim = (id, row) => ({ id, kind: 'observation', status: 'observed', attribution: 'fixture',
+      text: row.input.entries[0].text, evidence: [span(row.source, row.input)] });
+    for (const [index, row] of [...flood, other].entries()) {
+      const id = withPrefix(index < 8 ? '0' : 'f', suffix => `claim-${index}-${suffix}`, value => identity('record', 'modes', value));
+      row.record = id;
+      await memory.enrich('modes', { records: [modeClaim(id, row)], relations: [] });
+    }
+    const excludedFlood = [{ source: 'mode-fixture', conversation_id: 'flood' }];
+    const admittedChannels = async (exclude = [], candidates = 3, per = 2) => {
+      const scanned = (await memory.store.vectors('modes', key, 10001, exclude)).slice(0, 10000).map(row => row.uid);
+      return Promise.all([
+        ...['turn', 'record', 'chunk'].map(kind => memory.store.admittedLexical('modes', kind, 'admissionneedle', candidates, per, exclude)),
+        ...['chunk', 'record'].map(kind => memory.store.admittedVectors('modes', kind, key, [0, -1, 0], scanned, candidates, per, exclude)),
+      ]);
+    };
+    await check('conversation admission inside all five channels admits the other conversation past a seed flood', async () => {
+      const results = await admittedChannels();
+      assert.deepEqual(results.map(result => [result.hits.length, result.admitted_conversations, result.exhausted,
+        result.hits.filter(hit => hit.conversations.some(context => context.key.conversation_id === 'flood')).length,
+        result.hits.filter(hit => hit.conversations.some(context => context.key.conversation_id === 'other')).length]),
+      Array.from({ length: 5 }, () => [3, 2, true, 2, 1]), 'conversation admission must precede channel candidate caps');
+    });
+    await check('grouped seed truncation counts unique omitted identities and excludes seeds rescued by another channel', async () => {
+      const recalled = await memory.recall('modes', { query: 'admissionneedle', group: 'conversation', candidates: 3, per_conversation: 2, limit: 32, max_chars: 200000 });
+      const unit = recalled.units.find(unit => unit.key.conversation_id === 'flood');
+      const turnSeeds = new Set(unit.seeds.filter(bundle => bundle.match.kind === 'turn').map(bundle => bundle.match.id));
+      const recordSeeds = new Set(unit.seeds.filter(bundle => bundle.match.kind === 'record').map(bundle => bundle.match.id));
+      assert.deepEqual([unit.seeds_truncated, recalled.bundles, recalled.pool_truncated,
+        fiveChannels.map(name => [recalled.channels[name].admitted_conversations, recalled.channels[name].exhausted]),
+        Object.hasOwn(recalled.channels.reranker, 'admitted_conversations'), Object.hasOwn(recalled.channels.reranker, 'exhausted')],
+      [16 - turnSeeds.size - recordSeeds.size, recalled.units.flatMap(unit => unit.seeds), 0, Array.from({ length: 5 }, () => [2, true]), false, false]);
+    });
+    await check('grouped exclusion precedes admission and candidate caps in all five channels', async () => {
+      const results = await admittedChannels(excludedFlood, 1, 1);
+      assert.deepEqual(results.map(result => [result.hits.length, result.admitted_conversations, result.exhausted,
+        result.hits.every(hit => hit.conversations.every(context => context.key.conversation_id === 'other'))]),
+      Array.from({ length: 5 }, () => [1, 1, false, true]), 'exclusion must precede grouped channel caps');
+    });
+    await check('grouped vector exclusion precedes the shared scan bound and scan truncation remains partial', async () => {
+      const bounded = new Memory({ ...config, vector_scan_limit: 2 }, memory.store);
+      const request = { query: 'admissionneedle', group: 'conversation', candidates: 3 };
+      const excluded = await bounded.recall('modes', { ...request, exclude_conversations: excludedFlood });
+      const full = await bounded.recall('modes', request);
+      assert.deepEqual(['chunk_vector', 'record_vector'].map(name => [excluded.channels[name].status,
+        excluded.channels[name].scan_truncated, excluded.channels[name].admitted_conversations, full.channels[name].status, full.channels[name].scan_truncated]),
+      [['ready', false, 1, 'partial', true], ['ready', false, 1, 'partial', true]], 'vector exclusion must precede the shared scan cap');
+    });
+    await check('grouped pending counts exclude unindexed text from excluded conversations', async () => {
+      const deferred = new Memory({ ...config, index_on_write: false }, memory.store);
+      await deferred.ingest('modes', modeTurn('flood', 'deferred', 'admissionneedle quartz still unindexed'));
+      const request = { query: 'admissionneedle', group: 'conversation' };
+      const excluded = await memory.recall('modes', { ...request, exclude_conversations: excludedFlood });
+      const full = await memory.recall('modes', request);
+      assert.deepEqual([excluded.channels.chunk_vector.status, excluded.channels.chunk_vector.unindexed,
+        full.channels.chunk_vector.status, full.channels.chunk_vector.unindexed > 0], ['ready', 0, 'partial', true], 'pending counts must exclude excluded conversations');
+      await memory.index('modes');
+    });
+    await check('duplicate matching chunks consume one turn seed in conversation admission', async () => {
+      await memory.ingest('modes', modeTurn('flood', 'many-chunks', 'admissionneedle quartz '.repeat(1000)));
+      const result = await memory.store.admittedLexical('modes', 'chunk', 'admissionneedle', 3, 2);
+      assert.deepEqual([result.hits.length, new Set(result.hits.map(hit => hit.id)).size,
+        result.hits.filter(hit => hit.conversations[0].key.conversation_id === 'flood').length], [3, 3, 2]);
+    });
+    await check('grouped vector cosine ties break by node uid regardless of scanned input order', async () => {
+      const scanned = (await memory.store.vectors('modes', key, 10001)).map(row => row.uid).reverse();
+      const chunks = await memory.store.admittedVectors('modes', 'chunk', key, [0, -1, 0], scanned, 3, 2);
+      const records = await memory.store.admittedVectors('modes', 'record', key, [0, -1, 0], scanned, 3, 2);
+      const firstRecord = [...flood].sort((a, b) => identity('record', 'modes', a.record).localeCompare(identity('record', 'modes', b.record)))[0];
+      const expectedChunk = scanned.filter(uid => uid.startsWith('chunk_')).sort()[0];
+      const row = (await memory.store.vectors('modes', key, 10001)).find(row => row.uid === expectedChunk);
+      assert.deepEqual([chunks.hits[0].id, records.hits[0].id], [row.turn_uid, firstRecord.record]);
+    });
+    await check('record exclusion precedes per-key admission even for a retained multi-conversation record', async () => {
+      const records = flood.slice(0, 6).map((row, index) => ({ ...modeClaim(`membership-${index}`, row), text: 'membershipneedle '.repeat(20) }));
+      records.push({ ...modeClaim('membership-mixed', other), text: `${'context '.repeat(180)}membershipneedle`,
+        evidence: [span(flood[0].source, flood[0].input), span(other.source, other.input)] });
+      await memory.enrich('modes', { records, relations: [] });
+      const result = await memory.store.admittedLexical('modes', 'record', 'membershipneedle', 1, 1, excludedFlood);
+      assert.deepEqual([result.hits.map(hit => hit.id), result.admitted_conversations, result.exhausted], [['membership-mixed'], 2, false],
+        'exclusion must precede per-key admission for shared records');
+    });
+    await check('recall validates optional modes grouping and per-conversation bounds before storage access', async () => {
+      const denied = new Memory({ scopes: config.scopes }, new Proxy({}, { get: () => { throw new Error('storage touched'); } }));
+      for (const input of [{ mode: null }, { mode: 'other' }, { mode: ['history_search'] }, { mode: {} },
+        { group: null }, { group: 'turn' }, { group: ['conversation'] },
+        ...[0, 5, 1.5, '2', null, true].map(per_conversation => ({ per_conversation }))]) {
+        await assert.rejects(denied.recall('modes', { query: 'q', ...input }), { code: 'invalid_input' });
+      }
+      await assert.rejects(denied.conversationUnits('not-allowed', [], {}, [], 'q', 1, 256, 1, 0), { code: 'scope_denied' });
+    });
+    await check('absent options remain byte-identical to pinned I1 and mode alone only echoes its exact contract', async () => {
+      const [baseline, priorStore] = await Promise.all(['memory', 'store'].map(file =>
+        exec('git', ['show', `5e2dab07c60a75d8bba6e05b2456dac0c409b4f4:src/${file}.mjs`])));
+      const path = join(scratch, 'i1-memory.mjs');
+      const storePath = join(scratch, 'i1-store.mjs');
+      const imports = source => source.replaceAll("'./core.mjs'", JSON.stringify(new URL('../src/core.mjs', import.meta.url).href))
+        .replaceAll("'./models.mjs'", JSON.stringify(new URL('../src/models.mjs', import.meta.url).href))
+        .replaceAll("'neo4j-driver'", JSON.stringify(import.meta.resolve('neo4j-driver')));
+      await writeFile(storePath, imports(priorStore.stdout), { mode: 0o600 });
+      await writeFile(path, imports(baseline.stdout).replaceAll("'./store.mjs'", JSON.stringify(pathToFileURL(storePath).href)), { mode: 0o600 });
+      const { Memory: I1 } = await import(pathToFileURL(path).href);
+      const { Neo4jStore: I1Store } = await import(pathToFileURL(storePath).href);
+      const cache = store => {
+        const results = new Map();
+        return new Proxy(store, { get(target, name) {
+          const value = target[name];
+          if (typeof value !== 'function') return value;
+          return (...args) => {
+            const token = JSON.stringify([name, args]);
+            if (!results.has(token)) results.set(token, value.apply(target, args));
+            return results.get(token);
+          };
+        } });
+      };
+      const original = new I1Store(database);
+      try {
+        const old = new I1(config, cache(original));
+        const current = new Memory(config, cache(memory.store));
+        for (const request of [{ query: 'admissionneedle', limit: 1 }, { query: 'admissionneedle', max_chars: 256 },
+          { query: 'admissionneedle', exclude_conversations: excludedFlood }]) {
+          // Freeze each implementation's own real-store responses, removing only transaction completion-order noise.
+          await old.recall('modes', request);
+          await current.recall('modes', request);
+          const before = JSON.stringify(await old.recall('modes', request));
+          assert.equal(JSON.stringify(await current.recall('modes', request)), before);
+          assert.equal(JSON.stringify(await current.recall('modes', { ...request, per_conversation: 4 })), before);
+          for (const mode of Object.keys(contracts)) {
+            const { mode: echoed, mode_contract, ...rest } = await current.recall('modes', { ...request, mode });
+            assert.deepEqual([JSON.stringify(rest), echoed, mode_contract], [before, mode, contracts[mode]]);
+          }
+        }
+      } finally { await original.close(); }
+    });
+    const packingA = modeTurn('a', 'pack-a', `${'packneedle '.repeat(30)}A_OWNER_MARKER`);
+    const packingB = modeTurn('b', 'pack-b', `B_OWNER_MARKER ${'context '.repeat(180)}packneedle`);
+    const packedA = await plain.ingest('packing', packingA);
+    const packedB = await plain.ingest('packing', packingB);
+    await plain.enrich('packing', { records: [{ id: 'shared', kind: 'observation', status: 'observed', attribution: 'fixture',
+      text: 'packneedle sharedonlyneedle', evidence: [span(packedB, packingB), span(packedA, packingA)] }], relations: [] });
+    await check('conversation units package a multi-conversation record once without splitting evidence', async () => {
+      const recalled = await plain.recall('packing', { query: 'packneedle', group: 'conversation', per_conversation: 1, limit: 2 });
+      const unit = recalled.units.find(unit => unit.key.conversation_id === 'a');
+      const shared = unit.seeds.find(bundle => bundle.match.kind === 'record');
+      const modeResults = [];
+      const shape = reply => reply.units.map(unit => [unit.key, unit.seeds.map(bundle => bundle.match.id)]);
+      for (const mode of Object.keys(contracts)) {
+        const reply = await plain.recall('packing', { query: 'packneedle', group: 'conversation', per_conversation: 1, limit: 2, mode });
+        modeResults.push([reply.mode, reply.mode_contract, shape(reply)]);
+      }
+      assert.deepEqual([recalled.units.length, unit.seeds.length, unit.also_cites, recalled.bundles,
+        recalled.bundles.filter(bundle => bundle.match.kind === 'record').length, shared.records[0].supporting_evidence.map(span => span.conversation_id), modeResults],
+      [2, 2, [{ scope: 'packing', source: 'mode-fixture', conversation_id: 'b' }], recalled.units.flatMap(unit => unit.seeds), 1, ['b', 'a'],
+        Object.entries(contracts).map(([mode, contract]) => [mode, contract, shape(recalled)])]);
+    });
+    await check('shared-record ownership follows final reranked seed priority and qualified-key tie order', async () => {
+      const reranked = new Memory({ ...config, embedding: undefined, reranker: { ...config.reranker, url: `${url}/owner-rerank` } }, memory.store);
+      const chosen = await reranked.recall('packing', { query: 'packneedle', group: 'conversation', limit: 2 });
+      const tied = await plain.recall('packing', { query: 'sharedonlyneedle', group: 'conversation', limit: 2 });
+      assert.deepEqual([chosen.units[0].key.conversation_id, chosen.units[0].seeds.some(bundle => bundle.match.kind === 'record'),
+        chosen.units[0].also_cites, tied.units.map(unit => unit.key.conversation_id), tied.units[0].seeds.length],
+      ['b', true, [{ scope: 'packing', source: 'mode-fixture', conversation_id: 'a' }], ['a'], 1]);
+    });
+    await check('legacy grouping uses body keys without changing exclusion or crossing scopes with identical source keys', async () => {
+      const input = modeTurn('legacy-collision', 'same-turn', 'legacygroupneedle local');
+      const local = await plain.ingest('packing', input);
+      await plain.ingest('packing', { ...input, turn_id: 'newer', entries: [{ ...input.entries[0], text: 'legacygroupneedle newer' }] });
+      const foreign = await plain.ingest('foreign', { ...input, entries: [{ ...input.entries[0], text: 'legacygroupneedle foreign' }] });
+      await memory.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) REMOVE t.source,t.conversation_id', { uid: local.id }));
+      const request = { query: 'legacygroupneedle', group: 'conversation', per_conversation: 1,
+        exclude_conversations: [{ source: input.source, conversation_id: input.conversation_id }] };
+      const own = await plain.recall('packing', request);
+      const otherScope = await plain.recall('foreign', { ...request, exclude_conversations: [] });
+      const retained = await memory.store.transaction('read', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) RETURN t.source AS source,t.conversation_id AS conversation', { uid: local.id }));
+      assert.deepEqual([own.units.map(unit => [unit.key, unit.legacy, unit.seeds[0].match.id]),
+        otherScope.units.map(unit => [unit.key, unit.seeds[0].match.id]), retained.records[0].toObject()],
+      [[[{ scope: 'packing', source: input.source, conversation_id: input.conversation_id }, true, local.id]],
+        [[{ scope: 'foreign', source: input.source, conversation_id: input.conversation_id }, foreign.id]], { source: null, conversation: null }]);
+    });
+    const largeInput = modeTurn('large', 'budget-large', `LARGE_OWNER_MARKER budgetneedle budgetneedle ${'🪄'.repeat(700)}`);
+    const large = await plain.ingest('packing', largeInput);
+    await plain.enrich('packing', { records: [{ ...modeClaim('large-claim', { source: large, input: largeInput }), text: 'budgetneedle claim' }], relations: [] });
+    await plain.ingest('packing', modeTurn('small', 'budget-small', 'budgetneedle shorter'));
+    await check('grouped budgets use UTF-8 bytes and skip entire multi-seed units while continuing to the next unit', async () => {
+      const budgeted = new Memory({ ...config, embedding: undefined, reranker: { ...config.reranker, url: `${url}/large-rerank` } }, memory.store);
+      const request = { query: 'budgetneedle', group: 'conversation', limit: 2, max_chars: 200000 };
+      const wide = await budgeted.recall('packing', request);
+      const first = wide.units[0];
+      const bytes = Buffer.byteLength(JSON.stringify(first));
+      const exact = await budgeted.recall('packing', { ...request, limit: 1, max_chars: bytes });
+      const short = await budgeted.recall('packing', { ...request, limit: 1, max_chars: bytes - 1 });
+      const multibyte = await budgeted.recall('packing', { ...request, max_chars: JSON.stringify(first).length });
+      assert.deepEqual([first.key.conversation_id, first.seeds.length, exact.units[0].seeds.length, exact.pool_truncated,
+        short.units.length, short.bundles.length, short.budget_omitted, short.status, short.relationship_context_complete,
+        multibyte.units.map(unit => unit.key.conversation_id), multibyte.bundles, multibyte.budget_omitted, multibyte.pool_truncated, multibyte.budget_unit],
+      ['large', 2, 2, 1, 0, 0, 1, 'budget_limited', false, ['small'], multibyte.units.flatMap(unit => unit.seeds), 1, 0, 'utf8_bytes']);
+    });
+    await check('pending and unavailable grouped channels remain readiness states rather than budget omissions', async () => {
+      const status = memory.store.lexicalStatus;
+      try {
+        for (const state of [{ status: 'pending' }, { status: 'unavailable', reason: 'fixture_unavailable' }]) {
+          memory.store.lexicalStatus = (scope, kind) => kind === 'chunk' ? state : status.call(memory.store, scope, kind);
+          const recalled = await plain.recall('packing', { query: 'sharedonlyneedle', group: 'conversation' });
+          assert.deepEqual([recalled.channels.chunk_lexical, recalled.budget_omitted, recalled.pool_truncated, recalled.retrieval_complete,
+            recalled.status === 'degraded'], [{ ...state, admitted_conversations: 0, exhausted: false }, 0, 0, false, state.status === 'unavailable']);
+        }
+      } finally { memory.store.lexicalStatus = status; }
+    });
     const lexical = new Memory({ neo4j: database, scopes: config.scopes });
     try {
       const input = { ...turn('long', ''), entries: ['system', 'user', 'tool', 'assistant'].map(role => ({
@@ -423,8 +662,12 @@ export async function runIntegration(database, scratch) {
       const source = await run('ingest', input);
       await run('enrich', { records: [{ ...record('cli-record', source, input), kind: 'observation', status: 'observed' }], relations: [] });
       const recalled = await run('recall', { query: 'unabridged' });
+      const grouped = await run('recall', { query: 'unabridged', mode: 'evidence_advice', group: 'conversation' });
       const shown = await run('show', { kind: 'turn', id: source.id });
-      assert.deepEqual([recalled.ok, recalled.bundles.length > 0, shown.turn.entries[0].text], [true, true, input.entries[0].text]);
+      assert.deepEqual([recalled.ok, recalled.bundles.length > 0, shown.turn.entries[0].text, grouped.ok, grouped.mode, grouped.mode_contract,
+        grouped.units[0].key, grouped.pool_truncated, fiveChannels.map(name => typeof grouped.channels[name].admitted_conversations)],
+      [true, true, input.entries[0].text, true, 'evidence_advice', contracts.evidence_advice,
+        { scope: 'cli', source: input.source, conversation_id: input.conversation_id }, 0, Array(5).fill('number')]);
     });
     if (process.env.SOURCE_MEMORY_REAL_EMBEDDING_URL) {
       await check('a real local embedding endpoint indexes and recalls by meaning', async () => {
