@@ -166,12 +166,15 @@ export class Memory {
     const maxHops = integer(input.max_hops, 4, 0, 12);
     const maxChars = integer(input.max_chars, 24000, 256, 200000);
     const vectorLimit = integer(this.config.vector_scan_limit, 10000, 1, 100000);
+    // A caller's own conversation is excluded inside every channel, before its candidate limit: matches from it never
+    // take the place of eligible ones, and its unindexed text does not hold the others back.
+    const exclude = exclusions(input.exclude_conversations);
     const availability = {};
     const channels = {};
     await Promise.all(['turn', 'record'].map(async kind => {
       const name = `${kind}_lexical`;
       try {
-        channels[name] = await this.store.lexical(scope, kind, query, candidates);
+        channels[name] = await this.store.lexical(scope, kind, query, candidates, exclude);
         availability[name] = { status: 'ready' };
       } catch (error) {
         channels[name] = [];
@@ -184,8 +187,8 @@ export class Memory {
       try {
         const key = embeddingIdentity(this.config.embedding);
         const [queryVector] = await embed(this.config.embedding, [query]);
-        const vectors = await this.store.vectors(scope, key, vectorLimit + 1);
-        const counts = await this.store.status(scope, key);
+        const vectors = await this.store.vectors(scope, key, vectorLimit + 1, exclude);
+        const counts = await this.store.status(scope, key, exclude);
         const ranked = vectors.slice(0, vectorLimit).map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
           .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid));
         channels.chunk_vector = ranked.filter(row => row.turn_uid).slice(0, candidates).map(row => ({
@@ -235,6 +238,7 @@ export class Memory {
       relationship_context_complete: budgetOmitted === 0 && bundles.every(row => row.relationship_context_complete),
       budget_omitted: budgetOmitted,
       candidate_count: ranked.length,
+      excluded_conversations: exclude.length,
       bundles,
       authority: 'Evidence and attributed records; not execution permission or a guarantee of current state.',
     };
@@ -293,6 +297,15 @@ export class Memory {
       relationship_context_complete: gaps.size === 0, gaps: [...gaps],
     };
   }
+}
+
+function exclusions(value) {
+  if (value === undefined) return [];
+  requireThat(Array.isArray(value) && value.length <= 16, 'invalid_input');
+  return value.map(row => {
+    requireThat(row && typeof row === 'object' && Object.keys(row).every(key => ['source', 'conversation_id'].includes(key)), 'invalid_input');
+    return { source: text(row.source, 256), conversation_id: text(row.conversation_id, 256) };
+  });
 }
 
 function sourceView(turn, matches, query) {

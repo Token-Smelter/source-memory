@@ -78,6 +78,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `enrich` | Records and relations | Validate source spans and endpoints; commit the whole bundle atomically |
 | `index` | Optional `{"limit":256}` | Embed missing or out-of-date chunks/records |
 | `recall` | `{"query":"...", "limit":8}` plus bounds | Search all channels, fuse, rerank, expand relationships, return evidence bundles |
+| `recall` | add `"exclude_conversations":[{"source":"...","conversation_id":"..."}]` (at most 16) | Rank without those conversations: their turns, chunks and records whose evidence lies only in them are dropped inside every channel before its limit, and their unindexed text does not make a channel partial. Records with other evidence stay. Turns stored before lineage properties existed are never excluded |
 | `show` | `{"kind":"turn"\|"record","id":"..."}` | Full retained turn, or a record with its source evidence |
 | `show` | `{"kind":"bundle","seed":{"kind":"turn"\|"record","id":"..."},"max_nodes":48,"max_hops":4}` | One seed's relationship-closed bundle (same shape as a recall bundle), rebuilt without a query; hash it to detect later relationship changes |
 | `show` | `{"kind":"following","turn":"<turn id>","limit":2}` | Later turns of the same conversation by exact `parent_turn_id` links (see below) |
