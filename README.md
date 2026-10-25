@@ -182,9 +182,11 @@ Only `group:"conversation"` enables grouping. `per_conversation` must be an inte
 
 The shared, eligible vector scan still obeys `vector_scan_limit` before ranking/admission; exceeding it still reports `partial` / `scan_truncated`. The grouped path ranks scanned vectors with Neo4j `vector.similarity.cosine`, breaking ties by node UID; float precision can make these ranks differ from the default JavaScript cosine. Grouped full-text channels search only `ONLINE` indexes; populating indexes remain `pending`, missing/failed indexes remain `unavailable`.
 
+Admission fields are present only on `ready` or `partial` entries among the five retrieval channels. `pending`, `unavailable`, and `unconfigured` entries, and the reranker, omit both fields rather than reporting fabricated zero activity.
+
 | Grouped output | Meaning |
 |---|---|
-| `channels[name].admitted_conversations` | Integer count of distinct qualified keys represented by returned seeds, on the five retrieval channels only (not the reranker) |
+| `channels[name].admitted_conversations` | Integer count of distinct qualified keys represented by that channel's returned seeds |
 | `channels[name].exhausted` | Boolean: eligible matches before conversation admission exceeded that channel's `candidates` cap |
 | `units[]` | `{key, legacy?, seeds, seeds_truncated, also_cites}`; `seeds` contains unchanged bundle objects in final seed rank order |
 | `units[].seeds_truncated` | Integer count of unique turn/record identities omitted by admission for that conversation, excluding identities admitted by another channel |

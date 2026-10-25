@@ -123,8 +123,10 @@ export async function runIntegration(database, scratch) {
       const excluded = await bounded.recall('modes', { ...request, exclude_conversations: excludedFlood });
       const full = await bounded.recall('modes', request);
       assert.deepEqual(['chunk_vector', 'record_vector'].map(name => [excluded.channels[name].status,
-        excluded.channels[name].scan_truncated, excluded.channels[name].admitted_conversations, full.channels[name].status, full.channels[name].scan_truncated]),
-      [['ready', false, 1, 'partial', true], ['ready', false, 1, 'partial', true]], 'vector exclusion must precede the shared scan cap');
+        excluded.channels[name].scan_truncated, excluded.channels[name].admitted_conversations, full.channels[name].status, full.channels[name].scan_truncated,
+        typeof full.channels[name].admitted_conversations, typeof full.channels[name].exhausted]),
+      [['ready', false, 1, 'partial', true, 'number', 'boolean'], ['ready', false, 1, 'partial', true, 'number', 'boolean']],
+        'vector exclusion must precede the shared scan cap');
     });
     await check('grouped pending counts exclude unindexed text from excluded conversations', async () => {
       const deferred = new Memory({ ...config, index_on_write: false }, memory.store);
@@ -282,9 +284,22 @@ export async function runIntegration(database, scratch) {
           memory.store.lexicalStatus = (scope, kind) => kind === 'chunk' ? state : status.call(memory.store, scope, kind);
           const recalled = await plain.recall('packing', { query: 'sharedonlyneedle', group: 'conversation' });
           assert.deepEqual([recalled.channels.chunk_lexical, recalled.budget_omitted, recalled.pool_truncated, recalled.retrieval_complete,
-            recalled.status === 'degraded'], [{ ...state, admitted_conversations: 0, exhausted: false }, 0, 0, false, state.status === 'unavailable']);
+            recalled.status === 'degraded'], [state, 0, 0, false, state.status === 'unavailable']);
         }
       } finally { memory.store.lexicalStatus = status; }
+    });
+    await check('unconfigured grouped vector channels omit admission metadata rather than reporting zero activity', async () => {
+      const recalled = await plain.recall('packing', { query: 'sharedonlyneedle', group: 'conversation' });
+      assert.deepEqual([recalled.channels.chunk_vector, recalled.channels.record_vector, recalled.channels.reranker],
+        [{ status: 'unconfigured' }, { status: 'unconfigured' }, { status: 'unconfigured' }]);
+    });
+    await check('unavailable grouped vector channels omit admission metadata when their model call fails', async () => {
+      modelDown = true;
+      try {
+        const recalled = await memory.recall('modes', { query: 'admissionneedle', group: 'conversation' });
+        assert.deepEqual([recalled.channels.chunk_vector, recalled.channels.record_vector],
+          [{ status: 'unavailable', reason: 'model_request_failed' }, { status: 'unavailable', reason: 'model_request_failed' }]);
+      } finally { modelDown = false; }
     });
     const lexical = new Memory({ neo4j: database, scopes: config.scopes });
     try {
@@ -667,7 +682,7 @@ export async function runIntegration(database, scratch) {
       assert.deepEqual([recalled.ok, recalled.bundles.length > 0, shown.turn.entries[0].text, grouped.ok, grouped.mode, grouped.mode_contract,
         grouped.units[0].key, grouped.pool_truncated, fiveChannels.map(name => typeof grouped.channels[name].admitted_conversations)],
       [true, true, input.entries[0].text, true, 'evidence_advice', contracts.evidence_advice,
-        { scope: 'cli', source: input.source, conversation_id: input.conversation_id }, 0, Array(5).fill('number')]);
+        { scope: 'cli', source: input.source, conversation_id: input.conversation_id }, 0, ['number', 'number', 'number', 'undefined', 'undefined']]);
     });
     if (process.env.SOURCE_MEMORY_REAL_EMBEDDING_URL) {
       await check('a real local embedding endpoint indexes and recalls by meaning', async () => {

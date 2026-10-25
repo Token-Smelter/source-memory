@@ -182,14 +182,17 @@ export class Memory {
     const availability = {};
     const channels = {};
     const omitted = [];
-    const admissionFields = grouped ? { admitted_conversations: 0, exhausted: false } : {};
     await Promise.all(['turn', 'record', 'chunk'].map(async kind => {
       const name = `${kind}_lexical`;
       try {
         if (grouped) {
           const state = await this.store.lexicalStatus(scope, kind);
-          const result = state.status === 'ready' ? await this.store.admittedLexical(scope, kind, query, candidates, perConversation, exclude)
-            : { hits: [], omitted: [], ...admissionFields };
+          if (state.status !== 'ready') {
+            channels[name] = [];
+            availability[name] = state;
+            return;
+          }
+          const result = await this.store.admittedLexical(scope, kind, query, candidates, perConversation, exclude);
           channels[name] = result.hits;
           omitted.push(...result.omitted);
           availability[name] = { ...state, admitted_conversations: result.admitted_conversations, exhausted: result.exhausted };
@@ -201,7 +204,7 @@ export class Memory {
         }
       } catch (error) {
         channels[name] = [];
-        availability[name] = { status: 'unavailable', reason: safeCode(error), ...admissionFields };
+        availability[name] = { status: 'unavailable', reason: safeCode(error) };
       }
     }));
     channels.chunk_vector = [];
@@ -237,12 +240,12 @@ export class Memory {
           availability.record_vector = { ...state };
         }
       } catch (error) {
-        availability.chunk_vector = { status: 'unavailable', reason: safeCode(error), ...admissionFields };
+        availability.chunk_vector = { status: 'unavailable', reason: safeCode(error) };
         availability.record_vector = { ...availability.chunk_vector };
       }
     } else {
-      availability.chunk_vector = { status: 'unconfigured', ...admissionFields };
-      availability.record_vector = { status: 'unconfigured', ...admissionFields };
+      availability.chunk_vector = { status: 'unconfigured' };
+      availability.record_vector = { status: 'unconfigured' };
     }
     let ranked = grouped ? fuse(channels) : fuse(channels).slice(0, candidates);
     if (this.config.reranker && ranked.length) {
