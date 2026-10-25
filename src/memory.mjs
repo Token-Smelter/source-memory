@@ -171,11 +171,13 @@ export class Memory {
     const exclude = exclusions(input.exclude_conversations);
     const availability = {};
     const channels = {};
-    await Promise.all(['turn', 'record'].map(async kind => {
+    await Promise.all(['turn', 'record', 'chunk'].map(async kind => {
       const name = `${kind}_lexical`;
       try {
-        channels[name] = await this.store.lexical(scope, kind, query, candidates, exclude);
-        availability[name] = { status: 'ready' };
+        const state = kind === 'chunk' ? await this.store.chunkLexicalStatus(scope) : { status: 'ready' };
+        channels[name] = state.status !== 'ready' ? [] : kind === 'chunk' ? await this.store.chunkLexical(scope, query, candidates, exclude)
+          : await this.store.lexical(scope, kind, query, candidates, exclude);
+        availability[name] = state;
       } catch (error) {
         channels[name] = [];
         availability[name] = { status: 'unavailable', reason: safeCode(error) };
@@ -315,6 +317,8 @@ function sourceView(turn, matches, query) {
     const key = `${span.entry_id}:${span.start}:${span.end}`;
     if (seen.has(key)) return;
     seen.add(key);
+    // Chunk lexical matches already carry exact text and an exact-or-unknown role; legacy entries may not resolve.
+    if (span.text !== undefined && span.role !== undefined) { spans.push({ ...span }); return; }
     const entry = turn.entries.find(row => row.id === span.entry_id);
     if (!entry || span.end > entry.text.length) return;
     spans.push({ ...span, role: entry.role, text: entry.text.slice(span.start, span.end) });

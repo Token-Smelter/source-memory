@@ -12,15 +12,15 @@ test('source normalization preserves exact text and attribution', () => {
   assert.deepEqual(turn().entries[0], { id: 'u1', role: 'user', text: 'Keep the original words. 🪄 No paraphrasing.', occurred_at: null });
 });
 
-test('chunks retain exact offsets, overlap and final short text', () => {
+test('chunks retain entry roles, exact offsets, overlap and final short text', () => {
   const source = normalizeTurn({ source: 'fixture', conversation_id: 'chat', turn_id: '1', entries: [
     { id: 'a', role: 'assistant', text: 'zero one two three four five six seven eight nine ten' },
     { id: 'b', role: 'user', text: 'a second entry' },
   ] });
-  assert.deepEqual(chunkEntries(source, 8, 2).map(chunk => [chunk.entry_id, chunk.start, chunk.end, chunk.text]), [
-    ['a', 0, 38, 'zero one two three four five six seven'],
-    ['a', 29, 53, 'six seven eight nine ten'],
-    ['b', 0, 14, 'a second entry'],
+  assert.deepEqual(chunkEntries(source, 8, 2).map(chunk => [chunk.entry_id, chunk.role, chunk.start, chunk.end, chunk.text]), [
+    ['a', 'assistant', 0, 38, 'zero one two three four five six seven'],
+    ['a', 'assistant', 29, 53, 'six seven eight nine ten'],
+    ['b', 'user', 0, 14, 'a second entry'],
   ]);
 });
 

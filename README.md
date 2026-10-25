@@ -8,7 +8,7 @@ flowchart LR
   Ingest --> Store["Neo4j: turns, chunks, records, relations"]
   Interpreter["Model or caller"] --> Enrich["enrich: records + relations with source spans"]
   Enrich --> Store
-  Query["recall query"] --> Lexical["Full-text: whole turns and records"]
+  Query["recall query"] --> Lexical["Full-text: whole turns, chunks and records"]
   Query --> Vector["Cosine: chunks and records"]
   Store --> Lexical
   Store --> Vector
@@ -77,7 +77,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `ingest` | Turn envelope | Atomically retain exact source and its chunks; then embed unless `index_on_write` is false |
 | `enrich` | Records and relations | Validate source spans and endpoints; commit the whole bundle atomically |
 | `index` | Optional `{"limit":256}` | Embed missing or out-of-date chunks/records |
-| `recall` | `{"query":"...", "limit":8}` plus bounds | Search all channels, fuse, rerank, expand relationships, return evidence bundles |
+| `recall` | `{"query":"...", "limit":8}` plus bounds | Search turn/chunk/record lexical and chunk/record vector channels, fuse, rerank, expand relationships, return evidence bundles |
 | `recall` | add `"exclude_conversations":[{"source":"...","conversation_id":"..."}]` (at most 16) | Rank without those conversations: their turns, chunks and records whose evidence lies only in them are dropped inside every channel before its limit, and their unindexed text does not make a channel partial. Records with other evidence stay. Turns stored before lineage properties existed are never excluded |
 | `show` | `{"kind":"turn"\|"record","id":"..."}` | Full retained turn, or a record with its source evidence |
 | `show` | `{"kind":"bundle","seed":{"kind":"turn"\|"record","id":"..."},"max_nodes":48,"max_hops":4}` | One seed's relationship-closed bundle (same shape as a recall bundle), rebuilt without a query; hash it to detect later relationship changes |
@@ -147,7 +147,9 @@ Later turns are context, not supersession: a later statement does not by itself 
 
 ## Recall
 
-Four independent channels run under the requested scope: full-text over whole turns, full-text over records, cosine over chunks, cosine over records. Query text is treated as literal terms, never as Lucene or Cypher syntax. Results merge by reciprocal rank fusion; an optional reranker then reorders them. Each scope has its own full-text indexes, and every vector, traversal, and evidence read filters by scope before ranking.
+Five independent channels run under the requested scope: `turn_lexical`, `chunk_lexical`, `record_lexical`, `chunk_vector`, `record_vector`. Query text is treated as literal terms, never as Lucene or Cypher syntax. Results merge by reciprocal rank fusion; an optional reranker then reorders them. Each scope has its own full-text indexes, and every vector, traversal, and evidence read filters by scope before ranking.
+
+Chunk lexical hits identify the entry, role, UTF-16 span, and qualified `conversation` key (`scope`, `source`, `conversation_id`). Legacy roles resolve from the parent turn's stored entries; a missing or ambiguous entry yields `unknown` without dropping the hit. Body-derived conversation keys carry `legacy: true` and are informational only. The channel queries only an `ONLINE` chunk index: `POPULATING` reports `pending` without hits; missing or failed indexes report `unavailable`.
 
 From each seed, expansion follows `supersedes` (both directions), `qualifies`, `contradicts`, `depends_on`, and `outcome_of`, with node, hop, and edge limits. Cycles terminate. Limits that cut context are reported as gaps, and a bundle that does not fit the output budget is omitted whole rather than trimmed of its successor.
 
@@ -158,7 +160,7 @@ From each seed, expansion follows `supersedes` (both directions), `qualifies`, `
 | Field | Meaning |
 |---|---|
 | `status` | `ready`, `no_matches`, `budget_limited`, or `degraded` (a configured channel failed) |
-| `channels` | Per-channel `ready` / `partial` / `unconfigured` / `unavailable`, with reasons |
+| `channels` | Per-channel `ready` / `partial` / `pending` / `unconfigured` / `unavailable`, with reasons |
 | `retrieval_complete` | All channels ran without known index or scan gaps. Not a guarantee every relevant memory was found. |
 | `relationship_context_complete` | Expansion from the returned seeds hit no limit |
 | `bundles[]` | Match provenance, source excerpts, records with supporting evidence, relations with evidence |

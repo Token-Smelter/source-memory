@@ -27,11 +27,11 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
 
 try {
   await exec('docker', ['run', '--detach', '--rm', '--name', name,
-    '--publish', '127.0.0.1::7687', '--memory', '768m', '--cpus', '1',
+    '--publish', '127.0.0.1::7687', '--memory', '1536m', '--cpus', '2',
     '--env', 'NEO4J_AUTH=none',
-    '--env', 'NEO4J_server_memory_heap_initial__size=128m',
-    '--env', 'NEO4J_server_memory_heap_max__size=256m',
-    '--env', 'NEO4J_server_memory_pagecache_size=64m',
+    '--env', 'NEO4J_server_memory_heap_initial__size=512m',
+    '--env', 'NEO4J_server_memory_heap_max__size=512m',
+    '--env', 'NEO4J_server_memory_pagecache_size=128m',
     'neo4j:5.26.14-community'], { timeout: 90000 });
   owned = true;
   const mapping = (await exec('docker', ['port', name, '7687/tcp'], { timeout: 10000 })).stdout.trim();
