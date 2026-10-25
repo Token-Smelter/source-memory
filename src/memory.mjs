@@ -76,6 +76,7 @@ export class Memory {
   async show(scope, input) {
     authorize(this.config, scope);
     if (input.kind === 'bundle') return this.showBundle(scope, input);
+    if (input.kind === 'units') return this.showUnits(scope, input);
     if (input.kind === 'following') return this.showFollowing(scope, input);
     if (input.kind === 'turn_by_key') return this.showTurnByKey(scope, input);
     const id = text(input.id, 256);
@@ -110,10 +111,25 @@ export class Memory {
     const start = await this.store.getTurn(scope, text(input.turn, 256));
     requireThat(start, 'not_found');
     const limit = integer(input.limit, 2, 1, 16);
+    const { turns, end, unlinked } = await this.walkFollowing(scope, start, limit);
+    return {
+      // recorded_end is the last turn this store holds, not proof that the conversation ended there.
+      kind: 'following', turn: start.id, turns, has_more: end === 'limit', end,
+      lineage: end === 'branched' || end === 'cycle' ? end : unlinked ? 'unknown' : 'linked',
+      unlinked_turns: unlinked,
+    };
+  }
+
+  async walkFollowing(scope, start, limit, maxBytes = null) {
+    authorize(this.config, scope);
+    integer(limit, undefined, 1, 16);
+    if (maxBytes !== null) integer(maxBytes, undefined, 1, 65536);
     const turns = [];
     const seen = new Set([start.id]);
     let current = start;
     let end = 'recorded_end';
+    let bound = null;
+    let bytes = 0;
     while (true) {
       const children = await this.store.childTurns(scope, current, 2);
       if (children.length === 0) break;
@@ -121,17 +137,66 @@ export class Memory {
       const [child] = children;
       if (seen.has(child.id)) { end = 'cycle'; break; }
       seen.add(child.id);
-      if (turns.length === limit) { end = 'limit'; break; }
+      if (turns.length === limit) { end = 'limit'; bound = 'turns'; break; }
+      const size = maxBytes === null ? 0 : Buffer.byteLength(JSON.stringify(followingTurn(child)));
+      if (maxBytes !== null && bytes + size > maxBytes) { end = 'limit'; bound = 'bytes'; break; }
       turns.push(child);
+      bytes += size;
       current = child;
     }
     const unlinked = await this.store.unlinkedTurns(scope, start);
-    return {
-      // recorded_end is the last turn this store holds, not proof that the conversation ended there.
-      kind: 'following', turn: start.id, turns, has_more: end === 'limit', end,
-      lineage: end === 'branched' || end === 'cycle' ? end : unlinked ? 'unknown' : 'linked',
-      unlinked_turns: unlinked,
-    };
+    return { turns, end, bound, unlinked };
+  }
+
+  async followingForBundles(scope, seeds, follow, cache) {
+    authorize(this.config, scope);
+    const roots = [...new Set(seeds.flatMap(bundle => [bundle.source?.id,
+      ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence.map(span => span.turn))]).filter(Boolean))].sort();
+    const following = [];
+    for (const after of roots) {
+      if (!cache.has(after)) cache.set(after, (async () => {
+        const start = await this.store.getTurn(scope, after);
+        requireThat(start, 'source_unavailable');
+        const read = await this.walkFollowing(scope, start, follow.turns, follow.bytes);
+        return { after, status: read.end === 'limit' ? 'has_more' : ['branched', 'cycle'].includes(read.end)
+          ? read.end : read.unlinked ? 'unknown' : 'recorded_end',
+          bound: read.bound, turns: read.turns.map(followingTurn), unlinked_turns: read.unlinked };
+      })());
+      following.push(await cache.get(after));
+    }
+    return following;
+  }
+
+  async showUnits(scope, input) {
+    authorize(this.config, scope);
+    const follow = followingOptions(input.follow, true);
+    const maxNodes = integer(input.max_nodes, 48, 1, 256);
+    const maxHops = integer(input.max_hops, 4, 0, 12);
+    requireThat(Array.isArray(input.units) && input.units.length <= 4);
+    const requests = input.units.map(unit => {
+      requireThat(unit && unit.key && Array.isArray(unit.seeds) && unit.seeds.length <= 20);
+      const key = { scope: text(unit.key.scope, 256), source: text(unit.key.source, 256), conversation_id: text(unit.key.conversation_id, 256) };
+      requireThat(key.scope === scope, 'scope_denied');
+      const seeds = unit.seeds.map(seed => {
+        requireThat(seed && ['turn', 'record'].includes(seed.kind), 'invalid_kind');
+        return { kind: seed.kind, id: text(seed.id, 256) };
+      });
+      return { key, seeds };
+    });
+    const cache = new Map();
+    const units = [];
+    for (const request of requests) {
+      const seeds = [];
+      const missing = [];
+      for (const seed of request.seeds) {
+        const found = seed.kind === 'turn' ? await this.store.getTurn(scope, seed.id) : await this.store.getRecord(scope, seed.id);
+        if (!found) { missing.push(seed); continue; }
+        seeds.push(await this.bundle(scope, { ...seed, score: null, channels: [] }, '', maxNodes, maxHops));
+      }
+      units.push({ key: request.key, seeds, missing,
+        ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, cache) } : {}) });
+    }
+    return { kind: 'units', units };
   }
 
   // Rebuilds one seed's relationship-closed bundle without a query, so a caller can detect changes since it last read it.
@@ -169,6 +234,7 @@ export class Memory {
     requireThat(input.group === undefined || input.group === 'conversation', 'invalid_input');
     const grouped = input.group === 'conversation';
     const perConversation = integer(input.per_conversation, 2, 1, 4);
+    const follow = followingOptions(input.follow, grouped);
     const query = text(input.query, 4000);
     const candidates = integer(input.candidates, 64, 1, 256);
     const limit = integer(input.limit, 8, 1, 32);
@@ -262,7 +328,7 @@ export class Memory {
     let budgetOmitted = 0;
     let groupedOutput = {};
     if (grouped) {
-      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops);
+      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow);
       budgetOmitted = result.budget_omitted;
       groupedOutput = { units: result.units, pool_truncated: result.pool_truncated, budget_unit: 'utf8_bytes' };
       bundles.push(...result.units.flatMap(unit => unit.seeds));
@@ -279,7 +345,7 @@ export class Memory {
     return {
       scope, query,
       status: unavailable ? 'degraded' : budgetOmitted > 0 ? 'budget_limited' : bundles.length ? 'ready' : 'no_matches',
-      channels: availability,
+      channels: Object.fromEntries(Object.entries(availability).sort(([a], [b]) => a.localeCompare(b))),
       retrieval_complete: Object.values(availability).every(row => ['ready', 'not_needed'].includes(row.status)),
       relationship_context_complete: budgetOmitted === 0 && bundles.every(row => row.relationship_context_complete),
       budget_omitted: budgetOmitted,
@@ -292,7 +358,7 @@ export class Memory {
     };
   }
 
-  async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops) {
+  async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops, follow = null) {
     authorize(this.config, scope);
     const priority = new Map();
     for (const [rank, seed] of ranked.entries()) for (const context of seed.conversations) {
@@ -322,6 +388,7 @@ export class Memory {
       for (const context of contexts.slice(1)) unit.also.set(conversationToken(context.key), context.key);
     }
     const units = [];
+    const followingCache = new Map();
     let bytes = 0;
     let budgetOmitted = 0;
     for (const unit of [...pool.values()].slice(0, limit)) {
@@ -336,7 +403,8 @@ export class Memory {
         }
       }
       const rendered = { key: unit.key, ...(unit.legacy ? { legacy: true } : {}), seeds,
-        seeds_truncated: truncated.get(conversationToken(unit.key))?.size ?? 0, also_cites: [...unit.also.values()].sort(compareConversationKeys) };
+        seeds_truncated: truncated.get(conversationToken(unit.key))?.size ?? 0, also_cites: [...unit.also.values()].sort(compareConversationKeys),
+        ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, followingCache) } : {}) };
       const size = Buffer.byteLength(JSON.stringify(rendered));
       // Admission limits seeds; rendering budgets may only skip an entire unit, never a seed or part of its evidence.
       if (bytes + size > maxBytes) { budgetOmitted += 1; continue; }
@@ -393,12 +461,23 @@ export class Memory {
       edges.push({ ...relation, supporting_evidence: await this.evidence(scope, relation.evidence) });
     }
     return {
-      match: { kind: seed.kind, id: seed.id, rank_score: seed.score, channels: seed.channels,
+      match: { kind: seed.kind, id: seed.id, rank_score: seed.score,
+        channels: [...seed.channels].sort((a, b) => a.channel.localeCompare(b.channel)),
         ...(seed.rerank_score === undefined ? {} : { rerank_score: seed.rerank_score }) },
       source, records: withEvidence, relations: edges,
       relationship_context_complete: gaps.size === 0, gaps: [...gaps],
     };
   }
+}
+
+const followingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, occurred_at: turn.occurred_at ?? null,
+  entries: turn.entries.map(entry => ({ id: entry.id, role: entry.role, text: entry.text })) });
+
+function followingOptions(input, allowed) {
+  if (input === undefined) return null;
+  requireThat(allowed && input && typeof input === 'object' && !Array.isArray(input)
+    && Object.keys(input).every(key => ['turns', 'bytes'].includes(key)), 'invalid_input');
+  return { turns: integer(input.turns, 8, 1, 16), bytes: integer(input.bytes, 16384, 1, 65536) };
 }
 
 const seedToken = seed => JSON.stringify([seed.kind, seed.id]);

@@ -16,6 +16,22 @@ const contracts = {
   history_search: 'History search: retained conversations in search rank order. Not an answer to what is current. Omitted or later material may correct shown items. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
 };
 
+const projectedFollowingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, occurred_at: turn.occurred_at ?? null,
+  entries: turn.entries.map(entry => ({ id: entry.id, role: entry.role, text: entry.text })) });
+const canonicalBundle = bundle => ({ ...bundle, match: { ...bundle.match,
+  channels: [...bundle.match.channels].sort((a, b) => a.channel.localeCompare(b.channel)) } });
+const canonicalRecall = reply => ({ ...reply,
+  channels: Object.fromEntries(Object.entries(reply.channels).sort(([a], [b]) => a.localeCompare(b))),
+  bundles: reply.bundles.map(canonicalBundle),
+  ...(reply.units ? { units: reply.units.map(unit => ({ ...unit, seeds: unit.seeds.map(canonicalBundle) })) } : {}) });
+function assertStableOrder(reply) {
+  assert.deepEqual(Object.keys(reply.channels), Object.keys(reply.channels).sort(), 'availability keys must use stable alphabetical order');
+  for (const bundle of reply.bundles) {
+    const names = bundle.match.channels.map(trace => trace.channel);
+    assert.deepEqual(names, [...names].sort(), 'channel traces must use stable alphabetical order');
+  }
+}
+
 export async function runIntegration(database, scratch) {
   const results = [];
   async function check(name, fn) {
@@ -42,7 +58,7 @@ export async function runIntegration(database, scratch) {
   model.listen(0, '127.0.0.1');
   await once(model, 'listening');
   const url = `http://127.0.0.1:${model.address().port}`;
-  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing'], write: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing'] },
+  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing', 'follow'], write: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing', 'follow'] },
     embedding: { url: `${url}/embed`, model: 'fixture-only', dimensions: 3 },
     reranker: { url: `${url}/rerank`, model: 'fixture-only' } };
   const memory = new Memory(config);
@@ -59,6 +75,7 @@ export async function runIntegration(database, scratch) {
     await memory.init('exclusion');
     await memory.init('modes');
     await memory.init('packing');
+    await memory.init('follow');
     const plain = new Memory({ ...config, embedding: undefined, reranker: undefined }, memory.store);
     const key = embeddingIdentity(config.embedding);
     const fiveChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'];
@@ -165,24 +182,16 @@ export async function runIntegration(database, scratch) {
     await check('recall validates optional modes grouping and per-conversation bounds before storage access', async () => {
       const denied = new Memory({ scopes: config.scopes }, new Proxy({}, { get: () => { throw new Error('storage touched'); } }));
       for (const input of [{ mode: null }, { mode: 'other' }, { mode: ['history_search'] }, { mode: {} },
-        { group: null }, { group: 'turn' }, { group: ['conversation'] },
+        { group: null }, { group: 'turn' }, { group: ['conversation'] }, { follow: {} }, { mode: 'history_search', follow: {} },
+        ...[null, [], false, 'follow', { turns: 0 }, { turns: 17 }, { turns: 1.5 }, { turns: '8' }, { turns: null },
+          { bytes: 0 }, { bytes: 65537 }, { bytes: 1.5 }, { bytes: '16384' }, { bytes: null }, { other: true }]
+          .map(follow => ({ group: 'conversation', follow })),
         ...[0, 5, 1.5, '2', null, true].map(per_conversation => ({ per_conversation }))]) {
         await assert.rejects(denied.recall('modes', { query: 'q', ...input }), { code: 'invalid_input' });
       }
       await assert.rejects(denied.conversationUnits('not-allowed', [], {}, [], 'q', 1, 256, 1, 0), { code: 'scope_denied' });
     });
-    await check('absent options remain byte-identical to pinned I1 and mode alone only echoes its exact contract', async () => {
-      const [baseline, priorStore] = await Promise.all(['memory', 'store'].map(file =>
-        exec('git', ['show', `5e2dab07c60a75d8bba6e05b2456dac0c409b4f4:src/${file}.mjs`])));
-      const path = join(scratch, 'i1-memory.mjs');
-      const storePath = join(scratch, 'i1-store.mjs');
-      const imports = source => source.replaceAll("'./core.mjs'", JSON.stringify(new URL('../src/core.mjs', import.meta.url).href))
-        .replaceAll("'./models.mjs'", JSON.stringify(new URL('../src/models.mjs', import.meta.url).href))
-        .replaceAll("'neo4j-driver'", JSON.stringify(import.meta.resolve('neo4j-driver')));
-      await writeFile(storePath, imports(priorStore.stdout), { mode: 0o600 });
-      await writeFile(path, imports(baseline.stdout).replaceAll("'./store.mjs'", JSON.stringify(pathToFileURL(storePath).href)), { mode: 0o600 });
-      const { Memory: I1 } = await import(pathToFileURL(path).href);
-      const { Neo4jStore: I1Store } = await import(pathToFileURL(storePath).href);
+    await check('absent following preserves pinned I1 and PR8 semantic values with intentional stable trace ordering', async () => {
       const cache = store => {
         const results = new Map();
         return new Proxy(store, { get(target, name) {
@@ -195,24 +204,40 @@ export async function runIntegration(database, scratch) {
           };
         } });
       };
-      const original = new I1Store(database);
-      try {
-        const old = new I1(config, cache(original));
-        const current = new Memory(config, cache(memory.store));
-        for (const request of [{ query: 'admissionneedle', limit: 1 }, { query: 'admissionneedle', max_chars: 256 },
-          { query: 'admissionneedle', exclude_conversations: excludedFlood }]) {
-          // Freeze each implementation's own real-store responses, removing only transaction completion-order noise.
-          await old.recall('modes', request);
-          await current.recall('modes', request);
-          const before = JSON.stringify(await old.recall('modes', request));
-          assert.equal(JSON.stringify(await current.recall('modes', request)), before);
-          assert.equal(JSON.stringify(await current.recall('modes', { ...request, per_conversation: 4 })), before);
-          for (const mode of Object.keys(contracts)) {
-            const { mode: echoed, mode_contract, ...rest } = await current.recall('modes', { ...request, mode });
-            assert.deepEqual([JSON.stringify(rest), echoed, mode_contract], [before, mode, contracts[mode]]);
+      for (const revision of ['5e2dab07c60a75d8bba6e05b2456dac0c409b4f4', 'db13652837284caba2f61489ec73fbaa5a3c6793']) {
+        const [baseline, priorStore] = await Promise.all(['memory', 'store'].map(file => exec('git', ['show', `${revision}:src/${file}.mjs`])));
+        const path = join(scratch, `${revision}-memory.mjs`);
+        const storePath = join(scratch, `${revision}-store.mjs`);
+        const imports = source => source.replaceAll("'./core.mjs'", JSON.stringify(new URL('../src/core.mjs', import.meta.url).href))
+          .replaceAll("'./models.mjs'", JSON.stringify(new URL('../src/models.mjs', import.meta.url).href))
+          .replaceAll("'neo4j-driver'", JSON.stringify(import.meta.resolve('neo4j-driver')));
+        await writeFile(storePath, imports(priorStore.stdout), { mode: 0o600 });
+        await writeFile(path, imports(baseline.stdout).replaceAll("'./store.mjs'", JSON.stringify(pathToFileURL(storePath).href)), { mode: 0o600 });
+        const { Memory: PriorMemory } = await import(pathToFileURL(path).href);
+        const { Neo4jStore: PriorStore } = await import(pathToFileURL(storePath).href);
+        const original = new PriorStore(database);
+        try {
+          const old = new PriorMemory(config, cache(original));
+          const current = new Memory(config, cache(memory.store));
+          const grouping = revision.startsWith('db136') ? { group: 'conversation' } : {};
+          for (const request of [{ query: 'admissionneedle', limit: 1, ...grouping }, { query: 'admissionneedle', max_chars: 256, ...grouping },
+            { query: 'admissionneedle', exclude_conversations: excludedFlood, ...grouping }]) {
+            // Freeze each implementation's own store responses, then normalize only the intentionally changed ordering.
+            await old.recall('modes', request);
+            await current.recall('modes', request);
+            const before = canonicalRecall(await old.recall('modes', request));
+            const reply = await current.recall('modes', request);
+            assertStableOrder(reply);
+            assert.deepEqual(reply, before);
+            for (const unit of reply.units ?? []) assert.equal(Object.hasOwn(unit, 'following'), false);
+            if (!request.group) assert.deepEqual(await current.recall('modes', { ...request, per_conversation: 4 }), before);
+            for (const mode of Object.keys(contracts)) {
+              const { mode: echoed, mode_contract, ...rest } = await current.recall('modes', { ...request, mode });
+              assert.deepEqual([rest, echoed, mode_contract], [before, mode, contracts[mode]]);
+            }
           }
-        }
-      } finally { await original.close(); }
+        } finally { await original.close(); }
+      }
     });
     const packingA = modeTurn('a', 'pack-a', `${'packneedle '.repeat(30)}A_OWNER_MARKER`);
     const packingB = modeTurn('b', 'pack-b', `B_OWNER_MARKER ${'context '.repeat(180)}packneedle`);
@@ -300,6 +325,147 @@ export async function runIntegration(database, scratch) {
         assert.deepEqual([recalled.channels.chunk_vector, recalled.channels.record_vector],
           [{ status: 'unavailable', reason: 'model_request_failed' }, { status: 'unavailable', reason: 'model_request_failed' }]);
       } finally { modelDown = false; }
+    });
+    const followInput = (conversation, id, parent, value) => ({ source: 'follow-fixture', conversation_id: conversation, turn_id: id,
+      ...(parent ? { parent_turn_id: parent } : { lineage_root: true }),
+      entries: [{ id: `${id}-u`, role: 'user', text: value }] });
+    const makeChain = async (conversation, needle, length) => {
+      const turns = [];
+      for (let index = 0; index <= length; index += 1) {
+        const input = { ...followInput(conversation, `${conversation}-${index}`, index ? `${conversation}-${index - 1}` : null,
+          index ? `Exact correction ${index}: 🪄 ${conversation}.` : `${needle} retained root`),
+          occurred_at: `2026-01-01T00:${String(index).padStart(2, '0')}:00Z` };
+        turns.push({ ...input, id: (await plain.ingest('follow', input)).id });
+      }
+      return turns;
+    };
+    const within = await makeChain('within', 'withinchainneedle', 4);
+    const over = await makeChain('over', 'overchainneedle', 5);
+    await plain.enrich('follow', { records: [{ id: 'within-claim', kind: 'observation', text: 'withinchainneedle claim',
+      attribution: 'fixture', evidence: [span(within[0], within[0])] }], relations: [] });
+    const folded = (query, follow = {}) => plain.recall('follow', { query, group: 'conversation', follow, limit: 4, max_chars: 200000 });
+    await check('folded following renders an unrelated long chain through its recorded end with exact projected turns', async () => {
+      const reply = await folded('withinchainneedle');
+      const standalone = await plain.show('follow', { kind: 'following', turn: within[0].id, limit: 8 });
+      const expected = within.slice(1).map(projectedFollowingTurn);
+      assert.deepEqual([reply.status, reply.units[0].following, standalone.turns.map(projectedFollowingTurn), standalone.turns[0].parent_turn_id],
+        ['ready', [{ after: within[0].id, status: 'recorded_end', bound: null, turns: expected, unlinked_turns: 0 }], expected, within[0].turn_id]);
+    });
+    await check('folded following reports has_more for an actual over-bound chain and peeks past exact count bounds', async () => {
+      const limited = await folded('overchainneedle', { turns: 2, bytes: 65536 });
+      const exact = await folded('withinchainneedle', { turns: 4 });
+      assert.deepEqual([limited.status, limited.units[0].following, exact.units[0].following[0].status, exact.units[0].following[0].bound],
+        ['ready', [{ after: over[0].id, status: 'has_more', bound: 'turns', turns: over.slice(1, 3).map(projectedFollowingTurn), unlinked_turns: 0 }],
+          'recorded_end', null], 'folded following must disclose a real turn bound rather than claim recorded_end');
+    });
+    await check('folded following byte bounds count whole projected UTF-8 turn objects with zero empty-payload overhead', async () => {
+      const expected = within.slice(1).map(projectedFollowingTurn);
+      const first = Buffer.byteLength(JSON.stringify(expected[0]));
+      const all = expected.reduce((bytes, turn) => bytes + Buffer.byteLength(JSON.stringify(turn)), 0);
+      const tooSmall = (await folded('withinchainneedle', { bytes: first - 1 })).units[0].following[0];
+      const exactFirst = (await folded('withinchainneedle', { bytes: first })).units[0].following[0];
+      const tiny = (await folded('withinchainneedle', { bytes: 1 })).units[0].following[0];
+      const exactAll = (await folded('withinchainneedle', { turns: 16, bytes: all })).units[0].following[0];
+      assert.deepEqual([[tooSmall.status, tooSmall.bound, tooSmall.turns], [exactFirst.status, exactFirst.bound, exactFirst.turns],
+        [tiny.status, tiny.bound, tiny.turns], [exactAll.status, exactAll.bound, exactAll.turns]],
+      [['has_more', 'bytes', []], ['has_more', 'bytes', expected.slice(0, 1)], ['has_more', 'bytes', []], ['recorded_end', null, expected]],
+      'folded following must stop before a whole turn that exceeds its byte bound');
+    });
+    const branched = await makeChain('branched', 'branchfollowingneedle', 0);
+    await plain.ingest('follow', followInput('branched', 'branch-left', branched[0].turn_id, 'First branch.'));
+    await plain.ingest('follow', followInput('branched', 'branch-right', branched[0].turn_id, 'Second branch.'));
+    const cycleInput = followInput('cycle', 'cycle-a', 'cycle-b', 'cyclefollowingneedle first');
+    const cycleA = await plain.ingest('follow', cycleInput);
+    const cycleB = await plain.ingest('follow', followInput('cycle', 'cycle-b', 'cycle-a', 'Second cyclic turn.'));
+    const unknown = await makeChain('unknown', 'unknownfollowingneedle', 0);
+    await plain.ingest('follow', followInput('unknown', 'unknown-gap', 'missing-parent', 'Capture gap.'));
+    await check('folded following preserves exact branched cycle and unknown lineage rules with null bounds', async () => {
+      const branch = (await folded('branchfollowingneedle')).units[0].following[0];
+      const cycle = (await folded('cyclefollowingneedle')).units[0].following[0];
+      const gap = (await folded('unknownfollowingneedle')).units[0].following[0];
+      assert.deepEqual([[branch.after, branch.status, branch.bound, branch.turns.length, branch.unlinked_turns],
+        [cycle.after, cycle.status, cycle.bound, cycle.turns.map(turn => turn.id), cycle.unlinked_turns],
+        [gap.after, gap.status, gap.bound, gap.turns.length, gap.unlinked_turns]],
+      [[branched[0].id, 'branched', null, 0, 0], [cycleA.id, 'cycle', null, [cycleB.id], 0], [unknown[0].id, 'unknown', null, 0, 1]]);
+    });
+    await check('following bytes participate in the atomic whole-unit budget without dropping seeds or trimming turns', async () => {
+      const wide = await folded('withinchainneedle');
+      const unit = wide.units[0];
+      const bytes = Buffer.byteLength(JSON.stringify(unit));
+      const exact = await plain.recall('follow', { query: 'withinchainneedle', group: 'conversation', follow: {}, max_chars: bytes });
+      const short = await plain.recall('follow', { query: 'withinchainneedle', group: 'conversation', follow: {}, max_chars: bytes - 1 });
+      const bare = await plain.recall('follow', { query: 'withinchainneedle', group: 'conversation', max_chars: bytes - 1 });
+      assert.deepEqual([unit.seeds.length, exact.units[0].seeds.length, exact.units[0].following[0].turns.length,
+        short.units.length, short.bundles.length, short.budget_omitted, short.status, short.relationship_context_complete,
+        bare.units.length, Object.hasOwn(bare.units[0], 'following')],
+      [2, 2, 4, 0, 0, 1, 'budget_limited', false, 1, false], 'unit budgets must include folded following without partial rendering');
+    });
+    await plain.enrich('follow', { records: [{ id: 'cross-following', kind: 'observation', text: 'Cross-conversation evidence.',
+      attribution: 'fixture', evidence: [span(within[0], within[0]), span(over[0], over[0])] }], relations: [] });
+    const foreignFollow = await plain.ingest('foreign', followInput('foreign-follow', 'foreign-follow', null, 'Foreign retained root.'));
+    const withinKey = { scope: 'follow', source: 'follow-fixture', conversation_id: 'within' };
+    const overKey = { ...withinKey, conversation_id: 'over' };
+    const batch = { kind: 'units', units: [{ key: overKey, seeds: [
+      { kind: 'record', id: 'absent-record-a' }, { kind: 'turn', id: over[0].id }, { kind: 'record', id: 'cross-following' },
+      { kind: 'turn', id: 'absent-turn' }, { kind: 'record', id: 'absent-record-z' }, { kind: 'turn', id: foreignFollow.id },
+    ] }, { key: withinKey, seeds: [{ kind: 'turn', id: within[0].id }] }], max_nodes: 8, max_hops: 2 };
+    await check('show units preserves explicit unit seed and missing order without ranking or adding seeds', async () => {
+      const reply = await plain.show('follow', batch);
+      const source = await plain.show('follow', { kind: 'bundle', seed: { kind: 'turn', id: over[0].id }, max_nodes: 8, max_hops: 2 });
+      assert.deepEqual([reply.kind, reply.units.map(unit => unit.key), reply.units.map(unit => unit.seeds.map(bundle => [bundle.match.kind, bundle.match.id])),
+        reply.units.map(unit => unit.missing), reply.units.map(unit => Object.hasOwn(unit, 'following')), reply.units[0].seeds[0]],
+      ['units', [overKey, withinKey], [[['turn', over[0].id], ['record', 'cross-following']], [['turn', within[0].id]]],
+        [[{ kind: 'record', id: 'absent-record-a' }, { kind: 'turn', id: 'absent-turn' }, { kind: 'record', id: 'absent-record-z' },
+          { kind: 'turn', id: foreignFollow.id }], []], [false, false], source.bundle]);
+    });
+    await check('show units folds every cited root in uid order including cross-conversation record evidence', async () => {
+      const reply = await plain.show('follow', { ...batch, follow: {} });
+      const roots = [within[0].id, over[0].id].sort();
+      assert.deepEqual(reply.units.map(unit => unit.following.map(read => [read.after, read.status, read.bound, read.unlinked_turns])),
+        Array.from({ length: 2 }, () => roots.map(after => [after, 'recorded_end', null, 0])));
+    });
+    await check('show units validates batch caps follow bounds and caller scope before storage access', async () => {
+      const denied = new Memory({ scopes: config.scopes }, new Proxy({}, { get: () => { throw new Error('storage touched'); } }));
+      const unit = { key: withinKey, seeds: [] };
+      for (const input of [{ units: null }, { units: Array(5).fill(unit) },
+        { units: [{ ...unit, seeds: Array(21).fill({ kind: 'turn', id: 'missing' }) }] },
+        { units: [unit], follow: null }, { units: [unit], follow: { bytes: 0 } }, { units: [unit], follow: { turns: 17 } }]) {
+        await assert.rejects(denied.show('follow', { kind: 'units', ...input }), { code: 'invalid_input' });
+      }
+      await assert.rejects(denied.show('follow', { kind: 'units', units: [
+        { ...unit, seeds: [{ kind: 'turn', id: within[0].id }] }, { ...unit, key: { ...withinKey, scope: 'foreign' } },
+      ] }), { code: 'scope_denied' });
+      const missing = Array.from({ length: 20 }, (_, index) => ({ kind: 'turn', id: `missing-${index}` }));
+      const maximum = await plain.show('follow', { kind: 'units', units: [{ key: withinKey, seeds: missing }] });
+      assert.deepEqual([maximum.units[0].missing, (await denied.show('follow', { kind: 'units', units: [] })).units], [missing, []]);
+    });
+    const cacheA = await makeChain('a-cache', 'cache-a-root', 0);
+    const cacheB = await makeChain('b-cache', 'cache-b-root', 0);
+    const cacheZ = await makeChain('z-cache', 'cache-z-root', 1);
+    await plain.enrich('follow', { records: [
+      { id: 'cache-a', kind: 'observation', text: 'cachefollowingneedle', attribution: 'fixture', evidence: [span(cacheA[0], cacheA[0]), span(cacheZ[0], cacheZ[0])] },
+      { id: 'cache-b', kind: 'observation', text: 'cachefollowingneedle', attribution: 'fixture', evidence: [span(cacheB[0], cacheB[0]), span(cacheZ[0], cacheZ[0])] },
+    ], relations: [] });
+    await check('folded following is computed once per cited root per request and carried by every unit that cites it', async () => {
+      const original = memory.store.unlinkedTurns;
+      let reads = 0;
+      memory.store.unlinkedTurns = (...args) => {
+        if (args[1].id === cacheZ[0].id) reads += 1;
+        return original.apply(memory.store, args);
+      };
+      try {
+        const request = { query: 'cachefollowingneedle', group: 'conversation', follow: {}, max_chars: 200000 };
+        const reply = await plain.recall('follow', request);
+        const first = reads;
+        await plain.recall('follow', request);
+        const second = reads;
+        const units = reply.units.map(unit => ({ key: unit.key, seeds: unit.seeds.map(bundle => ({ kind: bundle.match.kind, id: bundle.match.id })) }));
+        reads = 0;
+        const recheck = await plain.show('follow', { kind: 'units', units, follow: {} });
+        assert.deepEqual([reply.units.length, reply.units.map(unit => unit.following.filter(read => read.after === cacheZ[0].id).length),
+          first, second, recheck.units.map(unit => unit.following.filter(read => read.after === cacheZ[0].id).length), reads],
+        [2, [1, 1], 1, 2, [1, 1], 1]);
+      } finally { memory.store.unlinkedTurns = original; }
     });
     const lexical = new Memory({ neo4j: database, scopes: config.scopes });
     try {
@@ -678,11 +844,17 @@ export async function runIntegration(database, scratch) {
       await run('enrich', { records: [{ ...record('cli-record', source, input), kind: 'observation', status: 'observed' }], relations: [] });
       const recalled = await run('recall', { query: 'unabridged' });
       const grouped = await run('recall', { query: 'unabridged', mode: 'evidence_advice', group: 'conversation' });
+      const followed = await run('recall', { query: 'unabridged', mode: 'history_search', group: 'conversation', follow: {} });
+      const checked = await run('show', { kind: 'units', units: [{ key: followed.units[0].key,
+        seeds: followed.units[0].seeds.map(bundle => ({ kind: bundle.match.kind, id: bundle.match.id })) }], follow: {} });
       const shown = await run('show', { kind: 'turn', id: source.id });
+      const terminal = [{ after: source.id, status: 'recorded_end', bound: null, turns: [], unlinked_turns: 0 }];
       assert.deepEqual([recalled.ok, recalled.bundles.length > 0, shown.turn.entries[0].text, grouped.ok, grouped.mode, grouped.mode_contract,
-        grouped.units[0].key, grouped.pool_truncated, fiveChannels.map(name => typeof grouped.channels[name].admitted_conversations)],
+        grouped.units[0].key, grouped.pool_truncated, fiveChannels.map(name => typeof grouped.channels[name].admitted_conversations),
+        followed.units[0].following, checked.kind, checked.units[0].following, checked.units[0].missing],
       [true, true, input.entries[0].text, true, 'evidence_advice', contracts.evidence_advice,
-        { scope: 'cli', source: input.source, conversation_id: input.conversation_id }, 0, ['number', 'number', 'number', 'undefined', 'undefined']]);
+        { scope: 'cli', source: input.source, conversation_id: input.conversation_id }, 0, ['number', 'number', 'number', 'undefined', 'undefined'],
+        terminal, 'units', terminal, []]);
     });
     if (process.env.SOURCE_MEMORY_REAL_EMBEDDING_URL) {
       await check('a real local embedding endpoint indexes and recalls by meaning', async () => {
