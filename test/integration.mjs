@@ -96,6 +96,23 @@ export async function runIntegration(database, scratch) {
       assert.deepEqual([excluded.channels.chunk_vector.status, plain.channels.chunk_vector.status], ['ready', 'partial']);
       await memory.index('exclusion');
     });
+    await check('a turn stored without conversation properties is never excluded, nor are its chunks, records or pending text', async () => {
+      const legacyInput = said('legacy', 'old1', 'Quartz legacy note about the window.');
+      const later = new Memory({ ...config, index_on_write: false });
+      const legacy = await later.ingest('exclusion', legacyInput);
+      await later.close();
+      // As turns stored before lineage properties existed.
+      await memory.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) REMOVE t.source, t.conversation_id', { uid: legacy.id }));
+      const pending = await memory.recall('exclusion', { query: 'quartz legacy note', limit: 32, exclude_conversations: asker });
+      await memory.enrich('exclusion', { records: [claim('legacy-claim', legacyInput, legacy),
+        claim('asker-legacy-claim', asked[1].input, asked[1].source, [span(legacy, legacyInput)])], relations: [] });
+      await memory.index('exclusion');
+      const recalled = await memory.recall('exclusion', { query: 'quartz legacy note', limit: 32, exclude_conversations: asker });
+      const turn = recalled.bundles.find(bundle => bundle.match.kind === 'turn' && bundle.source.id === legacy.id);
+      const records = new Set(recalled.bundles.flatMap(bundle => bundle.records.map(row => row.id)));
+      assert.deepEqual([pending.channels.chunk_vector.status, turn?.match.channels.map(row => row.channel).sort(), records.has('legacy-claim'), records.has('asker-legacy-claim')],
+        ['partial', ['chunk_vector', 'turn_lexical'], true, true]);
+    });
     await check('exclusion names a source and conversation exactly and is bounded', async () => {
       const otherSource = await memory.recall('exclusion', { query: 'quartz backup window start', limit: 4, exclude_conversations: [{ source: 'other', conversation_id: 'asker' }] });
       assert.equal(otherSource.bundles.every(bundle => conversationsOf(bundle).includes('asker')), true);

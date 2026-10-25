@@ -11,7 +11,8 @@ const decodeRelation = props => props ? { uid: props.uid, ...JSON.parse(props.bo
  * such a turn, and a record whose every evidence turn is in one. A record with any other evidence stays, so a mixed bundle
  * still reaches the caller. Turns stored before lineage properties existed carry no conversation and are never excluded.
  */
-const excludedTurn = turn => `any(x IN $exclude WHERE x.source = ${turn}.source AND x.conversation_id = ${turn}.conversation_id)`;
+// A turn missing these properties compares as null; coalesce makes it explicitly not excluded rather than silently dropped.
+const excludedTurn = turn => `coalesce(any(x IN $exclude WHERE x.source = ${turn}.source AND x.conversation_id = ${turn}.conversation_id), false)`;
 const eligible = n => `(size($exclude) = 0
   OR (${n}:SMTurn AND NOT ${excludedTurn(n)})
   OR (${n}:SMChunk AND EXISTS { MATCH (t:SMTurn)-[:SM_HAS_CHUNK]->(${n}) WHERE NOT ${excludedTurn('t')} })
