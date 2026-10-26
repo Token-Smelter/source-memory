@@ -40,9 +40,9 @@ try {
   if (!/^127\.0\.0\.1:\d+$/.test(mapping)) throw new Error('unexpected private port mapping');
   const uri = `bolt://${mapping}`;
   const image = (await exec('docker', ['inspect', '--format', '{{.Config.Image}}', name], { timeout: 10000 })).stdout.trim();
-  const envOut = (await exec('docker', ['inspect', '--format', '{{range .Config.Env}}{{println .}}{{end}}', name], { timeout: 10000 })).stdout;
-  const authLine = envOut.split('\n').find(line => line.startsWith('NEO4J_AUTH='));
-  const auth = authLine === 'NEO4J_AUTH=none' ? 'none' : 'other';
+  const authTemplate = '{{range .Config.Env}}{{if eq (index (split . "=") 0) "NEO4J_AUTH"}}{{if eq . "NEO4J_AUTH=none"}}none{{else}}other{{end}}{{end}}{{end}}';
+  const authOut = (await exec('docker', ['inspect', '--format', authTemplate, name], { timeout: 10000 })).stdout.trim();
+  const auth = authOut === 'none' ? 'none' : 'other';
   const hostPort = Number(mapping.split(':')[1]);
   container = { image, host_port: hostPort, auth };
   console.log(`integration container: image=${image} port=127.0.0.1:${hostPort} auth=${auth}`);
