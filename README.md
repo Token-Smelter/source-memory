@@ -86,6 +86,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `show` | `{"kind":"following","turn":"<turn id>","limit":2}` | Later turns of the same conversation by exact `parent_turn_id` links (see below) |
 | `show` | `{"kind":"turn_by_key","source":"...","conversation_id":"...","turn_ids":["..."]}` | Which of up to 16 caller turn keys already name stored turns (`found`, in request order); for callers that must reuse an existing identity |
 | `status` | None | Counts, unindexed items, configured models |
+| `warm` | None | Sends one fixed embedding request (no memory text) through the configured `embedding` endpoint, never connecting to Neo4j or writing, and returns `{warm:{model,embedding_key,ms}}`, or `{warm:{status:"unconfigured"}}` with no request. It keeps a local embedding model resident: that consumes shared model memory on the endpoint, so callers should schedule it only while recall is in use |
 
 ### Turn envelope
 
