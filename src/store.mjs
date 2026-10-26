@@ -336,7 +336,7 @@ export class Neo4jStore {
           RETURN admitted,[hit IN unique WHERE NOT any(prior IN admitted WHERE prior.seed_id=hit.seed_id) |
             {kind:$seedKind,id:CASE WHEN $seedKind='record' THEN hit.node.record_id ELSE hit.seed_id END,keys:hit.keys}] AS omitted
         }
-        RETURN admitted[..$limit] AS rows,omitted,total > $limit AS exhausted${withRawCount ? ',raw_count' : ''}`,
+        RETURN admitted[..$limit] AS rows,omitted,total > $limit AS exhausted${withRawCount ? ',raw_count,size(matches) AS considered' : ''}`,
       { ...params, scope, legacy, seedKind: kind === 'record' ? 'record' : 'turn' });
       const row = result.records[0];
       const hits = (row?.get('rows') ?? []).map(hit => {
@@ -362,7 +362,7 @@ export class Neo4jStore {
       });
       return { hits, omitted: row?.get('omitted') ?? [], exhausted: row?.get('exhausted') ?? false,
         admitted_conversations: new Set(hits.flatMap(hit => hit.conversations.map(context => JSON.stringify(context.key)))).size,
-        ...(withRawCount ? { raw_count: row?.get('raw_count') ?? 0 } : {}) };
+        ...(withRawCount ? { raw_count: row?.get('raw_count') ?? 0, considered: row?.get('considered') ?? 0 } : {}) };
     });
   }
 
@@ -379,24 +379,36 @@ export class Neo4jStore {
         && row.properties.length === 1 && row.properties[0] === 'embedding'
         && String(config['vector.similarity_function']).toLowerCase() === 'cosine', 'vector_index_schema_mismatch');
       requireThat(dimensions === null || Number(config['vector.dimensions']) === dimensions, 'vector_index_dimension_mismatch');
+      requireThat(config['vector.quantization.enabled'] === false, 'vector_index_quantization_mismatch');
       return row.state === 'ONLINE' ? 'online' : row.state === 'POPULATING' ? 'populating' : 'failed';
     });
   }
 
-  async indexedVectors(scope, kind, model, vector, limit, perConversation = null, exclude = []) {
+  async vectorCounts(scope, kind, model, exclude = []) {
+    const label = `${namespace(scope)}${kind === 'chunk' ? 'Chunk' : 'Record'}`;
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`MATCH (node:${label} {scope:$scope}) WHERE ${eligible('node')}
+        RETURN count(CASE WHEN node.embedding_key=$model THEN 1 END) AS total,
+          count(CASE WHEN node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed`, { scope, model, exclude });
+      return result.records[0].toObject();
+    });
+  }
+
+  async indexedVectors(scope, kind, model, vector, limit, perConversation = null, exclude = [], budget = { remaining: 7 }) {
     integer(limit, undefined, 1, 256);
     if (perConversation !== null) integer(perConversation, undefined, 1, 4);
     const index = indexNames(scope)[kind === 'chunk' ? 'vectorChunks' : 'vectorRecords'];
-    const label = `${namespace(scope)}${kind === 'chunk' ? 'Chunk' : 'Record'}`;
-    // This census preserves admission disclosure semantics without transferring or scoring all vectors.
-    const total = perConversation === null ? 0 : await this.transaction('read', async tx => {
-      const count = await tx.run(`MATCH (node:${label} {scope:$scope,embedding_key:$model}) WHERE ${eligible('node')}
-        RETURN count(node) AS total`, { scope, model, exclude });
-      return count.records[0].get('total');
-    });
+    // A short approximate result is not exhaustion evidence. Census both grouped and ordinary queries independently.
+    const { total, unindexed } = await this.vectorCounts(scope, kind, model, exclude);
+    const empty = perConversation === null ? { nodes: [] } : { hits: [], omitted: [], admitted_conversations: 0, exhausted: total > limit };
     const cap = 4096;
     let k = Math.max(limit * 4, 64);
+    let rounds = 0;
+    let previous = empty;
     while (true) {
+      if (budget.remaining <= 0) return { ...previous, k, rounds, unindexed, partial: true, reason: 'vector_query_budget', ran: rounds > 0 };
+      budget.remaining -= 1;
+      rounds += 1;
       const params = { index, scope, model, vector, exclude, k: neo4j.int(k), limit: neo4j.int(limit),
         total: neo4j.int(total), per: perConversation === null ? null : neo4j.int(perConversation) };
       const search = `CALL db.index.vector.queryNodes($index,$k,$vector) YIELD node,score
@@ -410,18 +422,19 @@ export class Neo4jStore {
         WITH matches,size(raw) AS raw_count,$total AS total`;
       const result = perConversation !== null ? await this.admission(scope, kind, search, params, true)
         : await this.transaction('read', async tx => {
-          const selected = await tx.run(`${search} RETURN matches[..$limit] AS rows,raw_count`, params);
+          const selected = await tx.run(`${search} RETURN matches[..$limit] AS rows,raw_count,size(matches) AS considered`, params);
           const row = selected.records[0];
           const nodes = row.get('rows').map(hit => {
             const node = unwrap(hit.node);
             requireThat(node.scope === scope, 'index_scope_mismatch');
             return { ...node, similarity: 2 * hit.score - 1 };
           });
-          return { nodes, raw_count: row.get('raw_count') };
+          return { nodes, raw_count: row.get('raw_count'), considered: row.get('considered') };
         });
       const size = perConversation === null ? result.nodes.length : result.hits.length;
-      if (size >= limit || result.raw_count < k) return { ...result, k, partial: false };
-      if (k === cap) return { ...result, k, partial: true, reason: 'vector_overfetch_cap' };
+      if (size >= Math.min(limit, total) || result.considered >= total) return { ...result, k, rounds, unindexed, partial: false, ran: true };
+      if (k === cap) return { ...result, k, rounds, unindexed, partial: true, reason: 'vector_overfetch_cap', ran: true };
+      previous = result;
       k = Math.min(k * 2, cap);
     }
   }

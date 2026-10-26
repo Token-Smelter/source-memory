@@ -76,6 +76,15 @@ export async function runIntegration(database, scratch) {
     }
     throw new Error('private vector indexes did not become online');
   };
+  const waitForRawVectorIndex = async name => {
+    const deadline = performance.now() + 120000;
+    while (performance.now() < deadline) {
+      const result = await memory.store.transaction('read', tx => tx.run('SHOW VECTOR INDEXES YIELD name,state WHERE name=$name RETURN state', { name }));
+      if (result.records[0]?.get('state') === 'ONLINE') return;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error('private comparison index did not become online');
+  };
   const withoutVectorIndexes = async (scope, action) => {
     const names = indexNames(scope);
     for (const name of [names.vectorChunks, names.vectorRecords]) await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name} IF EXISTS`));
@@ -159,9 +168,71 @@ export async function runIntegration(database, scratch) {
         options.records[0].get('options').indexConfig['vector.quantization.enabled']],
         [{ chunk: 'online', record: 'online' }, { chunk: 'missing', record: 'missing' }, false]);
     });
+    await check('a forced short ANN response widens to the cap instead of falsely proving exhaustion on either path', async () => {
+      const original = memory.store.transaction;
+      memory.store.transaction = (mode, action) => original.call(memory.store, mode, tx => action({ run: async (query, params) => {
+        const result = await tx.run(query, params);
+        if (!query.includes('db.index.vector.queryNodes')) return result;
+        return { ...result, records: result.records.map(record => ({ get: name => name === 'rows' ? record.get(name).slice(0, 1)
+          : ['raw_count', 'considered'].includes(name) ? 1 : record.get(name) })) };
+      } }));
+      try {
+        for (const per of [null, 2]) {
+          const result = await memory.store.indexedVectors('vector', 'chunk', nativeKey, queryVector, 4, per);
+          assert.deepEqual([result.k, result.rounds, result.partial, result.reason],
+            [4096, 7, true, 'vector_overfetch_cap'], 'short ANN returns cannot establish completeness without the eligible census');
+        }
+      } finally { memory.store.transaction = original; }
+    });
+    await check('an incompatible record index is refused without rebuilding or suppressing the healthy chunk channel', async () => {
+      const name = indexNames('vector').vectorRecords;
+      for (const [dimensions, quantization, reason] of [[4, false, 'vector_index_dimension_mismatch'], [3, true, 'vector_index_quantization_mismatch']]) {
+        await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name}`));
+        await memory.store.transaction('write', tx => tx.run(`CREATE VECTOR INDEX ${name} FOR (n:${namespace('vector')}Record) ON (n.embedding)
+          OPTIONS {indexConfig:{\`vector.dimensions\`:${dimensions},\`vector.similarity_function\`:'cosine',\`vector.quantization.enabled\`:$quantization}}`,
+        { quantization }));
+        await waitForRawVectorIndex(name);
+        try {
+          await assert.rejects(native.init('vector'), { code: reason }, 'incompatible vector schemas must be refused without rebuilding');
+          const reply = await native.recall('vector', { query: 'vectorquery', candidates: 4, limit: 1 });
+          const status = await native.status('vector');
+          const options = await memory.store.transaction('read', tx => tx.run('SHOW VECTOR INDEXES YIELD name,options WHERE name=$name RETURN options', { name }));
+          assert.deepEqual([reply.channels.chunk_vector.status, reply.channels.chunk_vector.vector_index,
+            reply.channels.record_vector.status, reply.channels.record_vector.reason, reply.bundles.length > 0,
+            status.vector_indexes, status.vector_index_errors, options.records[0].get('options').indexConfig['vector.quantization.enabled']],
+          ['ready', 'online', 'unavailable', reason, true, { chunk: 'online', record: 'incompatible' }, { record: reason }, quantization],
+          'catalog incompatibility must affect only its own vector kind');
+        } finally {
+          await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name}`));
+          await native.init('vector');
+          await waitForVectors(native, 'vector');
+        }
+      }
+    });
+    await check('a failed record fallback does not block the online chunk channel', async () => {
+      const name = indexNames('vector').vectorRecords;
+      await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name}`));
+      const original = memory.store.vectors;
+      memory.store.vectors = (...args) => {
+        if (args[4] === 'record') throw new Error('forced fallback failure');
+        return original.apply(memory.store, args);
+      };
+      try {
+        const reply = await native.recall('vector', { query: 'vectorquery', candidates: 4, limit: 1 });
+        assert.deepEqual([reply.channels.chunk_vector.status, reply.channels.chunk_vector.vector_index,
+          reply.channels.record_vector.status, reply.channels.record_vector.vector_index, reply.channels.record_vector.reason, reply.bundles.length > 0],
+        ['ready', 'online', 'unavailable', 'missing', 'database_unavailable', true], 'fallback failure must affect only its own vector kind');
+      } finally { memory.store.vectors = original; await native.init('vector'); await waitForVectors(native, 'vector'); }
+    });
+    await addVectors('vector', 'quota', 0, 4, () => queryVector, 'quota-model', 1);
+    await check('grouped quota and duplicate collapse can finish short only when every eligible vector was considered', async () => {
+      const result = await memory.store.indexedVectors('vector', 'chunk', 'quota-model', queryVector, 4, 1);
+      assert.deepEqual([result.hits.length, result.considered, result.partial], [1, 4, false]);
+    });
     await addVectors('vector', 'dominant', 0, 128, () => queryVector, nativeKey, 1);
     await addVectors('vector', 'stale', 0, 64, () => queryVector, 'old-model', 1);
-    const vectorExclusion = [{ source: 'vector-fixture', conversation_id: 'dominant-0' }, { source: 'vector-fixture', conversation_id: 'stale-0' }];
+    const vectorExclusion = [{ source: 'vector-fixture', conversation_id: 'dominant-0' }, { source: 'vector-fixture', conversation_id: 'stale-0' },
+      { source: 'vector-fixture', conversation_id: 'quota-0' }];
     await check('native post-filter rejects other models and excluded neighbours before limit and widens to eligible hits', async () => {
       const result = await memory.store.indexedVectors('vector', 'chunk', nativeKey, queryVector, 4, null, vectorExclusion);
       const grouped = await memory.store.indexedVectors('vector', 'chunk', nativeKey, queryVector, 4, 2, vectorExclusion);
@@ -262,18 +333,15 @@ export async function runIntegration(database, scratch) {
     await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${scaleIndex}`));
     await memory.store.transaction('write', tx => tx.run(`CREATE VECTOR INDEX ${scaleIndex} FOR (n:${namespace('vector-scale')}Chunk) ON (n.embedding)
       OPTIONS {indexConfig:{\`vector.dimensions\`:3,\`vector.similarity_function\`:'cosine',\`vector.quantization.enabled\`:true}}`));
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      if (await memory.store.vectorIndexStatus('vector-scale', 'chunk', 3) === 'online') break;
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    assert.equal(await memory.store.vectorIndexStatus('vector-scale', 'chunk', 3), 'online');
+    await waitForRawVectorIndex(scaleIndex);
+    await assert.rejects(memory.store.vectorIndexStatus('vector-scale', 'chunk', 3), { code: 'vector_index_quantization_mismatch' });
     timings[1].index_quantization_on = await samples(() => memory.store.indexedVectors('vector-scale', 'chunk', nativeKey, queryVector, 64));
     await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${scaleIndex}`));
     await native.init('vector-scale');
     await waitForVectors(native, 'vector-scale');
     await writeFile('.memory-local/vector-index-latency.json', JSON.stringify({
       fixture: 'private Neo4j 5.26.14; 1536m memory; 2 CPUs; 512m heap; 128m pagecache', dimensions: 3, candidates: 64,
-      measurement: 'warm vector retrieval/scoring/top-k only; excludes catalog readiness, corpus counts, fusion and bundle rendering',
+      measurement: 'warm vector retrieval/scoring/top-k including native eligible census; excludes catalog readiness, model calls, fusion and bundle rendering',
       warmups: 1, measured_runs: 5, results: timings,
     }, null, 2));
     console.log(`VECTOR_LATENCY ${JSON.stringify(timings)}`);

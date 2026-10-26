@@ -31,14 +31,66 @@ test('vector index dimensions cannot silently disagree with configuration', asyn
   await assert.rejects(store.vectorIndexStatus('test', 'chunk', 3), { code: 'vector_index_dimension_mismatch' });
 });
 
+for (const quantization of [true, undefined]) {
+  test(`quantization ${String(quantization)} is refused instead of silently reusing an incompatible vector index`, async () => {
+    const store = Object.assign(Object.create(Neo4jStore.prototype), {
+      transaction: async (_mode, action) => action({ run: async () => ({ records: [{ toObject: () => ({
+        type: 'VECTOR', state: 'ONLINE', labelsOrTypes: [`${namespace('test')}Chunk`], properties: ['embedding'],
+        options: { indexConfig: { 'vector.dimensions': 3, 'vector.similarity_function': 'cosine', 'vector.quantization.enabled': quantization } },
+      }) }] }) }),
+    });
+    await assert.rejects(store.vectorIndexStatus('test', 'chunk', 3), { code: 'vector_index_quantization_mismatch' });
+  });
+}
+
+test('short approximate returns keep widening without independent completeness evidence', async () => {
+  const requests = [];
+  const store = Object.assign(Object.create(Neo4jStore.prototype), {
+    vectorCounts: async () => ({ total: 2, unindexed: 0 }),
+    transaction: async (_mode, action) => action({ run: async (_query, params) => {
+      requests.push(params.k.toNumber());
+      return { records: [{ get: name => name === 'rows' ? [] : 0 }] };
+    } }),
+  });
+  const result = await store.indexedVectors('test', 'chunk', 'model', [1, 0, 1], 1);
+  assert.deepEqual([requests, result.partial, result.reason], [[64, 128, 256, 512, 1024, 2048, 4096], true, 'vector_overfetch_cap']);
+});
+
+test('grouped admission may complete a short result only when its window considered the entire eligible census', async () => {
+  const store = Object.assign(Object.create(Neo4jStore.prototype), {
+    vectorCounts: async () => ({ total: 2, unindexed: 0 }),
+    admission: async () => ({ hits: [{ id: 'one-parent' }], raw_count: 2, considered: 2 }),
+  });
+  const result = await store.indexedVectors('test', 'chunk', 'model', [1, 0, 1], 4, 1);
+  assert.deepEqual([result.hits.length, result.partial, result.rounds], [1, false, 1]);
+});
+
+test('a shared round budget bounds multiple native queries and reports an unexecuted channel without admission counters', async () => {
+  const requests = [];
+  const store = Object.assign(Object.create(Neo4jStore.prototype), {
+    vectorCounts: async () => ({ total: 2, unindexed: 0 }),
+    transaction: async (_mode, action) => action({ run: async (_query, params) => {
+      requests.push(params.k.toNumber());
+      return { records: [{ get: name => name === 'rows' ? [] : 0 }] };
+    } }),
+  });
+  const budget = { remaining: 2 };
+  const first = await store.indexedVectors('test', 'chunk', 'model', [1, 0, 1], 1, null, [], budget);
+  const second = await store.indexedVectors('test', 'record', 'model', [1, 0, 1], 1, null, [], budget);
+  assert.deepEqual([requests, first.reason, first.rounds, first.ran, second.reason, second.rounds, second.ran, budget.remaining],
+    [[64, 128], 'vector_query_budget', 2, true, 'vector_query_budget', 0, false, 0]);
+});
+
 for (const capped of [false, true]) {
   test(`native vector queries ${capped ? 'report partial at the widening cap' : 'widen until eligible hits survive'}`, async () => {
     const requests = [];
     const store = Object.assign(Object.create(Neo4jStore.prototype), {
+      vectorCounts: async () => ({ total: 1, unindexed: 0 }),
       transaction: async (_mode, action) => action({ run: async (_query, params) => {
         const k = params.k.toNumber();
         requests.push(k);
         return { records: [{ get: name => name === 'raw_count' ? capped || k === 64 ? k : 1
+          : name === 'considered' ? capped || k === 64 ? 0 : 1
           : capped || k === 64 ? [] : [{ node: { properties: { uid: 'eligible', scope: 'test' } }, score: 0.75 }] }] };
       } }),
     });

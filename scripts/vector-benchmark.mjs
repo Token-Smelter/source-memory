@@ -88,6 +88,41 @@ try {
   const query = vector(0);
   const ns = namespace(scope);
   const text = 'Synthetic source.';
+  const worstCaseWidening = async () => {
+    const parents = Array.from({ length: 200 }, (_, index) => ({
+      uid: identity('turn', scope, 'benchmark', `dense-${index}`, 'root'), conversation: `dense-${index}`,
+    }));
+    const old = parents[9999 % 200].uid;
+    const uid = identity('chunk', scope, old, 9999);
+    const far = identity('turn', scope, 'benchmark', 'widen-eligible', 'root');
+    await memory.store.transaction('write', tx => tx.run(`UNWIND $parents AS parent MATCH (t:SMTurn {uid:parent.uid})
+      SET t.conversation_id='widen-dominant'`, { parents }));
+    await memory.store.transaction('write', tx => tx.run(`MATCH (old:SMTurn {uid:$old})-[edge:SM_HAS_CHUNK]->(c:SMChunk {uid:$uid}) DELETE edge
+      MERGE (far:SMTurn {uid:$far}) ON CREATE SET far:${ns}Turn,far.scope=$scope,far.source='benchmark',
+        far.conversation_id='widen-eligible',far.turn_key='root',far.lineage=true,far.lineage_root=true,far.body=$body,far.text=$text
+      SET c.turn_uid=$far,c.embedding=$vector CREATE (far)-[:SM_HAS_CHUNK]->(c)`,
+    { old, uid, far, scope, text, vector: query.map(value => -value), body: JSON.stringify({ source: 'benchmark',
+      conversation_id: 'widen-eligible', turn_id: 'root', entries: [{ id: 'v', role: 'user', text }] }) }));
+    try {
+      const exclude = [{ source: 'benchmark', conversation_id: 'widen-dominant' }];
+      const action = async per => {
+        const result = await memory.store.indexedVectors(scope, 'chunk', key, query, 1, per, exclude);
+        if (result.rounds !== 7 || !result.partial || result.reason !== 'vector_overfetch_cap') throw new Error('worst-case widening fixture did not reach seven capped rounds');
+      };
+      const ordinary = await sample(() => action(null));
+      const grouped = await sample(() => action(1));
+      const result = { dimensions, vectors: 10000, candidates: 1, excluded_vectors: 9999, eligible_vectors: 1,
+        rounds: 7, quantization: false, ordinary, grouped };
+      results.at(-1).worst_case_widening = result;
+      console.log(`VECTOR_768_WIDENING ${JSON.stringify(result)}`);
+    } finally {
+      await memory.store.transaction('write', tx => tx.run(`MATCH (far:SMTurn {uid:$far})-[edge:SM_HAS_CHUNK]->(c:SMChunk {uid:$uid}) DELETE edge
+        SET c.turn_uid=$old,c.embedding=$vector WITH far,c MATCH (old:SMTurn {uid:$old}) CREATE (old)-[:SM_HAS_CHUNK]->(c) DELETE far`,
+      { old, uid, far, vector: vector(9999) }));
+      await memory.store.transaction('write', tx => tx.run(`UNWIND $parents AS parent MATCH (t:SMTurn {uid:parent.uid})
+        SET t.conversation_id=parent.conversation`, { parents }));
+    }
+  };
   let loaded = 0;
   for (const count of [10000, 50000]) {
     try {
@@ -116,6 +151,7 @@ try {
         ...(scan.median_ms && index.median_ms ? { speedup: Number((scan.median_ms / index.median_ms).toFixed(2)) } : {}) });
       console.log(`VECTOR_768_LATENCY ${JSON.stringify(results.at(-1))}`);
       if (count === 10000 && (scan.unavailable || index.unavailable)) throw new Error('required 10000-vector benchmark unavailable');
+      if (count === 10000) await worstCaseWidening();
     } catch (error) {
       failure = errorData(error);
       if (count === 10000) process.exitCode = 1;
@@ -130,7 +166,7 @@ finally {
   await mkdir('.memory-local', { recursive: true, mode: 0o700 });
   const report = { started_at: started, finished_at: new Date().toISOString(),
     fixture: 'private Neo4j5.26.14; 1536m memory; 2 CPUs; 512m heap; 128m pagecache', candidates: 64,
-    method: 'warm vector retrieval/scoring/top-k only; no model endpoint calls; one warmup and five measured samples; original 15s transaction bound',
+    method: 'warm vector retrieval/scoring/top-k, including native eligible census; no catalog/fusion/render/model calls; one warmup and five samples; original 15s transaction bound',
     results, failure, owned_container: name, container_stopped: stopped, container_removed: removed };
   const path = `.memory-local/vector-768-benchmark-${started.replaceAll(':', '-')}.json`;
   await writeFile(path, JSON.stringify(report, null, 2), { mode: 0o600 });

@@ -173,9 +173,11 @@ Recalled material is evidence, not authority. A proposal is not an accepted deci
 
 ### Vector indexes, widening, and fallback
 
-With `embedding` configured, `init` idempotently creates `smvc_<scope digest>` and `smvr_<scope digest>` on the scope's Chunk/Record labels and `embedding` property, with configured dimensions, cosine similarity, and quantization disabled. Without embedding configuration it creates no vector indexes. Existing indexes are not silently rebuilt: a dimension conflict fails clearly with `vector_index_dimension_mismatch`; resolve it explicitly before using a changed dimension. `init` waits only for this scope's full-text indexes, then creates/checks native schemas without waiting for vector population; its configured result includes per-kind `vector_indexes` states.
+With `embedding` configured, `init` idempotently creates `smvc_<scope digest>` and `smvr_<scope digest>` on the scope's Chunk/Record labels and `embedding` property, with configured dimensions, cosine similarity, and quantization disabled. Without embedding configuration it creates no vector indexes. Existing indexes are not silently rebuilt: dimension conflicts fail clearly with `vector_index_dimension_mismatch`, and quantization enabled or missing is refused with `vector_index_quantization_mismatch`. Resolve incompatible schemas explicitly. `init` waits only for this scope's full-text indexes, then creates/checks native schemas without waiting for vector population; its configured result includes per-kind `vector_indexes` states.
 
-Native queries start with `k=max(candidates*4,64)`. They filter scope, embedding identity, and requester exclusions **inside the query**, rescore the surviving window with exact cosine, then apply admission/limits. If too few hits survive and the index returned `k` raw rows, `k` doubles up to 4096. A short result at that cap is `partial` with `reason:"vector_overfetch_cap"`; a provider-exhausted window may return fewer hits as `ready`. Cosine values and UID tie-breaking apply within the ANN candidate window, not an exact global ranking guarantee.
+Native queries start with `k=max(candidates*4,64)`. They filter scope, embedding identity, and requester exclusions **inside the query**, rescore the surviving window with exact cosine, then apply admission/limits. A count-only eligible census runs on both paths: a result is complete when it covers `min(candidates, eligible_count)`, or when the filtered window demonstrably considered every eligible node before grouped quota/dedup. A short approximate provider return is **never** exhaustion evidence. Otherwise `k` doubles through 4096; an unresolved capped window is `partial` with `reason:"vector_overfetch_cap"`. Cosine values and UID tie-breaking apply within the ANN candidate window, not an exact global ranking guarantee.
+
+Widening has at most **7 rounds per kind / 14 per recall**, with a shared 14-round backstop (`vector_query_budget` if exhausted). Each grouped round also reads legacy-parent grouping keys before its ANN/admission query. Census and catalog reads are additional work; existing driver retries and 15s transaction bounds remain. A query-count bound is not a 4s whole-CLI guarantee.
 
 `status.vector_indexes` reports each kind's catalog state. Recall exposes it as `channels.chunk_vector.vector_index` / `record_vector.vector_index`:
 
@@ -184,9 +186,9 @@ Native queries start with `k=max(candidates*4,64)`. They filter scope, embedding
 | `online` | Native query; no `vector_scan_limit` scan. Pending embeddings can still make the channel partial. |
 | `populating` | `partial`, reason `vector_index_populating`, no query/scan and no fabricated admission counters |
 | `missing` | Explicit legacy fallback, reported as `vector_index:"missing"`; exceeding the scan bound remains `partial` / `scan_truncated` |
-| `failed` or incompatible schema/dimensions | Unavailable with a safe reason; never silently fall back |
+| `failed`, incompatible schema/dimensions/quantization, or failed fallback | Only that kind becomes unavailable with a safe reason; the healthy sibling still runs. No silent fallback on incompatibility. |
 
-When both indexes are missing, the fallback retains the original shared eligible UID scan bound. If only one is missing, only that kind is scanned under the bound; the healthy kind still uses its native index. Run `init` to populate indexes over an old store's existing embeddings. A fresh or rebuilt scope serves vector channels as partial until its indexes become online; poll `status` and inspect `vector_indexes.chunk` / `vector_indexes.record`. There is no `--wait` flag. Neither a native index nor a ready channel establishes currentness or completeness.
+Catalog validation and fallback preparation are isolated per kind. `status.vector_index_errors` reports kind-specific incompatibilities alongside the healthy kind's state. When both indexes are missing, the fallback retains the original shared eligible UID scan bound. If only one is missing, only that kind is scanned under the bound; the healthy kind still uses its native index. Run `init` to populate indexes over an old store's existing embeddings. A fresh or rebuilt scope serves vector channels as partial until its indexes become online; poll `status` and inspect `vector_indexes.chunk` / `vector_indexes.record`. There is no `--wait` flag. Neither a native index nor a ready channel establishes currentness or completeness.
 
 ### Modes and conversation units
 
@@ -285,16 +287,18 @@ npm run test:integration # disposable loopback Neo4j container; needs Docker
 
 ### Vector-stage benchmark
 
-Warm medians in milliseconds: one warmup, five measured samples, 64 candidates; private Neo4j 5.26.14, 1536m memory, 2 CPUs, 512m heap, 128m pagecache. These measure vector retrieval/scoring/top-k, **not** catalog readiness, counts, model calls, fusion, rendering, or full-CLI latency. Synthetic data is not a retrieval-quality benchmark.
+Warm medians in milliseconds: one warmup, five measured samples, 64 candidates; private Neo4j 5.26.14, 1536m memory, 2 CPUs, 512m heap, 128m pagecache. These measure vector retrieval/scoring/top-k including the native eligible census, **not** catalog readiness, model calls, fusion, rendering, or full-CLI latency. Synthetic data is not a retrieval-quality benchmark.
 
 | Dimensions | Vectors | Exact scan | Native, quantization off | Native, quantization on |
 |---:|---:|---:|---:|---:|
-| 3 | 10,000 | 160.716 | 50.134 | — |
-| 3 | 50,000 | 754.775 | 48.701 | 49.134 |
-| 768 | 10,000 | 1181.298 | 98.346 | — |
-| 768 | 50,000 | Timed out at the existing 15s transaction bound | 111.605 | — |
+| 3 | 10,000 | 157.539 | 79.424 | — |
+| 3 | 50,000 | 755.527 | 188.061 | 183.268 |
+| 768 | 10,000 | 1257.761 | 143.452 | — |
+| 768 | 50,000 | Timed out at the existing 15s transaction bound | 264.636 | — |
 
-The 768-d container held all 50,000 vectors and stopped cleanly; only the exact scan failed its original transaction deadline, so no scan median/speedup is invented for that row. Quantization remains off: the 50k comparison showed no measured off penalty, and disabling it also avoids quantized candidate selection. Both paths retain bounded exact cosine rescoring.
+The 768-d container held all 50,000 vectors and stopped cleanly; only the exact scan failed its original transaction deadline, so no scan median/speedup is invented for that row. Quantization remains off for fidelity; the 50k off/on sample ranges overlap, with a small median difference. Both paths retain bounded exact cosine rescoring.
+
+Worst-case widening at 768d/10k: 9999 excluded nearest vectors plus one eligible far vector, one candidate, all 7 ANN rounds through 4096, ending truthfully partial. Ordinary median: 618.143 ms. Grouped median: 630.483 ms, including 7 legacy-parent reads. These are vector-stage costs, not whole-CLI latency guarantees.
 
 ## Limitations
 

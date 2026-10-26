@@ -70,10 +70,13 @@ export class Memory {
     authorize(this.config, scope);
     const key = embeddingIdentity(this.config.embedding);
     const dimensions = this.config.embedding?.dimensions ?? null;
-    const states = await Promise.all(['chunk', 'record'].map(kind => this.store.vectorIndexStatus(scope, kind, dimensions)));
+    const catalog = await vectorCatalog(this.store, scope, dimensions);
+    const errors = Object.fromEntries(catalog.filter(entry => entry.reason).map(entry => [entry.kind, entry.reason]));
     return { scope, ...(await this.store.status(scope, key)),
       embedding: key ? { configured: true, model: this.config.embedding.model, key } : { configured: false },
-      reranker: { configured: Boolean(this.config.reranker) }, vector_indexes: { chunk: states[0], record: states[1] } };
+      reranker: { configured: Boolean(this.config.reranker) },
+      vector_indexes: Object.fromEntries(catalog.map(entry => [entry.kind, entry.vector_index])),
+      ...(Object.keys(errors).length ? { vector_index_errors: errors } : {}) };
   }
 
   async show(scope, input) {
@@ -282,39 +285,48 @@ export class Memory {
       try {
         const key = embeddingIdentity(this.config.embedding);
         const [queryVector] = await embed(this.config.embedding, [query]);
-        const kinds = ['chunk', 'record'];
-        const states = await Promise.all(kinds.map(kind => this.store.vectorIndexStatus(scope, kind, queryVector.length)));
-        const missing = kinds.filter((_, index) => states[index] === 'missing');
-        const vectors = missing.length ? await this.store.vectors(scope, key, vectorLimit + 1, exclude, missing.length === 1 ? missing[0] : null) : [];
-        const counts = states.some(state => ['online', 'missing'].includes(state)) ? await this.store.status(scope, key, exclude) : null;
-        const scanned = vectors.slice(0, vectorLimit).map(row => row.uid);
-        const ranked = !grouped && missing.length ? vectors.slice(0, vectorLimit).map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
-          .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid)) : [];
-        const results = await Promise.all(kinds.map(async (kind, index) => {
-          const vector_index = states[index];
+        const catalog = await vectorCatalog(this.store, scope, queryVector.length);
+        const missing = catalog.filter(entry => entry.vector_index === 'missing');
+        const prepareFallback = async kind => {
+          const vectors = await this.store.vectors(scope, key, vectorLimit + 1, exclude, kind);
+          const selected = vectors.slice(0, vectorLimit);
+          return { scanned: selected.map(row => row.uid), scan_truncated: vectors.length > vectorLimit,
+            ranked: grouped ? [] : selected.map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
+              .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid)) };
+        };
+        let sharedFallback;
+        const budget = { remaining: 14 };
+        const results = await Promise.all(catalog.map(async ({ kind, vector_index, reason }) => {
+          if (reason) return { hits: [], omitted: [], state: { status: 'unavailable', vector_index, reason } };
           if (vector_index === 'populating') return { hits: [], omitted: [], state: { status: 'partial', vector_index, reason: 'vector_index_populating' } };
           if (vector_index === 'failed') return { hits: [], omitted: [], state: { status: 'unavailable', vector_index, reason: 'vector_index_failed' } };
           try {
             let result;
+            let unindexed;
+            let scan_truncated = false;
             if (vector_index === 'online') {
-              result = await this.store.indexedVectors(scope, kind, key, queryVector, candidates, grouped ? perConversation : null, exclude);
+              result = await this.store.indexedVectors(scope, kind, key, queryVector, candidates, grouped ? perConversation : null, exclude, budget);
+              unindexed = result.unindexed;
               if (!grouped) result.hits = vectorHits(kind, result.nodes);
-            } else if (grouped) {
-              result = await this.store.admittedVectors(scope, kind, key, queryVector, scanned, candidates, perConversation, exclude);
             } else {
-              result = { hits: vectorHits(kind, ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates)) };
+              // Share only a truly combined missing-index scan. One kind's failure never blocks an online sibling.
+              const fallback = missing.length === 2 ? sharedFallback ??= prepareFallback(null) : prepareFallback(kind);
+              const [data, counts] = await Promise.all([fallback, this.store.vectorCounts(scope, kind, key, exclude)]);
+              unindexed = counts.unindexed;
+              scan_truncated = data.scan_truncated;
+              result = grouped ? await this.store.admittedVectors(scope, kind, key, queryVector, data.scanned, candidates, perConversation, exclude)
+                : { hits: vectorHits(kind, data.ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates)) };
             }
-            const scan_truncated = vector_index === 'missing' && vectors.length > vectorLimit;
-            const state = { status: result.partial || scan_truncated || counts.unindexed > 0 ? 'partial' : 'ready',
-              scan_truncated, unindexed: counts.unindexed, embedding_key: key, vector_index,
+            const state = { status: result.partial || scan_truncated || unindexed > 0 ? 'partial' : 'ready',
+              scan_truncated, unindexed, embedding_key: key, vector_index,
               ...(result.reason ? { reason: result.reason } : {}),
-              ...(grouped ? { admitted_conversations: result.admitted_conversations, exhausted: result.exhausted } : {}) };
+              ...(grouped && result.ran !== false ? { admitted_conversations: result.admitted_conversations, exhausted: result.exhausted } : {}) };
             return { hits: result.hits, omitted: result.omitted ?? [], state };
           } catch (error) {
             return { hits: [], omitted: [], state: { status: 'unavailable', vector_index, reason: safeCode(error) } };
           }
         }));
-        for (const [index, kind] of kinds.entries()) {
+        for (const [index, kind] of ['chunk', 'record'].entries()) {
           channels[`${kind}_vector`] = results[index].hits;
           omitted.push(...results[index].omitted);
           availability[`${kind}_vector`] = results[index].state;
@@ -482,6 +494,16 @@ export class Memory {
       relationship_context_complete: gaps.size === 0, gaps: [...gaps],
     };
   }
+}
+
+async function vectorCatalog(store, scope, dimensions) {
+  return Promise.all(['chunk', 'record'].map(async kind => {
+    try { return { kind, vector_index: await store.vectorIndexStatus(scope, kind, dimensions) }; }
+    catch (error) {
+      const reason = safeCode(error);
+      return { kind, vector_index: reason.startsWith('vector_index_') ? 'incompatible' : 'unavailable', reason };
+    }
+  }));
 }
 
 const vectorHits = (kind, nodes) => nodes.map(row => kind === 'chunk' ? {
