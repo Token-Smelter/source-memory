@@ -277,6 +277,27 @@ async function controller(args) {
     report.integration = JSON.parse(await readFile(integrationResult, 'utf8'));
     assert.equal(report.integration.failure, null);
     // Only this newly created, label-verified, disposable database is cleared between its integration and benchmark phases.
+    const population = await writer.store.transaction('read', tx => tx.run('MATCH (n) RETURN count(n) AS count'));
+    const initialNodes = number(population.records[0].get('count'));
+    assert.ok(Number.isSafeInteger(initialNodes) && initialNodes >= 0);
+    const reset = report.conditions.integration_reset = { initial_nodes: initialNodes, deletion_batch: 1000, deleted_nodes: 0, committed_batches: 0 };
+    await persist();
+    while (reset.deleted_nodes < initialNodes) {
+      assert.ok(reset.committed_batches < Math.ceil(initialNodes / reset.deletion_batch), 'integration reset exceeded batch bound');
+      const batch = await writer.store.transaction('write', tx => tx.run('MATCH (n) WITH n LIMIT 1000 DETACH DELETE n RETURN count(*) AS removed'));
+      const removed = number(batch.records[0].get('removed'));
+      assert.ok(Number.isSafeInteger(removed) && removed > 0 && removed <= reset.deletion_batch, 'integration reset made no bounded progress');
+      reset.deleted_nodes += removed;
+      reset.committed_batches += 1;
+      assert.ok(reset.deleted_nodes <= initialNodes, 'integration population changed during reset');
+      await persist();
+    }
+    const empty = await writer.store.transaction('read', tx => tx.run('MATCH (n) RETURN count(n) AS count'));
+    assert.equal(number(empty.records[0].get('count')), 0, 'integration nodes remain');
+    const emptyRelationships = await writer.store.transaction('read', tx => tx.run('MATCH ()-[r]->() RETURN count(r) AS count'));
+    assert.equal(number(emptyRelationships.records[0].get('count')), 0, 'integration relationships remain');
+    Object.assign(reset, { nodes: 0, relationships: 0 });
+    await persist();
     const constraints = await writer.store.transaction('read', tx => tx.run('SHOW CONSTRAINTS YIELD name RETURN name'));
     const quote = name => '`' + name.replaceAll('`', '``') + '`';
     for (const row of constraints.records) await writer.store.transaction('write', tx => tx.run(`DROP CONSTRAINT ${quote(row.get('name'))}`));
@@ -284,10 +305,7 @@ async function controller(args) {
     for (const row of indexes.records.filter(row => row.get('type') !== 'LOOKUP')) {
       await writer.store.transaction('write', tx => tx.run(`DROP INDEX ${quote(row.get('name'))}`));
     }
-    await writer.store.transaction('write', tx => tx.run('MATCH (n) DETACH DELETE n'));
-    const empty = await writer.store.transaction('read', tx => tx.run('MATCH (n) RETURN count(n) AS count'));
-    assert.equal(number(empty.records[0].get('count')), 0, 'integration data remains');
-    report.conditions.integration_reset = { nodes: 0, only_lookup_indexes_retained: true };
+    reset.only_lookup_indexes_retained = true;
     await persist();
     model = createServer(async (req, res) => {
       try {
