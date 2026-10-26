@@ -15,6 +15,7 @@ let owned = false;
 let stopped = false;
 let results = [];
 let failure = null;
+let container = null;
 
 async function stop() {
   if (!owned || stopped) return;
@@ -38,6 +39,13 @@ try {
   const mapping = (await exec('docker', ['port', name, '7687/tcp'], { timeout: 10000 })).stdout.trim();
   if (!/^127\.0\.0\.1:\d+$/.test(mapping)) throw new Error('unexpected private port mapping');
   const uri = `bolt://${mapping}`;
+  const image = (await exec('docker', ['inspect', '--format', '{{.Config.Image}}', name], { timeout: 10000 })).stdout.trim();
+  const authTemplate = '{{range .Config.Env}}{{if eq (index (split . "=") 0) "NEO4J_AUTH"}}{{if eq . "NEO4J_AUTH=none"}}none{{else}}other{{end}}{{end}}{{end}}';
+  const authOut = (await exec('docker', ['inspect', '--format', authTemplate, name], { timeout: 10000 })).stdout.trim();
+  const auth = authOut === 'none' ? 'none' : 'other';
+  const hostPort = Number(mapping.split(':')[1]);
+  container = { image, host_port: hostPort, auth };
+  console.log(`integration container: image=${image} port=127.0.0.1:${hostPort} auth=${auth}`);
   const deadline = Date.now() + 90000;
   let ready = false;
   while (Date.now() < deadline) {
@@ -58,7 +66,7 @@ try {
   const report = { started_at: startedAt, finished_at: new Date().toISOString(),
     fixture: 'disposable Neo4j 5.26.14; fictional content; deterministic HTTP model fixtures',
     semantic_quality_measured: false, tests: results, failure,
-    owned_container: name, container_stopped: stopped, scratch };
+    owned_container: name, container, container_stopped: stopped, scratch };
   const reportPath = `.memory-local/integration-${startedAt.replaceAll(':', '-')}.json`;
   await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 });
   console.log(`integration report: ${reportPath}`);
