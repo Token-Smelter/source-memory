@@ -180,13 +180,13 @@ Native queries start with `k=max(candidates*4,64)`. They filter scope, embedding
 
 Widening has at most **7 rounds per kind / 14 per recall**, with a shared 14-round backstop (`vector_query_budget` if exhausted). Each grouped round also reads legacy-parent grouping keys before its ANN/admission query. Census and catalog reads are additional work; existing driver retries and 15s transaction bounds remain. A query-count bound is not a 4s whole-CLI guarantee.
 
-`status.vector_indexes` reports each kind's catalog state. Recall exposes it as `channels.chunk_vector.vector_index` / `record_vector.vector_index`:
+`status.vector_indexes` reports each kind's catalog state. Recall channel objects carry no index field; a non-ready index surfaces only through the channel's `status` and `reason`:
 
 | Index state | Channel behaviour |
 |---|---|
 | `online` | Native query; no `vector_scan_limit` scan. Pending embeddings can still make the channel partial. |
 | `populating` | `partial`, reason `vector_index_populating`, no query/scan and no fabricated admission counters |
-| `missing` | Explicit legacy fallback, reported as `vector_index:"missing"`; exceeding the scan bound remains `partial` / `scan_truncated` |
+| `missing` | Explicit legacy fallback; exceeding the scan bound remains `partial` / `scan_truncated` |
 | `failed`, incompatible schema/dimensions/quantization, or failed fallback | Only that kind becomes unavailable with a safe reason; the healthy sibling still runs. No silent fallback on incompatibility. |
 
 Catalog validation and fallback preparation are isolated per kind. `status.vector_index_errors` reports kind-specific incompatibilities alongside the healthy kind's state. When both indexes are missing, the fallback retains the original shared eligible UID scan bound. If only one is missing, only that kind is scanned under the bound; the healthy kind still uses its native index. Run `init` to populate indexes over an old store's existing embeddings. A fresh or rebuilt scope serves vector channels as partial until its indexes become online; poll `status` and inspect `vector_indexes.chunk` / `vector_indexes.record`. There is no `--wait` flag. Neither a native index nor a ready channel establishes currentness or completeness.

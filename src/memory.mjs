@@ -297,9 +297,9 @@ export class Memory {
         let sharedFallback;
         const budget = { remaining: 14 };
         const results = await Promise.all(catalog.map(async ({ kind, vector_index, reason }) => {
-          if (reason) return { hits: [], omitted: [], state: { status: 'unavailable', vector_index, reason } };
-          if (vector_index === 'populating') return { hits: [], omitted: [], state: { status: 'partial', vector_index, reason: 'vector_index_populating' } };
-          if (vector_index === 'failed') return { hits: [], omitted: [], state: { status: 'unavailable', vector_index, reason: 'vector_index_failed' } };
+          if (reason) return { hits: [], omitted: [], state: { status: 'unavailable', reason } };
+          if (vector_index === 'populating') return { hits: [], omitted: [], state: { status: 'partial', reason: 'vector_index_populating' } };
+          if (vector_index === 'failed') return { hits: [], omitted: [], state: { status: 'unavailable', reason: 'vector_index_failed' } };
           try {
             let result;
             let unindexed;
@@ -318,12 +318,12 @@ export class Memory {
                 : { hits: vectorHits(kind, data.ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates)) };
             }
             const state = { status: result.partial || scan_truncated || unindexed > 0 ? 'partial' : 'ready',
-              scan_truncated, unindexed, embedding_key: key, vector_index,
+              scan_truncated, unindexed, embedding_key: key,
               ...(result.reason ? { reason: result.reason } : {}),
               ...(grouped && result.ran !== false ? { admitted_conversations: result.admitted_conversations, exhausted: result.exhausted } : {}) };
             return { hits: result.hits, omitted: result.omitted ?? [], state };
           } catch (error) {
-            return { hits: [], omitted: [], state: { status: 'unavailable', vector_index, reason: safeCode(error) } };
+            return { hits: [], omitted: [], state: { status: 'unavailable', reason: safeCode(error) } };
           }
         }));
         for (const [index, kind] of ['chunk', 'record'].entries()) {

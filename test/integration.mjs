@@ -21,11 +21,7 @@ const projectedFollowingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, oc
 const canonicalBundle = bundle => ({ ...bundle, match: { ...bundle.match,
   channels: [...bundle.match.channels].sort((a, b) => a.channel.localeCompare(b.channel)) } });
 const canonicalRecall = reply => ({ ...reply,
-  channels: Object.fromEntries(Object.entries(reply.channels).map(([name, state]) => {
-    if (state.vector_index !== 'missing') return [name, state];
-    const { vector_index: _index, ...legacy } = state;
-    return [name, legacy];
-  }).sort(([a], [b]) => a.localeCompare(b))),
+  channels: Object.fromEntries(Object.entries(reply.channels).sort(([a], [b]) => a.localeCompare(b))),
   bundles: reply.bundles.map(canonicalBundle),
   ...(reply.units ? { units: reply.units.map(unit => ({ ...unit, seeds: unit.seeds.map(canonicalBundle) })) } : {}) });
 function assertStableOrder(reply) {
@@ -197,10 +193,10 @@ export async function runIntegration(database, scratch) {
           const reply = await native.recall('vector', { query: 'vectorquery', candidates: 4, limit: 1 });
           const status = await native.status('vector');
           const options = await memory.store.transaction('read', tx => tx.run('SHOW VECTOR INDEXES YIELD name,options WHERE name=$name RETURN options', { name }));
-          assert.deepEqual([reply.channels.chunk_vector.status, reply.channels.chunk_vector.vector_index,
+          assert.deepEqual([reply.channels.chunk_vector.status,
             reply.channels.record_vector.status, reply.channels.record_vector.reason, reply.bundles.length > 0,
             status.vector_indexes, status.vector_index_errors, options.records[0].get('options').indexConfig['vector.quantization.enabled']],
-          ['ready', 'online', 'unavailable', reason, true, { chunk: 'online', record: 'incompatible' }, { record: reason }, quantization],
+          ['ready', 'unavailable', reason, true, { chunk: 'online', record: 'incompatible' }, { record: reason }, quantization],
           'catalog incompatibility must affect only its own vector kind');
         } finally {
           await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name}`));
@@ -219,9 +215,9 @@ export async function runIntegration(database, scratch) {
       };
       try {
         const reply = await native.recall('vector', { query: 'vectorquery', candidates: 4, limit: 1 });
-        assert.deepEqual([reply.channels.chunk_vector.status, reply.channels.chunk_vector.vector_index,
-          reply.channels.record_vector.status, reply.channels.record_vector.vector_index, reply.channels.record_vector.reason, reply.bundles.length > 0],
-        ['ready', 'online', 'unavailable', 'missing', 'database_unavailable', true], 'fallback failure must affect only its own vector kind');
+        assert.deepEqual([reply.channels.chunk_vector.status,
+          reply.channels.record_vector.status, reply.channels.record_vector.reason, reply.bundles.length > 0],
+        ['ready', 'unavailable', 'database_unavailable', true], 'fallback failure must affect only its own vector kind');
       } finally { memory.store.vectors = original; await native.init('vector'); await waitForVectors(native, 'vector'); }
     });
     await addVectors('vector', 'quota', 0, 4, () => queryVector, 'quota-model', 1);
@@ -246,8 +242,8 @@ export async function runIntegration(database, scratch) {
       const result = await memory.store.indexedVectors('vector', 'chunk', nativeKey, queryVector, 4, null, cappedExclusion);
       const recalled = await native.recall('vector', { query: 'vectorquery', candidates: 4, exclude_conversations: cappedExclusion });
       assert.deepEqual([result.k, result.partial, result.reason, recalled.channels.chunk_vector.status,
-        recalled.channels.chunk_vector.vector_index, recalled.channels.chunk_vector.reason, recalled.channels.chunk_vector.scan_truncated],
-      [4096, true, 'vector_overfetch_cap', 'partial', 'online', 'vector_overfetch_cap', false], 'native vector cap must remain partial');
+        recalled.channels.chunk_vector.reason, recalled.channels.chunk_vector.scan_truncated],
+      [4096, true, 'vector_overfetch_cap', 'partial', 'vector_overfetch_cap', false], 'native vector cap must remain partial');
     });
     await check('native scope labels and the in-query scope filter isolate a sibling scope', async () => {
       const foreign = await addVectors('foreign', 'native-sibling', 0, 1, () => queryVector);
@@ -264,9 +260,9 @@ export async function runIntegration(database, scratch) {
       memory.store.vectors = (...args) => { scans.push(args[4]); return original.apply(memory.store, args); };
       try {
         const reply = await native.recall('vector', { query: 'vectorquery', candidates: 4, exclude_conversations: cappedExclusion });
-        assert.deepEqual([scans, reply.channels.chunk_vector.vector_index, reply.channels.record_vector.vector_index,
+        assert.deepEqual([scans, reply.channels.chunk_vector.status,
           reply.channels.record_vector.status, (await native.status('vector')).vector_indexes],
-        [['record'], 'online', 'missing', 'ready', { chunk: 'online', record: 'missing' }]);
+        [['record'], 'ready', 'ready', { chunk: 'online', record: 'missing' }]);
       } finally { memory.store.vectors = original; await native.init('vector'); await waitForVectors(native, 'vector'); }
     });
     const timings = [];
@@ -322,8 +318,8 @@ export async function runIntegration(database, scratch) {
         const indexed = new Memory({ ...nativeConfig, vector_scan_limit: 2 }, memory.store);
         for (const grouping of [{}, { group: 'conversation' }]) {
           const reply = await indexed.recall('vector-scale', { query: 'scalabilityprobe', candidates: 8, limit: 1, ...grouping });
-          assert.deepEqual(['chunk_vector', 'record_vector'].map(name => [reply.channels[name].status, reply.channels[name].vector_index,
-            reply.channels[name].scan_truncated]), [['ready', 'online', false], ['ready', 'online', false]]);
+          assert.deepEqual(['chunk_vector', 'record_vector'].map(name => [reply.channels[name].status,
+            reply.channels[name].scan_truncated]), [['ready', false], ['ready', false]]);
           assert.equal(reply.bundles.length > 0, true);
         }
       } finally { memory.store.vectors = original; }
@@ -498,7 +494,7 @@ export async function runIntegration(database, scratch) {
             const reply = await current.recall('modes', request);
             assertStableOrder(reply);
             assert.deepEqual(canonicalRecall(reply), before);
-            assert.deepEqual([reply.channels.chunk_vector.vector_index, reply.channels.record_vector.vector_index], ['missing', 'missing']);
+            assert.equal(Object.values(reply.channels).some(state => Object.hasOwn(state, 'vector_index')), false);
             for (const unit of reply.units ?? []) assert.equal(Object.hasOwn(unit, 'following'), false);
             if (!request.group) assert.deepEqual(canonicalRecall(await current.recall('modes', { ...request, per_conversation: 4 })), before);
             for (const mode of Object.keys(contracts)) {
