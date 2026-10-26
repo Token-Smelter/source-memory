@@ -1,8 +1,9 @@
 api_version: sourcerer.project-checks/v1
 
-# Declared checks for agent harnesses that read this file. Each runs an existing
-# npm script. The Docker-backed integration suite (npm run test:integration) is
-# not declared: it needs a Docker daemon and the neo4j:5.26.14-community image.
+# Declared checks for agent harnesses that read this file. `integration` and
+# `bench-grouped` need a host Docker daemon and the neo4j:5.26.14-community
+# image; each starts and removes its own disposable Neo4j bound to 127.0.0.1 on
+# a random port and never connects to any other instance.
 project_checks:
   tests:
     command: "npm ci --ignore-scripts && npm test"
@@ -26,3 +27,25 @@ project_checks:
       - "config/**"
       - "examples/**"
       - "package.json"
+  integration:
+    command: "npm ci --ignore-scripts && npm run test:integration"
+    proof_type: text
+    timeout_seconds: 900
+    input_paths:
+      - "src/**"
+      - "bin/**"
+      - "scripts/**"
+      - "test/**"
+      - "package.json"
+      - "package-lock.json"
+  # Grouped recall benchmark: prints its JSON report to stdout and writes only
+  # under .memory-local/. Its container uses at least 2048m. Opt-in: it runs only
+  # when the benchmark or its fixture changes, or when a task requires it by name.
+  bench-grouped:
+    command: "npm ci --ignore-scripts && node scripts/bench-grouped.mjs"
+    proof_type: text
+    timeout_seconds: 1800
+    run_when: input_paths_changed
+    input_paths:
+      - "scripts/bench-grouped.mjs"
+      - "test/fixtures/bench-grouped/**"
