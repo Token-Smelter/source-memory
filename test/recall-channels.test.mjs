@@ -30,6 +30,8 @@ function fixture(t, url, states, indexed = { hits: [], nodes: [], omitted: [], u
     chunkLexicalStatus: async () => ready, chunkLexical: async () => [], lexical: async () => [],
     vectorIndexStatus: index(states),
     indexedVectors: async () => indexed,
+    vectors: async () => [], vectorCounts: async () => ({ unindexed: 0 }),
+    admittedVectors: async () => ({ hits: [], omitted: [], admitted_conversations: 0, exhausted: true }),
     status: async () => ({ initialized: true }),
   };
   return new Memory({ scopes: { read: ['test'], write: [] }, embedding: { url, model: 'fixture', dimensions: 2 } }, store);
@@ -64,6 +66,18 @@ for (const request of [{}, { group: 'conversation' }]) {
     const reply = await memory.recall('test', { query: 'q', ...request });
     assert.equal(Object.values(reply.channels).some(state => Object.hasOwn(state, 'vector_index')), false);
     assert.deepEqual([reply.channels.chunk_vector.status, reply.channels.chunk_vector.reason], ['partial', 'vector_overfetch_cap']);
+  });
+
+  test(`${label} recall with a capped online chunk and a missing record index keeps each kind's own status`, async t => {
+    const url = await embeddingEndpoint(t);
+    const memory = fixture(t, url, { chunk: 'online', record: 'missing' },
+      { hits: [], nodes: [], omitted: [], unindexed: 0, partial: true, reason: 'vector_overfetch_cap' });
+    const reply = await memory.recall('test', { query: 'q', ...request });
+    assert.equal(Object.values(reply.channels).some(state => Object.hasOwn(state, 'vector_index')), false);
+    assert.deepEqual([reply.channels.chunk_vector.status, reply.channels.chunk_vector.reason,
+      reply.channels.record_vector.status, reply.channels.record_vector.reason, reply.channels.record_vector.scan_truncated],
+    ['partial', 'vector_overfetch_cap', 'ready', undefined, false]);
+    assert.deepEqual((await memory.status('test')).vector_indexes, { chunk: 'online', record: 'missing' });
   });
 }
 

@@ -260,9 +260,9 @@ export async function runIntegration(database, scratch) {
       memory.store.vectors = (...args) => { scans.push(args[4]); return original.apply(memory.store, args); };
       try {
         const reply = await native.recall('vector', { query: 'vectorquery', candidates: 4, exclude_conversations: cappedExclusion });
-        assert.deepEqual([scans, reply.channels.chunk_vector.status,
+        assert.deepEqual([scans, reply.channels.chunk_vector.status, reply.channels.chunk_vector.reason,
           reply.channels.record_vector.status, (await native.status('vector')).vector_indexes],
-        [['record'], 'ready', 'ready', { chunk: 'online', record: 'missing' }]);
+        [['record'], 'partial', 'vector_overfetch_cap', 'ready', { chunk: 'online', record: 'missing' }]);
       } finally { memory.store.vectors = original; await native.init('vector'); await waitForVectors(native, 'vector'); }
     });
     const timings = [];
@@ -307,7 +307,7 @@ export async function runIntegration(database, scratch) {
         memory.store.vectorIndexStatus = (scope, kind, dimensions) => scope === 'vector-scale' && kind === 'chunk'
           ? Promise.resolve(observed) : original.call(memory.store, scope, kind, dimensions);
         const reply = await native.recall('vector-scale', { query: 'scalabilityprobe', group: 'conversation', candidates: 8 });
-        assert.deepEqual(reply.channels.chunk_vector, { status: 'partial', vector_index: 'populating', reason: 'vector_index_populating' });
+        assert.deepEqual(reply.channels.chunk_vector, { status: 'partial', reason: 'vector_index_populating' });
       } finally { memory.store.vectorIndexStatus = original; await initializing; }
     });
     await waitForVectors(native, 'vector-scale');
