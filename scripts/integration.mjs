@@ -26,6 +26,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
 });
 
 try {
+  await mkdir('.memory-local', { recursive: true, mode: 0o700 });
   await exec('docker', ['run', '--detach', '--rm', '--name', name,
     '--publish', '127.0.0.1::7687', '--memory', '1536m', '--cpus', '2',
     '--env', 'NEO4J_AUTH=none',
@@ -58,7 +59,6 @@ try {
     fixture: 'disposable Neo4j 5.26.14; fictional content; deterministic HTTP model fixtures',
     semantic_quality_measured: false, tests: results, failure,
     owned_container: name, container_stopped: stopped, scratch };
-  await mkdir('.memory-local', { recursive: true, mode: 0o700 });
   const reportPath = `.memory-local/integration-${startedAt.replaceAll(':', '-')}.json`;
   await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 });
   console.log(`integration report: ${reportPath}`);
