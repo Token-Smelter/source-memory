@@ -1,5 +1,5 @@
 import neo4j from 'neo4j-driver';
-import { digest, identity, indexNames, namespace, requireThat, sourceExcerpt, lexicalQuery } from './core.mjs';
+import { digest, identity, indexNames, integer, namespace, requireThat, sourceExcerpt, lexicalQuery } from './core.mjs';
 
 const unwrap = node => node?.properties ?? null;
 const decodeTurn = props => props ? { id: props.uid, scope: props.scope, ...JSON.parse(props.body) } : null;
@@ -44,7 +44,8 @@ export class Neo4jStore {
     finally { await session.close(); }
   }
 
-  async init(scope) {
+  async init(scope, dimensions = null) {
+    if (dimensions !== null) integer(dimensions, undefined, 1, 4096);
     for (const label of ['SMTurn', 'SMChunk', 'SMRecord', 'SMRelation']) {
       await this.transaction('write', tx => tx.run(`CREATE CONSTRAINT ${label.toLowerCase()}_uid IF NOT EXISTS FOR (n:${label}) REQUIRE n.uid IS UNIQUE`));
     }
@@ -54,8 +55,21 @@ export class Neo4jStore {
     await this.transaction('write', tx => tx.run(`CREATE FULLTEXT INDEX ${names.turns} IF NOT EXISTS FOR (n:${ns}Turn) ON EACH [n.text]`));
     await this.transaction('write', tx => tx.run(`CREATE FULLTEXT INDEX ${names.records} IF NOT EXISTS FOR (n:${ns}Record) ON EACH [n.text]`));
     await this.transaction('write', tx => tx.run(`CREATE FULLTEXT INDEX ${names.chunks} IF NOT EXISTS FOR (n:${ns}Chunk) ON EACH [n.text]`));
-    await this.transaction('read', tx => tx.run('CALL db.awaitIndexes(30)'));
-    return { initialized: true, scope };
+    for (const index of [names.turns, names.records, names.chunks]) {
+      await this.transaction('read', tx => tx.run('CALL db.awaitIndex($index,30)', { index }));
+    }
+    if (dimensions !== null) {
+      for (const kind of ['chunk', 'record']) {
+        await this.vectorIndexStatus(scope, kind, dimensions);
+        const index = names[kind === 'chunk' ? 'vectorChunks' : 'vectorRecords'];
+        const label = `${ns}${kind === 'chunk' ? 'Chunk' : 'Record'}`;
+        await this.transaction('write', tx => tx.run(`CREATE VECTOR INDEX ${index} IF NOT EXISTS FOR (n:${label}) ON (n.embedding)
+          OPTIONS {indexConfig:{\`vector.dimensions\`:$dimensions,\`vector.similarity_function\`:'cosine',\`vector.quantization.enabled\`:false}}`, { dimensions: neo4j.int(dimensions) }));
+        requireThat(await this.vectorIndexStatus(scope, kind, dimensions) !== 'missing', 'vector_index_schema_mismatch');
+      }
+    }
+    const states = dimensions === null ? null : await Promise.all(['chunk', 'record'].map(kind => this.vectorIndexStatus(scope, kind, dimensions)));
+    return { initialized: true, scope, ...(states ? { vector_indexes: { chunk: states[0], record: states[1] } } : {}) };
   }
 
   async ingest(scope, turn, chunks) {
@@ -293,7 +307,7 @@ export class Neo4jStore {
       }`, { model, vector, scanned, limit: neo4j.int(limit), per: neo4j.int(perConversation), exclude });
   }
 
-  async admission(scope, kind, search, params) {
+  async admission(scope, kind, search, params, withRawCount = false) {
     return this.transaction('read', async tx => {
       // Neo4j core cannot decode JSON. Only legacy grouping keys are decoded here; exclusion never uses this map.
       const old = await tx.run(`MATCH (t:SMTurn {scope:$scope}) WHERE t.source IS NULL OR t.conversation_id IS NULL
@@ -322,7 +336,7 @@ export class Neo4jStore {
           RETURN admitted,[hit IN unique WHERE NOT any(prior IN admitted WHERE prior.seed_id=hit.seed_id) |
             {kind:$seedKind,id:CASE WHEN $seedKind='record' THEN hit.node.record_id ELSE hit.seed_id END,keys:hit.keys}] AS omitted
         }
-        RETURN admitted[..$limit] AS rows,omitted,total > $limit AS exhausted`,
+        RETURN admitted[..$limit] AS rows,omitted,total > $limit AS exhausted${withRawCount ? ',raw_count,size(matches) AS considered' : ''}`,
       { ...params, scope, legacy, seedKind: kind === 'record' ? 'record' : 'turn' });
       const row = result.records[0];
       const hits = (row?.get('rows') ?? []).map(hit => {
@@ -347,13 +361,88 @@ export class Neo4jStore {
           match: { turn: parent.uid, entry_id: node.entry_id, start: node.start, end: node.end, role }, conversations };
       });
       return { hits, omitted: row?.get('omitted') ?? [], exhausted: row?.get('exhausted') ?? false,
-        admitted_conversations: new Set(hits.flatMap(hit => hit.conversations.map(context => JSON.stringify(context.key)))).size };
+        admitted_conversations: new Set(hits.flatMap(hit => hit.conversations.map(context => JSON.stringify(context.key)))).size,
+        ...(withRawCount ? { raw_count: row?.get('raw_count') ?? 0, considered: row?.get('considered') ?? 0 } : {}) };
     });
   }
 
-  async vectors(scope, model, limit, exclude = []) {
+  async vectorIndexStatus(scope, kind, dimensions = null) {
+    const index = indexNames(scope)[kind === 'chunk' ? 'vectorChunks' : 'vectorRecords'];
     return this.transaction('read', async tx => {
-      const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope AND n.embedding_key=$model AND ${eligible('n')}
+      const result = await tx.run(`SHOW INDEXES YIELD name,type,state,labelsOrTypes,properties,options
+        WHERE name=$index RETURN type,state,labelsOrTypes,properties,options`, { index });
+      if (!result.records.length) return 'missing';
+      const row = result.records[0].toObject();
+      const config = row.options?.indexConfig ?? {};
+      const label = `${namespace(scope)}${kind === 'chunk' ? 'Chunk' : 'Record'}`;
+      requireThat(row.type === 'VECTOR' && row.labelsOrTypes.length === 1 && row.labelsOrTypes[0] === label
+        && row.properties.length === 1 && row.properties[0] === 'embedding'
+        && String(config['vector.similarity_function']).toLowerCase() === 'cosine', 'vector_index_schema_mismatch');
+      requireThat(dimensions === null || Number(config['vector.dimensions']) === dimensions, 'vector_index_dimension_mismatch');
+      requireThat(config['vector.quantization.enabled'] === false, 'vector_index_quantization_mismatch');
+      return row.state === 'ONLINE' ? 'online' : row.state === 'POPULATING' ? 'populating' : 'failed';
+    });
+  }
+
+  async vectorCounts(scope, kind, model, exclude = []) {
+    const label = `${namespace(scope)}${kind === 'chunk' ? 'Chunk' : 'Record'}`;
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`MATCH (node:${label} {scope:$scope}) WHERE ${eligible('node')}
+        RETURN count(CASE WHEN node.embedding_key=$model THEN 1 END) AS total,
+          count(CASE WHEN node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed`, { scope, model, exclude });
+      return result.records[0].toObject();
+    });
+  }
+
+  async indexedVectors(scope, kind, model, vector, limit, perConversation = null, exclude = [], budget = { remaining: 7 }) {
+    integer(limit, undefined, 1, 256);
+    if (perConversation !== null) integer(perConversation, undefined, 1, 4);
+    const index = indexNames(scope)[kind === 'chunk' ? 'vectorChunks' : 'vectorRecords'];
+    // A short approximate result is not exhaustion evidence. Census both grouped and ordinary queries independently.
+    const { total, unindexed } = await this.vectorCounts(scope, kind, model, exclude);
+    const empty = perConversation === null ? { nodes: [] } : { hits: [], omitted: [], admitted_conversations: 0, exhausted: total > limit };
+    const cap = 4096;
+    let k = Math.max(limit * 4, 64);
+    let rounds = 0;
+    let previous = empty;
+    while (true) {
+      if (budget.remaining <= 0) return { ...previous, k, rounds, unindexed, partial: true, reason: 'vector_query_budget', ran: rounds > 0 };
+      budget.remaining -= 1;
+      rounds += 1;
+      const params = { index, scope, model, vector, exclude, k: neo4j.int(k), limit: neo4j.int(limit),
+        total: neo4j.int(total), per: perConversation === null ? null : neo4j.int(perConversation) };
+      const search = `CALL db.index.vector.queryNodes($index,$k,$vector) YIELD node,score
+        WITH collect({node:node,score:score}) AS raw
+        CALL {
+          WITH raw UNWIND raw AS candidate WITH candidate.node AS node,candidate.score AS score
+          WHERE node.scope=$scope AND node.embedding_key=$model AND ${eligible('node')}
+          WITH node,vector.similarity.cosine(node.embedding,$vector) AS score ORDER BY score DESC,node.uid
+          RETURN collect({node:node,score:score}) AS matches
+        }
+        WITH matches,size(raw) AS raw_count,$total AS total`;
+      const result = perConversation !== null ? await this.admission(scope, kind, search, params, true)
+        : await this.transaction('read', async tx => {
+          const selected = await tx.run(`${search} RETURN matches[..$limit] AS rows,raw_count,size(matches) AS considered`, params);
+          const row = selected.records[0];
+          const nodes = row.get('rows').map(hit => {
+            const node = unwrap(hit.node);
+            requireThat(node.scope === scope, 'index_scope_mismatch');
+            return { ...node, similarity: 2 * hit.score - 1 };
+          });
+          return { nodes, raw_count: row.get('raw_count'), considered: row.get('considered') };
+        });
+      const size = perConversation === null ? result.nodes.length : result.hits.length;
+      if (size >= Math.min(limit, total) || result.considered >= total) return { ...result, k, rounds, unindexed, partial: false, ran: true };
+      if (k === cap) return { ...result, k, rounds, unindexed, partial: true, reason: 'vector_overfetch_cap', ran: true };
+      previous = result;
+      k = Math.min(k * 2, cap);
+    }
+  }
+
+  async vectors(scope, model, limit, exclude = [], kind = null) {
+    return this.transaction('read', async tx => {
+      const labels = kind === null ? '(n:SMChunk OR n:SMRecord)' : kind === 'chunk' ? 'n:SMChunk' : 'n:SMRecord';
+      const result = await tx.run(`MATCH (n) WHERE ${labels} AND n.scope=$scope AND n.embedding_key=$model AND ${eligible('n')}
         RETURN n ORDER BY n.uid LIMIT $limit`, { scope, model, limit: neo4j.int(limit), exclude });
       return result.records.map(row => unwrap(row.get('n')));
     });

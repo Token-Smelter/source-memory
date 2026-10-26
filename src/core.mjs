@@ -33,7 +33,8 @@ export function canonical(value) {
 export const digest = value => createHash('sha256').update(typeof value === 'string' ? value : canonical(value)).digest('hex');
 export const identity = (kind, scope, ...parts) => `${kind}_${digest([scope, ...parts])}`;
 export const namespace = scope => `SMN${digest(scope)}`;
-export const indexNames = scope => ({ turns: `smt_${digest(scope)}`, records: `smr_${digest(scope)}`, chunks: `smc_${digest(scope)}` });
+export const indexNames = scope => ({ turns: `smt_${digest(scope)}`, records: `smr_${digest(scope)}`, chunks: `smc_${digest(scope)}`,
+  vectorChunks: `smvc_${digest(scope)}`, vectorRecords: `smvr_${digest(scope)}` });
 
 export function authorize(config, scope, operation = 'read') {
   text(scope, 256);
