@@ -11,6 +11,16 @@ const MODE_CONTRACTS = {
   history_search: 'History search: retained conversations in search rank order. Not an answer to what is current. Omitted or later material may correct shown items. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
 };
 
+// Retained turn/record identities are immutable. Reuse only successful reads inside one grouped request.
+async function immutableRead(reads, scope, kind, id, load) {
+  if (!reads) return load();
+  const key = JSON.stringify([scope, kind, id]);
+  if (reads.has(key)) return reads.get(key);
+  const value = await load();
+  if (value) reads.set(key, value);
+  return value;
+}
+
 export class Memory {
   constructor(config, store = null) {
     this.config = config;
@@ -155,14 +165,14 @@ export class Memory {
     return { turns, end, bound, unlinked };
   }
 
-  async followingForBundles(scope, seeds, follow, cache) {
+  async followingForBundles(scope, seeds, follow, cache, reads = null) {
     authorize(this.config, scope);
     const roots = [...new Set(seeds.flatMap(bundle => [bundle.source?.id,
       ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence.map(span => span.turn))]).filter(Boolean))].sort();
     const following = [];
     for (const after of roots) {
       if (!cache.has(after)) cache.set(after, (async () => {
-        const start = await this.store.getTurn(scope, after);
+        const start = await immutableRead(reads, scope, 'turn', after, () => this.store.getTurn(scope, after));
         requireThat(start, 'source_unavailable');
         const read = await this.walkFollowing(scope, start, follow.turns, follow.bytes);
         return { after, status: read.end === 'limit' ? 'has_more' : ['branched', 'cycle'].includes(read.end)
@@ -220,12 +230,12 @@ export class Memory {
     return { kind: 'bundle', bundle };
   }
 
-  async evidence(scope, spans) {
+  async evidence(scope, spans, reads = null) {
     authorize(this.config, scope);
     const turns = new Map();
     const result = [];
     for (const span of spans) {
-      if (!turns.has(span.turn)) turns.set(span.turn, await this.store.getTurn(scope, span.turn));
+      if (!turns.has(span.turn)) turns.set(span.turn, await immutableRead(reads, scope, 'turn', span.turn, () => this.store.getTurn(scope, span.turn)));
       const turn = turns.get(span.turn);
       requireThat(turn, 'evidence_unavailable');
       result.push({ ...sourceExcerpt(turn, span), source: turn.source,
@@ -388,6 +398,7 @@ export class Memory {
 
   async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops, follow = null) {
     authorize(this.config, scope);
+    const reads = new Map();
     const priority = new Map();
     for (const [rank, seed] of ranked.entries()) for (const context of seed.conversations) {
       const token = conversationToken(context.key);
@@ -422,7 +433,7 @@ export class Memory {
     for (const unit of [...pool.values()].slice(0, limit)) {
       const seeds = [];
       for (const candidate of unit.candidates) {
-        const bundle = await this.bundle(scope, candidate, query, maxNodes, maxHops);
+        const bundle = await this.bundle(scope, candidate, query, maxNodes, maxHops, reads);
         seeds.push(bundle);
         const evidence = [bundle.source, ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence)].filter(Boolean);
         for (const span of evidence) {
@@ -432,7 +443,7 @@ export class Memory {
       }
       const rendered = { key: unit.key, ...(unit.legacy ? { legacy: true } : {}), seeds,
         seeds_truncated: truncated.get(conversationToken(unit.key))?.size ?? 0, also_cites: [...unit.also.values()].sort(compareConversationKeys),
-        ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, followingCache) } : {}) };
+        ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, followingCache, reads) } : {}) };
       const size = Buffer.byteLength(JSON.stringify(rendered));
       // Admission limits seeds; rendering budgets may only skip an entire unit, never a seed or part of its evidence.
       if (bytes + size > maxBytes) { budgetOmitted += 1; continue; }
@@ -442,7 +453,7 @@ export class Memory {
     return { units, pool_truncated: Math.max(0, pool.size - limit), budget_omitted: budgetOmitted };
   }
 
-  async bundle(scope, seed, query, maxNodes, maxHops) {
+  async bundle(scope, seed, query, maxNodes, maxHops, reads = null) {
     authorize(this.config, scope);
     const records = new Map();
     const relations = new Map();
@@ -455,12 +466,12 @@ export class Memory {
       records.set(record.id, record);
     };
     if (seed.kind === 'turn') {
-      const turn = await this.store.getTurn(scope, seed.id);
+      const turn = await immutableRead(reads, scope, 'turn', seed.id, () => this.store.getTurn(scope, seed.id));
       requireThat(turn, 'source_unavailable');
       source = sourceView(turn, seed.matches ?? [], query);
       const linked = await this.store.recordsForTurn(scope, seed.id, maxNodes + 1);
       for (const record of linked) addRecord(record);
-    } else addRecord(await this.store.getRecord(scope, seed.id));
+    } else addRecord(await immutableRead(reads, scope, 'record', seed.id, () => this.store.getRecord(scope, seed.id)));
     let frontier = [...records.keys()];
     const visited = new Set();
     for (let hop = 0; hop <= maxHops && frontier.length; hop++) {
@@ -473,7 +484,7 @@ export class Memory {
         const newEndpoints = [edge.from, edge.to].filter(id => !records.has(id));
         if (newEndpoints.length && hop === maxHops) { gaps.add('hop_limit'); continue; }
         if (records.size + newEndpoints.length > maxNodes) { gaps.add('node_limit'); continue; }
-        for (const id of newEndpoints) addRecord(await this.store.getRecord(scope, id));
+        for (const id of newEndpoints) addRecord(await immutableRead(reads, scope, 'record', id, () => this.store.getRecord(scope, id)));
         if (!records.has(edge.from) || !records.has(edge.to)) continue;
         relations.set(edge.id, edge);
         for (const id of [edge.from, edge.to]) if (!visited.has(id)) next.add(id);
@@ -482,11 +493,11 @@ export class Memory {
     }
     const withEvidence = [];
     for (const record of records.values()) {
-      withEvidence.push({ ...record, supporting_evidence: await this.evidence(scope, record.evidence) });
+      withEvidence.push({ ...record, supporting_evidence: await this.evidence(scope, record.evidence, reads) });
     }
     const edges = [];
     for (const relation of relations.values()) {
-      edges.push({ ...relation, supporting_evidence: await this.evidence(scope, relation.evidence) });
+      edges.push({ ...relation, supporting_evidence: await this.evidence(scope, relation.evidence, reads) });
     }
     return {
       match: { kind: seed.kind, id: seed.id, rank_score: seed.score,
