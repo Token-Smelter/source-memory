@@ -3,13 +3,15 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { Memory } from '../src/memory.mjs';
 import { MemoryError, requireThat } from '../src/core.mjs';
+import { warm } from '../src/warm.mjs';
 
-const HELP = `source-memory <init|ingest|enrich|index|recall|show|status> [--config FILE] --scope SCOPE [--input FILE]
+const HELP = `source-memory <init|ingest|enrich|index|recall|show|status|warm> [--config FILE] --scope SCOPE [--input FILE]
 
 --config defaults to $SOURCE_MEMORY_CONFIG.
 
 JSON input is read from --input or stdin for ingest/enrich/recall/show.
-index accepts optional --input {"limit":256}; init/status need no input.
+index accepts optional --input {"limit":256}; init/status/warm need no input.
+warm sends one fixed embedding request and never touches the database.
 Source is copied by the caller, never transcribed by a model or discovered from host paths.
 Use a local configuration with neo4j and explicit scopes.read/scopes.write allowlists.
 Embeddings/reranking are optional loopback services; their availability is reported.
@@ -39,7 +41,7 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
   const [command, ...rest] = argv;
-  requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'status'].includes(command), 'unknown_command');
+  requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'status', 'warm'].includes(command), 'unknown_command');
   const options = {};
   for (let i = 0; i < rest.length; i += 2) {
     requireThat(['--config', '--scope', '--input'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
@@ -51,6 +53,10 @@ export async function main(argv = process.argv.slice(2)) {
   let input = {};
   if (options['--input']) input = await fileJson(options['--input'], 4_000_000);
   else if (['ingest', 'enrich', 'recall', 'show'].includes(command)) input = JSON.parse(await readBounded(process.stdin));
+  if (command === 'warm') {
+    process.stdout.write(`${JSON.stringify({ ok: true, ...await warm(config, options['--scope']) })}\n`);
+    return;
+  }
   const memory = new Memory(config);
   try {
     const result = await memory[command](options['--scope'], input);
