@@ -219,6 +219,14 @@ Admission fields are present only on retrieval channels that actually ran with s
 
 Units are ordered by their best final seed rank, after the optional reranker. Every admitted seed is rendered before budgeting: the CLI never drops a seed or trims a unit to make it fit. A byte-budget omission still means `budget_limited` and `relationship_context_complete:false`; pending/unavailable channels and bundle relationship gaps keep their own meanings and are never relabeled as omissions.
 
+### Grouped `evidence_advice` pool budget and stdout bound
+
+Only `recall` with `mode:"evidence_advice"` **and** `group:"conversation"` accepts `max_chars` up to **1,000,000** (default 24,000 and minimum 256 are unchanged; 1,000,001 is `invalid_input`). For this request `max_chars` is a budget of **serialized UTF-8 JSON bytes**: `U = Σ Buffer.byteLength(JSON.stringify(unit))` over the returned whole units, `U ≤ max_chars`, and the reply keeps `budget_unit:"utf8_bytes"`. Quotes, backslashes, control characters (`\u00XX`) and non-BMP text count at their serialized size, so 1,000,000 bytes may admit much less raw text. A unit that does not fit is skipped whole (`budget_omitted`, `budget_limited`); nothing is truncated.
+
+The reply repeats every seed in the top-level `bundles` (`D`, at most `U`). Everything else (`E`: channels, counts, contracts, array framing and the trailing newline) is the transport envelope. For this request the CLI serializes the reply once and requires `E ≤ 65,536` bytes and total stdout bytes `≤ 2 × max_chars + 65,536` (2,065,536 at the maximum). A violation prints no reply: the CLI writes `{"ok":false,"error":"output_envelope_exceeded"}` to stderr and exits 1.
+
+Every other mode and group keeps the 200,000 cap, its existing unit (UTF-16 code units for ungrouped recall, UTF-8 JSON bytes for grouped recall) and no envelope check.
+
 ### Folded following and exact batch rechecks
 
 `follow` is optional, valid on grouped recall and `show {"kind":"units"}` only. `{}` enables defaults: `turns:8` (integer 1–16) and `bytes:16384` (integer 1–65536). Bounds apply **per root**, not per unit or request. Roots are every distinct retained turn cited by a unit's seed bundles: source turns plus record/relation evidence turns. A root's following walk is computed once per request, cached by UID, and carried by every unit that cites it.

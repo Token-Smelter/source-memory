@@ -2,6 +2,7 @@ import {
   authorize, chunkEntries, cosine, fuse, identity, integer, MemoryError,
   normalizeEnrichment, normalizeTurn, requireThat, sourceExcerpt, text,
 } from './core.mjs';
+import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, embeddingIdentity, rerank } from './models.mjs';
 import { Neo4jStore } from './store.mjs';
 
@@ -246,7 +247,8 @@ export class Memory {
     const limit = integer(input.limit, 8, 1, 32);
     const maxNodes = integer(input.max_nodes, 48, 1, 256);
     const maxHops = integer(input.max_hops, 4, 0, 12);
-    const maxChars = integer(input.max_chars, 24000, 256, 200000);
+    // Only grouped evidence_advice may ask for the larger pool; there max_chars counts serialized UTF-8 bytes of whole units.
+    const maxChars = integer(input.max_chars, 24000, 256, isPoolRequest({ mode, group: input.group }) ? POOL_MAX_CHARS : 200000);
     const vectorLimit = integer(this.config.vector_scan_limit, 10000, 1, 100000);
     // A caller's own conversation is excluded inside every channel, before its candidate limit: matches from it never
     // take the place of eligible ones, and its unindexed text does not hold the others back.
