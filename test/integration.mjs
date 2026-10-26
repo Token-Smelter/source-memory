@@ -5,10 +5,32 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { Memory } from '../src/memory.mjs';
-import { indexNames, namespace } from '../src/core.mjs';
+import { identity, indexNames, namespace } from '../src/core.mjs';
+import { embeddingIdentity } from '../src/models.mjs';
 
 const exec = promisify(execFile);
+const contracts = {
+  evidence_advice: 'Evidence advice: prioritizes extracted claims that cite user spans; a cited user span may be a question, so this is not user assertion or authority. May return no relevant history. Omitted material may correct shown claims. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
+  history_search: 'History search: retained conversations in search rank order. Not an answer to what is current. Omitted or later material may correct shown items. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
+};
+
+const projectedFollowingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, occurred_at: turn.occurred_at ?? null,
+  entries: turn.entries.map(entry => ({ id: entry.id, role: entry.role, text: entry.text })) });
+const canonicalBundle = bundle => ({ ...bundle, match: { ...bundle.match,
+  channels: [...bundle.match.channels].sort((a, b) => a.channel.localeCompare(b.channel)) } });
+const canonicalRecall = reply => ({ ...reply,
+  channels: Object.fromEntries(Object.entries(reply.channels).sort(([a], [b]) => a.localeCompare(b))),
+  bundles: reply.bundles.map(canonicalBundle),
+  ...(reply.units ? { units: reply.units.map(unit => ({ ...unit, seeds: unit.seeds.map(canonicalBundle) })) } : {}) });
+function assertStableOrder(reply) {
+  assert.deepEqual(Object.keys(reply.channels), Object.keys(reply.channels).sort(), 'availability keys must use stable alphabetical order');
+  for (const bundle of reply.bundles) {
+    const names = bundle.match.channels.map(trace => trace.channel);
+    assert.deepEqual(names, [...names].sort(), 'channel traces must use stable alphabetical order');
+  }
+}
 
 export async function runIntegration(database, scratch) {
   const results = [];
@@ -27,12 +49,16 @@ export async function runIntegration(database, scratch) {
       const vector = value => /aubergine|purple/i.test(value) ? [0, 1, 0] : /amber/i.test(value) ? [-1, 0, 0] : /blue/i.test(value) ? [1, 0, 0]
         : /04:00/.test(value) ? [0, -1, 1] : /quartz/i.test(value) ? [0, -1, 0] : [0, 0, 1];
       res.end(JSON.stringify({ model: 'fixture-only', data: input.input.map((value, index) => ({ index, embedding: vector(value) })) }));
-    } else res.end(JSON.stringify({ results: input.documents.map((_text, index) => ({ index, relevance_score: 1 / (index + 1) })) }));
+    } else {
+      const favored = req.url === '/owner-rerank' ? 'B_OWNER_MARKER' : req.url === '/large-rerank' ? 'LARGE_OWNER_MARKER' : null;
+      res.end(JSON.stringify({ results: input.documents.map((value, index) => ({ index,
+        relevance_score: favored && value.includes(favored) ? 100 : 1 / (index + 1) })) }));
+    }
   });
   model.listen(0, '127.0.0.1');
   await once(model, 'listening');
   const url = `http://127.0.0.1:${model.address().port}`;
-  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical'], write: ['demo', 'foreign', 'exclusion', 'lexical'] },
+  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing', 'follow'], write: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing', 'follow'] },
     embedding: { url: `${url}/embed`, model: 'fixture-only', dimensions: 3 },
     reranker: { url: `${url}/rerank`, model: 'fixture-only' } };
   const memory = new Memory(config);
@@ -47,6 +73,400 @@ export async function runIntegration(database, scratch) {
     await memory.init('demo');
     await memory.init('foreign');
     await memory.init('exclusion');
+    await memory.init('modes');
+    await memory.init('packing');
+    await memory.init('follow');
+    const plain = new Memory({ ...config, embedding: undefined, reranker: undefined }, memory.store);
+    const key = embeddingIdentity(config.embedding);
+    const fiveChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'];
+    const modeTurn = (conversation, id, value) => ({ source: 'mode-fixture', conversation_id: conversation, turn_id: id,
+      entries: [{ id: `entry-${id}`, role: 'user', text: value }] });
+    const chunkUid = input => identity('chunk', 'modes', identity('turn', 'modes', input.source, input.conversation_id, input.turn_id), 0);
+    const withPrefix = (prefix, make, uid) => {
+      for (let index = 0; index < 10000; index += 1) {
+        const value = make(index);
+        if (uid(value).split('_')[1].startsWith(prefix)) return value;
+      }
+      throw new Error('fixture identity prefix unavailable');
+    };
+    const flood = [];
+    for (let index = 0; index < 8; index += 1) {
+      const input = withPrefix('0', suffix => modeTurn('flood', `flood-${index}-${suffix}`, `${'admissionneedle '.repeat(12)}quartz question ${index}`), chunkUid);
+      flood.push({ input, source: await memory.ingest('modes', input) });
+    }
+    const otherInput = withPrefix('f', suffix => modeTurn('other', `answer-${suffix}`, `${'context '.repeat(180)}admissionneedle quartz answer`), chunkUid);
+    const other = { input: otherInput, source: await memory.ingest('modes', otherInput) };
+    const modeClaim = (id, row) => ({ id, kind: 'observation', status: 'observed', attribution: 'fixture',
+      text: row.input.entries[0].text, evidence: [span(row.source, row.input)] });
+    for (const [index, row] of [...flood, other].entries()) {
+      const id = withPrefix(index < 8 ? '0' : 'f', suffix => `claim-${index}-${suffix}`, value => identity('record', 'modes', value));
+      row.record = id;
+      await memory.enrich('modes', { records: [modeClaim(id, row)], relations: [] });
+    }
+    const excludedFlood = [{ source: 'mode-fixture', conversation_id: 'flood' }];
+    const admittedChannels = async (exclude = [], candidates = 3, per = 2) => {
+      const scanned = (await memory.store.vectors('modes', key, 10001, exclude)).slice(0, 10000).map(row => row.uid);
+      return Promise.all([
+        ...['turn', 'record', 'chunk'].map(kind => memory.store.admittedLexical('modes', kind, 'admissionneedle', candidates, per, exclude)),
+        ...['chunk', 'record'].map(kind => memory.store.admittedVectors('modes', kind, key, [0, -1, 0], scanned, candidates, per, exclude)),
+      ]);
+    };
+    await check('conversation admission inside all five channels admits the other conversation past a seed flood', async () => {
+      const results = await admittedChannels();
+      assert.deepEqual(results.map(result => [result.hits.length, result.admitted_conversations, result.exhausted,
+        result.hits.filter(hit => hit.conversations.some(context => context.key.conversation_id === 'flood')).length,
+        result.hits.filter(hit => hit.conversations.some(context => context.key.conversation_id === 'other')).length]),
+      Array.from({ length: 5 }, () => [3, 2, true, 2, 1]), 'conversation admission must precede channel candidate caps');
+    });
+    await check('grouped seed truncation counts unique omitted identities and excludes seeds rescued by another channel', async () => {
+      const recalled = await memory.recall('modes', { query: 'admissionneedle', group: 'conversation', candidates: 3, per_conversation: 2, limit: 32, max_chars: 200000 });
+      const unit = recalled.units.find(unit => unit.key.conversation_id === 'flood');
+      const turnSeeds = new Set(unit.seeds.filter(bundle => bundle.match.kind === 'turn').map(bundle => bundle.match.id));
+      const recordSeeds = new Set(unit.seeds.filter(bundle => bundle.match.kind === 'record').map(bundle => bundle.match.id));
+      assert.deepEqual([unit.seeds_truncated, recalled.bundles, recalled.pool_truncated,
+        fiveChannels.map(name => [recalled.channels[name].admitted_conversations, recalled.channels[name].exhausted]),
+        Object.hasOwn(recalled.channels.reranker, 'admitted_conversations'), Object.hasOwn(recalled.channels.reranker, 'exhausted')],
+      [16 - turnSeeds.size - recordSeeds.size, recalled.units.flatMap(unit => unit.seeds), 0, Array.from({ length: 5 }, () => [2, true]), false, false]);
+    });
+    await check('grouped exclusion precedes admission and candidate caps in all five channels', async () => {
+      const results = await admittedChannels(excludedFlood, 1, 1);
+      assert.deepEqual(results.map(result => [result.hits.length, result.admitted_conversations, result.exhausted,
+        result.hits.every(hit => hit.conversations.every(context => context.key.conversation_id === 'other'))]),
+      Array.from({ length: 5 }, () => [1, 1, false, true]), 'exclusion must precede grouped channel caps');
+    });
+    await check('grouped vector exclusion precedes the shared scan bound and scan truncation remains partial', async () => {
+      const bounded = new Memory({ ...config, vector_scan_limit: 2 }, memory.store);
+      const request = { query: 'admissionneedle', group: 'conversation', candidates: 3 };
+      const excluded = await bounded.recall('modes', { ...request, exclude_conversations: excludedFlood });
+      const full = await bounded.recall('modes', request);
+      assert.deepEqual(['chunk_vector', 'record_vector'].map(name => [excluded.channels[name].status,
+        excluded.channels[name].scan_truncated, excluded.channels[name].admitted_conversations, full.channels[name].status, full.channels[name].scan_truncated,
+        typeof full.channels[name].admitted_conversations, typeof full.channels[name].exhausted]),
+      [['ready', false, 1, 'partial', true, 'number', 'boolean'], ['ready', false, 1, 'partial', true, 'number', 'boolean']],
+        'vector exclusion must precede the shared scan cap');
+    });
+    await check('grouped pending counts exclude unindexed text from excluded conversations', async () => {
+      const deferred = new Memory({ ...config, index_on_write: false }, memory.store);
+      await deferred.ingest('modes', modeTurn('flood', 'deferred', 'admissionneedle quartz still unindexed'));
+      const request = { query: 'admissionneedle', group: 'conversation' };
+      const excluded = await memory.recall('modes', { ...request, exclude_conversations: excludedFlood });
+      const full = await memory.recall('modes', request);
+      assert.deepEqual([excluded.channels.chunk_vector.status, excluded.channels.chunk_vector.unindexed,
+        full.channels.chunk_vector.status, full.channels.chunk_vector.unindexed > 0], ['ready', 0, 'partial', true], 'pending counts must exclude excluded conversations');
+      await memory.index('modes');
+    });
+    await check('duplicate matching chunks consume one turn seed in conversation admission', async () => {
+      await memory.ingest('modes', modeTurn('flood', 'many-chunks', 'admissionneedle quartz '.repeat(1000)));
+      const result = await memory.store.admittedLexical('modes', 'chunk', 'admissionneedle', 3, 2);
+      assert.deepEqual([result.hits.length, new Set(result.hits.map(hit => hit.id)).size,
+        result.hits.filter(hit => hit.conversations[0].key.conversation_id === 'flood').length], [3, 3, 2]);
+    });
+    await check('grouped vector cosine ties break by node uid regardless of scanned input order', async () => {
+      const scanned = (await memory.store.vectors('modes', key, 10001)).map(row => row.uid).reverse();
+      const chunks = await memory.store.admittedVectors('modes', 'chunk', key, [0, -1, 0], scanned, 3, 2);
+      const records = await memory.store.admittedVectors('modes', 'record', key, [0, -1, 0], scanned, 3, 2);
+      const firstRecord = [...flood].sort((a, b) => identity('record', 'modes', a.record).localeCompare(identity('record', 'modes', b.record)))[0];
+      const expectedChunk = scanned.filter(uid => uid.startsWith('chunk_')).sort()[0];
+      const row = (await memory.store.vectors('modes', key, 10001)).find(row => row.uid === expectedChunk);
+      assert.deepEqual([chunks.hits[0].id, records.hits[0].id], [row.turn_uid, firstRecord.record]);
+    });
+    await check('record exclusion precedes per-key admission even for a retained multi-conversation record', async () => {
+      const records = flood.slice(0, 6).map((row, index) => ({ ...modeClaim(`membership-${index}`, row), text: 'membershipneedle '.repeat(20) }));
+      records.push({ ...modeClaim('membership-mixed', other), text: `${'context '.repeat(180)}membershipneedle`,
+        evidence: [span(flood[0].source, flood[0].input), span(other.source, other.input)] });
+      await memory.enrich('modes', { records, relations: [] });
+      const result = await memory.store.admittedLexical('modes', 'record', 'membershipneedle', 1, 1, excludedFlood);
+      assert.deepEqual([result.hits.map(hit => hit.id), result.admitted_conversations, result.exhausted], [['membership-mixed'], 2, false],
+        'exclusion must precede per-key admission for shared records');
+    });
+    await check('recall validates optional modes grouping and per-conversation bounds before storage access', async () => {
+      const denied = new Memory({ scopes: config.scopes }, new Proxy({}, { get: () => { throw new Error('storage touched'); } }));
+      for (const input of [{ mode: null }, { mode: 'other' }, { mode: ['history_search'] }, { mode: {} },
+        { group: null }, { group: 'turn' }, { group: ['conversation'] }, { follow: {} }, { mode: 'history_search', follow: {} },
+        ...[null, [], false, 'follow', { turns: 0 }, { turns: 17 }, { turns: 1.5 }, { turns: '8' }, { turns: null },
+          { bytes: 0 }, { bytes: 65537 }, { bytes: 1.5 }, { bytes: '16384' }, { bytes: null }, { other: true }]
+          .map(follow => ({ group: 'conversation', follow })),
+        ...[0, 5, 1.5, '2', null, true].map(per_conversation => ({ per_conversation }))]) {
+        await assert.rejects(denied.recall('modes', { query: 'q', ...input }), { code: 'invalid_input' });
+      }
+      await assert.rejects(denied.conversationUnits('not-allowed', [], {}, [], 'q', 1, 256, 1, 0), { code: 'scope_denied' });
+    });
+    await check('absent following preserves pinned I1 and PR8 semantic values with intentional stable trace ordering', async () => {
+      const cache = store => {
+        const results = new Map();
+        return new Proxy(store, { get(target, name) {
+          const value = target[name];
+          if (typeof value !== 'function') return value;
+          return (...args) => {
+            const token = JSON.stringify([name, args]);
+            if (!results.has(token)) results.set(token, value.apply(target, args));
+            return results.get(token);
+          };
+        } });
+      };
+      for (const revision of ['5e2dab07c60a75d8bba6e05b2456dac0c409b4f4', 'db13652837284caba2f61489ec73fbaa5a3c6793']) {
+        const [baseline, priorStore] = await Promise.all(['memory', 'store'].map(file => exec('git', ['show', `${revision}:src/${file}.mjs`])));
+        const path = join(scratch, `${revision}-memory.mjs`);
+        const storePath = join(scratch, `${revision}-store.mjs`);
+        const imports = source => source.replaceAll("'./core.mjs'", JSON.stringify(new URL('../src/core.mjs', import.meta.url).href))
+          .replaceAll("'./models.mjs'", JSON.stringify(new URL('../src/models.mjs', import.meta.url).href))
+          .replaceAll("'neo4j-driver'", JSON.stringify(import.meta.resolve('neo4j-driver')));
+        await writeFile(storePath, imports(priorStore.stdout), { mode: 0o600 });
+        await writeFile(path, imports(baseline.stdout).replaceAll("'./store.mjs'", JSON.stringify(pathToFileURL(storePath).href)), { mode: 0o600 });
+        const { Memory: PriorMemory } = await import(pathToFileURL(path).href);
+        const { Neo4jStore: PriorStore } = await import(pathToFileURL(storePath).href);
+        const original = new PriorStore(database);
+        try {
+          const old = new PriorMemory(config, cache(original));
+          const current = new Memory(config, cache(memory.store));
+          const grouping = revision.startsWith('db136') ? { group: 'conversation' } : {};
+          for (const request of [{ query: 'admissionneedle', limit: 1, ...grouping }, { query: 'admissionneedle', max_chars: 256, ...grouping },
+            { query: 'admissionneedle', exclude_conversations: excludedFlood, ...grouping }]) {
+            // Freeze each implementation's own store responses, then normalize only the intentionally changed ordering.
+            await old.recall('modes', request);
+            await current.recall('modes', request);
+            const before = canonicalRecall(await old.recall('modes', request));
+            const reply = await current.recall('modes', request);
+            assertStableOrder(reply);
+            assert.deepEqual(reply, before);
+            for (const unit of reply.units ?? []) assert.equal(Object.hasOwn(unit, 'following'), false);
+            if (!request.group) assert.deepEqual(await current.recall('modes', { ...request, per_conversation: 4 }), before);
+            for (const mode of Object.keys(contracts)) {
+              const { mode: echoed, mode_contract, ...rest } = await current.recall('modes', { ...request, mode });
+              assert.deepEqual([rest, echoed, mode_contract], [before, mode, contracts[mode]]);
+            }
+          }
+        } finally { await original.close(); }
+      }
+    });
+    const packingA = modeTurn('a', 'pack-a', `${'packneedle '.repeat(30)}A_OWNER_MARKER`);
+    const packingB = modeTurn('b', 'pack-b', `B_OWNER_MARKER ${'context '.repeat(180)}packneedle`);
+    const packedA = await plain.ingest('packing', packingA);
+    const packedB = await plain.ingest('packing', packingB);
+    await plain.enrich('packing', { records: [{ id: 'shared', kind: 'observation', status: 'observed', attribution: 'fixture',
+      text: 'packneedle sharedonlyneedle', evidence: [span(packedB, packingB), span(packedA, packingA)] }], relations: [] });
+    await check('conversation units package a multi-conversation record once without splitting evidence', async () => {
+      const recalled = await plain.recall('packing', { query: 'packneedle', group: 'conversation', per_conversation: 1, limit: 2 });
+      const unit = recalled.units.find(unit => unit.key.conversation_id === 'a');
+      const shared = unit.seeds.find(bundle => bundle.match.kind === 'record');
+      const modeResults = [];
+      const shape = reply => reply.units.map(unit => [unit.key, unit.seeds.map(bundle => bundle.match.id)]);
+      for (const mode of Object.keys(contracts)) {
+        const reply = await plain.recall('packing', { query: 'packneedle', group: 'conversation', per_conversation: 1, limit: 2, mode });
+        modeResults.push([reply.mode, reply.mode_contract, shape(reply)]);
+      }
+      assert.deepEqual([recalled.units.length, unit.seeds.length, unit.also_cites, recalled.bundles,
+        recalled.bundles.filter(bundle => bundle.match.kind === 'record').length, shared.records[0].supporting_evidence.map(span => span.conversation_id), modeResults],
+      [2, 2, [{ scope: 'packing', source: 'mode-fixture', conversation_id: 'b' }], recalled.units.flatMap(unit => unit.seeds), 1, ['b', 'a'],
+        Object.entries(contracts).map(([mode, contract]) => [mode, contract, shape(recalled)])]);
+    });
+    await check('shared-record ownership follows final reranked seed priority and qualified-key tie order', async () => {
+      const reranked = new Memory({ ...config, embedding: undefined, reranker: { ...config.reranker, url: `${url}/owner-rerank` } }, memory.store);
+      const chosen = await reranked.recall('packing', { query: 'packneedle', group: 'conversation', limit: 2 });
+      const tied = await plain.recall('packing', { query: 'sharedonlyneedle', group: 'conversation', limit: 2 });
+      assert.deepEqual([chosen.units[0].key.conversation_id, chosen.units[0].seeds.some(bundle => bundle.match.kind === 'record'),
+        chosen.units[0].also_cites, tied.units.map(unit => unit.key.conversation_id), tied.units[0].seeds.length],
+      ['b', true, [{ scope: 'packing', source: 'mode-fixture', conversation_id: 'a' }], ['a'], 1]);
+    });
+    await check('legacy grouping uses body keys without changing exclusion or crossing scopes with identical source keys', async () => {
+      const input = modeTurn('legacy-collision', 'same-turn', 'legacygroupneedle local');
+      const local = await plain.ingest('packing', input);
+      await plain.ingest('packing', { ...input, turn_id: 'newer', entries: [{ ...input.entries[0], text: 'legacygroupneedle newer' }] });
+      const foreign = await plain.ingest('foreign', { ...input, entries: [{ ...input.entries[0], text: 'legacygroupneedle foreign' }] });
+      await memory.store.transaction('write', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) REMOVE t.source,t.conversation_id', { uid: local.id }));
+      const request = { query: 'legacygroupneedle', group: 'conversation', per_conversation: 1,
+        exclude_conversations: [{ source: input.source, conversation_id: input.conversation_id }] };
+      const own = await plain.recall('packing', request);
+      const otherScope = await plain.recall('foreign', { ...request, exclude_conversations: [] });
+      const retained = await memory.store.transaction('read', tx => tx.run('MATCH (t:SMTurn {uid:$uid}) RETURN t.source AS source,t.conversation_id AS conversation', { uid: local.id }));
+      assert.deepEqual([own.units.map(unit => [unit.key, unit.legacy, unit.seeds[0].match.id]),
+        otherScope.units.map(unit => [unit.key, unit.seeds[0].match.id]), retained.records[0].toObject()],
+      [[[{ scope: 'packing', source: input.source, conversation_id: input.conversation_id }, true, local.id]],
+        [[{ scope: 'foreign', source: input.source, conversation_id: input.conversation_id }, foreign.id]], { source: null, conversation: null }]);
+    });
+    const largeInput = modeTurn('large', 'budget-large', `LARGE_OWNER_MARKER budgetneedle budgetneedle ${'🪄'.repeat(700)}`);
+    const large = await plain.ingest('packing', largeInput);
+    await plain.enrich('packing', { records: [{ ...modeClaim('large-claim', { source: large, input: largeInput }), text: 'budgetneedle claim' }], relations: [] });
+    await plain.ingest('packing', modeTurn('small', 'budget-small', 'budgetneedle shorter'));
+    await check('grouped budgets use UTF-8 bytes and skip entire multi-seed units while continuing to the next unit', async () => {
+      const budgeted = new Memory({ ...config, embedding: undefined, reranker: { ...config.reranker, url: `${url}/large-rerank` } }, memory.store);
+      const request = { query: 'budgetneedle', group: 'conversation', limit: 2, max_chars: 200000 };
+      const wide = await budgeted.recall('packing', request);
+      const first = wide.units[0];
+      const bytes = Buffer.byteLength(JSON.stringify(first));
+      const exact = await budgeted.recall('packing', { ...request, limit: 1, max_chars: bytes });
+      const short = await budgeted.recall('packing', { ...request, limit: 1, max_chars: bytes - 1 });
+      const multibyte = await budgeted.recall('packing', { ...request, max_chars: JSON.stringify(first).length });
+      assert.deepEqual([first.key.conversation_id, first.seeds.length, exact.units[0].seeds.length, exact.pool_truncated,
+        short.units.length, short.bundles.length, short.budget_omitted, short.status, short.relationship_context_complete,
+        multibyte.units.map(unit => unit.key.conversation_id), multibyte.bundles, multibyte.budget_omitted, multibyte.pool_truncated, multibyte.budget_unit],
+      ['large', 2, 2, 1, 0, 0, 1, 'budget_limited', false, ['small'], multibyte.units.flatMap(unit => unit.seeds), 1, 0, 'utf8_bytes']);
+    });
+    await check('pending and unavailable grouped channels remain readiness states rather than budget omissions', async () => {
+      const status = memory.store.lexicalStatus;
+      try {
+        for (const state of [{ status: 'pending' }, { status: 'unavailable', reason: 'fixture_unavailable' }]) {
+          memory.store.lexicalStatus = (scope, kind) => kind === 'chunk' ? state : status.call(memory.store, scope, kind);
+          const recalled = await plain.recall('packing', { query: 'sharedonlyneedle', group: 'conversation' });
+          assert.deepEqual([recalled.channels.chunk_lexical, recalled.budget_omitted, recalled.pool_truncated, recalled.retrieval_complete,
+            recalled.status === 'degraded'], [state, 0, 0, false, state.status === 'unavailable']);
+        }
+      } finally { memory.store.lexicalStatus = status; }
+    });
+    await check('unconfigured grouped vector channels omit admission metadata rather than reporting zero activity', async () => {
+      const recalled = await plain.recall('packing', { query: 'sharedonlyneedle', group: 'conversation' });
+      assert.deepEqual([recalled.channels.chunk_vector, recalled.channels.record_vector, recalled.channels.reranker],
+        [{ status: 'unconfigured' }, { status: 'unconfigured' }, { status: 'unconfigured' }]);
+    });
+    await check('unavailable grouped vector channels omit admission metadata when their model call fails', async () => {
+      modelDown = true;
+      try {
+        const recalled = await memory.recall('modes', { query: 'admissionneedle', group: 'conversation' });
+        assert.deepEqual([recalled.channels.chunk_vector, recalled.channels.record_vector],
+          [{ status: 'unavailable', reason: 'model_request_failed' }, { status: 'unavailable', reason: 'model_request_failed' }]);
+      } finally { modelDown = false; }
+    });
+    const followInput = (conversation, id, parent, value) => ({ source: 'follow-fixture', conversation_id: conversation, turn_id: id,
+      ...(parent ? { parent_turn_id: parent } : { lineage_root: true }),
+      entries: [{ id: `${id}-u`, role: 'user', text: value }] });
+    const makeChain = async (conversation, needle, length) => {
+      const turns = [];
+      for (let index = 0; index <= length; index += 1) {
+        const input = { ...followInput(conversation, `${conversation}-${index}`, index ? `${conversation}-${index - 1}` : null,
+          index ? `Exact correction ${index}: 🪄 ${conversation}.` : `${needle} retained root`),
+          occurred_at: `2026-01-01T00:${String(index).padStart(2, '0')}:00Z` };
+        turns.push({ ...input, id: (await plain.ingest('follow', input)).id });
+      }
+      return turns;
+    };
+    const within = await makeChain('within', 'withinchainneedle', 4);
+    const over = await makeChain('over', 'overchainneedle', 5);
+    await plain.enrich('follow', { records: [{ id: 'within-claim', kind: 'observation', text: 'withinchainneedle claim',
+      attribution: 'fixture', evidence: [span(within[0], within[0])] }], relations: [] });
+    const folded = (query, follow = {}) => plain.recall('follow', { query, group: 'conversation', follow, limit: 4, max_chars: 200000 });
+    await check('folded following renders an unrelated long chain through its recorded end with exact projected turns', async () => {
+      const reply = await folded('withinchainneedle');
+      const standalone = await plain.show('follow', { kind: 'following', turn: within[0].id, limit: 8 });
+      const expected = within.slice(1).map(projectedFollowingTurn);
+      assert.deepEqual([reply.status, reply.units[0].following, standalone.turns.map(projectedFollowingTurn), standalone.turns[0].parent_turn_id],
+        ['ready', [{ after: within[0].id, status: 'recorded_end', bound: null, turns: expected, unlinked_turns: 0 }], expected, within[0].turn_id]);
+    });
+    await check('folded following reports has_more for an actual over-bound chain and peeks past exact count bounds', async () => {
+      const limited = await folded('overchainneedle', { turns: 2, bytes: 65536 });
+      const exact = await folded('withinchainneedle', { turns: 4 });
+      assert.deepEqual([limited.status, limited.units[0].following, exact.units[0].following[0].status, exact.units[0].following[0].bound],
+        ['ready', [{ after: over[0].id, status: 'has_more', bound: 'turns', turns: over.slice(1, 3).map(projectedFollowingTurn), unlinked_turns: 0 }],
+          'recorded_end', null], 'folded following must disclose a real turn bound rather than claim recorded_end');
+    });
+    await check('folded following byte bounds count whole projected UTF-8 turn objects with zero empty-payload overhead', async () => {
+      const expected = within.slice(1).map(projectedFollowingTurn);
+      const first = Buffer.byteLength(JSON.stringify(expected[0]));
+      const all = expected.reduce((bytes, turn) => bytes + Buffer.byteLength(JSON.stringify(turn)), 0);
+      const tooSmall = (await folded('withinchainneedle', { bytes: first - 1 })).units[0].following[0];
+      const exactFirst = (await folded('withinchainneedle', { bytes: first })).units[0].following[0];
+      const tiny = (await folded('withinchainneedle', { bytes: 1 })).units[0].following[0];
+      const exactAll = (await folded('withinchainneedle', { turns: 16, bytes: all })).units[0].following[0];
+      assert.deepEqual([[tooSmall.status, tooSmall.bound, tooSmall.turns], [exactFirst.status, exactFirst.bound, exactFirst.turns],
+        [tiny.status, tiny.bound, tiny.turns], [exactAll.status, exactAll.bound, exactAll.turns]],
+      [['has_more', 'bytes', []], ['has_more', 'bytes', expected.slice(0, 1)], ['has_more', 'bytes', []], ['recorded_end', null, expected]],
+      'folded following must stop before a whole turn that exceeds its byte bound');
+    });
+    const branched = await makeChain('branched', 'branchfollowingneedle', 0);
+    await plain.ingest('follow', followInput('branched', 'branch-left', branched[0].turn_id, 'First branch.'));
+    await plain.ingest('follow', followInput('branched', 'branch-right', branched[0].turn_id, 'Second branch.'));
+    const cycleInput = followInput('cycle', 'cycle-a', 'cycle-b', 'cyclefollowingneedle first');
+    const cycleA = await plain.ingest('follow', cycleInput);
+    const cycleB = await plain.ingest('follow', followInput('cycle', 'cycle-b', 'cycle-a', 'Second cyclic turn.'));
+    const unknown = await makeChain('unknown', 'unknownfollowingneedle', 0);
+    await plain.ingest('follow', followInput('unknown', 'unknown-gap', 'missing-parent', 'Capture gap.'));
+    await check('folded following preserves exact branched cycle and unknown lineage rules with null bounds', async () => {
+      const branch = (await folded('branchfollowingneedle')).units[0].following[0];
+      const cycle = (await folded('cyclefollowingneedle')).units[0].following[0];
+      const gap = (await folded('unknownfollowingneedle')).units[0].following[0];
+      assert.deepEqual([[branch.after, branch.status, branch.bound, branch.turns.length, branch.unlinked_turns],
+        [cycle.after, cycle.status, cycle.bound, cycle.turns.map(turn => turn.id), cycle.unlinked_turns],
+        [gap.after, gap.status, gap.bound, gap.turns.length, gap.unlinked_turns]],
+      [[branched[0].id, 'branched', null, 0, 0], [cycleA.id, 'cycle', null, [cycleB.id], 0], [unknown[0].id, 'unknown', null, 0, 1]]);
+    });
+    await check('following bytes participate in the atomic whole-unit budget without dropping seeds or trimming turns', async () => {
+      const wide = await folded('withinchainneedle');
+      const unit = wide.units[0];
+      const bytes = Buffer.byteLength(JSON.stringify(unit));
+      const exact = await plain.recall('follow', { query: 'withinchainneedle', group: 'conversation', follow: {}, max_chars: bytes });
+      const short = await plain.recall('follow', { query: 'withinchainneedle', group: 'conversation', follow: {}, max_chars: bytes - 1 });
+      const bare = await plain.recall('follow', { query: 'withinchainneedle', group: 'conversation', max_chars: bytes - 1 });
+      assert.deepEqual([unit.seeds.length, exact.units[0].seeds.length, exact.units[0].following[0].turns.length,
+        short.units.length, short.bundles.length, short.budget_omitted, short.status, short.relationship_context_complete,
+        bare.units.length, Object.hasOwn(bare.units[0], 'following')],
+      [2, 2, 4, 0, 0, 1, 'budget_limited', false, 1, false], 'unit budgets must include folded following without partial rendering');
+    });
+    await plain.enrich('follow', { records: [{ id: 'cross-following', kind: 'observation', text: 'Cross-conversation evidence.',
+      attribution: 'fixture', evidence: [span(within[0], within[0]), span(over[0], over[0])] }], relations: [] });
+    const foreignFollow = await plain.ingest('foreign', followInput('foreign-follow', 'foreign-follow', null, 'Foreign retained root.'));
+    const withinKey = { scope: 'follow', source: 'follow-fixture', conversation_id: 'within' };
+    const overKey = { ...withinKey, conversation_id: 'over' };
+    const batch = { kind: 'units', units: [{ key: overKey, seeds: [
+      { kind: 'record', id: 'absent-record-a' }, { kind: 'turn', id: over[0].id }, { kind: 'record', id: 'cross-following' },
+      { kind: 'turn', id: 'absent-turn' }, { kind: 'record', id: 'absent-record-z' }, { kind: 'turn', id: foreignFollow.id },
+    ] }, { key: withinKey, seeds: [{ kind: 'turn', id: within[0].id }] }], max_nodes: 8, max_hops: 2 };
+    await check('show units preserves explicit unit seed and missing order without ranking or adding seeds', async () => {
+      const reply = await plain.show('follow', batch);
+      const source = await plain.show('follow', { kind: 'bundle', seed: { kind: 'turn', id: over[0].id }, max_nodes: 8, max_hops: 2 });
+      assert.deepEqual([reply.kind, reply.units.map(unit => unit.key), reply.units.map(unit => unit.seeds.map(bundle => [bundle.match.kind, bundle.match.id])),
+        reply.units.map(unit => unit.missing), reply.units.map(unit => Object.hasOwn(unit, 'following')), reply.units[0].seeds[0]],
+      ['units', [overKey, withinKey], [[['turn', over[0].id], ['record', 'cross-following']], [['turn', within[0].id]]],
+        [[{ kind: 'record', id: 'absent-record-a' }, { kind: 'turn', id: 'absent-turn' }, { kind: 'record', id: 'absent-record-z' },
+          { kind: 'turn', id: foreignFollow.id }], []], [false, false], source.bundle]);
+    });
+    await check('show units folds every cited root in uid order including cross-conversation record evidence', async () => {
+      const reply = await plain.show('follow', { ...batch, follow: {} });
+      const roots = [within[0].id, over[0].id].sort();
+      assert.deepEqual(reply.units.map(unit => unit.following.map(read => [read.after, read.status, read.bound, read.unlinked_turns])),
+        Array.from({ length: 2 }, () => roots.map(after => [after, 'recorded_end', null, 0])));
+    });
+    await check('show units validates batch caps follow bounds and caller scope before storage access', async () => {
+      const denied = new Memory({ scopes: config.scopes }, new Proxy({}, { get: () => { throw new Error('storage touched'); } }));
+      const unit = { key: withinKey, seeds: [] };
+      for (const input of [{ units: null }, { units: Array(5).fill(unit) },
+        { units: [{ ...unit, seeds: Array(21).fill({ kind: 'turn', id: 'missing' }) }] },
+        { units: [unit], follow: null }, { units: [unit], follow: { bytes: 0 } }, { units: [unit], follow: { turns: 17 } }]) {
+        await assert.rejects(denied.show('follow', { kind: 'units', ...input }), { code: 'invalid_input' });
+      }
+      await assert.rejects(denied.show('follow', { kind: 'units', units: [
+        { ...unit, seeds: [{ kind: 'turn', id: within[0].id }] }, { ...unit, key: { ...withinKey, scope: 'foreign' } },
+      ] }), { code: 'scope_denied' });
+      const missing = Array.from({ length: 20 }, (_, index) => ({ kind: 'turn', id: `missing-${index}` }));
+      const maximum = await plain.show('follow', { kind: 'units', units: [{ key: withinKey, seeds: missing }] });
+      assert.deepEqual([maximum.units[0].missing, (await denied.show('follow', { kind: 'units', units: [] })).units], [missing, []]);
+    });
+    const cacheA = await makeChain('a-cache', 'cache-a-root', 0);
+    const cacheB = await makeChain('b-cache', 'cache-b-root', 0);
+    const cacheZ = await makeChain('z-cache', 'cache-z-root', 1);
+    await plain.enrich('follow', { records: [
+      { id: 'cache-a', kind: 'observation', text: 'cachefollowingneedle', attribution: 'fixture', evidence: [span(cacheA[0], cacheA[0]), span(cacheZ[0], cacheZ[0])] },
+      { id: 'cache-b', kind: 'observation', text: 'cachefollowingneedle', attribution: 'fixture', evidence: [span(cacheB[0], cacheB[0]), span(cacheZ[0], cacheZ[0])] },
+    ], relations: [] });
+    await check('folded following is computed once per cited root per request and carried by every unit that cites it', async () => {
+      const original = memory.store.unlinkedTurns;
+      let reads = 0;
+      memory.store.unlinkedTurns = (...args) => {
+        if (args[1].id === cacheZ[0].id) reads += 1;
+        return original.apply(memory.store, args);
+      };
+      try {
+        const request = { query: 'cachefollowingneedle', group: 'conversation', follow: {}, max_chars: 200000 };
+        const reply = await plain.recall('follow', request);
+        const first = reads;
+        await plain.recall('follow', request);
+        const second = reads;
+        const units = reply.units.map(unit => ({ key: unit.key, seeds: unit.seeds.map(bundle => ({ kind: bundle.match.kind, id: bundle.match.id })) }));
+        reads = 0;
+        const recheck = await plain.show('follow', { kind: 'units', units, follow: {} });
+        assert.deepEqual([reply.units.length, reply.units.map(unit => unit.following.filter(read => read.after === cacheZ[0].id).length),
+          first, second, recheck.units.map(unit => unit.following.filter(read => read.after === cacheZ[0].id).length), reads],
+        [2, [1, 1], 1, 2, [1, 1], 1]);
+      } finally { memory.store.unlinkedTurns = original; }
+    });
     const lexical = new Memory({ neo4j: database, scopes: config.scopes });
     try {
       const input = { ...turn('long', ''), entries: ['system', 'user', 'tool', 'assistant'].map(role => ({
@@ -423,8 +843,18 @@ export async function runIntegration(database, scratch) {
       const source = await run('ingest', input);
       await run('enrich', { records: [{ ...record('cli-record', source, input), kind: 'observation', status: 'observed' }], relations: [] });
       const recalled = await run('recall', { query: 'unabridged' });
+      const grouped = await run('recall', { query: 'unabridged', mode: 'evidence_advice', group: 'conversation' });
+      const followed = await run('recall', { query: 'unabridged', mode: 'history_search', group: 'conversation', follow: {} });
+      const checked = await run('show', { kind: 'units', units: [{ key: followed.units[0].key,
+        seeds: followed.units[0].seeds.map(bundle => ({ kind: bundle.match.kind, id: bundle.match.id })) }], follow: {} });
       const shown = await run('show', { kind: 'turn', id: source.id });
-      assert.deepEqual([recalled.ok, recalled.bundles.length > 0, shown.turn.entries[0].text], [true, true, input.entries[0].text]);
+      const terminal = [{ after: source.id, status: 'recorded_end', bound: null, turns: [], unlinked_turns: 0 }];
+      assert.deepEqual([recalled.ok, recalled.bundles.length > 0, shown.turn.entries[0].text, grouped.ok, grouped.mode, grouped.mode_contract,
+        grouped.units[0].key, grouped.pool_truncated, fiveChannels.map(name => typeof grouped.channels[name].admitted_conversations),
+        followed.units[0].following, checked.kind, checked.units[0].following, checked.units[0].missing],
+      [true, true, input.entries[0].text, true, 'evidence_advice', contracts.evidence_advice,
+        { scope: 'cli', source: input.source, conversation_id: input.conversation_id }, 0, ['number', 'number', 'number', 'undefined', 'undefined'],
+        terminal, 'units', terminal, []]);
     });
     if (process.env.SOURCE_MEMORY_REAL_EMBEDDING_URL) {
       await check('a real local embedding endpoint indexes and recalls by meaning', async () => {

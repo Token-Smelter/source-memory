@@ -259,6 +259,98 @@ export class Neo4jStore {
     });
   }
 
+  async lexicalStatus(scope, kind) {
+    return this.transaction('read', async tx => {
+      const index = indexNames(scope)[{ turn: 'turns', record: 'records', chunk: 'chunks' }[kind]];
+      const result = await tx.run('SHOW FULLTEXT INDEXES YIELD name,state WHERE name=$name RETURN state', { name: index });
+      const state = result.records[0]?.get('state');
+      if (state === 'ONLINE') return { status: 'ready' };
+      if (state === 'POPULATING') return { status: 'pending' };
+      return { status: 'unavailable', reason: `${kind}_index_${!state ? 'missing' : state === 'FAILED' ? 'failed' : 'unavailable'}` };
+    });
+  }
+
+  async admittedLexical(scope, kind, query, limit, perConversation, exclude = []) {
+    const lucene = lexicalQuery(query);
+    if (!lucene) return { hits: [], omitted: [], admitted_conversations: 0, exhausted: false };
+    const index = indexNames(scope)[{ turn: 'turns', record: 'records', chunk: 'chunks' }[kind]];
+    return this.admission(scope, kind, `CALL db.index.fulltext.queryNodes($index,$query) YIELD node,score WHERE ${eligible('node')}
+      WITH node,score ORDER BY score DESC,node.uid
+      WITH collect({node:node,score:score}) AS matches
+      WITH matches,size(matches) AS total`, { index, query: lucene, limit: neo4j.int(limit), per: neo4j.int(perConversation), exclude });
+  }
+
+  async admittedVectors(scope, kind, model, vector, scanned, limit, perConversation, exclude = []) {
+    const label = kind === 'chunk' ? 'SMChunk' : 'SMRecord';
+    return this.admission(scope, kind, `CALL {
+        MATCH (node:${label} {scope:$scope,embedding_key:$model}) WHERE ${eligible('node')}
+        RETURN count(node) AS total
+      }
+      CALL {
+        UNWIND $scanned AS uid MATCH (node:${label} {uid:uid,scope:$scope,embedding_key:$model}) WHERE ${eligible('node')}
+        WITH node,vector.similarity.cosine(node.embedding,$vector) AS score ORDER BY score DESC,node.uid
+        RETURN collect({node:node,score:score}) AS matches
+      }`, { model, vector, scanned, limit: neo4j.int(limit), per: neo4j.int(perConversation), exclude });
+  }
+
+  async admission(scope, kind, search, params) {
+    return this.transaction('read', async tx => {
+      // Neo4j core cannot decode JSON. Only legacy grouping keys are decoded here; exclusion never uses this map.
+      const old = await tx.run(`MATCH (t:SMTurn {scope:$scope}) WHERE t.source IS NULL OR t.conversation_id IS NULL
+        RETURN t.uid AS uid,t.body AS body`, { scope });
+      const legacy = Object.fromEntries(old.records.map(row => {
+        const body = JSON.parse(row.get('body'));
+        return [row.get('uid'), { source: body.source, conversation_id: body.conversation_id }];
+      }));
+      const parents = kind === 'turn' ? 'WITH node,score,[node] AS parents' : kind === 'chunk'
+        ? 'MATCH (parent:SMTurn {scope:$scope})-[:SM_HAS_CHUNK]->(node) WITH node,score,collect(DISTINCT parent) AS parents'
+        : 'CALL { WITH node MATCH (node)-[:SM_EVIDENCE]->(parent:SMTurn {scope:$scope}) RETURN collect(DISTINCT parent) AS parents }';
+      const seed = kind === 'chunk' ? 'parents[0].uid' : 'node.uid';
+      const result = await tx.run(`${search}
+        CALL {
+          WITH matches UNWIND matches AS candidate WITH candidate.node AS node,candidate.score AS score
+          ${parents}
+          WITH node,score,parents,[parent IN parents | {scope:parent.scope,source:coalesce(parent.source,$legacy[parent.uid].source),
+            conversation_id:coalesce(parent.conversation_id,$legacy[parent.uid].conversation_id)}] AS keys
+          WITH {node:node,score:score,parents:parents,keys:keys,seed_id:${seed}} AS hit ORDER BY hit.score DESC,hit.node.uid
+          WITH hit.seed_id AS seed_id,head(collect(hit)) AS hit
+          WITH hit ORDER BY hit.score DESC,hit.node.uid
+          WITH collect(hit) AS unique
+          WITH unique,reduce(admitted=[],hit IN unique |
+            CASE WHEN all(key IN hit.keys WHERE size([prior IN admitted WHERE key IN prior.keys]) < $per)
+              THEN admitted + hit ELSE admitted END) AS admitted
+          RETURN admitted,[hit IN unique WHERE NOT any(prior IN admitted WHERE prior.seed_id=hit.seed_id) |
+            {kind:$seedKind,id:CASE WHEN $seedKind='record' THEN hit.node.record_id ELSE hit.seed_id END,keys:hit.keys}] AS omitted
+        }
+        RETURN admitted[..$limit] AS rows,omitted,total > $limit AS exhausted`,
+      { ...params, scope, legacy, seedKind: kind === 'record' ? 'record' : 'turn' });
+      const row = result.records[0];
+      const hits = (row?.get('rows') ?? []).map(hit => {
+        const node = unwrap(hit.node);
+        const parents = hit.parents.map(unwrap);
+        requireThat(node.scope === scope && parents.length && parents.every(parent => parent.scope === scope), 'index_scope_mismatch');
+        const contexts = new Map();
+        for (const parent of parents) {
+          const old = parent.source == null || parent.conversation_id == null;
+          const body = old ? JSON.parse(parent.body) : null;
+          const key = { scope, source: parent.source ?? body.source, conversation_id: parent.conversation_id ?? body.conversation_id };
+          requireThat(typeof key.source === 'string' && typeof key.conversation_id === 'string', 'conversation_unavailable');
+          const token = JSON.stringify(key);
+          contexts.set(token, { key, ...(old || contexts.get(token)?.legacy ? { legacy: true } : {}) });
+        }
+        const conversations = [...contexts.values()];
+        if (kind !== 'chunk') return { kind, id: kind === 'turn' ? node.uid : node.record_id, text: node.text, conversations };
+        const parent = parents[0];
+        const entries = JSON.parse(parent.body).entries.filter(entry => entry.id === node.entry_id);
+        const role = entries.length === 1 ? node.role ?? entries[0].role : 'unknown';
+        return { kind: 'turn', id: parent.uid, text: node.text,
+          match: { turn: parent.uid, entry_id: node.entry_id, start: node.start, end: node.end, role }, conversations };
+      });
+      return { hits, omitted: row?.get('omitted') ?? [], exhausted: row?.get('exhausted') ?? false,
+        admitted_conversations: new Set(hits.flatMap(hit => hit.conversations.map(context => JSON.stringify(context.key)))).size };
+    });
+  }
+
   async vectors(scope, model, limit, exclude = []) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope AND n.embedding_key=$model AND ${eligible('n')}

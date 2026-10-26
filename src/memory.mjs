@@ -5,6 +5,11 @@ import {
 import { embed, embeddingIdentity, rerank } from './models.mjs';
 import { Neo4jStore } from './store.mjs';
 
+const MODE_CONTRACTS = {
+  evidence_advice: 'Evidence advice: prioritizes extracted claims that cite user spans; a cited user span may be a question, so this is not user assertion or authority. May return no relevant history. Omitted material may correct shown claims. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
+  history_search: 'History search: retained conversations in search rank order. Not an answer to what is current. Omitted or later material may correct shown items. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
+};
+
 export class Memory {
   constructor(config, store = null) {
     this.config = config;
@@ -71,6 +76,7 @@ export class Memory {
   async show(scope, input) {
     authorize(this.config, scope);
     if (input.kind === 'bundle') return this.showBundle(scope, input);
+    if (input.kind === 'units') return this.showUnits(scope, input);
     if (input.kind === 'following') return this.showFollowing(scope, input);
     if (input.kind === 'turn_by_key') return this.showTurnByKey(scope, input);
     const id = text(input.id, 256);
@@ -105,10 +111,25 @@ export class Memory {
     const start = await this.store.getTurn(scope, text(input.turn, 256));
     requireThat(start, 'not_found');
     const limit = integer(input.limit, 2, 1, 16);
+    const { turns, end, unlinked } = await this.walkFollowing(scope, start, limit);
+    return {
+      // recorded_end is the last turn this store holds, not proof that the conversation ended there.
+      kind: 'following', turn: start.id, turns, has_more: end === 'limit', end,
+      lineage: end === 'branched' || end === 'cycle' ? end : unlinked ? 'unknown' : 'linked',
+      unlinked_turns: unlinked,
+    };
+  }
+
+  async walkFollowing(scope, start, limit, maxBytes = null) {
+    authorize(this.config, scope);
+    integer(limit, undefined, 1, 16);
+    if (maxBytes !== null) integer(maxBytes, undefined, 1, 65536);
     const turns = [];
     const seen = new Set([start.id]);
     let current = start;
     let end = 'recorded_end';
+    let bound = null;
+    let bytes = 0;
     while (true) {
       const children = await this.store.childTurns(scope, current, 2);
       if (children.length === 0) break;
@@ -116,17 +137,66 @@ export class Memory {
       const [child] = children;
       if (seen.has(child.id)) { end = 'cycle'; break; }
       seen.add(child.id);
-      if (turns.length === limit) { end = 'limit'; break; }
+      if (turns.length === limit) { end = 'limit'; bound = 'turns'; break; }
+      const size = maxBytes === null ? 0 : Buffer.byteLength(JSON.stringify(followingTurn(child)));
+      if (maxBytes !== null && bytes + size > maxBytes) { end = 'limit'; bound = 'bytes'; break; }
       turns.push(child);
+      bytes += size;
       current = child;
     }
     const unlinked = await this.store.unlinkedTurns(scope, start);
-    return {
-      // recorded_end is the last turn this store holds, not proof that the conversation ended there.
-      kind: 'following', turn: start.id, turns, has_more: end === 'limit', end,
-      lineage: end === 'branched' || end === 'cycle' ? end : unlinked ? 'unknown' : 'linked',
-      unlinked_turns: unlinked,
-    };
+    return { turns, end, bound, unlinked };
+  }
+
+  async followingForBundles(scope, seeds, follow, cache) {
+    authorize(this.config, scope);
+    const roots = [...new Set(seeds.flatMap(bundle => [bundle.source?.id,
+      ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence.map(span => span.turn))]).filter(Boolean))].sort();
+    const following = [];
+    for (const after of roots) {
+      if (!cache.has(after)) cache.set(after, (async () => {
+        const start = await this.store.getTurn(scope, after);
+        requireThat(start, 'source_unavailable');
+        const read = await this.walkFollowing(scope, start, follow.turns, follow.bytes);
+        return { after, status: read.end === 'limit' ? 'has_more' : ['branched', 'cycle'].includes(read.end)
+          ? read.end : read.unlinked ? 'unknown' : 'recorded_end',
+          bound: read.bound, turns: read.turns.map(followingTurn), unlinked_turns: read.unlinked };
+      })());
+      following.push(await cache.get(after));
+    }
+    return following;
+  }
+
+  async showUnits(scope, input) {
+    authorize(this.config, scope);
+    const follow = followingOptions(input.follow, true);
+    const maxNodes = integer(input.max_nodes, 48, 1, 256);
+    const maxHops = integer(input.max_hops, 4, 0, 12);
+    requireThat(Array.isArray(input.units) && input.units.length <= 4);
+    const requests = input.units.map(unit => {
+      requireThat(unit && unit.key && Array.isArray(unit.seeds) && unit.seeds.length <= 20);
+      const key = { scope: text(unit.key.scope, 256), source: text(unit.key.source, 256), conversation_id: text(unit.key.conversation_id, 256) };
+      requireThat(key.scope === scope, 'scope_denied');
+      const seeds = unit.seeds.map(seed => {
+        requireThat(seed && ['turn', 'record'].includes(seed.kind), 'invalid_kind');
+        return { kind: seed.kind, id: text(seed.id, 256) };
+      });
+      return { key, seeds };
+    });
+    const cache = new Map();
+    const units = [];
+    for (const request of requests) {
+      const seeds = [];
+      const missing = [];
+      for (const seed of request.seeds) {
+        const found = seed.kind === 'turn' ? await this.store.getTurn(scope, seed.id) : await this.store.getRecord(scope, seed.id);
+        if (!found) { missing.push(seed); continue; }
+        seeds.push(await this.bundle(scope, { ...seed, score: null, channels: [] }, '', maxNodes, maxHops));
+      }
+      units.push({ key: request.key, seeds, missing,
+        ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, cache) } : {}) });
+    }
+    return { kind: 'units', units };
   }
 
   // Rebuilds one seed's relationship-closed bundle without a query, so a caller can detect changes since it last read it.
@@ -159,6 +229,12 @@ export class Memory {
 
   async recall(scope, input) {
     authorize(this.config, scope);
+    const mode = input.mode;
+    requireThat(mode === undefined || (typeof mode === 'string' && Object.hasOwn(MODE_CONTRACTS, mode)), 'invalid_input');
+    requireThat(input.group === undefined || input.group === 'conversation', 'invalid_input');
+    const grouped = input.group === 'conversation';
+    const perConversation = integer(input.per_conversation, 2, 1, 4);
+    const follow = followingOptions(input.follow, grouped);
     const query = text(input.query, 4000);
     const candidates = integer(input.candidates, 64, 1, 256);
     const limit = integer(input.limit, 8, 1, 32);
@@ -171,13 +247,27 @@ export class Memory {
     const exclude = exclusions(input.exclude_conversations);
     const availability = {};
     const channels = {};
+    const omitted = [];
     await Promise.all(['turn', 'record', 'chunk'].map(async kind => {
       const name = `${kind}_lexical`;
       try {
-        const state = kind === 'chunk' ? await this.store.chunkLexicalStatus(scope) : { status: 'ready' };
-        channels[name] = state.status !== 'ready' ? [] : kind === 'chunk' ? await this.store.chunkLexical(scope, query, candidates, exclude)
-          : await this.store.lexical(scope, kind, query, candidates, exclude);
-        availability[name] = state;
+        if (grouped) {
+          const state = await this.store.lexicalStatus(scope, kind);
+          if (state.status !== 'ready') {
+            channels[name] = [];
+            availability[name] = state;
+            return;
+          }
+          const result = await this.store.admittedLexical(scope, kind, query, candidates, perConversation, exclude);
+          channels[name] = result.hits;
+          omitted.push(...result.omitted);
+          availability[name] = { ...state, admitted_conversations: result.admitted_conversations, exhausted: result.exhausted };
+        } else {
+          const state = kind === 'chunk' ? await this.store.chunkLexicalStatus(scope) : { status: 'ready' };
+          channels[name] = state.status !== 'ready' ? [] : kind === 'chunk' ? await this.store.chunkLexical(scope, query, candidates, exclude)
+            : await this.store.lexical(scope, kind, query, candidates, exclude);
+          availability[name] = state;
+        }
       } catch (error) {
         channels[name] = [];
         availability[name] = { status: 'unavailable', reason: safeCode(error) };
@@ -191,18 +281,30 @@ export class Memory {
         const [queryVector] = await embed(this.config.embedding, [query]);
         const vectors = await this.store.vectors(scope, key, vectorLimit + 1, exclude);
         const counts = await this.store.status(scope, key, exclude);
-        const ranked = vectors.slice(0, vectorLimit).map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
-          .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid));
-        channels.chunk_vector = ranked.filter(row => row.turn_uid).slice(0, candidates).map(row => ({
-          kind: 'turn', id: row.turn_uid, text: row.text,
-          match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
-        }));
-        channels.record_vector = ranked.filter(row => row.record_id).slice(0, candidates)
-          .map(row => ({ kind: 'record', id: row.record_id, text: row.text }));
         const state = { status: vectors.length > vectorLimit || counts.unindexed > 0 ? 'partial' : 'ready',
           scan_truncated: vectors.length > vectorLimit, unindexed: counts.unindexed, embedding_key: key };
-        availability.chunk_vector = state;
-        availability.record_vector = { ...state };
+        if (grouped) {
+          const scanned = vectors.slice(0, vectorLimit).map(row => row.uid);
+          const results = await Promise.all(['chunk', 'record'].map(kind =>
+            this.store.admittedVectors(scope, kind, key, queryVector, scanned, candidates, perConversation, exclude)));
+          for (const [index, kind] of ['chunk', 'record'].entries()) {
+            const result = results[index];
+            channels[`${kind}_vector`] = result.hits;
+            omitted.push(...result.omitted);
+            availability[`${kind}_vector`] = { ...state, admitted_conversations: result.admitted_conversations, exhausted: result.exhausted };
+          }
+        } else {
+          const ranked = vectors.slice(0, vectorLimit).map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
+            .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid));
+          channels.chunk_vector = ranked.filter(row => row.turn_uid).slice(0, candidates).map(row => ({
+            kind: 'turn', id: row.turn_uid, text: row.text,
+            match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
+          }));
+          channels.record_vector = ranked.filter(row => row.record_id).slice(0, candidates)
+            .map(row => ({ kind: 'record', id: row.record_id, text: row.text }));
+          availability.chunk_vector = state;
+          availability.record_vector = { ...state };
+        }
       } catch (error) {
         availability.chunk_vector = { status: 'unavailable', reason: safeCode(error) };
         availability.record_vector = { ...availability.chunk_vector };
@@ -211,7 +313,7 @@ export class Memory {
       availability.chunk_vector = { status: 'unconfigured' };
       availability.record_vector = { status: 'unconfigured' };
     }
-    let ranked = fuse(channels).slice(0, candidates);
+    let ranked = grouped ? fuse(channels) : fuse(channels).slice(0, candidates);
     if (this.config.reranker && ranked.length) {
       try {
         // This cut affects ranking only. Evidence is read independently from the retained source.
@@ -224,18 +326,26 @@ export class Memory {
     const bundles = [];
     let chars = 0;
     let budgetOmitted = 0;
-    for (const seed of ranked.slice(0, limit)) {
-      const bundle = await this.bundle(scope, seed, query, maxNodes, maxHops);
-      const size = JSON.stringify(bundle).length;
-      if (chars + size > maxChars) { budgetOmitted += 1; continue; }
-      bundles.push(bundle);
-      chars += size;
+    let groupedOutput = {};
+    if (grouped) {
+      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow);
+      budgetOmitted = result.budget_omitted;
+      groupedOutput = { units: result.units, pool_truncated: result.pool_truncated, budget_unit: 'utf8_bytes' };
+      bundles.push(...result.units.flatMap(unit => unit.seeds));
+    } else {
+      for (const seed of ranked.slice(0, limit)) {
+        const bundle = await this.bundle(scope, seed, query, maxNodes, maxHops);
+        const size = JSON.stringify(bundle).length;
+        if (chars + size > maxChars) { budgetOmitted += 1; continue; }
+        bundles.push(bundle);
+        chars += size;
+      }
     }
     const unavailable = Object.values(availability).some(row => row.status === 'unavailable');
     return {
       scope, query,
       status: unavailable ? 'degraded' : budgetOmitted > 0 ? 'budget_limited' : bundles.length ? 'ready' : 'no_matches',
-      channels: availability,
+      channels: Object.fromEntries(Object.entries(availability).sort(([a], [b]) => a.localeCompare(b))),
       retrieval_complete: Object.values(availability).every(row => ['ready', 'not_needed'].includes(row.status)),
       relationship_context_complete: budgetOmitted === 0 && bundles.every(row => row.relationship_context_complete),
       budget_omitted: budgetOmitted,
@@ -243,7 +353,65 @@ export class Memory {
       excluded_conversations: exclude.length,
       bundles,
       authority: 'Evidence and attributed records; not execution permission or a guarantee of current state.',
+      ...groupedOutput,
+      ...(mode === undefined ? {} : { mode, mode_contract: MODE_CONTRACTS[mode] }),
     };
+  }
+
+  async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops, follow = null) {
+    authorize(this.config, scope);
+    const priority = new Map();
+    for (const [rank, seed] of ranked.entries()) for (const context of seed.conversations) {
+      const token = conversationToken(context.key);
+      if (!priority.has(token)) priority.set(token, rank);
+    }
+    const admitted = new Set(Object.values(channels).flatMap(hits => hits.map(seedToken)));
+    const truncated = new Map();
+    for (const seed of omitted) {
+      if (admitted.has(seedToken(seed))) continue;
+      for (const key of seed.keys) {
+        const token = conversationToken(key);
+        if (!truncated.has(token)) truncated.set(token, new Set());
+        truncated.get(token).add(seedToken(seed));
+      }
+    }
+    const pool = new Map();
+    for (const seed of ranked) {
+      const contexts = [...seed.conversations].sort((a, b) => priority.get(conversationToken(a.key)) - priority.get(conversationToken(b.key))
+        || compareConversationKeys(a.key, b.key));
+      const owner = contexts[0];
+      const token = conversationToken(owner.key);
+      if (!pool.has(token)) pool.set(token, { key: owner.key, legacy: false, candidates: [], also: new Map() });
+      const unit = pool.get(token);
+      unit.legacy ||= owner.legacy === true;
+      unit.candidates.push(seed);
+      for (const context of contexts.slice(1)) unit.also.set(conversationToken(context.key), context.key);
+    }
+    const units = [];
+    const followingCache = new Map();
+    let bytes = 0;
+    let budgetOmitted = 0;
+    for (const unit of [...pool.values()].slice(0, limit)) {
+      const seeds = [];
+      for (const candidate of unit.candidates) {
+        const bundle = await this.bundle(scope, candidate, query, maxNodes, maxHops);
+        seeds.push(bundle);
+        const evidence = [bundle.source, ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence)].filter(Boolean);
+        for (const span of evidence) {
+          const key = { scope, source: span.source, conversation_id: span.conversation_id };
+          if (conversationToken(key) !== conversationToken(unit.key)) unit.also.set(conversationToken(key), key);
+        }
+      }
+      const rendered = { key: unit.key, ...(unit.legacy ? { legacy: true } : {}), seeds,
+        seeds_truncated: truncated.get(conversationToken(unit.key))?.size ?? 0, also_cites: [...unit.also.values()].sort(compareConversationKeys),
+        ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, followingCache) } : {}) };
+      const size = Buffer.byteLength(JSON.stringify(rendered));
+      // Admission limits seeds; rendering budgets may only skip an entire unit, never a seed or part of its evidence.
+      if (bytes + size > maxBytes) { budgetOmitted += 1; continue; }
+      units.push(rendered);
+      bytes += size;
+    }
+    return { units, pool_truncated: Math.max(0, pool.size - limit), budget_omitted: budgetOmitted };
   }
 
   async bundle(scope, seed, query, maxNodes, maxHops) {
@@ -293,13 +461,28 @@ export class Memory {
       edges.push({ ...relation, supporting_evidence: await this.evidence(scope, relation.evidence) });
     }
     return {
-      match: { kind: seed.kind, id: seed.id, rank_score: seed.score, channels: seed.channels,
+      match: { kind: seed.kind, id: seed.id, rank_score: seed.score,
+        channels: [...seed.channels].sort((a, b) => a.channel.localeCompare(b.channel)),
         ...(seed.rerank_score === undefined ? {} : { rerank_score: seed.rerank_score }) },
       source, records: withEvidence, relations: edges,
       relationship_context_complete: gaps.size === 0, gaps: [...gaps],
     };
   }
 }
+
+const followingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, occurred_at: turn.occurred_at ?? null,
+  entries: turn.entries.map(entry => ({ id: entry.id, role: entry.role, text: entry.text })) });
+
+function followingOptions(input, allowed) {
+  if (input === undefined) return null;
+  requireThat(allowed && input && typeof input === 'object' && !Array.isArray(input)
+    && Object.keys(input).every(key => ['turns', 'bytes'].includes(key)), 'invalid_input');
+  return { turns: integer(input.turns, 8, 1, 16), bytes: integer(input.bytes, 16384, 1, 65536) };
+}
+
+const seedToken = seed => JSON.stringify([seed.kind, seed.id]);
+const conversationToken = key => JSON.stringify([key.scope, key.source, key.conversation_id]);
+const compareConversationKeys = (a, b) => a.scope.localeCompare(b.scope) || a.source.localeCompare(b.source) || a.conversation_id.localeCompare(b.conversation_id);
 
 function exclusions(value) {
   if (value === undefined) return [];

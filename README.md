@@ -78,9 +78,11 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `enrich` | Records and relations | Validate source spans and endpoints; commit the whole bundle atomically |
 | `index` | Optional `{"limit":256}` | Embed missing or out-of-date chunks/records |
 | `recall` | `{"query":"...", "limit":8}` plus bounds | Search turn/chunk/record lexical and chunk/record vector channels, fuse, rerank, expand relationships, return evidence bundles |
+| `recall` | Optional `mode`, `group:"conversation"`, `per_conversation`, `follow` | Echo a mode contract; opt into admission, atomic conversation units, and bounded folded following (below) |
 | `recall` | add `"exclude_conversations":[{"source":"...","conversation_id":"..."}]` (at most 16) | Rank without those conversations: their turns, chunks and records whose evidence lies only in them are dropped inside every channel before its limit, and their unindexed text does not make a channel partial. Records with other evidence stay. Turns stored before lineage properties existed are never excluded |
 | `show` | `{"kind":"turn"\|"record","id":"..."}` | Full retained turn, or a record with its source evidence |
 | `show` | `{"kind":"bundle","seed":{"kind":"turn"\|"record","id":"..."},"max_nodes":48,"max_hops":4}` | One seed's relationship-closed bundle (same shape as a recall bundle), rebuilt without a query; hash it to detect later relationship changes |
+| `show` | `{"kind":"units","units":[{"key":{"scope":"...","source":"...","conversation_id":"..."},"seeds":[{"kind":"turn"\|"record","id":"..."}]}],"follow":{}}` | Recheck up to 4 units of up to 20 exact seeds each, optionally folding following; no ranking or exclusion |
 | `show` | `{"kind":"following","turn":"<turn id>","limit":2}` | Later turns of the same conversation by exact `parent_turn_id` links (see below) |
 | `show` | `{"kind":"turn_by_key","source":"...","conversation_id":"...","turn_ids":["..."]}` | Which of up to 16 caller turn keys already name stored turns (`found`, in request order); for callers that must reuse an existing identity |
 | `status` | None | Counts, unindexed items, configured models |
@@ -168,6 +170,78 @@ From each seed, expansion follows `supersedes` (both directions), `qualifies`, `
 The cosine channels score a bounded, scope-filtered vector scan; this is not an approximate-nearest-neighbor index and is sized for personal and team histories, not web-scale corpora.
 
 Recalled material is evidence, not authority. A proposal is not an accepted decision, a changed justification does not repeal a decision by itself, and several channels matching the same turn are one source, not corroboration.
+
+### Modes and conversation units
+
+Default recall keeps its existing semantic values and selection policy, but raw byte ordering of channel trace arrays and availability keys changes intentionally to the stable ordering documented below. Optional `mode` accepts only `evidence_advice` or `history_search` and adds `mode` plus its exact `mode_contract`; mode alone does not change admission or selection. These contracts describe intent and bounds, not assertion, authority, currentness, or completeness. Lane selection, carried-evidence collapse, following-read refusal, and adapter deadlines belong to the consumer, not this CLI.
+
+```json
+{"query":"backup window", "mode":"history_search", "group":"conversation", "per_conversation":2, "limit":12, "max_chars":24000}
+```
+
+Only `group:"conversation"` enables grouping. `per_conversation` must be an integer from 1 to 4 (default 2); it applies inside each channel's query before `candidates`. Exclusion precedes admission and all caps. Duplicate chunks count as one turn seed; shared records must fit every cited conversation's per-channel quota. Keys are qualified by `scope`, `source`, and `conversation_id`. Legacy keys are decoded read-only from stored turn bodies and marked `legacy: true`; they never affect exclusion or lineage.
+
+The shared, eligible vector scan still obeys `vector_scan_limit` before ranking/admission; exceeding it still reports `partial` / `scan_truncated`. The grouped path ranks scanned vectors with Neo4j `vector.similarity.cosine`, breaking ties by node UID; float precision can make these ranks differ from the default JavaScript cosine. Grouped full-text channels search only `ONLINE` indexes; populating indexes remain `pending`, missing/failed indexes remain `unavailable`.
+
+Admission fields are present only on `ready` or `partial` entries among the five retrieval channels. `pending`, `unavailable`, and `unconfigured` entries, and the reranker, omit both fields rather than reporting fabricated zero activity.
+
+| Grouped output | Meaning |
+|---|---|
+| `channels[name].admitted_conversations` | Integer count of distinct qualified keys represented by that channel's returned seeds |
+| `channels[name].exhausted` | Boolean: eligible matches before conversation admission exceeded that channel's `candidates` cap |
+| `units[]` | `{key, legacy?, seeds, seeds_truncated, also_cites}`; `seeds` contains unchanged bundle objects in final seed rank order |
+| `units[].seeds_truncated` | Integer count of unique turn/record identities omitted by admission for that conversation, excluding identities admitted by another channel |
+| `units[].also_cites` | Other qualified conversation keys cited by the unit; a multi-conversation record is packaged once under the conversation with the best final seed rank, with qualified-key tie order |
+| `pool_truncated` | Integer count of units beyond `limit`, or 0; `limit` counts units, not seeds |
+| `budget_unit` | `utf8_bytes`: grouped `max_chars` measures UTF-8 JSON unit bytes; the default path keeps character counting |
+| `budget_omitted` | Number of whole units skipped for the rendering budget; placement continues with the next unit inside the pool |
+| `bundles[]` | Flattened seeds from accepted units, retaining the existing bundle shape |
+
+Units are ordered by their best final seed rank, after the optional reranker. Every admitted seed is rendered before budgeting: the CLI never drops a seed or trims a unit to make it fit. A byte-budget omission still means `budget_limited` and `relationship_context_complete:false`; pending/unavailable channels and bundle relationship gaps keep their own meanings and are never relabeled as omissions.
+
+### Folded following and exact batch rechecks
+
+`follow` is optional, valid on grouped recall and `show {"kind":"units"}` only. `{}` enables defaults: `turns:8` (integer 1–16) and `bytes:16384` (integer 1–65536). Bounds apply **per root**, not per unit or request. Roots are every distinct retained turn cited by a unit's seed bundles: source turns plus record/relation evidence turns. A root's following walk is computed once per request, cached by UID, and carried by every unit that cites it.
+
+Each unit gains `following` only when `follow` is supplied:
+
+```json
+{"following":[{"after":"<root turn uid>","status":"recorded_end","bound":null,"turns":[{"id":"<turn uid>","turn_id":"<caller turn key>","occurred_at":null,"entries":[{"id":"<entry id>","role":"user","text":"Exact retained text."}]}],"unlinked_turns":0}]}
+```
+
+| Following field / rule | Meaning |
+|---|---|
+| `status` | `recorded_end`, `has_more`, `branched`, `cycle`, or `unknown`; exact parent links and existing unlinked-turn rules only, with no new inference |
+| `bound` | `turns` or `bytes` only for `has_more`; `null` for every other status |
+| `turns` | Whole turns projected exactly to `id`, `turn_id`, `occurred_at`, `entries:[{id,role,text}]`; never truncated mid-turn |
+| `bytes` accounting | Sum of `Buffer.byteLength(JSON.stringify(projectedTurn))` for included turns; empty payload is 0, excluding array/separator overhead |
+| Lookahead | An actual next turn that cannot fit yields `has_more`; an exactly-at-bound chain with no next child still yields `recorded_end` |
+| Bounds precedence | Count is checked before bytes when both would exclude the next turn; existing branch/cycle checks remain unchanged |
+| Unit budget | All following fields and framing count inside the unit's UTF-8 `max_chars` size; skip a whole oversized unit, never a root or seed |
+
+Following bounds are disclosed by `status`/`bound`, not relabeled as budget omissions or channel readiness. No new wall-clock deadline is added. Standalone `show {"kind":"following"}` retains its existing response and lineage behavior.
+
+Batch recheck input:
+
+```json
+{"kind":"units","units":[{"key":{"scope":"default","source":"my-host","conversation_id":"chat"},"seeds":[{"kind":"turn","id":"<turn uid>"},{"kind":"record","id":"<record id>"}]}],"follow":{"turns":8,"bytes":16384},"max_nodes":8,"max_hops":2}
+```
+
+The response is `{kind:"units",units:[{key,seeds:[<existing bundle shape>],missing:[{kind,id}],following?}]}`. Units, exact found seeds, and missing references preserve input order; no ranking or other seeds are added. Empty batches are allowed. Each key's scope must equal the caller's scope, even if another scope is readable. Exclusion does not apply to explicit IDs. Absent `follow` omits `following`, just as in grouped recall.
+
+### Stable ordering (intentional byte-order change)
+
+| Output | Stable key / preserved semantics |
+|---|---|
+| `bundle.match.channels` | Channel name ascending, on recall and every show/batch path; trace values and ranks are unchanged |
+| `channels` availability keys | Channel name ascending, independent of asynchronous query completion |
+| Recall seeds / units | Existing final ranking after optional reranking; units follow their best seed's final rank. No query, rank, or authority policy changes |
+| `also_cites` | Qualified key tuple: scope, source, conversation ID |
+| `following` entries | Root UID ascending; each entry's turns retain exact parent-link traversal order, not timestamp sorting |
+| Batch units / seeds / missing | Input order, not ranking order |
+| Entry / evidence arrays | Existing retained or evidence order is preserved |
+
+Compatibility tests compare pinned older semantic values with this new canonical trace/key ordering; old raw bytes are intentionally not promised unchanged.
 
 ## Local model protocols
 
