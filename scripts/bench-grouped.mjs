@@ -4,7 +4,7 @@ import { promisify } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdir, realpath, readFile, writeFile, appendFile } from 'node:fs/promises';
+import { mkdir, realpath, readFile, writeFile, appendFile, symlink, unlink } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runIntegration } from '../test/integration.mjs';
@@ -130,6 +130,7 @@ async function integrationWorker(args) {
   const result = { checks: null, failure: null, real_embedding_disabled: !process.env.SOURCE_MEMORY_REAL_EMBEDDING_URL };
   try {
     assert.equal(result.real_embedding_disabled, true, 'real embedding integration is forbidden');
+    await mkdir('.memory-local', { recursive: true, mode: 0o700 });
     result.checks = await runIntegration(database, args['--scratch']);
   } catch (error) { result.failure = errorData(error); process.exitCode = 1; }
   finally { await save(args['--results'], result); }
@@ -177,7 +178,9 @@ async function controller(args) {
   await mkdir(scratch, { mode: 0o700 });
   const paths = { scratch, report_dir: reportDir, config: join(scratch, 'recall-config.json'), fixture: join(reportDir, 'fixture.json'),
     method: join(reportDir, 'method.json'), report: join(reportDir, 'report.json'), proceed: join(scratch, 'container-record-relayed.json'),
-    integration_config: join(scratch, 'integration-database.json'), integration_report: join(reportDir, 'integration.json') };
+    integration_config: join(scratch, 'integration-database.json'), integration_report: join(reportDir, 'integration.json'),
+    integration_cwd: after.root, integration_artifacts: join(scratch, 'integration', '.memory-local'),
+    integration_artifact_link: join(after.root, '.memory-local') };
   const name = `source-memory-grouped-${runId}`;
   const method = { kind: 'existing-project-docker-method', owner_pid: process.pid, run_id: runId, name, id: null, paths,
     requested: { image: IMAGE, binding: '127.0.0.1::7687', auth: 'none', memory_bytes: 2048 * 1024 * 1024, cpus: 2,
@@ -257,11 +260,17 @@ async function controller(args) {
     const integrationConfig = paths.integration_config;
     const integrationResult = paths.integration_report;
     await save(integrationConfig, { uri, auth: 'none', database: 'neo4j' });
-    const integration = await child([resolve(process.argv[1]), '--integration-worker', after.root,
-      '--config', integrationConfig, '--scratch', scratch, '--results', integrationResult], after.root, scratch);
-    await writeFile(join(reportDir, 'integration.stdout.txt'), integration.stdout, { mode: 0o600 });
-    report.integration_worker = { ...integration, stdout: undefined };
-    await persist();
+    await mkdir(paths.integration_artifacts, { recursive: true, mode: 0o700 });
+    // Keep the existing CLI/Git cwd, but retain its relative artifacts inside this attempt's private root.
+    await symlink(paths.integration_artifacts, paths.integration_artifact_link, 'dir');
+    let integration;
+    try {
+      integration = await child([resolve(process.argv[1]), '--integration-worker', after.root,
+        '--config', integrationConfig, '--scratch', scratch, '--results', integrationResult], paths.integration_cwd, scratch);
+      await writeFile(join(reportDir, 'integration.stdout.txt'), integration.stdout, { mode: 0o600 });
+      report.integration_worker = { ...integration, stdout: undefined };
+      await persist();
+    } finally { await unlink(paths.integration_artifact_link); }
     assert.equal(integration.code, 0, 'existing fictional integration failed; no retry');
     assert.equal(integration.signal, null);
     assert.equal(integration.overflow, false);
