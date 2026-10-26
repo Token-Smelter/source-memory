@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { Memory } from '../src/memory.mjs';
 import { MemoryError, requireThat } from '../src/core.mjs';
 import { warm } from '../src/warm.mjs';
+import { isPoolRequest, serializePoolReply } from '../src/envelope.mjs';
 
 const HELP = `source-memory <init|ingest|enrich|index|recall|show|status|warm> [--config FILE] --scope SCOPE [--input FILE]
 
@@ -60,7 +61,9 @@ export async function main(argv = process.argv.slice(2)) {
   const memory = new Memory(config);
   try {
     const result = await memory[command](options['--scope'], input);
-    process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
+    const reply = { ok: true, ...result };
+    process.stdout.write(command === 'recall' && isPoolRequest(input) ? serializePoolReply(reply, input.max_chars ?? 24000)
+      : `${JSON.stringify(reply)}\n`);
   } finally { await memory.close(); }
 }
 

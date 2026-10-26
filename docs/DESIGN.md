@@ -44,6 +44,7 @@ A host adapter (for example, an agent harness) owns knowing when a turn complete
 ## Known limits
 
 - Native ANN candidate selection can miss exact neighbours, and heavy post-filtering may exhaust the widening budget. These bounds are disclosed; a ready channel is not a currentness or retrieval-quality guarantee.
+- Grouped `evidence_advice` recall may request `max_chars` up to 1,000,000 serialized UTF-8 JSON bytes of whole units (other modes stay at 200,000). Its stdout is bounded: transport envelope (everything beyond the units and the duplicate top-level `bundles`) at most 65,536 bytes and total at most `2 × max_chars + 65,536`; a reply beyond either is replaced by `output_envelope_exceeded`. Escape-heavy text admits less raw text per byte, and a corpus that does not fit is refused, never truncated.
 - Scope enforcement trusts the local configuration file. A multi-tenant deployment needs authenticated, host-issued scope binding.
 - There is no erasure command; deliberate deletion must also remove derived chunks, embeddings and dependent records.
 - Integration tests use deterministic model fixtures; they verify mechanics, not retrieval quality. An optional real-embedding check is available.
