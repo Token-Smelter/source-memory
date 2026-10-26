@@ -61,7 +61,7 @@ echo '{"query":"dashboard"}' | node bin/memory.mjs recall --config config/host.j
 | `index_on_write` | `false` makes `ingest`/`enrich` return without embedding; run `index` separately. Use it on latency-sensitive paths. |
 | `embedding` | Optional `{url, model, dimensions, timeout_ms, allow_remote}`; OpenAI-compatible `/v1/embeddings`. |
 | `reranker` | Optional `{url, model, timeout_ms, allow_remote}`; see the rerank protocol below. |
-| `vector_scan_limit` | Maximum vectors scored per recall (default 10,000). |
+| `vector_scan_limit` | Legacy scan bound only when a vector index is missing (default 10,000); healthy native indexes do not use it. |
 
 To use a different Neo4j server, change `neo4j.uri` (plus `allow_remote` if it is not on loopback) and the credential variable. Nothing else in the code assumes the bundled server.
 
@@ -73,7 +73,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 
 | Command | Input | Behavior |
 |---|---|---|
-| `init` | None | Create uniqueness constraints and this scope's full-text indexes |
+| `init` | None | Create uniqueness constraints, scope full-text indexes, and native vector indexes when embedding is configured |
 | `ingest` | Turn envelope | Atomically retain exact source and its chunks; then embed unless `index_on_write` is false |
 | `enrich` | Records and relations | Validate source spans and endpoints; commit the whole bundle atomically |
 | `index` | Optional `{"limit":256}` | Embed missing or out-of-date chunks/records |
@@ -149,7 +149,7 @@ Later turns are context, not supersession: a later statement does not by itself 
 
 ## Recall
 
-Five independent channels run under the requested scope: `turn_lexical`, `chunk_lexical`, `record_lexical`, `chunk_vector`, `record_vector`. Query text is treated as literal terms, never as Lucene or Cypher syntax. Results merge by reciprocal rank fusion; an optional reranker then reorders them. Each scope has its own full-text indexes, and every vector, traversal, and evidence read filters by scope before ranking.
+Five independent channels run under the requested scope: `turn_lexical`, `chunk_lexical`, `record_lexical`, `chunk_vector`, `record_vector`. Query text is treated as literal terms, never as Lucene or Cypher syntax. Results merge by reciprocal rank fusion; an optional reranker then reorders them. Each scope has its own full-text and vector indexes; traversals and evidence reads enforce scope, and native vector candidates are scope/model/exclusion-filtered inside the query before the channel limit.
 
 Chunk lexical hits identify the entry, role, UTF-16 span, and qualified `conversation` key (`scope`, `source`, `conversation_id`). Legacy roles resolve from the parent turn's stored entries; a missing or ambiguous entry yields `unknown` without dropping the hit. Body-derived conversation keys carry `legacy: true` and are informational only. The channel queries only an `ONLINE` chunk index: `POPULATING` reports `pending` without hits; missing or failed indexes report `unavailable`.
 
@@ -167,13 +167,30 @@ From each seed, expansion follows `supersedes` (both directions), `qualifies`, `
 | `relationship_context_complete` | Expansion from the returned seeds hit no limit |
 | `bundles[]` | Match provenance, source excerpts, records with supporting evidence, relations with evidence |
 
-The cosine channels score a bounded, scope-filtered vector scan; this is not an approximate-nearest-neighbor index and is sized for personal and team histories, not web-scale corpora.
+The cosine channels use scope-local Neo4j HNSW vector indexes. ANN candidate selection is approximate; only the returned, post-filtered window is rescored with cosine and sorted by score then UID. This avoids transferring/scoring the corpus and removes the 10,000-vector readiness cliff on an online index. It does not guarantee exact global nearest neighbours.
 
 Recalled material is evidence, not authority. A proposal is not an accepted decision, a changed justification does not repeal a decision by itself, and several channels matching the same turn are one source, not corroboration.
 
+### Vector indexes, widening, and fallback
+
+With `embedding` configured, `init` idempotently creates `smvc_<scope digest>` and `smvr_<scope digest>` on the scope's Chunk/Record labels and `embedding` property, with configured dimensions, cosine similarity, and quantization disabled. Without embedding configuration it creates no vector indexes. Existing indexes are not silently rebuilt: a dimension conflict fails clearly with `vector_index_dimension_mismatch`; resolve it explicitly before using a changed dimension. `init` waits only for this scope's full-text indexes, then creates/checks native schemas without waiting for vector population; its configured result includes per-kind `vector_indexes` states.
+
+Native queries start with `k=max(candidates*4,64)`. They filter scope, embedding identity, and requester exclusions **inside the query**, rescore the surviving window with exact cosine, then apply admission/limits. If too few hits survive and the index returned `k` raw rows, `k` doubles up to 4096. A short result at that cap is `partial` with `reason:"vector_overfetch_cap"`; a provider-exhausted window may return fewer hits as `ready`. Cosine values and UID tie-breaking apply within the ANN candidate window, not an exact global ranking guarantee.
+
+`status.vector_indexes` reports each kind's catalog state. Recall exposes it as `channels.chunk_vector.vector_index` / `record_vector.vector_index`:
+
+| Index state | Channel behaviour |
+|---|---|
+| `online` | Native query; no `vector_scan_limit` scan. Pending embeddings can still make the channel partial. |
+| `populating` | `partial`, reason `vector_index_populating`, no query/scan and no fabricated admission counters |
+| `missing` | Explicit legacy fallback, reported as `vector_index:"missing"`; exceeding the scan bound remains `partial` / `scan_truncated` |
+| `failed` or incompatible schema/dimensions | Unavailable with a safe reason; never silently fall back |
+
+When both indexes are missing, the fallback retains the original shared eligible UID scan bound. If only one is missing, only that kind is scanned under the bound; the healthy kind still uses its native index. Run `init` to populate indexes over an old store's existing embeddings. A fresh or rebuilt scope serves vector channels as partial until its indexes become online; poll `status` and inspect `vector_indexes.chunk` / `vector_indexes.record`. There is no `--wait` flag. Neither a native index nor a ready channel establishes currentness or completeness.
+
 ### Modes and conversation units
 
-Default recall keeps its existing semantic values and selection policy, but raw byte ordering of channel trace arrays and availability keys changes intentionally to the stable ordering documented below. Optional `mode` accepts only `evidence_advice` or `history_search` and adds `mode` plus its exact `mode_contract`; mode alone does not change admission or selection. These contracts describe intent and bounds, not assertion, authority, currentness, or completeness. Lane selection, carried-evidence collapse, following-read refusal, and adapter deadlines belong to the consumer, not this CLI.
+The default envelope, lexical, grouping, and authority rules are retained, but native ANN may change vector candidates/ranks relative to a full exact scan. Channel traces and availability keys retain the stable ordering documented below. Optional `mode` accepts only `evidence_advice` or `history_search` and adds `mode` plus its exact `mode_contract`; mode alone does not change admission or selection. These contracts describe intent and bounds, not assertion, authority, currentness, or completeness. Lane selection, carried-evidence collapse, following-read refusal, and adapter deadlines belong to the consumer, not this CLI.
 
 ```json
 {"query":"backup window", "mode":"history_search", "group":"conversation", "per_conversation":2, "limit":12, "max_chars":24000}
@@ -181,9 +198,9 @@ Default recall keeps its existing semantic values and selection policy, but raw 
 
 Only `group:"conversation"` enables grouping. `per_conversation` must be an integer from 1 to 4 (default 2); it applies inside each channel's query before `candidates`. Exclusion precedes admission and all caps. Duplicate chunks count as one turn seed; shared records must fit every cited conversation's per-channel quota. Keys are qualified by `scope`, `source`, and `conversation_id`. Legacy keys are decoded read-only from stored turn bodies and marked `legacy: true`; they never affect exclusion or lineage.
 
-The shared, eligible vector scan still obeys `vector_scan_limit` before ranking/admission; exceeding it still reports `partial` / `scan_truncated`. The grouped path ranks scanned vectors with Neo4j `vector.similarity.cosine`, breaking ties by node UID; float precision can make these ranks differ from the default JavaScript cosine. Grouped full-text channels search only `ONLINE` indexes; populating indexes remain `pending`, missing/failed indexes remain `unavailable`.
+Both vector channels prefer native indexes. Filtering and exact cosine rescoring of their bounded ANN windows precede per-conversation admission and the candidate cap. `exhausted` retains its eligible-pre-admission meaning through a count-only scope/model/exclusion census, not a guessed ANN-window total. Floating-point precision and approximate candidate selection can differ from the legacy JavaScript scan. Missing indexes alone use the fallback scan below. Grouped full-text channels search only `ONLINE` indexes; populating full-text indexes remain `pending`, missing/failed ones remain `unavailable`.
 
-Admission fields are present only on `ready` or `partial` entries among the five retrieval channels. `pending`, `unavailable`, and `unconfigured` entries, and the reranker, omit both fields rather than reporting fabricated zero activity.
+Admission fields are present only on retrieval channels that actually ran with status `ready` or `partial`. A `partial` channel whose vector index is still populating did not run and carries no admission fields. Pending, unavailable, unconfigured, and reranker entries also omit both fields rather than reporting fabricated zero activity.
 
 | Grouped output | Meaning |
 |---|---|
@@ -235,13 +252,13 @@ The response is `{kind:"units",units:[{key,seeds:[<existing bundle shape>],missi
 |---|---|
 | `bundle.match.channels` | Channel name ascending, on recall and every show/batch path; trace values and ranks are unchanged |
 | `channels` availability keys | Channel name ascending, independent of asynchronous query completion |
-| Recall seeds / units | Existing final ranking after optional reranking; units follow their best seed's final rank. No query, rank, or authority policy changes |
+| Recall seeds / units | Final cosine/rank-fusion/optional-reranker policy; units follow their best seed's final rank. Native ANN candidate selection may differ from a full scan; authority rules do not change |
 | `also_cites` | Qualified key tuple: scope, source, conversation ID |
 | `following` entries | Root UID ascending; each entry's turns retain exact parent-link traversal order, not timestamp sorting |
 | Batch units / seeds / missing | Input order, not ranking order |
 | Entry / evidence arrays | Existing retained or evidence order is preserved |
 
-Compatibility tests compare pinned older semantic values with this new canonical trace/key ordering; old raw bytes are intentionally not promised unchanged.
+Compatibility tests cover the missing-index fallback's pinned older semantic values, normalizing declared index metadata and canonical trace/key ordering. Native ANN candidate sets/ranks and old raw bytes are intentionally not promised identical.
 
 ## Local model protocols
 
@@ -264,13 +281,26 @@ npm run check            # syntax and JSON checks
 npm run test:integration # disposable loopback Neo4j container; needs Docker
 ```
 
-`npm run test:integration` starts a throwaway `neo4j:5.26.14-community` container with no published credentials, runs transaction, search, scope, graph, outage, and CLI checks with fictional data and deterministic model fixtures, and stops the container. Set `SOURCE_MEMORY_REAL_EMBEDDING_URL` (and optionally `SOURCE_MEMORY_REAL_EMBEDDING_MODEL`, default `embeddinggemma`) to additionally exercise a real local embedding endpoint. Fixture results test plumbing, not retrieval quality.
+`npm run test:integration` starts a throwaway `neo4j:5.26.14-community` container with no published credentials, runs transaction, search, scope, graph, outage, and CLI checks with fictional data and deterministic model fixtures, and stops the container. Set `SOURCE_MEMORY_REAL_EMBEDDING_URL` (and optionally `SOURCE_MEMORY_REAL_EMBEDDING_MODEL`, default `embeddinggemma`) to additionally exercise a real local embedding endpoint. Fixture results test plumbing, not retrieval quality. `node scripts/vector-benchmark.mjs` runs the isolated 768-dimensional 10k/50k scan-versus-index benchmark under the same disposable resource limits; any 50k resource/timeout failure is reported explicitly.
+
+### Vector-stage benchmark
+
+Warm medians in milliseconds: one warmup, five measured samples, 64 candidates; private Neo4j 5.26.14, 1536m memory, 2 CPUs, 512m heap, 128m pagecache. These measure vector retrieval/scoring/top-k, **not** catalog readiness, counts, model calls, fusion, rendering, or full-CLI latency. Synthetic data is not a retrieval-quality benchmark.
+
+| Dimensions | Vectors | Exact scan | Native, quantization off | Native, quantization on |
+|---:|---:|---:|---:|---:|
+| 3 | 10,000 | 160.716 | 50.134 | — |
+| 3 | 50,000 | 754.775 | 48.701 | 49.134 |
+| 768 | 10,000 | 1181.298 | 98.346 | — |
+| 768 | 50,000 | Timed out at the existing 15s transaction bound | 111.605 | — |
+
+The 768-d container held all 50,000 vectors and stopped cleanly; only the exact scan failed its original transaction deadline, so no scan median/speedup is invented for that row. Quantization remains off: the 50k comparison showed no measured off penalty, and disabling it also avoids quantized candidate selection. Both paths retain bounded exact cosine rescoring.
 
 ## Limitations
 
 - Scope allowlists come from a local configuration file. They are an operator boundary, not isolation from other processes running as the same user. Do not expose the CLI as a network service.
 - No deletion or erasure command yet.
-- Vector search is a bounded scan, not an ANN index.
+- Native vector search is approximate and bounded post-filter widening can still report partial; missing-index fallback remains scan-limited.
 - No built-in extraction model: interpretation is supplied by the caller.
 
 ## License

@@ -20,7 +20,8 @@ export class Memory {
 
   async init(scope) {
     authorize(this.config, scope, 'write');
-    return this.store.init(scope);
+    const dimensions = this.config.embedding ? integer(this.config.embedding.dimensions, undefined, 1, 4096) : null;
+    return this.store.init(scope, dimensions);
   }
 
   async ingest(scope, input) {
@@ -68,9 +69,11 @@ export class Memory {
   async status(scope) {
     authorize(this.config, scope);
     const key = embeddingIdentity(this.config.embedding);
+    const dimensions = this.config.embedding?.dimensions ?? null;
+    const states = await Promise.all(['chunk', 'record'].map(kind => this.store.vectorIndexStatus(scope, kind, dimensions)));
     return { scope, ...(await this.store.status(scope, key)),
       embedding: key ? { configured: true, model: this.config.embedding.model, key } : { configured: false },
-      reranker: { configured: Boolean(this.config.reranker) } };
+      reranker: { configured: Boolean(this.config.reranker) }, vector_indexes: { chunk: states[0], record: states[1] } };
   }
 
   async show(scope, input) {
@@ -279,31 +282,42 @@ export class Memory {
       try {
         const key = embeddingIdentity(this.config.embedding);
         const [queryVector] = await embed(this.config.embedding, [query]);
-        const vectors = await this.store.vectors(scope, key, vectorLimit + 1, exclude);
-        const counts = await this.store.status(scope, key, exclude);
-        const state = { status: vectors.length > vectorLimit || counts.unindexed > 0 ? 'partial' : 'ready',
-          scan_truncated: vectors.length > vectorLimit, unindexed: counts.unindexed, embedding_key: key };
-        if (grouped) {
-          const scanned = vectors.slice(0, vectorLimit).map(row => row.uid);
-          const results = await Promise.all(['chunk', 'record'].map(kind =>
-            this.store.admittedVectors(scope, kind, key, queryVector, scanned, candidates, perConversation, exclude)));
-          for (const [index, kind] of ['chunk', 'record'].entries()) {
-            const result = results[index];
-            channels[`${kind}_vector`] = result.hits;
-            omitted.push(...result.omitted);
-            availability[`${kind}_vector`] = { ...state, admitted_conversations: result.admitted_conversations, exhausted: result.exhausted };
+        const kinds = ['chunk', 'record'];
+        const states = await Promise.all(kinds.map(kind => this.store.vectorIndexStatus(scope, kind, queryVector.length)));
+        const missing = kinds.filter((_, index) => states[index] === 'missing');
+        const vectors = missing.length ? await this.store.vectors(scope, key, vectorLimit + 1, exclude, missing.length === 1 ? missing[0] : null) : [];
+        const counts = states.some(state => ['online', 'missing'].includes(state)) ? await this.store.status(scope, key, exclude) : null;
+        const scanned = vectors.slice(0, vectorLimit).map(row => row.uid);
+        const ranked = !grouped && missing.length ? vectors.slice(0, vectorLimit).map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
+          .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid)) : [];
+        const results = await Promise.all(kinds.map(async (kind, index) => {
+          const vector_index = states[index];
+          if (vector_index === 'populating') return { hits: [], omitted: [], state: { status: 'partial', vector_index, reason: 'vector_index_populating' } };
+          if (vector_index === 'failed') return { hits: [], omitted: [], state: { status: 'unavailable', vector_index, reason: 'vector_index_failed' } };
+          try {
+            let result;
+            if (vector_index === 'online') {
+              result = await this.store.indexedVectors(scope, kind, key, queryVector, candidates, grouped ? perConversation : null, exclude);
+              if (!grouped) result.hits = vectorHits(kind, result.nodes);
+            } else if (grouped) {
+              result = await this.store.admittedVectors(scope, kind, key, queryVector, scanned, candidates, perConversation, exclude);
+            } else {
+              result = { hits: vectorHits(kind, ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates)) };
+            }
+            const scan_truncated = vector_index === 'missing' && vectors.length > vectorLimit;
+            const state = { status: result.partial || scan_truncated || counts.unindexed > 0 ? 'partial' : 'ready',
+              scan_truncated, unindexed: counts.unindexed, embedding_key: key, vector_index,
+              ...(result.reason ? { reason: result.reason } : {}),
+              ...(grouped ? { admitted_conversations: result.admitted_conversations, exhausted: result.exhausted } : {}) };
+            return { hits: result.hits, omitted: result.omitted ?? [], state };
+          } catch (error) {
+            return { hits: [], omitted: [], state: { status: 'unavailable', vector_index, reason: safeCode(error) } };
           }
-        } else {
-          const ranked = vectors.slice(0, vectorLimit).map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
-            .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid));
-          channels.chunk_vector = ranked.filter(row => row.turn_uid).slice(0, candidates).map(row => ({
-            kind: 'turn', id: row.turn_uid, text: row.text,
-            match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
-          }));
-          channels.record_vector = ranked.filter(row => row.record_id).slice(0, candidates)
-            .map(row => ({ kind: 'record', id: row.record_id, text: row.text }));
-          availability.chunk_vector = state;
-          availability.record_vector = { ...state };
+        }));
+        for (const [index, kind] of kinds.entries()) {
+          channels[`${kind}_vector`] = results[index].hits;
+          omitted.push(...results[index].omitted);
+          availability[`${kind}_vector`] = results[index].state;
         }
       } catch (error) {
         availability.chunk_vector = { status: 'unavailable', reason: safeCode(error) };
@@ -469,6 +483,11 @@ export class Memory {
     };
   }
 }
+
+const vectorHits = (kind, nodes) => nodes.map(row => kind === 'chunk' ? {
+  kind: 'turn', id: row.turn_uid, text: row.text,
+  match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
+} : { kind: 'record', id: row.record_id, text: row.text });
 
 const followingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, occurred_at: turn.occurred_at ?? null,
   entries: turn.entries.map(entry => ({ id: entry.id, role: entry.role, text: entry.text })) });

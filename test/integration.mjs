@@ -7,7 +7,7 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Memory } from '../src/memory.mjs';
-import { identity, indexNames, namespace } from '../src/core.mjs';
+import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
 
 const exec = promisify(execFile);
@@ -21,7 +21,11 @@ const projectedFollowingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, oc
 const canonicalBundle = bundle => ({ ...bundle, match: { ...bundle.match,
   channels: [...bundle.match.channels].sort((a, b) => a.channel.localeCompare(b.channel)) } });
 const canonicalRecall = reply => ({ ...reply,
-  channels: Object.fromEntries(Object.entries(reply.channels).sort(([a], [b]) => a.localeCompare(b))),
+  channels: Object.fromEntries(Object.entries(reply.channels).map(([name, state]) => {
+    if (state.vector_index !== 'missing') return [name, state];
+    const { vector_index: _index, ...legacy } = state;
+    return [name, legacy];
+  }).sort(([a], [b]) => a.localeCompare(b))),
   bundles: reply.bundles.map(canonicalBundle),
   ...(reply.units ? { units: reply.units.map(unit => ({ ...unit, seeds: unit.seeds.map(canonicalBundle) })) } : {}) });
 function assertStableOrder(reply) {
@@ -48,7 +52,8 @@ export async function runIntegration(database, scratch) {
     if (req.url === '/embed') {
       const vector = value => /aubergine|purple/i.test(value) ? [0, 1, 0] : /amber/i.test(value) ? [-1, 0, 0] : /blue/i.test(value) ? [1, 0, 0]
         : /04:00/.test(value) ? [0, -1, 1] : /quartz/i.test(value) ? [0, -1, 0] : [0, 0, 1];
-      res.end(JSON.stringify({ model: 'fixture-only', data: input.input.map((value, index) => ({ index, embedding: vector(value) })) }));
+      res.end(JSON.stringify({ model: input.model, data: input.input.map((value, index) => ({ index,
+        embedding: input.model === 'native-fixture' ? [1, 0, 0.2] : vector(value) })) }));
     } else {
       const favored = req.url === '/owner-rerank' ? 'B_OWNER_MARKER' : req.url === '/large-rerank' ? 'LARGE_OWNER_MARKER' : null;
       res.end(JSON.stringify({ results: input.documents.map((value, index) => ({ index,
@@ -58,10 +63,24 @@ export async function runIntegration(database, scratch) {
   model.listen(0, '127.0.0.1');
   await once(model, 'listening');
   const url = `http://127.0.0.1:${model.address().port}`;
-  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing', 'follow'], write: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing', 'follow'] },
+  const config = { neo4j: database, scopes: { read: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing', 'follow', 'vector', 'vector-scale', 'no-embedding'], write: ['demo', 'foreign', 'exclusion', 'lexical', 'modes', 'packing', 'follow', 'vector', 'vector-scale', 'no-embedding'] },
     embedding: { url: `${url}/embed`, model: 'fixture-only', dimensions: 3 },
     reranker: { url: `${url}/rerank`, model: 'fixture-only' } };
   const memory = new Memory(config);
+  const waitForVectors = async (client, scope) => {
+    const deadline = performance.now() + 120000;
+    while (performance.now() < deadline) {
+      const states = (await client.status(scope)).vector_indexes;
+      if (Object.values(states).every(state => state === 'online')) return;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error('private vector indexes did not become online');
+  };
+  const withoutVectorIndexes = async (scope, action) => {
+    const names = indexNames(scope);
+    for (const name of [names.vectorChunks, names.vectorRecords]) await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name} IF EXISTS`));
+    try { return await action(); } finally { await memory.init(scope); await waitForVectors(memory, scope); }
+  };
   const turn = (id, value) => ({ source: 'integration-fixture', conversation_id: 'conversation', turn_id: id,
     entries: [{ id: `u-${id}`, role: 'user', text: value }] });
   const oldInput = turn('old', 'Use blue for the dashboard.');
@@ -76,6 +95,188 @@ export async function runIntegration(database, scratch) {
     await memory.init('modes');
     await memory.init('packing');
     await memory.init('follow');
+    const nativeConfig = { ...config, embedding: { ...config.embedding, model: 'native-fixture' }, reranker: undefined };
+    const native = new Memory(nativeConfig, memory.store);
+    const nativeKey = embeddingIdentity(nativeConfig.embedding);
+    const queryVector = [1, 0, 0.2];
+    const fixtureText = 'Synthetic source.';
+    const addVectors = async (scope, category, start, count, vector, modelKey = nativeKey, parents = 200) => {
+      const ns = namespace(scope);
+      const chunks = [];
+      for (let first = start; first < start + count; first += 500) {
+        const rows = [];
+        for (let index = first; index < Math.min(first + 500, start + count); index += 1) {
+          const conversation = `${category}-${index % parents}`;
+          const uid = identity('turn', scope, 'vector-fixture', conversation, 'root');
+          const body = { source: 'vector-fixture', conversation_id: conversation, turn_id: 'root', parent_turn_id: null,
+            lineage_root: true, occurred_at: null, entries: [{ id: 'v', role: 'user', text: fixtureText, occurred_at: null }] };
+          const chunk = { uid: identity('chunk', scope, uid, index), scope, turn_uid: uid, ordinal: index,
+            entry_id: 'v', role: 'user', start: 0, end: fixtureText.length, text: fixtureText, embedding: vector(index), embedding_key: modelKey };
+          chunks.push(chunk);
+          rows.push({ parent: { uid, scope, source: body.source, conversation_id: conversation, turn_key: 'root',
+            lineage: true, lineage_root: true, chunked: true, body: JSON.stringify(body), text: fixtureText }, chunk });
+        }
+        await memory.store.transaction('write', tx => tx.run(`UNWIND $rows AS row
+          MERGE (t:SMTurn {uid:row.parent.uid}) ON CREATE SET t:${ns}Turn,t += row.parent
+          CREATE (c:SMChunk:${ns}Chunk) SET c=row.chunk CREATE (t)-[:SM_HAS_CHUNK]->(c)`, { rows }));
+      }
+      return chunks;
+    };
+    await native.init('vector');
+    await waitForVectors(native, 'vector');
+    const points = await addVectors('vector', 'eligible', 0, 130, index => index >= 128 ? queryVector : [1, index / 8, 0.2]);
+    const recordRows = points.map((point, index) => {
+      const id = `vector-record-${index}`;
+      const body = { id, kind: 'observation', status: 'observed', attribution: 'fixture', text: fixtureText,
+        evidence: [{ turn: point.turn_uid, entry_id: 'v', start: 0, end: fixtureText.length }] };
+      return { uid: identity('record', 'vector', id), scope: 'vector', record_id: id, text: fixtureText, body: JSON.stringify(body),
+        embedding: point.embedding, embedding_key: nativeKey, turn: point.turn_uid };
+    });
+    await memory.store.transaction('write', tx => tx.run(`UNWIND $rows AS row
+      CREATE (r:SMRecord:${namespace('vector')}Record) SET r=row
+      WITH r,row MATCH (t:SMTurn {uid:row.turn}) CREATE (r)-[:SM_EVIDENCE]->(t)`, { rows: recordRows }));
+    await check('quantization-off native candidate sets and cosine ordering match exact fixture top-k for both kinds', async () => {
+      for (const kind of ['chunk', 'record']) {
+        const scan = (await memory.store.vectors('vector', nativeKey, 1000, [], kind))
+          .map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
+          .sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid)).slice(0, 4);
+        const indexed = await memory.store.indexedVectors('vector', kind, nativeKey, queryVector, 4);
+        assert.deepEqual([indexed.nodes.map(row => row.uid), indexed.partial,
+          indexed.nodes.every((row, index) => Math.abs(row.similarity - scan[index].similarity) < 0.000001)],
+        [scan.map(row => row.uid), false, true]);
+      }
+    });
+    await check('native init is idempotent validates dimensions and creates no vector indexes without embedding configuration', async () => {
+      const initialized = await native.init('vector');
+      assert.deepEqual(initialized.vector_indexes, { chunk: 'online', record: 'online' });
+      const mismatch = new Memory({ ...nativeConfig, embedding: { ...nativeConfig.embedding, dimensions: 4 } }, memory.store);
+      await assert.rejects(mismatch.init('vector'), { code: 'vector_index_dimension_mismatch' });
+      const unconfigured = new Memory({ ...config, embedding: undefined }, memory.store);
+      await unconfigured.init('no-embedding');
+      const options = await memory.store.transaction('read', tx => tx.run('SHOW VECTOR INDEXES YIELD name,options WHERE name=$name RETURN options',
+        { name: indexNames('vector').vectorChunks }));
+      assert.deepEqual([(await native.status('vector')).vector_indexes, (await unconfigured.status('no-embedding')).vector_indexes,
+        options.records[0].get('options').indexConfig['vector.quantization.enabled']],
+        [{ chunk: 'online', record: 'online' }, { chunk: 'missing', record: 'missing' }, false]);
+    });
+    await addVectors('vector', 'dominant', 0, 128, () => queryVector, nativeKey, 1);
+    await addVectors('vector', 'stale', 0, 64, () => queryVector, 'old-model', 1);
+    const vectorExclusion = [{ source: 'vector-fixture', conversation_id: 'dominant-0' }, { source: 'vector-fixture', conversation_id: 'stale-0' }];
+    await check('native post-filter rejects other models and excluded neighbours before limit and widens to eligible hits', async () => {
+      const result = await memory.store.indexedVectors('vector', 'chunk', nativeKey, queryVector, 4, null, vectorExclusion);
+      const grouped = await memory.store.indexedVectors('vector', 'chunk', nativeKey, queryVector, 4, 2, vectorExclusion);
+      assert.deepEqual([result.nodes.length, result.nodes.every(row => row.embedding_key === nativeKey && points.some(point => point.uid === row.uid)),
+        result.k > 64, result.partial, grouped.hits.length, grouped.admitted_conversations, grouped.exhausted, grouped.partial],
+      [4, true, true, false, 4, 4, true, false], 'native vector post-filter and widening must preserve eligible top-k');
+    });
+    await addVectors('vector', 'blocked', 0, 5000, () => queryVector, nativeKey, 1);
+    const cappedExclusion = [...vectorExclusion, { source: 'vector-fixture', conversation_id: 'blocked-0' }];
+    await check('native widening cap reports partial rather than claiming an empty complete result', async () => {
+      const result = await memory.store.indexedVectors('vector', 'chunk', nativeKey, queryVector, 4, null, cappedExclusion);
+      const recalled = await native.recall('vector', { query: 'vectorquery', candidates: 4, exclude_conversations: cappedExclusion });
+      assert.deepEqual([result.k, result.partial, result.reason, recalled.channels.chunk_vector.status,
+        recalled.channels.chunk_vector.vector_index, recalled.channels.chunk_vector.reason, recalled.channels.chunk_vector.scan_truncated],
+      [4096, true, 'vector_overfetch_cap', 'partial', 'online', 'vector_overfetch_cap', false], 'native vector cap must remain partial');
+    });
+    await check('native scope labels and the in-query scope filter isolate a sibling scope', async () => {
+      const foreign = await addVectors('foreign', 'native-sibling', 0, 1, () => queryVector);
+      const result = await memory.store.indexedVectors('vector', 'chunk', nativeKey, queryVector, 32);
+      assert.deepEqual([result.nodes.length, result.nodes.every(row => row.scope === 'vector' && !foreign.some(point => point.uid === row.uid))], [32, true]);
+      const sibling = await memory.store.indexedVectors('foreign', 'chunk', nativeKey, queryVector, 4);
+      assert.deepEqual(sibling.nodes.map(row => row.uid), foreign.map(row => row.uid));
+    });
+    await check('one missing vector index falls back only for that kind and reports its own index state', async () => {
+      const names = indexNames('vector');
+      await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${names.vectorRecords}`));
+      const original = memory.store.vectors;
+      const scans = [];
+      memory.store.vectors = (...args) => { scans.push(args[4]); return original.apply(memory.store, args); };
+      try {
+        const reply = await native.recall('vector', { query: 'vectorquery', candidates: 4, exclude_conversations: cappedExclusion });
+        assert.deepEqual([scans, reply.channels.chunk_vector.vector_index, reply.channels.record_vector.vector_index,
+          reply.channels.record_vector.status, (await native.status('vector')).vector_indexes],
+        [['record'], 'online', 'missing', 'ready', { chunk: 'online', record: 'missing' }]);
+      } finally { memory.store.vectors = original; await native.init('vector'); await waitForVectors(native, 'vector'); }
+    });
+    const timings = [];
+    const samples = async action => {
+      await action();
+      const values = [];
+      for (let index = 0; index < 5; index += 1) {
+        const start = performance.now();
+        await action();
+        values.push(performance.now() - start);
+      }
+      return { median_ms: Number([...values].sort((a, b) => a - b)[2].toFixed(3)), samples_ms: values.map(value => Number(value.toFixed(3))) };
+    };
+    const measure = async count => {
+      const scan = await samples(async () => (await memory.store.vectors('vector-scale', nativeKey, count + 1, [], 'chunk'))
+        .map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
+        .sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid)).slice(0, 64));
+      const index = await samples(() => memory.store.indexedVectors('vector-scale', 'chunk', nativeKey, queryVector, 64));
+      timings.push({ vectors: count, scan, index_quantization_off: index, speedup: Number((scan.median_ms / index.median_ms).toFixed(2)) });
+    };
+    const scalePoint = index => [Math.cos(index * 0.61803398875), Math.sin(index * 0.61803398875), 0.2];
+    const noIndex = new Memory({ ...config, embedding: undefined }, memory.store);
+    await noIndex.init('vector-scale');
+    await addVectors('vector-scale', 'scale', 0, 10000, scalePoint);
+    await native.init('vector-scale');
+    await waitForVectors(native, 'vector-scale');
+    await measure(10000);
+    await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${indexNames('vector-scale').vectorChunks}`));
+    await addVectors('vector-scale', 'scale', 10000, 40000, scalePoint);
+    await check('a real populating vector index is partial without running native retrieval or fabricating admission fields', async () => {
+      const initializing = native.init('vector-scale');
+      const original = memory.store.vectorIndexStatus;
+      let observed = null;
+      try {
+        for (let index = 0; index < 300; index += 1) {
+          const state = await original.call(memory.store, 'vector-scale', 'chunk', 3);
+          if (state === 'populating') { observed = state; break; }
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        assert.equal(observed, 'populating');
+        // Freeze an actually observed population state so the transition to ONLINE cannot race this assertion.
+        memory.store.vectorIndexStatus = (scope, kind, dimensions) => scope === 'vector-scale' && kind === 'chunk'
+          ? Promise.resolve(observed) : original.call(memory.store, scope, kind, dimensions);
+        const reply = await native.recall('vector-scale', { query: 'scalabilityprobe', group: 'conversation', candidates: 8 });
+        assert.deepEqual(reply.channels.chunk_vector, { status: 'partial', vector_index: 'populating', reason: 'vector_index_populating' });
+      } finally { memory.store.vectorIndexStatus = original; await initializing; }
+    });
+    await waitForVectors(native, 'vector-scale');
+    await check('more than ten thousand indexed vectors never invoke the scan or become partial from vector_scan_limit', async () => {
+      const original = memory.store.vectors;
+      memory.store.vectors = () => { throw new Error('online index attempted a brute-force scan'); };
+      try {
+        const indexed = new Memory({ ...nativeConfig, vector_scan_limit: 2 }, memory.store);
+        for (const grouping of [{}, { group: 'conversation' }]) {
+          const reply = await indexed.recall('vector-scale', { query: 'scalabilityprobe', candidates: 8, limit: 1, ...grouping });
+          assert.deepEqual(['chunk_vector', 'record_vector'].map(name => [reply.channels[name].status, reply.channels[name].vector_index,
+            reply.channels[name].scan_truncated]), [['ready', 'online', false], ['ready', 'online', false]]);
+          assert.equal(reply.bundles.length > 0, true);
+        }
+      } finally { memory.store.vectors = original; }
+    });
+    await measure(50000);
+    const scaleIndex = indexNames('vector-scale').vectorChunks;
+    await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${scaleIndex}`));
+    await memory.store.transaction('write', tx => tx.run(`CREATE VECTOR INDEX ${scaleIndex} FOR (n:${namespace('vector-scale')}Chunk) ON (n.embedding)
+      OPTIONS {indexConfig:{\`vector.dimensions\`:3,\`vector.similarity_function\`:'cosine',\`vector.quantization.enabled\`:true}}`));
+    for (let attempt = 0; attempt < 600; attempt += 1) {
+      if (await memory.store.vectorIndexStatus('vector-scale', 'chunk', 3) === 'online') break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.equal(await memory.store.vectorIndexStatus('vector-scale', 'chunk', 3), 'online');
+    timings[1].index_quantization_on = await samples(() => memory.store.indexedVectors('vector-scale', 'chunk', nativeKey, queryVector, 64));
+    await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${scaleIndex}`));
+    await native.init('vector-scale');
+    await waitForVectors(native, 'vector-scale');
+    await writeFile('.memory-local/vector-index-latency.json', JSON.stringify({
+      fixture: 'private Neo4j 5.26.14; 1536m memory; 2 CPUs; 512m heap; 128m pagecache', dimensions: 3, candidates: 64,
+      measurement: 'warm vector retrieval/scoring/top-k only; excludes catalog readiness, corpus counts, fusion and bundle rendering',
+      warmups: 1, measured_runs: 5, results: timings,
+    }, null, 2));
+    console.log(`VECTOR_LATENCY ${JSON.stringify(timings)}`);
     const plain = new Memory({ ...config, embedding: undefined, reranker: undefined }, memory.store);
     const key = embeddingIdentity(config.embedding);
     const fiveChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'];
@@ -134,7 +335,7 @@ export async function runIntegration(database, scratch) {
         result.hits.every(hit => hit.conversations.every(context => context.key.conversation_id === 'other'))]),
       Array.from({ length: 5 }, () => [1, 1, false, true]), 'exclusion must precede grouped channel caps');
     });
-    await check('grouped vector exclusion precedes the shared scan bound and scan truncation remains partial', async () => {
+    await check('missing-index fallback exclusion precedes the shared scan bound and scan truncation remains partial', async () => withoutVectorIndexes('modes', async () => {
       const bounded = new Memory({ ...config, vector_scan_limit: 2 }, memory.store);
       const request = { query: 'admissionneedle', group: 'conversation', candidates: 3 };
       const excluded = await bounded.recall('modes', { ...request, exclude_conversations: excludedFlood });
@@ -144,7 +345,7 @@ export async function runIntegration(database, scratch) {
         typeof full.channels[name].admitted_conversations, typeof full.channels[name].exhausted]),
       [['ready', false, 1, 'partial', true, 'number', 'boolean'], ['ready', false, 1, 'partial', true, 'number', 'boolean']],
         'vector exclusion must precede the shared scan cap');
-    });
+    }));
     await check('grouped pending counts exclude unindexed text from excluded conversations', async () => {
       const deferred = new Memory({ ...config, index_on_write: false }, memory.store);
       await deferred.ingest('modes', modeTurn('flood', 'deferred', 'admissionneedle quartz still unindexed'));
@@ -191,7 +392,7 @@ export async function runIntegration(database, scratch) {
       }
       await assert.rejects(denied.conversationUnits('not-allowed', [], {}, [], 'q', 1, 256, 1, 0), { code: 'scope_denied' });
     });
-    await check('absent following preserves pinned I1 and PR8 semantic values with intentional stable trace ordering', async () => {
+    await check('missing-index fallback preserves pinned I1 and PR8 semantics apart from declared ordering and index metadata', async () => withoutVectorIndexes('modes', async () => {
       const cache = store => {
         const results = new Map();
         return new Proxy(store, { get(target, name) {
@@ -228,17 +429,18 @@ export async function runIntegration(database, scratch) {
             const before = canonicalRecall(await old.recall('modes', request));
             const reply = await current.recall('modes', request);
             assertStableOrder(reply);
-            assert.deepEqual(reply, before);
+            assert.deepEqual(canonicalRecall(reply), before);
+            assert.deepEqual([reply.channels.chunk_vector.vector_index, reply.channels.record_vector.vector_index], ['missing', 'missing']);
             for (const unit of reply.units ?? []) assert.equal(Object.hasOwn(unit, 'following'), false);
-            if (!request.group) assert.deepEqual(await current.recall('modes', { ...request, per_conversation: 4 }), before);
+            if (!request.group) assert.deepEqual(canonicalRecall(await current.recall('modes', { ...request, per_conversation: 4 })), before);
             for (const mode of Object.keys(contracts)) {
               const { mode: echoed, mode_contract, ...rest } = await current.recall('modes', { ...request, mode });
-              assert.deepEqual([rest, echoed, mode_contract], [before, mode, contracts[mode]]);
+              assert.deepEqual([canonicalRecall(rest), echoed, mode_contract], [before, mode, contracts[mode]]);
             }
           }
         } finally { await original.close(); }
       }
-    });
+    }));
     const packingA = modeTurn('a', 'pack-a', `${'packneedle '.repeat(30)}A_OWNER_MARKER`);
     const packingB = modeTurn('b', 'pack-b', `B_OWNER_MARKER ${'context '.repeat(180)}packneedle`);
     const packedA = await plain.ingest('packing', packingA);
