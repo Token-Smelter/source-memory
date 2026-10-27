@@ -289,7 +289,11 @@ export async function applyReviewedMemoryLinks({ memory, scope, result, review, 
     plan.invoked = true;
     const written = await memory.enrich(scope, copy(payload));
     const expectedIds = [...prepared.edge_ids].sort();
-    requireThat(written?.ok !== false && Array.isArray(written?.records) && written.records.length === 0
+    const plainReceipt = written !== null && typeof written === 'object' && !Array.isArray(written)
+      && [Object.prototype, null].includes(Object.getPrototypeOf(written));
+    requireThat(plainReceipt && (!Object.hasOwn(written, 'ok') || written.ok === true)
+      && Object.hasOwn(written, 'records') && Object.hasOwn(written, 'relations')
+      && Array.isArray(written.records) && written.records.length === 0
       && Object.keys(written).every(key => ['ok', 'records', 'relations', 'indexing'].includes(key))
       && Array.isArray(written.relations) && written.relations.length === expectedIds.length
       && canonical([...written.relations].sort()) === canonical(expectedIds), 'link_append_receipt_invalid');

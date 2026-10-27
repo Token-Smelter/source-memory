@@ -570,7 +570,8 @@ for (const effectBeforeError of [false, true]) {
   });
 }
 
-for (const mismatch of ['records', 'missing', 'extra', 'duplicate', 'false_ok', 'ambiguous_status']) {
+for (const mismatch of ['records', 'missing', 'extra', 'duplicate', 'false_ok', 'ambiguous_status',
+  'null_ok', 'zero_ok', 'string_ok', 'undefined_ok', 'array_envelope', 'null_envelope', 'non_plain_envelope']) {
   test(`ambiguous_append_receipt_${mismatch}_is_terminal_unknown`, async () => {
     const { request, memory } = await setup();
     const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
@@ -583,6 +584,13 @@ for (const mismatch of ['records', 'missing', 'extra', 'duplicate', 'false_ok', 
       if (mismatch === 'duplicate') receipt.relations.push(receipt.relations[0]);
       if (mismatch === 'false_ok') receipt.ok = false;
       if (mismatch === 'ambiguous_status') receipt.status = 'unknown';
+      if (mismatch === 'null_ok') receipt.ok = null;
+      if (mismatch === 'zero_ok') receipt.ok = 0;
+      if (mismatch === 'string_ok') receipt.ok = 'x';
+      if (mismatch === 'undefined_ok') receipt.ok = undefined;
+      if (mismatch === 'array_envelope') return Object.assign([], receipt);
+      if (mismatch === 'null_envelope') return null;
+      if (mismatch === 'non_plain_envelope') return Object.assign(Object.create({ fictional: true }), receipt);
       return receipt;
     };
     await assert.rejects(apply(request, result), { code: 'link_append_unknown' });
