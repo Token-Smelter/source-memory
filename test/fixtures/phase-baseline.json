@@ -1,0 +1,196 @@
+{
+ "plain": {
+  "calls": [
+   [
+    "lexical",
+    "s",
+    "turn",
+    "dashboard color",
+    64,
+    []
+   ],
+   [
+    "lexical",
+    "s",
+    "record",
+    "dashboard color",
+    64,
+    []
+   ],
+   [
+    "chunkLexicalStatus",
+    "s"
+   ],
+   [
+    "chunkLexical",
+    "s",
+    "dashboard color",
+    64,
+    []
+   ],
+   [
+    "getRecord",
+    "s",
+    "r1"
+   ],
+   [
+    "neighbors",
+    "s",
+    [
+     "r1"
+    ],
+    193
+   ],
+   [
+    "getTurn",
+    "s",
+    "t1"
+   ],
+   [
+    "getTurn",
+    "s",
+    "t1"
+   ],
+   [
+    "recordsForTurn",
+    "s",
+    "t1",
+    49
+   ],
+   [
+    "neighbors",
+    "s",
+    [
+     "r1"
+    ],
+    193
+   ],
+   [
+    "getTurn",
+    "s",
+    "t1"
+   ]
+  ],
+  "reply": "{\"ok\":true,\"scope\":\"s\",\"query\":\"dashboard color\",\"status\":\"ready\",\"channels\":{\"chunk_lexical\":{\"status\":\"ready\"},\"chunk_vector\":{\"status\":\"unconfigured\"},\"record_lexical\":{\"status\":\"ready\"},\"record_vector\":{\"status\":\"unconfigured\"},\"reranker\":{\"status\":\"unconfigured\"},\"turn_lexical\":{\"status\":\"ready\"}},\"retrieval_complete\":false,\"relationship_context_complete\":true,\"budget_omitted\":0,\"candidate_count\":2,\"excluded_conversations\":0,\"bundles\":[{\"match\":{\"kind\":\"record\",\"id\":\"r1\",\"rank_score\":0.01639344262295082,\"channels\":[{\"channel\":\"record_lexical\",\"rank\":1}]},\"source\":null,\"records\":[{\"uid\":\"r-uid\",\"id\":\"r1\",\"kind\":\"claim\",\"text\":\"color is teal\",\"evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13}],\"supporting_evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13,\"role\":\"user\",\"text\":\"dashboard\",\"occurred_at\":null,\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\"}]}],\"relations\":[],\"relationship_context_complete\":true,\"gaps\":[]},{\"match\":{\"kind\":\"turn\",\"id\":\"t1\",\"rank_score\":0.01639344262295082,\"channels\":[{\"channel\":\"turn_lexical\",\"rank\":1}]},\"source\":{\"id\":\"t1\",\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\",\"parent_turn_id\":null,\"occurred_at\":null,\"excerpts\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":0,\"end\":35,\"role\":\"user\",\"text\":\"the dashboard color changed to teal\"}],\"full_turn_available_via_show\":true,\"excerpted\":false},\"records\":[{\"uid\":\"r-uid\",\"id\":\"r1\",\"kind\":\"claim\",\"text\":\"color is teal\",\"evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13}],\"supporting_evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13,\"role\":\"user\",\"text\":\"dashboard\",\"occurred_at\":null,\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\"}]}],\"relations\":[],\"relationship_context_complete\":true,\"gaps\":[]}],\"authority\":\"Evidence and attributed records; not execution permission or a guarantee of current state.\"}\n"
+ },
+ "grouped": {
+  "calls": [
+   [
+    "lexicalStatus",
+    "s",
+    "turn"
+   ],
+   [
+    "lexicalStatus",
+    "s",
+    "record"
+   ],
+   [
+    "lexicalStatus",
+    "s",
+    "chunk"
+   ],
+   [
+    "admittedLexical",
+    "s",
+    "turn",
+    "dashboard color",
+    64,
+    2,
+    []
+   ],
+   [
+    "admittedLexical",
+    "s",
+    "record",
+    "dashboard color",
+    64,
+    2,
+    []
+   ],
+   [
+    "admittedLexical",
+    "s",
+    "chunk",
+    "dashboard color",
+    64,
+    2,
+    []
+   ],
+   [
+    "getRecord",
+    "s",
+    "r1"
+   ],
+   [
+    "neighbors",
+    "s",
+    [
+     "r1"
+    ],
+    193
+   ],
+   [
+    "getTurn",
+    "s",
+    "t1"
+   ],
+   [
+    "recordsForTurn",
+    "s",
+    "t1",
+    49
+   ],
+   [
+    "neighbors",
+    "s",
+    [
+     "r1"
+    ],
+    193
+   ],
+   [
+    "childTurns",
+    "s",
+    {
+     "id": "t1",
+     "scope": "s",
+     "source": "src",
+     "conversation_id": "c1",
+     "turn_id": "x1",
+     "parent_turn_id": null,
+     "occurred_at": null,
+     "entries": [
+      {
+       "id": "e1",
+       "role": "user",
+       "text": "the dashboard color changed to teal"
+      }
+     ]
+    },
+    2
+   ],
+   [
+    "unlinkedTurns",
+    "s",
+    {
+     "id": "t1",
+     "scope": "s",
+     "source": "src",
+     "conversation_id": "c1",
+     "turn_id": "x1",
+     "parent_turn_id": null,
+     "occurred_at": null,
+     "entries": [
+      {
+       "id": "e1",
+       "role": "user",
+       "text": "the dashboard color changed to teal"
+      }
+     ]
+    }
+   ]
+  ],
+  "reply": "{\"ok\":true,\"scope\":\"s\",\"query\":\"dashboard color\",\"status\":\"ready\",\"channels\":{\"chunk_lexical\":{\"status\":\"ready\",\"admitted_conversations\":1,\"exhausted\":true},\"chunk_vector\":{\"status\":\"unconfigured\"},\"record_lexical\":{\"status\":\"ready\",\"admitted_conversations\":1,\"exhausted\":true},\"record_vector\":{\"status\":\"unconfigured\"},\"reranker\":{\"status\":\"unconfigured\"},\"turn_lexical\":{\"status\":\"ready\",\"admitted_conversations\":1,\"exhausted\":true}},\"retrieval_complete\":false,\"relationship_context_complete\":true,\"budget_omitted\":0,\"candidate_count\":2,\"excluded_conversations\":0,\"bundles\":[{\"match\":{\"kind\":\"record\",\"id\":\"r1\",\"rank_score\":0.01639344262295082,\"channels\":[{\"channel\":\"record_lexical\",\"rank\":1}]},\"source\":null,\"records\":[{\"uid\":\"r-uid\",\"id\":\"r1\",\"kind\":\"claim\",\"text\":\"color is teal\",\"evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13}],\"supporting_evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13,\"role\":\"user\",\"text\":\"dashboard\",\"occurred_at\":null,\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\"}]}],\"relations\":[],\"relationship_context_complete\":true,\"gaps\":[]},{\"match\":{\"kind\":\"turn\",\"id\":\"t1\",\"rank_score\":0.01639344262295082,\"channels\":[{\"channel\":\"turn_lexical\",\"rank\":1}]},\"source\":{\"id\":\"t1\",\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\",\"parent_turn_id\":null,\"occurred_at\":null,\"excerpts\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":0,\"end\":35,\"role\":\"user\",\"text\":\"the dashboard color changed to teal\"}],\"full_turn_available_via_show\":true,\"excerpted\":false},\"records\":[{\"uid\":\"r-uid\",\"id\":\"r1\",\"kind\":\"claim\",\"text\":\"color is teal\",\"evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13}],\"supporting_evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13,\"role\":\"user\",\"text\":\"dashboard\",\"occurred_at\":null,\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\"}]}],\"relations\":[],\"relationship_context_complete\":true,\"gaps\":[]}],\"authority\":\"Evidence and attributed records; not execution permission or a guarantee of current state.\",\"units\":[{\"key\":{\"scope\":\"s\",\"source\":\"src\",\"conversation_id\":\"c1\"},\"seeds\":[{\"match\":{\"kind\":\"record\",\"id\":\"r1\",\"rank_score\":0.01639344262295082,\"channels\":[{\"channel\":\"record_lexical\",\"rank\":1}]},\"source\":null,\"records\":[{\"uid\":\"r-uid\",\"id\":\"r1\",\"kind\":\"claim\",\"text\":\"color is teal\",\"evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13}],\"supporting_evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13,\"role\":\"user\",\"text\":\"dashboard\",\"occurred_at\":null,\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\"}]}],\"relations\":[],\"relationship_context_complete\":true,\"gaps\":[]},{\"match\":{\"kind\":\"turn\",\"id\":\"t1\",\"rank_score\":0.01639344262295082,\"channels\":[{\"channel\":\"turn_lexical\",\"rank\":1}]},\"source\":{\"id\":\"t1\",\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\",\"parent_turn_id\":null,\"occurred_at\":null,\"excerpts\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":0,\"end\":35,\"role\":\"user\",\"text\":\"the dashboard color changed to teal\"}],\"full_turn_available_via_show\":true,\"excerpted\":false},\"records\":[{\"uid\":\"r-uid\",\"id\":\"r1\",\"kind\":\"claim\",\"text\":\"color is teal\",\"evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13}],\"supporting_evidence\":[{\"turn\":\"t1\",\"entry_id\":\"e1\",\"start\":4,\"end\":13,\"role\":\"user\",\"text\":\"dashboard\",\"occurred_at\":null,\"source\":\"src\",\"conversation_id\":\"c1\",\"turn_id\":\"x1\"}]}],\"relations\":[],\"relationship_context_complete\":true,\"gaps\":[]}],\"seeds_truncated\":0,\"also_cites\":[],\"following\":[{\"after\":\"t1\",\"status\":\"recorded_end\",\"bound\":null,\"turns\":[],\"unlinked_turns\":0}]}],\"pool_truncated\":0,\"budget_unit\":\"utf8_bytes\"}\n"
+ }
+}

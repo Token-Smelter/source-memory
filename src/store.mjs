@@ -1,4 +1,5 @@
 import neo4j from 'neo4j-driver';
+import { passthrough } from './phase-diagnostic.mjs';
 import { digest, identity, indexNames, integer, namespace, requireThat, sourceExcerpt, lexicalQuery } from './core.mjs';
 
 const unwrap = node => node?.properties ?? null;
@@ -284,14 +285,14 @@ export class Neo4jStore {
     });
   }
 
-  async admittedLexical(scope, kind, query, limit, perConversation, exclude = []) {
+  async admittedLexical(scope, kind, query, limit, perConversation, exclude = [], trace = passthrough) {
     const lucene = lexicalQuery(query);
     if (!lucene) return { hits: [], omitted: [], admitted_conversations: 0, exhausted: false };
     const index = indexNames(scope)[{ turn: 'turns', record: 'records', chunk: 'chunks' }[kind]];
     return this.admission(scope, kind, `CALL db.index.fulltext.queryNodes($index,$query) YIELD node,score WHERE ${eligible('node')}
       WITH node,score ORDER BY score DESC,node.uid
       WITH collect({node:node,score:score}) AS matches
-      WITH matches,size(matches) AS total`, { index, query: lucene, limit: neo4j.int(limit), per: neo4j.int(perConversation), exclude });
+      WITH matches,size(matches) AS total`, { index, query: lucene, limit: neo4j.int(limit), per: neo4j.int(perConversation), exclude }, false, trace);
   }
 
   async admittedVectors(scope, kind, model, vector, scanned, limit, perConversation, exclude = []) {
@@ -307,11 +308,11 @@ export class Neo4jStore {
       }`, { model, vector, scanned, limit: neo4j.int(limit), per: neo4j.int(perConversation), exclude });
   }
 
-  async admission(scope, kind, search, params, withRawCount = false) {
+  async admission(scope, kind, search, params, withRawCount = false, trace = passthrough) {
     return this.transaction('read', async tx => {
       // Neo4j core cannot decode JSON. Only legacy grouping keys are decoded here; exclusion never uses this map.
-      const old = await tx.run(`MATCH (t:SMTurn {scope:$scope}) WHERE t.source IS NULL OR t.conversation_id IS NULL
-        RETURN t.uid AS uid,t.body AS body`, { scope });
+      const old = await trace(`admission.${kind}.legacy`, () => tx.run(`MATCH (t:SMTurn {scope:$scope}) WHERE t.source IS NULL OR t.conversation_id IS NULL
+        RETURN t.uid AS uid,t.body AS body`, { scope }));
       const legacy = Object.fromEntries(old.records.map(row => {
         const body = JSON.parse(row.get('body'));
         return [row.get('uid'), { source: body.source, conversation_id: body.conversation_id }];
@@ -320,7 +321,7 @@ export class Neo4jStore {
         ? 'MATCH (parent:SMTurn {scope:$scope})-[:SM_HAS_CHUNK]->(node) WITH node,score,collect(DISTINCT parent) AS parents'
         : 'CALL { WITH node MATCH (node)-[:SM_EVIDENCE]->(parent:SMTurn {scope:$scope}) RETURN collect(DISTINCT parent) AS parents }';
       const seed = kind === 'chunk' ? 'parents[0].uid' : 'node.uid';
-      const result = await tx.run(`${search}
+      const result = await trace(`admission.${kind}.search`, () => tx.run(`${search}
         CALL {
           WITH matches UNWIND matches AS candidate WITH candidate.node AS node,candidate.score AS score
           ${parents}
@@ -337,7 +338,7 @@ export class Neo4jStore {
             {kind:$seedKind,id:CASE WHEN $seedKind='record' THEN hit.node.record_id ELSE hit.seed_id END,keys:hit.keys}] AS omitted
         }
         RETURN admitted[..$limit] AS rows,omitted,total > $limit AS exhausted${withRawCount ? ',raw_count,size(matches) AS considered' : ''}`,
-      { ...params, scope, legacy, seedKind: kind === 'record' ? 'record' : 'turn' });
+      { ...params, scope, legacy, seedKind: kind === 'record' ? 'record' : 'turn' }));
       const row = result.records[0];
       const hits = (row?.get('rows') ?? []).map(hit => {
         const node = unwrap(hit.node);

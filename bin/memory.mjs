@@ -6,6 +6,7 @@ import { MemoryError, requireThat } from '../src/core.mjs';
 import { warm } from '../src/warm.mjs';
 import { warmDb } from '../src/warm-db.mjs';
 import { isPoolRequest, serializePoolReply } from '../src/envelope.mjs';
+import { createStreamSink } from '../src/phase-diagnostic.mjs';
 
 const HELP = `source-memory <init|ingest|enrich|index|recall|show|status|warm> [--config FILE] --scope SCOPE [--input FILE]
 
@@ -13,6 +14,7 @@ const HELP = `source-memory <init|ingest|enrich|index|recall|show|status|warm> [
 
 JSON input is read from --input or stdin for ingest/enrich/recall/show.
 index accepts optional --input {"limit":256}; init/status/warm need no input.
+recall accepts --diagnostic-phases v1: bounded start/end phase markers and one footer line on stderr; stdout is unchanged.
 warm sends one fixed embedding request and never touches the database.
 warm --db v1 instead runs the read-only recall query paths once against Neo4j, makes no model call, and reports ready or unavailable.
 Source is copied by the caller, never transcribed by a model or discovered from host paths.
@@ -42,16 +44,17 @@ async function fileJson(path, max) {
 export async function main(argv = process.argv.slice(2), io = {}) {
   const { store, stdout = process.stdout, stderr = process.stderr } = io;
   if (!argv.length || argv.includes('--help') || argv.includes('-h')) {
-    process.stdout.write(HELP);
+    stdout.write(HELP);
     return;
   }
   const [command, ...rest] = argv;
   requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'status', 'warm'].includes(command), 'unknown_command');
   const options = {};
   for (let i = 0; i < rest.length; i += 2) {
-    requireThat(['--config', '--scope', '--input', '--db'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
+    requireThat(['--config', '--scope', '--input', '--diagnostic-phases', '--db'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
     options[rest[i]] = rest[i + 1];
   }
+  requireThat(options['--diagnostic-phases'] === undefined || (command === 'recall' && options['--diagnostic-phases'] === 'v1'), 'invalid_arguments');
   const configPath = options['--config'] ?? process.env.SOURCE_MEMORY_CONFIG;
   requireThat(configPath && options['--scope'], 'config_and_scope_required');
   requireThat(options['--db'] === undefined || (command === 'warm' && options['--db'] === 'v1'), 'invalid_arguments');
@@ -67,16 +70,20 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     return;
   }
   if (command === 'warm') {
-    process.stdout.write(`${JSON.stringify({ ok: true, ...await warm(config, options['--scope']) })}\n`);
+    stdout.write(`${JSON.stringify({ ok: true, ...await warm(config, options['--scope']) })}\n`);
     return;
   }
-  const memory = new Memory(config);
+  const memory = new Memory(config, store);
+  const phases = options['--diagnostic-phases'] ? createStreamSink(stderr) : null;
   try {
-    const result = await memory[command](options['--scope'], input);
+    const result = await memory[command](options['--scope'], input, ...(phases ? [{ phases }] : []));
     const reply = { ok: true, ...result };
-    process.stdout.write(command === 'recall' && isPoolRequest(input) ? serializePoolReply(reply, input.max_chars ?? 24000)
+    stdout.write(command === 'recall' && isPoolRequest(input) ? serializePoolReply(reply, input.max_chars ?? 24000)
       : `${JSON.stringify(reply)}\n`);
-  } finally { await memory.close(); }
+  } finally {
+    phases?.finish();
+    await memory.close();
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

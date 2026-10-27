@@ -4,6 +4,7 @@ import {
 } from './core.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, embeddingIdentity, rerank } from './models.mjs';
+import { passthrough, scoped, tracer } from './phase-diagnostic.mjs';
 import { Neo4jStore } from './store.mjs';
 
 const MODE_CONTRACTS = {
@@ -246,8 +247,12 @@ export class Memory {
     return result;
   }
 
-  async recall(scope, input) {
+  // `phases` is an opt-in marker sink (src/phase-diagnostic.mjs). Absent, recall makes exactly the calls it always made.
+  async recall(scope, input, { phases = null } = {}) {
     authorize(this.config, scope);
+    const trace = tracer(phases);
+    // Only the grouped admission query has finer steps worth bracketing; it takes the trace as an extra trailing argument.
+    const traced = phases ? [trace] : [];
     const mode = input.mode;
     requireThat(mode === undefined || (typeof mode === 'string' && Object.hasOwn(MODE_CONTRACTS, mode)), 'invalid_input');
     requireThat(input.group === undefined || input.group === 'conversation', 'invalid_input');
@@ -268,31 +273,31 @@ export class Memory {
     const availability = {};
     const channels = {};
     const omitted = [];
-    await Promise.all(['turn', 'record', 'chunk'].map(async kind => {
+    await Promise.all(['turn', 'record', 'chunk'].map(kind => trace(`lexical.${kind}`, async () => {
       const name = `${kind}_lexical`;
       try {
         if (grouped) {
-          const state = await this.store.lexicalStatus(scope, kind);
+          const state = await trace(`lexical.${kind}.status`, () => this.store.lexicalStatus(scope, kind));
           if (state.status !== 'ready') {
             channels[name] = [];
             availability[name] = state;
             return;
           }
-          const result = await this.store.admittedLexical(scope, kind, query, candidates, perConversation, exclude);
+          const result = await trace(`lexical.${kind}.query`, () => this.store.admittedLexical(scope, kind, query, candidates, perConversation, exclude, ...traced));
           channels[name] = result.hits;
           omitted.push(...result.omitted);
           availability[name] = { ...state, admitted_conversations: result.admitted_conversations, exhausted: result.exhausted };
         } else {
-          const state = kind === 'chunk' ? await this.store.chunkLexicalStatus(scope) : { status: 'ready' };
-          channels[name] = state.status !== 'ready' ? [] : kind === 'chunk' ? await this.store.chunkLexical(scope, query, candidates, exclude)
-            : await this.store.lexical(scope, kind, query, candidates, exclude);
+          const state = kind === 'chunk' ? await trace('lexical.chunk.status', () => this.store.chunkLexicalStatus(scope)) : { status: 'ready' };
+          channels[name] = state.status !== 'ready' ? [] : await trace(`lexical.${kind}.query`, () => kind === 'chunk'
+            ? this.store.chunkLexical(scope, query, candidates, exclude) : this.store.lexical(scope, kind, query, candidates, exclude));
           availability[name] = state;
         }
       } catch (error) {
         channels[name] = [];
         availability[name] = { status: 'unavailable', reason: safeCode(error) };
       }
-    }));
+    })));
     channels.chunk_vector = [];
     channels.record_vector = [];
     if (this.config.embedding) {
@@ -368,13 +373,14 @@ export class Memory {
     let budgetOmitted = 0;
     let groupedOutput = {};
     if (grouped) {
-      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow);
+      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow, trace);
       budgetOmitted = result.budget_omitted;
       groupedOutput = { units: result.units, pool_truncated: result.pool_truncated, budget_unit: 'utf8_bytes' };
       bundles.push(...result.units.flatMap(unit => unit.seeds));
     } else {
-      for (const seed of ranked.slice(0, limit)) {
-        const bundle = await this.bundle(scope, seed, query, maxNodes, maxHops);
+      for (const [index, seed] of ranked.slice(0, limit).entries()) {
+        const label = `bundle.${index}`;
+        const bundle = await trace(label, () => this.bundle(scope, seed, query, maxNodes, maxHops, null, scoped(trace, label)));
         const size = JSON.stringify(bundle).length;
         if (chars + size > maxChars) { budgetOmitted += 1; continue; }
         bundles.push(bundle);
@@ -398,7 +404,7 @@ export class Memory {
     };
   }
 
-  async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops, follow = null) {
+  async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops, follow = null, trace = passthrough) {
     authorize(this.config, scope);
     const reads = new Map();
     const priority = new Map();
@@ -432,10 +438,12 @@ export class Memory {
     const followingCache = new Map();
     let bytes = 0;
     let budgetOmitted = 0;
+    let ordinal = 0;
     for (const unit of [...pool.values()].slice(0, limit)) {
       const seeds = [];
       for (const candidate of unit.candidates) {
-        const bundle = await this.bundle(scope, candidate, query, maxNodes, maxHops, reads);
+        const label = `bundle.${ordinal++}`;
+        const bundle = await trace(label, () => this.bundle(scope, candidate, query, maxNodes, maxHops, reads, scoped(trace, label)));
         seeds.push(bundle);
         const evidence = [bundle.source, ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence)].filter(Boolean);
         for (const span of evidence) {
@@ -455,7 +463,7 @@ export class Memory {
     return { units, pool_truncated: Math.max(0, pool.size - limit), budget_omitted: budgetOmitted };
   }
 
-  async bundle(scope, seed, query, maxNodes, maxHops, reads = null) {
+  async bundle(scope, seed, query, maxNodes, maxHops, reads = null, trace = passthrough) {
     authorize(this.config, scope);
     const records = new Map();
     const relations = new Map();
@@ -494,13 +502,15 @@ export class Memory {
       frontier = [...next];
     }
     const withEvidence = [];
-    for (const record of records.values()) {
-      withEvidence.push({ ...record, supporting_evidence: await this.evidence(scope, record.evidence, reads) });
-    }
     const edges = [];
-    for (const relation of relations.values()) {
-      edges.push({ ...relation, supporting_evidence: await this.evidence(scope, relation.evidence, reads) });
-    }
+    await trace('evidence', async () => {
+      for (const record of records.values()) {
+        withEvidence.push({ ...record, supporting_evidence: await this.evidence(scope, record.evidence, reads) });
+      }
+      for (const relation of relations.values()) {
+        edges.push({ ...relation, supporting_evidence: await this.evidence(scope, relation.evidence, reads) });
+      }
+    });
     return {
       match: { kind: seed.kind, id: seed.id, rank_score: seed.score,
         channels: [...seed.channels].sort((a, b) => a.channel.localeCompare(b.channel)),
