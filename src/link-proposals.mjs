@@ -1,13 +1,14 @@
-import { authorize, canonical, digest, evidenceSpans, integer, normalizeEnrichment, normalizeTurn,
+import { authorize, canonical, digest, integer, normalizeEnrichment, normalizeTurn,
   RELATIONS, requireThat, sourceExcerpt, text } from './core.mjs';
 
-export const LINK_PROPOSAL_CONTRACT = 'source-memory-links/v1';
+export const LINK_PROPOSAL_CONTRACT = 'source-memory-links/v2';
 export const LINK_PROPOSAL_LIMITS = Object.freeze({ new_records: 16, candidate_records: 32,
   retained_turns: 128, evidence_spans: 128, links: 16, prompt_bytes: 120000,
   desired_output_bytes: 2048, output_bytes: 16384 });
 const KINDS = ['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action'];
 const plans = new WeakMap();
 const copy = value => structuredClone(value);
+const compareKeys = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const spanKey = span => canonical({ turn: span.turn, entry_id: span.entry_id, start: span.start, end: span.end });
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && canonical(Object.keys(value).sort()) === canonical([...keys].sort());
@@ -89,10 +90,11 @@ export function validateLinkProposals(output, packet) {
 }
 
 /** Run the real read/compare protocol; compare is the host's existing authenticated model controller, not a new route. */
-export async function proposeMemoryLinks({ memory, scope, turn, record_ids, compare, signal }) {
+export async function proposeMemoryLinks({ memory, scope, turn, record_ids, review_contract, compare, signal }) {
   access(memory, scope);
   active(signal);
   text(turn, 100);
+  text(review_contract, 128);
   requireThat(typeof compare === 'function' && Array.isArray(record_ids) && record_ids.length > 0
     && record_ids.length <= 16 && new Set(record_ids).size === record_ids.length, 'link_request_invalid');
   const recordPins = new Map(), turnPins = new Map();
@@ -169,7 +171,7 @@ export async function proposeMemoryLinks({ memory, scope, turn, record_ids, comp
     requireThat(entry.text.length <= 16000, 'link_trigger_bound');
     await offerSpan({ turn, entry_id: entry.id, start: 0, end: entry.text.length });
   }
-  const packet = freeze({ contract: LINK_PROPOSAL_CONTRACT, limits: { ...LINK_PROPOSAL_LIMITS },
+  const packet = freeze({ contract: LINK_PROPOSAL_CONTRACT, review_contract, limits: { ...LINK_PROPOSAL_LIMITS },
     record_kinds: [...KINDS], relation_types: [...RELATIONS],
     records, sources, retrieval: { status: retrieved.status, retrieval_complete: retrieved.retrieval_complete,
       channels: copy(retrieved.channels ?? {}), candidate_count: retrieved.candidate_count ?? null,
@@ -187,55 +189,122 @@ export async function proposeMemoryLinks({ memory, scope, turn, record_ids, comp
   const spanRefs = new Map([...sourceMap].map(([key, ref]) => [ref, JSON.parse(key)]));
   const references = { records: [...recordRefs].map(([ref, id]) => ({ ref, id })),
     sources: [...spanRefs].map(([ref, span]) => ({ ref, ...span })) };
-  const contextSha = digest({ contract: LINK_PROPOSAL_CONTRACT, scope, turn, references,
-    records: [...recordPins], turns: [...turnPins] });
+  const sortedPins = pins => [...pins].sort(([a], [b]) => compareKeys(a, b));
+  const contextSha = digest({ contract: LINK_PROPOSAL_CONTRACT, scope, turn, newly_retained: [...record_ids].sort(),
+    records: sortedPins(recordPins), turns: sortedPins(turnPins) });
+  const resolve = proposal => ({ type: proposal.type, from: recordRefs.get(proposal.from), to: recordRefs.get(proposal.to),
+    evidence: proposal.evidence.map(ref => spanRefs.get(ref)).sort((a, b) => compareKeys(spanKey(a), spanKey(b))) });
+  const resolved = checked.proposals.map(resolve);
+  const sortValues = values => values.sort((a, b) => compareKeys(canonical(a), canonical(b)));
+  const semanticSha = digest({ proposals: sortValues(copy(resolved)), unresolved: sortValues(checked.unresolved.map(row => ({
+    ...resolve(row), support: row.support, reason: row.reason }))) });
+  const operationId = `memory-link-operation-${digest({ contract: LINK_PROPOSAL_CONTRACT, scope, turn, review_contract,
+    context_sha256: contextSha, semantic_proposal_sha256: semanticSha })}`;
   const proposalSha = digest({ contract: LINK_PROPOSAL_CONTRACT, scope,
     context_sha256: contextSha, output: compared.text, route });
-  const result = freeze({ contract: LINK_PROPOSAL_CONTRACT, scope, trigger_turn: turn,
+  const result = freeze({ contract: LINK_PROPOSAL_CONTRACT, scope, trigger_turn: turn, review_contract,
     status: 'proposed', ...checked, model: route, review_status: 'pending', semantic_truth: 'NOT_VERIFIED',
-    context_sha256: contextSha, proposal_sha256: proposalSha, references, packet, prompt, raw_output: compared.text });
-  plans.set(result, { memory, scope, recordPins, turnPins, recordRefs, spanRefs });
+    operation_id: operationId, context_sha256: contextSha, semantic_proposal_sha256: semanticSha,
+    proposal_keys: resolved.map(row => digest(row)), proposal_sha256: proposalSha,
+    references, packet, prompt, raw_output: compared.text });
+  plans.set(result, { memory, scope, recordPins, turnPins, resolved, state: 'pending', prepared: null, committed: null });
   return result;
 }
 
-/** Only the trusted host may call this after semantic review. There is no relation proposal status in the store. */
-export async function applyReviewedMemoryLinks({ memory, scope, result, review, signal }) {
+export function memoryLinkProposalState(result) {
+  const plan = plans.get(result);
+  requireThat(plan, 'link_plan_binding_mismatch');
+  return freeze({ state: plan.state, operation_id: result.operation_id,
+    append_sha256: plan.prepared?.append_sha256 ?? null, receipt_ref: plan.receiptRef ?? null,
+    enrichment_invoked: plan.invoked ?? false, reason: plan.reason ?? null });
+}
+
+/** Review and durable intent belong to the trusted host. A JSON artifact is never an apply capability. */
+export async function applyReviewedMemoryLinks({ memory, scope, result, review, before_append, signal }) {
   access(memory, scope);
   active(signal);
   const plan = plans.get(result);
   requireThat(plan && plan.memory === memory && plan.scope === scope, 'link_plan_binding_mismatch');
-  requireThat(exact(review, ['reviewer', 'decision_ref', 'contract', 'scope', 'context_sha256', 'proposal_sha256', 'approved'])
+  requireThat(plan.state !== 'unknown', 'link_append_unknown');
+  requireThat(plan.state !== 'applying', 'link_append_in_progress');
+  requireThat(exact(review, ['reviewer', 'decision_ref', 'contract', 'scope', 'review_contract', 'operation_id',
+    'context_sha256', 'semantic_proposal_sha256', 'proposal_sha256', 'approved'])
     && Array.isArray(review.approved) && review.approved.length <= 16
     && new Set(review.approved).size === review.approved.length
     && review.contract === result.contract && review.scope === scope
+    && review.review_contract === result.review_contract && review.operation_id === result.operation_id
     && review.context_sha256 === result.context_sha256
+    && review.semantic_proposal_sha256 === result.semantic_proposal_sha256
     && review.proposal_sha256 === result.proposal_sha256, 'link_review_required');
   const reviewer = text(review.reviewer, 96), decision = text(review.decision_ref, 96);
   const selected = review.approved.map(index => {
     integer(index, undefined, 0, result.proposals.length - 1);
-    return result.proposals[index];
-  });
+    return plan.resolved[index];
+  }).sort((a, b) => compareKeys(canonical(a), canonical(b)));
+  const selectionKey = digest(selected);
+  if (plan.state === 'committed') {
+    requireThat(selectionKey === plan.selectionKey, 'link_result_consumed');
+    return { ...copy(plan.committed), replayed: true };
+  }
   if (!selected.length) return { status: 'not_written', records: [], relations: [], review: copy(review) };
-  for (const [id, previous] of plan.recordPins) {
+  requireThat(typeof before_append === 'function', 'link_append_preparation_required');
+  // Synchronous ownership precedes every await, including source revalidation and the durable host callback.
+  plan.state = 'applying';
+  plan.reason = null;
+  plan.invoked = false;
+  let invoked = false;
+  try {
+    for (const [id, previous] of plan.recordPins) {
+      active(signal);
+      const current = retainedRecord(await memory.show(scope, { kind: 'record', id }), scope, id);
+      requireThat(canonical(current) === canonical(previous), 'link_record_changed');
+    }
+    for (const [id, previous] of plan.turnPins) {
+      active(signal);
+      const current = retainedTurn(await memory.show(scope, { kind: 'turn', id }), scope, id);
+      requireThat(canonical(current) === canonical(previous), 'link_source_changed');
+    }
+    const relations = selected.map(content => ({ id: `memory-link-${digest({ contract: result.contract, scope,
+      turn: result.trigger_turn, context_sha256: result.context_sha256, review_contract: result.review_contract, ...content })}`,
+    ...content, attribution: `Model proposal ${result.model.provider}/${result.model.model}; reviewed by ${reviewer}; decision ${decision}; attributed assertion, not current authority` }));
+    const payload = normalizeEnrichment({ records: [], relations });
+    const payloadJson = canonical(payload), appendSha = digest(payloadJson);
+    requireThat(!plan.prepared || plan.prepared.append_sha256 === appendSha, 'link_prepared_payload_changed');
+    const prepared = freeze({ contract: result.contract, scope, operation_id: result.operation_id,
+      review_contract: result.review_contract, context_sha256: result.context_sha256,
+      semantic_proposal_sha256: result.semantic_proposal_sha256, proposal_sha256: result.proposal_sha256,
+      append_sha256: appendSha, enrichment: payload, enrichment_json: payloadJson,
+      edge_ids: relations.map(row => row.id), model: result.model, review: copy(review) });
+    access(memory, scope);
     active(signal);
-    const current = retainedRecord(await memory.show(scope, { kind: 'record', id }), scope, id);
-    requireThat(canonical(current) === canonical(previous), 'link_record_changed');
-  }
-  for (const [id, previous] of plan.turnPins) {
+    const accepted = await before_append(prepared, { signal });
+    requireThat(exact(accepted, ['accepted', 'operation_id', 'append_sha256', 'receipt_ref']) && accepted.accepted === true
+      && accepted.operation_id === prepared.operation_id && accepted.append_sha256 === appendSha,
+    'link_append_preparation_refused');
+    plan.receiptRef = text(accepted.receipt_ref, 256);
+    plan.prepared = prepared;
+    access(memory, scope);
     active(signal);
-    const current = retainedTurn(await memory.show(scope, { kind: 'turn', id }), scope, id);
-    requireThat(canonical(current) === canonical(previous), 'link_source_changed');
+    invoked = true;
+    plan.invoked = true;
+    const written = await memory.enrich(scope, copy(payload));
+    const expectedIds = [...prepared.edge_ids].sort();
+    requireThat(written?.ok !== false && Array.isArray(written?.records) && written.records.length === 0
+      && Object.keys(written).every(key => ['ok', 'records', 'relations', 'indexing'].includes(key))
+      && Array.isArray(written.relations) && written.relations.length === expectedIds.length
+      && canonical([...written.relations].sort()) === canonical(expectedIds), 'link_append_receipt_invalid');
+    plan.committed = freeze({ status: 'written', state: 'committed', operation_id: result.operation_id,
+      receipt_ref: plan.receiptRef, receipt: copy(written), enrichment: payload, review: copy(review),
+      append_sha256: appendSha, replayed: false, semantic_truth: 'HOST_REVIEWED_ASSERTION_NOT_INDEPENDENT_PROOF' });
+    plan.selectionKey = selectionKey;
+    plan.state = 'committed';
+    return copy(plan.committed);
+  } catch (error) {
+    plan.state = invoked ? 'unknown' : 'pending';
+    plan.reason = error.code ?? error.message;
+    if (!invoked) throw error;
+    const unknown = new Error('link_append_unknown', { cause: error });
+    unknown.code = 'link_append_unknown';
+    throw unknown;
   }
-  const relations = selected.map(proposal => {
-    const evidence = evidenceSpans(proposal.evidence.map(ref => plan.spanRefs.get(ref)));
-    const content = { type: proposal.type, from: plan.recordRefs.get(proposal.from), to: plan.recordRefs.get(proposal.to), evidence };
-    return { id: `memory-link-${digest({ scope, ...content, model: result.model, reviewer, decision })}`,
-      ...content, attribution: `Model proposal ${result.model.provider}/${result.model.model}; reviewed by ${reviewer}; decision ${decision}; attributed assertion, not current authority` };
-  });
-  const payload = normalizeEnrichment({ records: [], relations });
-  access(memory, scope);
-  active(signal);
-  const written = await memory.enrich(scope, payload);
-  return { status: 'written', receipt: written, enrichment: payload, review: copy(review),
-    semantic_truth: 'HOST_REVIEWED_ASSERTION_NOT_INDEPENDENT_PROOF' };
 }

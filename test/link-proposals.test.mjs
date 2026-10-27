@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { authorize, canonical, identity, normalizeEnrichment, normalizeTurn, sourceExcerpt, RELATIONS } from '../src/core.mjs';
-import { applyReviewedMemoryLinks, LINK_PROPOSAL_CONTRACT, LINK_PROPOSAL_LIMITS, proposeMemoryLinks } from '../src/link-proposals.mjs';
+import { authorize, canonical, digest, identity, normalizeEnrichment, normalizeTurn, sourceExcerpt, RELATIONS } from '../src/core.mjs';
+import { applyReviewedMemoryLinks, LINK_PROPOSAL_CONTRACT, LINK_PROPOSAL_LIMITS,
+  memoryLinkProposalState, proposeMemoryLinks } from '../src/link-proposals.mjs';
 
 const SCOPE = 'fictional-link-development';
+const REVIEW_CONTRACT = 'fictional-programmatic-policy/v1';
 const KINDS = ['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action'];
 const route = { provider: 'fixture', model: 'deterministic-comparison-not-a-model-run' };
 const clone = value => structuredClone(value);
@@ -12,7 +14,7 @@ const clone = value => structuredClone(value);
 function fixtureMemory() {
   const memory = {
     config: { scopes: { read: [SCOPE], write: [SCOPE] } },
-    turns: new Map(), records: new Map(), relations: new Map(), calls: [], writes: [],
+    turns: new Map(), records: new Map(), relations: new Map(), calls: [], writes: [], intents: [],
     async ingest(scope, input) {
       authorize(this.config, scope, 'write');
       const turn = normalizeTurn(input), id = identity('turn', scope, turn.source, turn.conversation_id, turn.turn_id);
@@ -91,16 +93,24 @@ async function setup(options = {}) {
   const memory = fixtureMemory();
   const item = makeFixtures(memory, options).cases[0];
   const value = await item.build(SCOPE);
-  const request = { memory, scope: SCOPE, turn: value.latest, record_ids: value.record_ids };
+  const request = { memory, scope: SCOPE, turn: value.latest, record_ids: value.record_ids, review_contract: REVIEW_CONTRACT,
+    before_append: async plan => {
+      memory.intents.push(clone(plan));
+      return acceptedIntent(plan);
+    } };
   return { memory, value, request };
 }
 
 const comparison = make => async input => ({ text: JSON.stringify({ links: [make(input.packet)] }), route });
+const acceptedIntent = plan => ({ accepted: true, operation_id: plan.operation_id,
+  append_sha256: plan.append_sha256, receipt_ref: 'fictional-durable-intent-001' });
 const reviewFor = (result, approved = [0]) => ({ contract: LINK_PROPOSAL_CONTRACT, scope: SCOPE,
-  context_sha256: result.context_sha256, proposal_sha256: result.proposal_sha256,
-  reviewer: 'fictional-programmatic-policy/v1', decision_ref: 'fixture-review-001', approved });
-const apply = (request, result, review = reviewFor(result)) => applyReviewedMemoryLinks({
-  memory: request.memory, scope: request.scope, result, review, signal: request.signal });
+  review_contract: result.review_contract, operation_id: result.operation_id,
+  context_sha256: result.context_sha256, semantic_proposal_sha256: result.semantic_proposal_sha256,
+  proposal_sha256: result.proposal_sha256,
+  reviewer: REVIEW_CONTRACT, decision_ref: 'fixture-review-001', approved });
+const apply = (request, result, review = reviewFor(result), before_append = request.before_append) => applyReviewedMemoryLinks({
+  memory: request.memory, scope: request.scope, result, review, before_append, signal: request.signal });
 
 for (const kind of KINDS) {
   test(`link_pipeline_${kind}_retains_existing_kind_and_requires_separate_review`, async () => {
@@ -235,7 +245,8 @@ test('known_partial_channel_stops_even_when_overall_status_is_ready', async () =
   await assert.rejects(proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) }), { code: 'link_retrieval_incomplete' });
 });
 
-for (const field of ['contract', 'scope', 'context_sha256', 'proposal_sha256']) {
+for (const field of ['contract', 'scope', 'review_contract', 'operation_id', 'context_sha256',
+  'semantic_proposal_sha256', 'proposal_sha256']) {
   test(`review_changed_${field}_cannot_authorize_append`, async () => {
     const { request, memory } = await setup();
     const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
@@ -387,4 +398,221 @@ test('host_reference_tables_and_pending_result_are_serializable_not_model_author
     frozen: Object.isFrozen(result) && Object.isFrozen(result.proposals),
     semanticTruth: serialized.semantic_truth }, {
     recordIds: ['new', 'old'], validSourceHandles: true, outputKeys: ['links'], frozen: true, semanticTruth: 'NOT_VERIFIED' });
+});
+
+test('canonical_operation_and_edges_ignore_model_order_format_route_and_review_labels', async () => {
+  const { request, memory } = await setup();
+  memory.records.set('new-extra', { ...clone(memory.records.get('new')), id: 'new-extra' });
+  request.record_ids = ['new', 'new-extra'];
+  const make = packet => {
+    const link = proposedLink(packet);
+    const evidence = packet.sources.map(row => row.ref);
+    return [{ ...link, evidence }, { ...link, type: 'contradicts', evidence }];
+  };
+  const first = await proposeMemoryLinks({ ...request, compare: async ({ packet }) => ({
+    text: JSON.stringify({ links: make(packet) }), route }) });
+  request.record_ids.reverse();
+  memory.records = new Map([...memory.records].reverse());
+  const second = await proposeMemoryLinks({ ...request, compare: async ({ packet }) => ({
+    text: JSON.stringify({ links: make(packet).reverse().map(row => ({ support: row.support,
+      evidence: [...row.evidence].reverse(), to: row.to, from: row.from, type: row.type })) }, null, 2),
+    route: { provider: 'different-fixture-provider', model: 'another-synthetic-attempt' } }) });
+  const plans = [];
+  const refuse = async plan => { plans.push(clone(plan)); return { ...acceptedIntent(plan), accepted: false }; };
+  await assert.rejects(apply(request, first, reviewFor(first, [0, 1]), refuse), { code: 'link_append_preparation_refused' });
+  await assert.rejects(apply(request, second, { ...reviewFor(second, [1, 0]),
+    reviewer: 'different-arbitrary-review-label', decision_ref: 'different-attempt-label' }, refuse), { code: 'link_append_preparation_refused' });
+  assert.deepEqual({ contextStable: first.context_sha256 === second.context_sha256,
+    semanticStable: first.semantic_proposal_sha256 === second.semantic_proposal_sha256,
+    operationStable: first.operation_id === second.operation_id, rawDifferent: first.proposal_sha256 !== second.proposal_sha256,
+    edgeIdsStable: canonical(plans[0].edge_ids) === canonical(plans[1].edge_ids),
+    exactMetadataDifferent: plans[0].append_sha256 !== plans[1].append_sha256, writes: memory.writes.length }, {
+    contextStable: true, semanticStable: true, operationStable: true, rawDifferent: true,
+    edgeIdsStable: true, exactMetadataDifferent: true, writes: 0 });
+});
+
+test('changed_semantic_proposal_changes_operation_and_edge_identity', async () => {
+  const { request } = await setup();
+  const first = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  const second = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet, { type: 'contradicts' })) });
+  const plans = [];
+  const refuse = async plan => { plans.push(clone(plan)); return { ...acceptedIntent(plan), accepted: false }; };
+  for (const result of [first, second]) {
+    await assert.rejects(apply(request, result, reviewFor(result), refuse), { code: 'link_append_preparation_refused' });
+  }
+  assert.deepEqual([first.context_sha256 === second.context_sha256,
+    first.semantic_proposal_sha256 !== second.semantic_proposal_sha256,
+    first.operation_id !== second.operation_id, plans[0].edge_ids[0] !== plans[1].edge_ids[0]], [true, true, true, true]);
+});
+
+test('review_contract_version_is_part_of_the_operation_and_edge_identity', async () => {
+  const { request } = await setup();
+  const compare = comparison(packet => proposedLink(packet));
+  const first = await proposeMemoryLinks({ ...request, compare });
+  const second = await proposeMemoryLinks({ ...request, review_contract: 'fictional-programmatic-policy/v2', compare });
+  const plans = [];
+  const refuse = async plan => { plans.push(clone(plan)); return { ...acceptedIntent(plan), accepted: false }; };
+  for (const result of [first, second]) {
+    await assert.rejects(apply(request, result, reviewFor(result), refuse), { code: 'link_append_preparation_refused' });
+  }
+  assert.deepEqual([first.context_sha256 === second.context_sha256,
+    first.semantic_proposal_sha256 === second.semantic_proposal_sha256,
+    first.operation_id !== second.operation_id, plans[0].edge_ids[0] !== plans[1].edge_ids[0]], [true, true, true, true]);
+});
+
+test('concurrent_apply_claims_capability_synchronously_and_appends_once', async () => {
+  const { request, memory } = await setup();
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let callbacks = 0;
+  const before = async plan => { callbacks++; await gate; return acceptedIntent(plan); };
+  const first = apply(request, result, reviewFor(result), before);
+  try {
+    assert.equal(memoryLinkProposalState(result).state, 'applying');
+    await assert.rejects(apply(request, result, reviewFor(result), before), { code: 'link_append_in_progress' });
+    release();
+    await first;
+  } finally { release(); }
+  assert.deepEqual([memoryLinkProposalState(result).state, callbacks, memory.writes.length], ['committed', 1, 1]);
+});
+
+for (const failure of ['refused', 'throws', 'wrong_operation', 'wrong_payload', 'ambiguous']) {
+  test(`durable_callback_${failure}_cannot_invoke_enrichment`, async () => {
+    const { request, memory } = await setup();
+    const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+    const before = async plan => {
+      if (failure === 'throws') throw new Error('fictional-durability-uncertain');
+      const ack = acceptedIntent(plan);
+      if (failure === 'refused') ack.accepted = false;
+      if (failure === 'wrong_operation') ack.operation_id = 'another-operation';
+      if (failure === 'wrong_payload') ack.append_sha256 = 'another-payload';
+      if (failure === 'ambiguous') ack.unknown = true;
+      return ack;
+    };
+    await assert.rejects(apply(request, result, reviewFor(result), before));
+    const state = memoryLinkProposalState(result);
+    assert.deepEqual([state.state, state.enrichment_invoked, memory.writes.length], ['pending', false, 0]);
+  });
+}
+
+test('missing_durable_callback_cannot_append', async () => {
+  const { request, memory } = await setup();
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  await assert.rejects(apply(request, result, reviewFor(result), null), { code: 'link_append_preparation_required' });
+  assert.deepEqual([memoryLinkProposalState(result).state, memory.writes.length], ['pending', 0]);
+});
+
+test('durable_callback_observes_frozen_exact_plan_before_any_store_write', async () => {
+  const { request, memory } = await setup();
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  let observed;
+  await apply(request, result, reviewFor(result), async plan => {
+    observed = { state: memoryLinkProposalState(result).state, writes: memory.writes.length,
+      frozen: Object.isFrozen(plan) && Object.isFrozen(plan.enrichment.relations),
+      exactBytes: canonical(plan.enrichment) === plan.enrichment_json,
+      exactHash: digest(plan.enrichment_json) === plan.append_sha256,
+      exactIds: canonical(plan.edge_ids) === canonical(plan.enrichment.relations.map(row => row.id)) };
+    return acceptedIntent(plan);
+  });
+  assert.deepEqual(observed, { state: 'applying', writes: 0, frozen: true, exactBytes: true, exactHash: true, exactIds: true });
+});
+
+test('accepted_intent_then_cancel_is_proved_uninvoked_and_cannot_change_frozen_payload', async () => {
+  const { request, memory } = await setup();
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  const controller = new AbortController();
+  request.signal = controller.signal;
+  await assert.rejects(apply(request, result, reviewFor(result), async plan => {
+    controller.abort();
+    return acceptedIntent(plan);
+  }), { code: 'link_proposal_aborted' });
+  const state = memoryLinkProposalState(result);
+  request.signal = new AbortController().signal;
+  await assert.rejects(apply(request, result, { ...reviewFor(result), decision_ref: 'changed-after-intent' }),
+    { code: 'link_prepared_payload_changed' });
+  assert.deepEqual([state.state, state.enrichment_invoked, state.receipt_ref, memory.writes.length],
+    ['pending', false, 'fictional-durable-intent-001', 0]);
+});
+
+test('committed_receipt_replay_does_not_compare_prepare_or_append_again', async () => {
+  const { request, memory } = await setup();
+  let comparisons = 0;
+  const result = await proposeMemoryLinks({ ...request, compare: async input => {
+    comparisons++;
+    return comparison(packet => proposedLink(packet))(input);
+  } });
+  const first = await apply(request, result);
+  const second = await apply(request, result, { ...reviewFor(result), decision_ref: 'arbitrary-retry-label' }, null);
+  assert.deepEqual({ state: memoryLinkProposalState(result).state, comparisons, intents: memory.intents.length,
+    writes: memory.writes.length, replayed: second.replayed, sameReceipt: canonical(first.receipt) === canonical(second.receipt),
+    originalReview: second.review.decision_ref }, {
+    state: 'committed', comparisons: 1, intents: 1, writes: 1, replayed: true, sameReceipt: true, originalReview: 'fixture-review-001' });
+});
+
+for (const effectBeforeError of [false, true]) {
+  test(`enrich_error_${effectBeforeError ? 'after' : 'before'}_observed_effect_holds_unknown_without_retry`, async () => {
+    const { request, memory } = await setup();
+    const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+    const enrich = memory.enrich.bind(memory);
+    let invocations = 0;
+    memory.enrich = async (...args) => {
+      invocations++;
+      if (effectBeforeError) await enrich(...args);
+      throw new Error('fictional-lost-receipt');
+    };
+    await assert.rejects(apply(request, result), { code: 'link_append_unknown' });
+    await assert.rejects(apply(request, result, { ...reviewFor(result), decision_ref: 'fresh-retry-label' }),
+      { code: 'link_append_unknown' });
+    const state = memoryLinkProposalState(result);
+    assert.deepEqual([state.state, state.enrichment_invoked, invocations, memory.intents.length, memory.writes.length],
+      ['unknown', true, 1, 1, effectBeforeError ? 1 : 0]);
+  });
+}
+
+for (const mismatch of ['records', 'missing', 'extra', 'duplicate', 'false_ok', 'ambiguous_status']) {
+  test(`ambiguous_append_receipt_${mismatch}_is_terminal_unknown`, async () => {
+    const { request, memory } = await setup();
+    const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+    const enrich = memory.enrich.bind(memory);
+    memory.enrich = async (...args) => {
+      const receipt = await enrich(...args);
+      if (mismatch === 'records') receipt.records.push('unexpected-record');
+      if (mismatch === 'missing') receipt.relations = [];
+      if (mismatch === 'extra') receipt.relations.push('unexpected-edge');
+      if (mismatch === 'duplicate') receipt.relations.push(receipt.relations[0]);
+      if (mismatch === 'false_ok') receipt.ok = false;
+      if (mismatch === 'ambiguous_status') receipt.status = 'unknown';
+      return receipt;
+    };
+    await assert.rejects(apply(request, result), { code: 'link_append_unknown' });
+    assert.deepEqual([memoryLinkProposalState(result).state, memory.writes.length], ['unknown', 1]);
+  });
+}
+
+test('known_append_receipt_with_deferred_or_unavailable_indexing_still_commits', async () => {
+  const { request, memory } = await setup();
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  const enrich = memory.enrich.bind(memory);
+  memory.enrich = async (...args) => ({ ...await enrich(...args), ok: true,
+    indexing: { status: 'unavailable', reason: 'fictional_index_only_outage' } });
+  const written = await apply(request, result);
+  assert.deepEqual([written.state, memoryLinkProposalState(result).state, memory.writes.length], ['committed', 'committed', 1]);
+});
+
+test('a_consumed_result_cannot_commit_a_different_approved_selection', async () => {
+  const { request, memory } = await setup();
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  await apply(request, result);
+  await assert.rejects(apply(request, result, reviewFor(result, [])), { code: 'link_result_consumed' });
+  assert.equal(memory.writes.length, 1);
+});
+
+test('state_readback_is_read_only_and_not_a_serialized_write_capability', async () => {
+  const { request } = await setup();
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  const state = memoryLinkProposalState(result);
+  assert.throws(() => { state.state = 'committed'; }, TypeError);
+  assert.throws(() => memoryLinkProposalState(JSON.parse(JSON.stringify(result))), { code: 'link_plan_binding_mismatch' });
+  assert.equal(memoryLinkProposalState(result).state, 'pending');
 });
