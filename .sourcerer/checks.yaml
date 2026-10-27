@@ -4,6 +4,11 @@ api_version: sourcerer.project-checks/v1
 # `bench-grouped` need a host Docker daemon and the neo4j:5.26.14-community
 # image; each starts and removes its own disposable Neo4j bound to 127.0.0.1 on
 # a random port and never connects to any other instance.
+# The code-change work type requires a build check; this package is plain ESM with no build step.
+not_applicable:
+  - id: build
+    reason: "plain ESM package, no build step"
+
 # Opt-in checks live under `overrides`, the only section that accepts
 # `project_battery: false`: they run only when a task requires them by name.
 overrides:
