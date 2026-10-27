@@ -170,6 +170,8 @@ From each seed, expansion follows `supersedes` (both directions), `qualifies`, `
 
 The cosine channels use scope-local Neo4j HNSW vector indexes. ANN candidate selection is approximate; only the returned, post-filtered window is rescored with cosine and sorted by score then UID. This avoids transferring/scoring the corpus and removes the 10,000-vector readiness cliff on an online index. It does not guarantee exact global nearest neighbours.
 
+`recall --diagnostic-phases v1` is an opt-in timing aid: it writes start/end markers (`phase v1 <span> <start|end> +<ms>ms`) for the lexical channels, their admission queries, and each serial bundle and its evidence reads to **stderr**, followed by one footer `phase v1 footer emitted=<n> dropped=<n>`. At most 48 markers, 6144 bytes in total (footer included) and 128 bytes per line are written; later markers are dropped and counted. Stdout, queries, ranking and exit code are unchanged, and a failing stderr is ignored.
+
 Recalled material is evidence, not authority. A proposal is not an accepted decision, a changed justification does not repeal a decision by itself, and several channels matching the same turn are one source, not corroboration.
 
 ### Vector indexes, widening, and fallback
