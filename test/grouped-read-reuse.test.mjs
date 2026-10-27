@@ -82,6 +82,57 @@ for (const mode of [undefined, 'evidence_advice', 'history_search']) {
   });
 }
 
+test('repeated grouped records retain independent nested evidence values', async () => {
+  const observe = async MemoryType => {
+    const value = fixture();
+    const memory = new MemoryType(value.config, value.store);
+    const reply = await memory.recall('primary', grouped('evidence_advice'));
+    const seeds = reply.units.flatMap(unit => unit.seeds);
+    const chosen = seeds.find(seed => seed.match.kind === 'record' && seed.match.id === 'turn');
+    const siblings = seeds.filter(seed => seed !== chosen).flatMap(seed => seed.records.filter(record => record.id === 'turn'));
+    const expected = structuredClone(siblings.map(record => record.evidence));
+    const record = chosen.records.find(record => record.id === 'turn');
+    record.evidence[0].start = 1;
+    record.evidence.push({ turn: 'local-mutation', entry_id: 'user', start: 0, end: 1 });
+    const next = await memory.recall('primary', grouped('evidence_advice'));
+    return { siblings: siblings.map(record => record.evidence), expected,
+      next: next.units.flatMap(unit => unit.seeds).flatMap(seed => seed.records.filter(row => row.id === 'turn')).map(row => row.evidence) };
+  };
+  const before = await observe(UncachedMemory);
+  const after = await observe(Memory);
+  assert.deepEqual(after, before);
+  assert.deepEqual(after.siblings, after.expected);
+});
+
+test('a successful cached read keeps a private snapshot before its first return', async () => {
+  const observe = async MemoryType => {
+    const value = fixture();
+    const loaded = [];
+    const load = value.store.getRecord;
+    value.store.getRecord = async (...args) => {
+      const record = await load(...args);
+      loaded.push(record);
+      return record;
+    };
+    const memory = new MemoryType(value.config, value.store);
+    const reads = new Map();
+    const bundle = id => memory.bundle('primary', { kind: 'record', id, score: 1, channels: [] }, 'fixture', 8, 2, reads);
+    const first = await bundle('turn');
+    const sibling = await bundle('other');
+    const expected = structuredClone(first.records.find(record => record.id === 'turn').evidence);
+    first.records.find(record => record.id === 'turn').evidence[0].start = 1;
+    first.records.find(record => record.id === 'turn').evidence.push({ turn: 'local-mutation', entry_id: 'user', start: 0, end: 1 });
+    loaded[0].evidence[0].end = 1;
+    const next = await bundle('turn');
+    return { sibling: sibling.records.find(record => record.id === 'turn').evidence,
+      next: next.records.find(record => record.id === 'turn').evidence, expected };
+  };
+  const before = await observe(UncachedMemory);
+  const after = await observe(Memory);
+  assert.deepEqual(after, before);
+  assert.deepEqual([after.sibling, after.next], [after.expected, after.expected]);
+});
+
 test('ungrouped recall retains the existing reads and reply bytes', async () => {
   const baseline = fixture();
   const candidate = fixture();

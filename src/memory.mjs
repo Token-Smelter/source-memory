@@ -15,10 +15,12 @@ const MODE_CONTRACTS = {
 async function immutableRead(reads, scope, kind, id, load) {
   if (!reads) return load();
   const key = JSON.stringify([scope, kind, id]);
-  if (reads.has(key)) return reads.get(key);
+  if (reads.has(key)) return structuredClone(reads.get(key));
   const value = await load();
-  if (value) reads.set(key, value);
-  return value;
+  if (!value) return value;
+  const snapshot = structuredClone(value);
+  reads.set(key, snapshot);
+  return structuredClone(snapshot);
 }
 
 export class Memory {
