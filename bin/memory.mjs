@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { Memory } from '../src/memory.mjs';
 import { MemoryError, requireThat } from '../src/core.mjs';
 import { warm } from '../src/warm.mjs';
+import { warmDb } from '../src/warm-db.mjs';
 import { isPoolRequest, serializePoolReply } from '../src/envelope.mjs';
 import { createStreamSink } from '../src/phase-diagnostic.mjs';
 
@@ -15,6 +16,7 @@ JSON input is read from --input or stdin for ingest/enrich/recall/show.
 index accepts optional --input {"limit":256}; init/status/warm need no input.
 recall accepts --diagnostic-phases v1: bounded start/end phase markers and one footer line on stderr; stdout is unchanged.
 warm sends one fixed embedding request and never touches the database.
+warm --db v1 instead runs the read-only recall query paths once against Neo4j, makes no model call, and reports ready or unavailable.
 Source is copied by the caller, never transcribed by a model or discovered from host paths.
 Use a local configuration with neo4j and explicit scopes.read/scopes.write allowlists.
 Embeddings/reranking are optional loopback services; their availability is reported.
@@ -49,16 +51,24 @@ export async function main(argv = process.argv.slice(2), io = {}) {
   requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'status', 'warm'].includes(command), 'unknown_command');
   const options = {};
   for (let i = 0; i < rest.length; i += 2) {
-    requireThat(['--config', '--scope', '--input', '--diagnostic-phases'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
+    requireThat(['--config', '--scope', '--input', '--diagnostic-phases', '--db'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
     options[rest[i]] = rest[i + 1];
   }
   requireThat(options['--diagnostic-phases'] === undefined || (command === 'recall' && options['--diagnostic-phases'] === 'v1'), 'invalid_arguments');
   const configPath = options['--config'] ?? process.env.SOURCE_MEMORY_CONFIG;
   requireThat(configPath && options['--scope'], 'config_and_scope_required');
+  requireThat(options['--db'] === undefined || (command === 'warm' && options['--db'] === 'v1'), 'invalid_arguments');
   const config = await fileJson(configPath, 64000);
   let input = {};
   if (options['--input']) input = await fileJson(options['--input'], 4_000_000);
   else if (['ingest', 'enrich', 'recall', 'show'].includes(command)) input = JSON.parse(await readBounded(process.stdin));
+  if (command === 'warm' && options['--db']) {
+    const memory = new Memory(config, store);
+    try {
+      stdout.write(`${JSON.stringify({ ok: true, ...await warmDb(config, options['--scope'], memory.store) })}\n`);
+    } finally { await memory.close(); }
+    return;
+  }
   if (command === 'warm') {
     stdout.write(`${JSON.stringify({ ok: true, ...await warm(config, options['--scope']) })}\n`);
     return;
