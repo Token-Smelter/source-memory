@@ -87,6 +87,30 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `show` | `{"kind":"turn_by_key","source":"...","conversation_id":"...","turn_ids":["..."]}` | Which of up to 16 caller turn keys already name stored turns (`found`, in request order); for callers that must reuse an existing identity |
 | `status` | None | Counts, unindexed items, configured models |
 | `warm` | None | Sends one fixed embedding request (no memory text) through the configured `embedding` endpoint, never connecting to Neo4j or writing, and returns `{warm:{model,embedding_key,ms}}`, or `{warm:{status:"unconfigured"}}` with no request. It keeps a local embedding model resident: that consumes shared model memory on the endpoint, so callers should schedule it only while recall is in use |
+| `warm --db v1` | None | Opt-in database warm-up (below). Needs read authorization for `--scope`; makes no model call and no write |
+
+### Warming the database (`warm --db v1`)
+
+A freshly started Neo4j is cold: in measurements, the first fulltext/recall transaction took about 2 s and exceeded the 2500 ms recall limit, while an identical repeat took 350–600 ms. A trivial `RETURN 1` did not warm it. `warm --db v1 --config FILE --scope SCOPE` pays that cost ahead of recall by running the real recall read paths once, under its own ceiling (`WARM_RUN_CEILING_MS`, 20 s). The recall limit is unchanged and recall gets no first-call tolerance.
+
+For each of turn, record and chunk it runs, through the same store methods recall uses, the index status read, the ungrouped lexical query and the grouped admission query, each with an empty and with a non-empty `exclude`. It also runs the reads a bundle makes (turn, evidence records, neighbors, record) against an id that names nothing. The query is the fixed neutral text `source memory warm`; results are discarded, and the reply holds no memory text and nothing about the scope. It is read-only, never touches an embedding or reranking endpoint, and is not a recall: its result is never injected.
+
+```json
+{"ok":true,"warm":{"db":{"status":"ready","ms":1800,"ceiling_ms":20000,
+ "channels":{"turn":{"steps":{"status":4,"lexical_empty":900},"status":"ready","ms":1200},"record":{},"chunk":{}},
+ "bundle":{"steps":{},"status":"ready","ms":40}}}}
+```
+
+(`steps` abbreviated here; each channel lists the milliseconds of every step it completed.)
+
+| `status` | Meaning |
+|---|---|
+| `ready` | Every step answered well-formed inside the ceiling |
+| `unavailable` | Anything else. `reason` is a closed code: `ceiling`, `index_not_ready` (index populating, failed or missing), `malformed_reply`, `database_unavailable`, or a store error code. Never reported as `ready` |
+
+The exit code is 0 with `ok:true` in both cases; the caller reads `status`. Invalid configuration or scope keeps the usual error reply and nonzero exit. `--db` accepts only `v1` and only with `warm`; plain `warm` is unchanged and never touches the database. The ceiling abandons slow reads rather than cancelling them; the process closes its driver and exits, and the server ends them at its own transaction timeout.
+
+`warming` is the caller's state while a run is in flight; this command never emits it. The caller also owns freshness: how long a `ready` result may be trusted is its policy (the window is deliberately not defined here, pending idle measurements), and it must warm again after any Neo4j restart because a restart makes the server cold again. The figures above are single measurements on private fresh containers (`/var/tmp/source-memory-direct-classifier-01/summary.json`, warm-series reports `/var/tmp/source-memory-warm-series-S*-01/`), measurement rather than qualification.
 
 ### Turn envelope
 
