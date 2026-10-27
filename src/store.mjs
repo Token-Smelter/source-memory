@@ -386,8 +386,16 @@ export class Neo4jStore {
 
   async vectorCounts(scope, kind, model, exclude = []) {
     const label = `${namespace(scope)}${kind === 'chunk' ? 'Chunk' : 'Record'}`;
+    // WHERE accepts only true. Full-branch CASE guards preserve OR eligibility without assuming disjoint labels.
+    const eligibility = `CASE
+      WHEN size($exclude) = 0 THEN true
+      WHEN node:SMTurn AND NOT ${excludedTurn('node')} THEN true
+      WHEN node:SMChunk AND EXISTS { MATCH (t:SMTurn)-[:SM_HAS_CHUNK]->(node) WHERE NOT ${excludedTurn('t')} } THEN true
+      WHEN node:SMRecord AND (NOT EXISTS { MATCH (node)-[:SM_EVIDENCE]->(:SMTurn) }
+        OR EXISTS { MATCH (node)-[:SM_EVIDENCE]->(t:SMTurn) WHERE NOT ${excludedTurn('t')} }) THEN true
+      ELSE false END`;
     return this.transaction('read', async tx => {
-      const result = await tx.run(`MATCH (node:${label} {scope:$scope}) WHERE ${eligible('node')}
+      const result = await tx.run(`MATCH (node:${label} {scope:$scope}) WHERE ${eligibility}
         RETURN count(CASE WHEN node.embedding_key=$model THEN 1 END) AS total,
           count(CASE WHEN node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed`, { scope, model, exclude });
       return result.records[0].toObject();
