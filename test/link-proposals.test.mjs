@@ -616,6 +616,58 @@ test('a_consumed_result_cannot_commit_a_different_approved_selection', async () 
   assert.equal(memory.writes.length, 1);
 });
 
+for (const interval of ['source_read', 'enrichment']) {
+  test(`caller_review_mutation_during_${interval}_cannot_change_selection_or_provenance`, async () => {
+    const { request, memory } = await setup();
+    const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+    const suppliedReview = reviewFor(result), originalReview = clone(suppliedReview);
+    let release, entered;
+    const held = new Promise(resolve => { release = resolve; });
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const show = memory.show.bind(memory), enrich = memory.enrich.bind(memory);
+    let sourceHeld = false;
+    memory.show = async (...args) => {
+      const shown = await show(...args);
+      if (interval === 'source_read' && !sourceHeld) {
+        sourceHeld = true;
+        entered();
+        await held;
+      }
+      return shown;
+    };
+    memory.enrich = async (...args) => {
+      if (interval === 'enrichment') {
+        entered();
+        await held;
+      }
+      return enrich(...args);
+    };
+    const applying = apply(request, result, suppliedReview);
+    let committed;
+    try {
+      await waiting;
+      suppliedReview.approved.splice(0);
+      suppliedReview.decision_ref = 'mutated-after-await';
+      suppliedReview.reviewer = 'mutated-caller-reviewer';
+      suppliedReview.operation_id = 'mutated-operation';
+      release();
+      committed = await applying;
+    } finally { release(); }
+    const replay = await apply(request, result, reviewFor(result));
+    const acknowledged = memory.intents[0], payload = memory.writes[0].input;
+    assert.deepEqual({ callerChanged: canonical(suppliedReview) !== canonical(originalReview),
+      acknowledgedReview: acknowledged.review, committedReview: committed.review, replayedReview: replay.review,
+      acknowledgedPayload: acknowledged.enrichment, committedPayload: committed.enrichment, replayedPayload: replay.enrichment,
+      selected: payload.relations.map(edge => [edge.from, edge.to]),
+      attribution: payload.relations[0].attribution.includes('decision fixture-review-001')
+        && !payload.relations[0].attribution.includes('mutated'),
+      calls: [memory.intents.length, memory.writes.length], replayed: replay.replayed }, {
+      callerChanged: true, acknowledgedReview: originalReview, committedReview: originalReview, replayedReview: originalReview,
+      acknowledgedPayload: payload, committedPayload: payload, replayedPayload: payload,
+      selected: [['new', 'old']], attribution: true, calls: [1, 1], replayed: true });
+  });
+}
+
 test('state_readback_is_read_only_and_not_a_serialized_write_capability', async () => {
   const { request } = await setup();
   const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });

@@ -220,7 +220,8 @@ export function memoryLinkProposalState(result) {
 }
 
 /** Review and durable intent belong to the trusted host. A JSON artifact is never an apply capability. */
-export async function applyReviewedMemoryLinks({ memory, scope, result, review, before_append, signal }) {
+export async function applyReviewedMemoryLinks({ memory, scope, result, review: suppliedReview, before_append, signal }) {
+  const review = freeze(copy(suppliedReview));
   access(memory, scope);
   active(signal);
   const plan = plans.get(result);
