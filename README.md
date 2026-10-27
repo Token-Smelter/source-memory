@@ -91,24 +91,26 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 
 ### Warming the database (`warm --db v1`)
 
-A freshly started Neo4j is cold: in measurements, the first fulltext/recall transaction took about 2 s and exceeded the 2500 ms recall limit, while an identical repeat took 350–600 ms. A trivial `RETURN 1` did not warm it. `warm --db v1 --config FILE --scope SCOPE` pays that cost ahead of recall by running the real recall read paths once, under its own ceiling (`WARM_RUN_CEILING_MS`, 20 s). The recall limit is unchanged and recall gets no first-call tolerance.
+A freshly started Neo4j is cold: in measurements, the first fulltext/recall transaction took about 2 s and exceeded the 2500 ms recall limit, while an identical repeat took 350–600 ms. A trivial `RETURN 1` did not warm it. `warm --db v1 --config FILE --scope SCOPE` pays that cost ahead of recall by running recall's own read paths once (listed next), under its own ceiling (`WARM_RUN_CEILING_MS`, 20 s). The recall limit is unchanged and recall gets no first-call tolerance.
 
-For each of turn, record and chunk it runs, through the same store methods recall uses, the index status read, the ungrouped lexical query and the grouped admission query, each with an empty and with a non-empty `exclude`. It also runs the reads a bundle makes (turn, evidence records, neighbors, record) against an id that names nothing. The query is the fixed neutral text `source memory warm`; results are discarded, and the reply holds no memory text and nothing about the scope. It is read-only, never touches an embedding or reranking endpoint, and is not a recall: its result is never injected.
+For each of turn, record and chunk it runs, through the same store methods recall uses, the index status read (chunk also runs its separate chunk status read), then the ungrouped lexical query and the grouped admission query, each of those two with an empty and with a non-empty `exclude` (the status reads take no `exclude`). It also runs the reads a bundle makes (turn, evidence records, neighbors, record) against an id that names nothing. It does **not** warm the vector, rerank, following or multi-hop expansion paths, so `ready` means "these paths answered", not "every recall channel is warm". The query is the fixed neutral text `source memory warm`; results are discarded, and the reply holds no memory text and nothing about the scope. It is read-only, never touches an embedding or reranking endpoint, and is not a recall: its result is never injected.
 
 ```json
 {"ok":true,"warm":{"db":{"status":"ready","ms":1800,"ceiling_ms":20000,
- "channels":{"turn":{"steps":{"status":4,"lexical_empty":900},"status":"ready","ms":1200},"record":{},"chunk":{}},
- "bundle":{"steps":{},"status":"ready","ms":40}}}}
+ "channels":{"turn":{"steps":{"status":4,"lexical_empty":900},"result":"completed","ms":1200},"record":{},"chunk":{}},
+ "bundle":{"steps":{},"result":"completed","ms":40}}}}
 ```
 
 (`steps` abbreviated here; each channel lists the milliseconds of every step it completed.)
 
-| `status` | Meaning |
-|---|---|
-| `ready` | Every step answered well-formed inside the ceiling |
-| `unavailable` | Anything else. `reason` is a closed code: `ceiling`, `index_not_ready` (index populating, failed or missing), `malformed_reply`, `database_unavailable`, or a store error code. Never reported as `ready` |
+**The single gate is `warm.db.status === 'ready'` and nothing else.** Not `ok`, not the exit code, not any field inside `channels` or `bundle`: those carry `result: "completed" | "failed"` (plus `reason`), and the text `"status":"ready"` occurs only at `warm.db.status`. A run that fails in one channel still has completed siblings.
 
-The exit code is 0 with `ok:true` in both cases; the caller reads `status`. Invalid configuration or scope keeps the usual error reply and nonzero exit. `--db` accepts only `v1` and only with `warm`; plain `warm` is unchanged and never touches the database. The ceiling abandons slow reads rather than cancelling them; the process closes its driver and exits, and the server ends them at its own transaction timeout.
+| `warm.db.status` | Meaning |
+|---|---|
+| `ready` | Every one of the turn, record, chunk and bundle records completed, every answer was well-formed, and the whole run took no longer than the ceiling |
+| `unavailable` | Anything else. `reason` is a closed code: `ceiling` (the timer fired, or the measured total exceeded `ceiling_ms` even though every step finished), `index_not_ready` (index populating, failed or missing), `malformed_reply`, `database_unavailable`, or a store error code. A thrown error without a usable code is `database_unavailable`. Never reported as `ready` |
+
+The exit code is 0 with `ok:true` in both cases; the caller reads `warm.db.status`. Invalid configuration or scope keeps the usual error reply and nonzero exit. `--db` accepts only `v1` and only with `warm`; plain `warm` is unchanged and never touches the database. The ceiling abandons slow reads rather than cancelling them. Each transaction carries a 15 s timeout that the client requests (`src/store.mjs`, `transaction`); abandoned reads end at that timeout, and the process closes its driver after the run. Exit after a ceiling against a hung socket has not been tested.
 
 `warming` is the caller's state while a run is in flight; this command never emits it. The caller also owns freshness: how long a `ready` result may be trusted is its policy (the window is deliberately not defined here, pending idle measurements), and it must warm again after any Neo4j restart because a restart makes the server cold again. The figures above are single measurements on private fresh containers (`/var/tmp/source-memory-direct-classifier-01/summary.json`, warm-series reports `/var/tmp/source-memory-warm-series-S*-01/`), measurement rather than qualification.
 

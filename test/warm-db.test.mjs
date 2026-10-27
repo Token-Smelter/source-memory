@@ -73,11 +73,12 @@ test('a full run is ready, reads only, and runs every recall query shape once', 
   assert.ok(Number.isInteger(warm.db.ms) && warm.db.ms >= 0);
   assert.deepEqual(Object.keys(warm.db.channels), ['turn', 'record', 'chunk']);
   for (const [kind, channel] of Object.entries(warm.db.channels)) {
-    assert.equal(channel.status, 'ready', kind);
+    assert.equal(channel.result, 'completed', kind);
+    assert.equal(channel.status, undefined, kind);
     assert.deepEqual(Object.keys(channel.steps), ['status', ...(kind === 'chunk' ? ['chunk_status'] : []),
       'lexical_empty', 'lexical_sample', 'grouped_empty', 'grouped_sample']);
   }
-  assert.equal(warm.db.bundle.status, 'ready');
+  assert.equal(warm.db.bundle.result, 'completed');
   assert.deepEqual(new Set(modes), new Set(['read']));
   assert.deepEqual(new Set(runs.map(run => run.mode)), new Set(['read']));
   const search = queries(runs);
@@ -114,23 +115,25 @@ for (const [name, state, reason] of [['populating', 'POPULATING', 'index_not_rea
     const { warm } = await warmDb(config(), SCOPE, store);
     assert.equal(warm.db.status, 'unavailable');
     assert.equal(warm.db.reason, reason);
-    assert.equal(Object.values(warm.db.channels).filter(channel => channel.status === 'ready').length, 0);
+    assert.equal(Object.values(warm.db.channels).filter(channel => channel.result === 'completed').length, 0);
   });
 }
 
-test('one failing step makes the whole run unavailable and hides the error text', async () => {
+test('one failing step makes the whole run unavailable, hides the error text, and still only reads', async () => {
   const chunks = indexNames(SCOPE).chunks;
-  const { store } = fixture({ answer: (query, params) => {
+  const { store, runs, modes } = fixture({ answer: (query, params) => {
     if (params?.index === chunks && query.includes('collect({node:node')) throw new Error('bolt://10.0.0.9 password=hunter2');
     return null;
   } });
   const { warm } = await warmDb(config(), SCOPE, store);
   assert.equal(warm.db.status, 'unavailable');
   assert.equal(warm.db.reason, 'database_unavailable');
-  assert.equal(warm.db.channels.turn.status, 'ready');
-  assert.equal(warm.db.channels.record.status, 'ready');
-  assert.deepEqual([warm.db.channels.chunk.status, warm.db.channels.chunk.reason], ['unavailable', 'database_unavailable']);
+  assert.equal(warm.db.channels.turn.result, 'completed');
+  assert.equal(warm.db.channels.record.result, 'completed');
+  assert.deepEqual([warm.db.channels.chunk.result, warm.db.channels.chunk.reason], ['failed', 'database_unavailable']);
   assert.doesNotMatch(JSON.stringify(warm), /hunter2|10\.0\.0\.9/);
+  assert.deepEqual(new Set(modes), new Set(['read']));
+  assert.deepEqual(new Set(runs.map(run => run.mode)), new Set(['read']));
 });
 
 test('a bundle-read failure alone makes the run unavailable', async () => {
@@ -139,9 +142,29 @@ test('a bundle-read failure alone makes the run unavailable', async () => {
     return null;
   } });
   const { warm } = await warmDb(config(), SCOPE, store);
-  assert.deepEqual([warm.db.status, warm.db.reason, warm.db.bundle.status], ['unavailable', 'fixture_failure', 'unavailable']);
-  assert.equal(warm.db.channels.turn.status, 'ready');
+  assert.deepEqual([warm.db.status, warm.db.reason, warm.db.bundle.result], ['unavailable', 'fixture_failure', 'failed']);
+  assert.equal(warm.db.channels.turn.result, 'completed');
 });
+
+for (const [label, code] of [['undefined', undefined], ['empty', ''], ['absent', 'absent']]) {
+  const failure = () => label === 'absent' ? new MemoryError() : new MemoryError(code);
+  test(`a codeless MemoryError (${label}) thrown asynchronously is unavailable, not ready`, async () => {
+    const { store } = fixture();
+    store.lexicalStatus = async () => { throw failure(); };
+    const { warm } = await warmDb(config(), SCOPE, store);
+    assert.deepEqual([warm.db.status, warm.db.reason], ['unavailable', 'database_unavailable']);
+    for (const channel of Object.values(warm.db.channels)) assert.deepEqual([channel.result, channel.reason], ['failed', 'database_unavailable']);
+  });
+
+  test(`a codeless MemoryError (${label}) thrown synchronously is unavailable, not ready`, async () => {
+    const { store } = fixture();
+    store.lexical = () => { throw failure(); };
+    const { warm } = await warmDb(config(), SCOPE, store);
+    assert.deepEqual([warm.db.status, warm.db.reason], ['unavailable', 'database_unavailable']);
+    assert.deepEqual([warm.db.channels.turn.result, warm.db.channels.turn.reason], ['failed', 'database_unavailable']);
+    assert.equal(warm.db.channels.chunk.result, 'completed');
+  });
+}
 
 test('a malformed answer is unavailable', async () => {
   for (const patch of [store => { store.lexicalStatus = async () => ({}); },
@@ -155,9 +178,26 @@ test('a malformed answer is unavailable', async () => {
   }
 });
 
-test('reaching the ceiling is unavailable with reason ceiling, and the timer is cleared', async () => {
-  const records = indexNames(SCOPE).records;
-  const { store } = fixture({ answer: (query, params) => params?.index === records && !query.includes('collect({node:node') ? { hang: true } : null });
+// Each reply has the wrong shape and carries text that must never reach the output.
+for (const [method, wrong, owner] of [
+  ['chunkLexical', { rows: [{ text: SECRET }] }, 'chunk'],
+  ['chunkLexicalStatus', { state: SECRET }, 'chunk'],
+  ['recordsForTurn', null, 'bundle'],
+  ['neighbors', SECRET, 'bundle'],
+  ['getRecord', { id: 'r', text: SECRET }, 'bundle']]) {
+  test(`a wrong-shape ${method} answer is unavailable as malformed_reply and shows no text`, async () => {
+    const { store } = fixture();
+    store[method] = async () => wrong;
+    const { warm } = await warmDb(config(), SCOPE, store);
+    assert.deepEqual([warm.db.status, warm.db.reason], ['unavailable', 'malformed_reply']);
+    const record = owner === 'bundle' ? warm.db.bundle : warm.db.channels[owner];
+    assert.deepEqual([record.result, record.reason], ['failed', 'malformed_reply']);
+    assert.doesNotMatch(JSON.stringify(warm), new RegExp(SECRET));
+  });
+}
+
+test('reaching the ceiling fails all four records with reason ceiling, and the timer is cleared', async () => {
+  const { store, modes } = fixture({ answer: () => ({ hang: true }) });
   const before = timers();
   const started = performance.now();
   const { warm } = await warmDb(config(), SCOPE, store, { ceilingMs: 100 });
@@ -165,8 +205,53 @@ test('reaching the ceiling is unavailable with reason ceiling, and the timer is 
   assert.equal(warm.db.status, 'unavailable');
   assert.equal(warm.db.reason, 'ceiling');
   assert.equal(warm.db.ceiling_ms, 100);
-  assert.deepEqual([warm.db.channels.record.status, warm.db.channels.record.reason], ['unavailable', 'ceiling']);
-  assert.equal(warm.db.channels.turn.status, 'ready');
+  for (const record of [...Object.values(warm.db.channels), warm.db.bundle]) assert.deepEqual([record.result, record.reason], ['failed', 'ceiling']);
+  assert.deepEqual(new Set(modes), new Set(['read']));
+  assert.equal(timers(), before);
+});
+
+test('a ceiling that stops one channel leaves the finished ones completed', async () => {
+  const records = indexNames(SCOPE).records;
+  const { store } = fixture({ answer: (query, params) => params?.index === records && !query.includes('collect({node:node') ? { hang: true } : null });
+  const { warm } = await warmDb(config(), SCOPE, store, { ceilingMs: 100 });
+  assert.deepEqual([warm.db.status, warm.db.reason], ['unavailable', 'ceiling']);
+  assert.deepEqual([warm.db.channels.record.result, warm.db.channels.record.reason], ['failed', 'ceiling']);
+  assert.equal(warm.db.channels.turn.result, 'completed');
+});
+
+function deepFreeze(value) {
+  if (value && typeof value === 'object') for (const inner of Object.values(value)) deepFreeze(inner);
+  return Object.freeze(value);
+}
+
+test('a step that resolves after the ceiling cannot change the returned result', async () => {
+  const { store } = fixture();
+  store.admittedLexical = async (_scope, kind) => {
+    if (kind === 'record') await new Promise(resolve => setTimeout(resolve, 100));
+    return { hits: [], omitted: [] };
+  };
+  const { warm } = await warmDb(config(), SCOPE, store, { ceilingMs: 40 });
+  assert.deepEqual([warm.db.status, warm.db.reason], ['unavailable', 'ceiling']);
+  const result = { warm };
+  const snapshot = deepFreeze(structuredClone(result));
+  // The record's two delayed steps finish about 200 ms after the start.
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.deepEqual(result, snapshot);
+  assert.deepEqual([warm.db.channels.record.result, warm.db.channels.record.reason], ['failed', 'ceiling']);
+});
+
+test('work that finishes synchronously past the ceiling is unavailable with reason ceiling', async () => {
+  const { store } = fixture();
+  let spun = false;
+  store.admittedLexical = async () => {
+    if (!spun) { spun = true; for (const end = performance.now() + 200; performance.now() < end;); }
+    return { hits: [], omitted: [] };
+  };
+  const before = timers();
+  const { warm } = await warmDb(config(), SCOPE, store, { ceilingMs: 50 });
+  assert.ok(warm.db.ms > 50);
+  assert.deepEqual([warm.db.status, warm.db.reason, warm.db.ceiling_ms], ['unavailable', 'ceiling', 50]);
+  assert.equal(JSON.stringify(warm).includes('"status":"ready"'), false);
   assert.equal(timers(), before);
 });
 
@@ -207,6 +292,7 @@ test('CLI warm --db v1 prints the reply, closes the store, and never calls a mod
   const reply = JSON.parse(out[0]);
   assert.equal(reply.ok, true);
   assert.equal(reply.warm.db.status, 'ready');
+  assert.equal(out[0].split('"status":"ready"').length - 1, 1);
   assert.deepEqual(new Set(modes), new Set(['read']));
   assert.equal(closed(), 1);
   assert.equal(requests.length, 0);
@@ -214,10 +300,18 @@ test('CLI warm --db v1 prints the reply, closes the store, and never calls a mod
 
 test('CLI closes the store when the run is unavailable and still reports ok', async t => {
   const { path, out, io } = await cli(t);
-  const { store, closed } = fixture({ answer: query => { if (query.includes('SHOW FULLTEXT')) throw new Error('down'); return null; } });
+  // Only the chunk index fails, so the other channels and the bundle complete: a caller must not read them as ready.
+  const chunks = indexNames(SCOPE).chunks;
+  const { store, closed, modes } = fixture({ answer: (query, params) => {
+    if (query.includes('SHOW FULLTEXT') && params.name === chunks) throw new Error('down');
+    return null;
+  } });
   await main(['warm', '--db', 'v1', '--config', path, '--scope', SCOPE], io(store));
   const reply = JSON.parse(out[0]);
   assert.deepEqual([reply.ok, reply.warm.db.status, reply.warm.db.reason], [true, 'unavailable', 'database_unavailable']);
+  assert.equal(reply.warm.db.channels.turn.result, 'completed');
+  assert.equal(out[0].includes('"status":"ready"'), false);
+  assert.deepEqual(new Set(modes), new Set(['read']));
   assert.equal(closed(), 1);
 });
 

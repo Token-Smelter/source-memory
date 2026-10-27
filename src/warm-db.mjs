@@ -18,7 +18,9 @@ const WARM_PER_CONVERSATION = 2;
 const KINDS = ['turn', 'record', 'chunk'];
 
 const elapsed = started => Math.round(performance.now() - started);
-const reasonOf = error => error instanceof MemoryError ? error.code : 'database_unavailable';
+// Only a MemoryError with a usable code passes through; anything else, including a codeless MemoryError, is redacted.
+const reasonOf = error => error instanceof MemoryError && typeof error.code === 'string' && error.code.length > 0
+  ? error.code : 'database_unavailable';
 const validStatus = value => Boolean(value) && typeof value.status === 'string';
 const validAdmitted = value => Boolean(value) && Array.isArray(value.hits) && Array.isArray(value.omitted);
 
@@ -33,9 +35,9 @@ async function step(record, name, read, valid) {
 async function conclude(record, started, work) {
   try {
     await work();
-    record.status = 'ready';
+    record.result = 'completed';
   } catch (error) {
-    record.status = 'unavailable';
+    record.result = 'failed';
     record.reason = reasonOf(error);
   }
   record.ms = elapsed(started);
@@ -75,7 +77,8 @@ function warmBundle(store, scope, record) {
 /**
  * Runs the recall-shaped read paths once against `store` and reports whether the server answered them all inside the
  * ceiling. Read-only, no model call. Any failure, timeout, unready index or malformed answer is 'unavailable', never
- * 'ready'. 'warming' is the caller's own state while a run is in flight and is never returned. The ceiling abandons
+ * 'ready'. Per-channel and bundle records say `result: 'completed' | 'failed'`, never a status, so `status: 'ready'` appears
+ * only at warm.db.status, the single gate. 'warming' is the caller's own state while a run is in flight and is never returned. The ceiling abandons
  * slow reads rather than cancelling them: the caller closes the store, and the server ends them at its own
  * transaction timeout.
  */
@@ -92,12 +95,16 @@ export async function warmDb(config, scope, store, { ceilingMs = WARM_RUN_CEILIN
     .finally(() => clearTimeout(timer));
   const ms = elapsed(started);
   const records = [...KINDS.map(kind => channels[kind]), bundle];
-  if (outcome === 'ceiling') {
-    for (const record of records) if (record.status === undefined) Object.assign(record, { status: 'unavailable', reason: 'ceiling' });
+  // A synchronous stretch can finish the work before the timer gets a turn, so elapsed time is checked as well.
+  const overCeiling = outcome === 'ceiling' || ms > ceilingMs;
+  if (overCeiling) {
+    for (const record of records) if (record.result === undefined) Object.assign(record, { result: 'failed', reason: 'ceiling' });
   }
-  const failed = records.find(record => record.status !== 'ready');
-  const reason = outcome === 'ceiling' ? 'ceiling' : failed?.reason;
+  // Ready is positively required of every record; a missing reason never implies success.
+  const ready = !overCeiling && records.every(record => record.result === 'completed');
+  const reason = ready ? undefined : overCeiling ? 'ceiling'
+    : records.find(record => record.result !== 'completed')?.reason ?? 'database_unavailable';
   // Reads still in flight after the ceiling write to the originals, so the reply is a snapshot.
-  return structuredClone({ warm: { db: { status: reason === undefined ? 'ready' : 'unavailable',
-    ...(reason === undefined ? {} : { reason }), ms, ceiling_ms: ceilingMs, channels, bundle } } });
+  return structuredClone({ warm: { db: { status: ready ? 'ready' : 'unavailable',
+    ...(ready ? {} : { reason }), ms, ceiling_ms: ceilingMs, channels, bundle } } });
 }
