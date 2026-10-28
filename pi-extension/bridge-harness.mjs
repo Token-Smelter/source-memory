@@ -78,35 +78,54 @@ export async function openEmbeddingRelay({ gateway, port, serverFactory = create
 }
 
 /** Adapter-driven orchestration. Docker/relay effects must be supplied by the caller and independently admitted. */
-export async function runHarness({ docker, relay, isolation, memory, sessions, cases, clock = () => performance.now() }) {
-  let network, database, driver, listener;
+export async function runHarness({ docker, relay, isolation, memory, memoryFactory, sessions, sessionFactory, cases,
+  onTurn = async () => {}, onIsolation = async () => {}, maxTurns = 110, clock = () => performance.now() }) {
+  let network, database, driver, listener, activeMemory = memory;
   let outcome = { status: 'failed' };
   let cleanupFailed = false;
+  if (!Number.isSafeInteger(maxTurns) || maxTurns < 1 || maxTurns > 110) return { status: 'failed', code: 'turn_limit_invalid' };
   try {
     network = await docker.createNetwork({ internal: true });
     database = await docker.createDatabase({ network, publishedPorts: false });
     driver = await docker.createDriver({ network, database });
-    listener = await relay.open({ network, database, driver });
+    listener = await relay.open({ network, database, driver, gateway: docker.gateway });
     const gate = await isolation({ network, database, driver });
+    await onIsolation(gate);
     if (gate?.ok !== true || !Array.isArray(gate.targets) || gate.targets.length < 3
       || !gate.targets.some(row => row.host === '127.0.0.1' && row.port === 27690)
       || gate.targets.some(row => !isIP(row.host) || row.port !== 27690 || !['error', 'timeout'].includes(row.outcome))) {
       return outcome = { status: 'isolation_failed', isolation: gate };
     }
-    if (!Array.isArray(sessions) || !sessions.length || !Array.isArray(cases) || !cases.length) throw fail('input_invalid');
-    await memory.init();
+    if (typeof docker.waitReady === 'function') await docker.waitReady({ network, database, driver });
+    if (!activeMemory && typeof memoryFactory === 'function') activeMemory = await memoryFactory({ network, database, driver, gateway: docker.gateway });
+    if (!sessions && typeof sessionFactory === 'function') sessions = await sessionFactory(activeMemory);
+    if (!activeMemory || !Array.isArray(sessions) || !sessions.length || !Array.isArray(cases) || !cases.length) throw fail('input_invalid');
+    await activeMemory.init();
     const replayed = [];
-    for (const item of sessions) replayed.push(await replay(item.session, item.leaves, item.cursor ?? null));
+    let processed = 0;
+    for (const item of sessions) {
+      if (processed >= maxTurns) return outcome = { status: 'turn_limit', replayed };
+      const result = await replay(item.session, item.leaves, item.cursor ?? null, { maxTurns: maxTurns - processed,
+        onTurn: turn => onTurn(turn, { session: item.session.conversation_id }) });
+      replayed.push(result);
+      processed += result.results.length;
+      if (result.status !== 'complete') return outcome = { status: result.status, replayed };
+    }
     const results = [];
     for (const item of cases) {
       const start = clock();
-      const result = await within(signal => memory.recall(item.scope ?? sessions[0]?.session.scopes[0], { query: item.query,
+      const result = await within(signal => activeMemory.recall(item.scope ?? sessions[0]?.session.scopes[0], { query: item.query,
         exclude_conversations: [{ source: 'pi-memory', conversation_id: item.asker_conversation_id }] }, { signal }), 15000);
       results.push({ id: item.id, evidence_not_ingestable: item.evidence_not_ingestable === true, elapsed_ms: clock() - start, result });
     }
     outcome = { status: 'complete', replayed, cases: results };
-  } catch (error) { outcome = { status: 'failed', code: typeof error?.code === 'string' ? error.code : 'harness_failed' }; }
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code : 'harness_failed';
+    outcome = { status: ['creation_unknown', 'cleanup_unknown'].includes(code) ? 'cleanup_unknown' : 'failed', code };
+    if (outcome.status === 'cleanup_unknown') cleanupFailed = true;
+  }
   finally {
+    try { if (activeMemory?.close && await activeMemory.close() !== 'closed') cleanupFailed = true; } catch { cleanupFailed = true; }
     try { await listener?.close(); } catch { cleanupFailed = true; }
     for (const id of [driver, database].filter(Boolean)) try { await docker.removeContainer(id); } catch { cleanupFailed = true; }
     if (network) try { await docker.removeNetwork(network); } catch { cleanupFailed = true; }

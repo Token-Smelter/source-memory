@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
+import { createInterface } from 'node:readline';
 
 const load = () => import('../pi-extension/bridge-harness.mjs');
 
@@ -15,6 +16,16 @@ test('a connected pilot target stops before init, and owned resources are cleane
   const result = await runHarness({ docker, relay, isolation: async () => ({ ok: false, targets: [{ outcome: 'connected' }] }),
     memory: { async init() { actions.push('init'); } }, sessions: [], cases: [] });
   assert.deepEqual([result.status, actions.includes('init'), actions.slice(-3)], ['isolation_failed', false, ['remove:driver-owned', 'remove:db-owned', 'remove:net-owned']]);
+});
+
+test('a failed isolation gate never starts the Memory process factory', async () => {
+  const { runHarness } = await load();
+  let calls = 0;
+  const docker = { async createNetwork() { return 'net'; }, async createDatabase() { return 'db'; }, async createDriver() { return 'driver'; },
+    async removeContainer() {}, async removeNetwork() {} };
+  const result = await runHarness({ docker, relay: { async open() { return { async close() {} }; } }, isolation: async () => ({ ok: false, targets: [] }),
+    memoryFactory: async () => { calls++; }, sessions: [], cases: [] });
+  assert.deepEqual([result.status, calls], ['isolation_failed', 0]);
 });
 
 test('bridge harness replays the shared cursor core then recalls with only asker exclusion', async () => {
@@ -39,6 +50,26 @@ test('isolation checks loopback, bridge gateway and all enumerated pilot address
   const result = await verifyPilotIsolation({ gateway: '172.30.0.1', pilotIps: ['172.17.0.8', '172.18.0.9'],
     connect: async (host, port) => { tested.push([host, port]); return host === '172.18.0.9' ? 'connected' : 'timeout'; } });
   assert.deepEqual([result.ok, tested], [false, [['127.0.0.1', 27690], ['172.30.0.1', 27690], ['172.17.0.8', 27690], ['172.18.0.9', 27690]]]);
+});
+
+test('docker-exec transport keeps one correlated fake Memory process and closes it', async () => {
+  const { openDockerMemory } = await import('../pi-extension/docker-memory.mjs');
+  const calls = [];
+  const spawnFn = (program, argv, options) => {
+    calls.push({ program, argv, options });
+    const child = new EventEmitter(); child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    const input = createInterface({ input: child.stdin });
+    input.on('line', line => { const request = JSON.parse(line); child.stdout.write(JSON.stringify({ id: request.id, ok: true, value: { id: 'fiction' } }) + '\n'); });
+    input.on('close', () => { child.stdout.end(); child.stderr.end(); setImmediate(() => child.emit('close', 0)); });
+    child.kill = () => true;
+    return child;
+  };
+  const id = 'a'.repeat(64);
+  const memory = openDockerMemory({ containerId: id, scope: 'private', configPath: '/scratch/config.json', intentDir: '/scratch/intents', spawnFn });
+  assert.equal((await memory.ingest('private', { source: 'pi-memory' })).id, 'fiction');
+  assert.equal(await memory.close(), 'closed');
+  assert.deepEqual([calls.length, calls[0].program, calls[0].argv.slice(0, 5)],
+    [1, '/usr/bin/docker', ['exec', '-i', id, '/usr/local/bin/node', '/memory/pi-extension/serve.mjs']]);
 });
 
 test('embedding relay binds only the supplied bridge gateway, never a wildcard', async () => {

@@ -63,6 +63,18 @@ test('replay invokes the same incremental core across successive leaves', () => 
     ['a3', [['u1', 'a1', 't1', 'u2', 'a2'], ['u3', 'a3']]]);
 }));
 
+test('replay stops between turns when reported usage reaches the ceiling and retains completed results', () => local(async dir => {
+  const { replay } = await import('../pi-extension/replay.mjs');
+  const { createInputBudget } = await import('../pi-extension/budget.mjs');
+  const budget = createInputBudget(100);
+  const results = [];
+  const session = { conversation_id: 'fiction', scopes: ['private'], entries: fixture.slice(1).map(JSON.parse), budget,
+    memory: { async ingest() { return { id: 'turn' }; } },
+    distiller: { async run() { budget.beforeCall(); budget.record({ input: 90, cacheRead: 10, cacheWrite: 0 }); return { status: 'complete' }; } } };
+  const result = await replay(session, ['a2', 'a3'], null, { onTurn: row => { results.push(row.cursor); } });
+  assert.deepEqual([result.status, result.cursor, results], ['budget_stopped', 'a2', ['a2']]);
+}));
+
 test('incremental private session reopens each source leaf with no prior task or future source context', () => local(async dir => {
   const { createIncrementalSession } = await load();
   const { createPiDistiller } = await import('../pi-extension/pi-runtime.mjs');

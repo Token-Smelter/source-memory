@@ -21,6 +21,18 @@ test('cursor-bounded turn includes original and steered entries without live ide
     ['pi-memory', ['u1', 'a1', 't1', 'u2', 'a2'], 'a2']);
 });
 
+test('custom message is omitted with its ID and cannot become a source evidence label', async () => {
+  const { distillThrough, createTurnTools } = await loadCore();
+  const session = fixture();
+  session.entries = [{ type: 'message', id: 'u', parentId: null, message: { role: 'user', content: 'Fiction' } },
+    { type: 'custom_message', id: 'advice', parentId: 'u', content: 'Earlier model advice' },
+    { type: 'message', id: 'a', parentId: 'advice', message: { role: 'assistant', content: 'Done', stopReason: 'stop' } }];
+  const result = await distillThrough(session, 'a', null);
+  const tools = createTurnTools({ scope: 'private', turn: session.calls[0].turn, receipt: { id: 'turn' }, memory: {} });
+  assert.deepEqual([session.calls[0].turn.entries.map(row => row.id), result.omissions, tools.labels().length],
+    [['u', 'a'], { custom_message: { count: 1, entry_ids: ['advice'] } }, 2]);
+});
+
 test('next cursor consumes only the same-branch suffix', async () => {
   const { distillThrough } = await loadCore();
   const session = fixture();
@@ -133,9 +145,9 @@ test('incremental fake Pi distiller reopens the same private session and branche
   const incremental = { sessionId: 'distiller-id', async syncThrough(id) { calls.push(['sync', id]); return { file: '/fiction/private' }; } };
   const manager = { getSessionId: () => 'distiller-id', branch(id) { calls.push(['branch', id]); this.leaf = id; },
     buildSessionContext() { return { messages: [{ role: 'user', content: this.leaf }] }; } };
-  const session = { sessionId: 'distiller-id', agent: { sessionId: 'distiller-id', state: {} }, messages: [],
-    async prompt() { calls.push(['prompt', this.agent.state.messages[0].content]); this.messages = [{ role: 'assistant', content: [{ type: 'text', text: 'done' }], stopReason: 'stop' }]; } };
-  const pi = { SessionManager: { open: () => { calls.push(['open']); return manager; } }, async createAgentSession() { return { session }; } };
+  const makeSession = () => ({ sessionId: 'distiller-id', agent: { sessionId: 'distiller-id', state: {} }, messages: [],
+    async prompt() { calls.push(['prompt', this.agent.state.messages[0].content]); this.messages = [{ role: 'assistant', content: [{ type: 'text', text: 'done' }], stopReason: 'stop' }]; } });
+  const pi = { SessionManager: { open: () => { calls.push(['open']); return manager; } }, async createAgentSession() { return { session: makeSession() }; } };
   const runtime = await createPiDistiller({ pi, incremental, workDir: '/fiction/work', model: {}, memory: {}, scope: 'private', createOptions: {} });
   for (const id of ['a2', 'a3']) await runtime.run({ throughEntryId: id, turn: { turn_id: id, entries: [] }, receipt: { id: 'turn' } });
   assert.deepEqual(calls, [['sync', 'a2'], ['open'], ['branch', 'a2'], ['prompt', 'a2'], ['sync', 'a3'], ['open'], ['branch', 'a3'], ['prompt', 'a3']]);
@@ -170,6 +182,17 @@ for (const mode of ['separate', 'self_review']) {
     assert.deepEqual(calls, [['compare', 1], ['review', mode], ['apply', `${mode}:fake-reviewer`]]);
   });
 }
+
+test('Pi reviewer is a separate call that approves only valid offered indices', async () => {
+  const { createPiReviewer } = await import('../pi-extension/reviewer.mjs');
+  let calls = 0;
+  const session = { messages: [], async prompt() { calls++; this.messages = [{ role: 'assistant', stopReason: 'stop',
+    content: [{ type: 'text', text: JSON.stringify({ verdicts: [{ index: 0, verdict: 'approve', reason: 'fiction' }] }) }] }]; } };
+  const pi = { SessionManager: { inMemory: () => ({}) }, async createAgentSession() { return { session }; } };
+  const reviewer = createPiReviewer({ pi, workDir: '/fiction', model: { provider: 'fake', id: 'reviewer' } });
+  const result = await reviewer.review({ mode: 'separate', proposal: { proposal_sha256: 'a', packet: {}, proposals: [{ from: 'r1', to: 'r0' }] } });
+  assert.deepEqual([calls, result.reviewer, result.approved], [1, 'fake/reviewer', [0]]);
+});
 
 test('Anthropic breakpoint uses the history block and respects the breakpoint cap', async () => {
   const { addHistoryBreakpoint } = await import('../pi-extension/pi-runtime.mjs');

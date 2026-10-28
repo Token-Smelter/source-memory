@@ -40,16 +40,16 @@ function turnAt(entries, through, cursor, conversation) {
     current = row.parentId;
   }
   if (current !== cursor || !chain.length) throw fail('cursor_unresolved');
-  const sourceEntries = chain.filter(row => row.message).map(row => {
+  const sourceEntries = chain.filter(row => row.type === 'message' && row.message).map(row => {
     const role = row.message.role === 'toolResult' ? 'tool' : row.message.role;
     if (!['user', 'assistant', 'tool', 'system'].includes(role)) throw fail('source_role_unsupported');
     return { id: row.id, role, text: entryText(row) };
   });
-  if (chain.some(row => row.type === 'custom_message')) throw fail('source_role_unsupported');
+  const omitted = chain.filter(row => row.type === 'custom_message').map(row => row.id);
   const turn = { source: 'pi-memory', conversation_id: conversation,
     turn_id: digest(['pi-memory-turn/v1', cursor, through]), ...(cursor === null ? { lineage_root: true } : {}), entries: sourceEntries };
   normalizeTurn(turn);
-  return turn;
+  return { turn, omissions: { custom_message: { count: omitted.length, entry_ids: omitted } } };
 }
 
 /** The same cursor-bounded source turn is retained before either live or replay distillation. */
@@ -57,12 +57,12 @@ export async function distillThrough(session, throughEntryId, cursor) {
   if (!session || !Array.isArray(session.scopes) || session.scopes.length !== 1
     || typeof session.scopes[0] !== 'string' || !session.scopes[0]) throw fail('scope_unresolved');
   if (!session.memory || typeof session.memory.ingest !== 'function' || !session.distiller || typeof session.distiller.run !== 'function') throw fail('invalid_input');
-  const turn = turnAt(session.entries, throughEntryId, cursor, session.conversation_id);
+  const { turn, omissions } = turnAt(session.entries, throughEntryId, cursor, session.conversation_id);
   const receipt = await session.memory.ingest(session.scopes[0], turn);
   if (typeof receipt?.id !== 'string' || !receipt.id) throw fail('ingest_receipt_invalid');
   const result = await session.distiller.run({ turn, receipt, throughEntryId, cursor, scope: session.scopes[0] });
   if (result?.status !== 'complete') throw fail('distillation_incomplete');
-  return { cursor: throughEntryId, turn_id: turn.turn_id, receipt, distillation: result };
+  return { cursor: throughEntryId, turn_id: turn.turn_id, receipt, omissions, distillation: result };
 }
 
 /** Collects only the record and evidence handles offered by the current Memory comparison packet. */
@@ -138,5 +138,6 @@ export function createTurnTools({ scope, turn, receipt, memory }) {
       return { status: 'pending_review' };
     },
     pendingLinks() { return offer && choices ? { token: offer.token, output: choices.output() } : null; },
+    stats() { return { records: recordIds.length }; },
   };
 }
