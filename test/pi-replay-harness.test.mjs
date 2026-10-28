@@ -41,6 +41,21 @@ test('isolation checks loopback, bridge gateway and all enumerated pilot address
   assert.deepEqual([result.ok, tested], [false, [['127.0.0.1', 27690], ['172.30.0.1', 27690], ['172.17.0.8', 27690], ['172.18.0.9', 27690]]]);
 });
 
+test('embedding relay binds only the supplied bridge gateway, never a wildcard', async () => {
+  const { openEmbeddingRelay } = await load();
+  const bindings = [];
+  const serverFactory = () => {
+    const server = new EventEmitter();
+    server.listen = (options, callback) => { bindings.push(options); callback(); };
+    server.close = callback => callback();
+    return server;
+  };
+  await assert.rejects(openEmbeddingRelay({ gateway: '0.0.0.0', port: 17688, serverFactory }), /gateway_invalid/);
+  const relay = await openEmbeddingRelay({ gateway: '172.30.0.1', port: 17688, serverFactory });
+  await relay.close();
+  assert.deepEqual(bindings, [{ host: '172.30.0.1', port: 17688 }]);
+});
+
 test('embedding relay refuses a different route without calling upstream', async () => {
   const { createEmbeddingHandler } = await load();
   let called = false;

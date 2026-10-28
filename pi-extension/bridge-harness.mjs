@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import { isIP } from 'node:net';
+import { createServer } from 'node:http';
 import { replay } from './replay.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -62,6 +63,18 @@ export function createEmbeddingHandler({ fetchFn = fetch, timeoutMs = 10000, max
     } catch { return send(502, '{"error":"relay_unavailable"}'); }
     finally { busy = false; }
   };
+}
+
+/** Bind only a caller-verified bridge gateway; wildcard and loopback addresses are refused. */
+export async function openEmbeddingRelay({ gateway, port, serverFactory = createServer, fetchFn }) {
+  if (isIP(gateway) !== 4 || gateway === '0.0.0.0' || gateway.startsWith('127.')
+    || !Number.isInteger(port) || port < 1024 || port > 65535) throw fail('gateway_invalid');
+  const server = serverFactory(createEmbeddingHandler({ fetchFn }));
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen({ host: gateway, port }, () => { server.removeListener('error', reject); resolve(); });
+  });
+  return { async close() { await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); } };
 }
 
 /** Adapter-driven orchestration. Docker/relay effects must be supplied by the caller and independently admitted. */
