@@ -79,8 +79,8 @@ function warmBundle(store, scope, record) {
  * ceiling. Read-only, no model call. Any failure, timeout, unready index or malformed answer is 'unavailable', never
  * 'ready'. Per-channel and bundle records say `result: 'completed' | 'failed'`, never a status, so `status: 'ready'` appears
  * only at warm.db.status, the single gate. 'warming' is the caller's own state while a run is in flight and is never returned. The ceiling abandons
- * slow reads rather than cancelling them: the caller closes the store, and the server ends them at its own
- * transaction timeout.
+ * slow reads rather than cancelling them: the caller closes the store. Each transaction requests a 15 s timeout from the
+ * server; that is a request, not a guarantee that abandoned work has ended when the ceiling fires or the process exits.
  */
 export async function warmDb(config, scope, store, { ceilingMs = WARM_RUN_CEILING_MS } = {}) {
   authorize(config, scope, 'read');
