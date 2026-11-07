@@ -64,13 +64,28 @@ test('an unfinished interval remains uncertain after restart', () => privateJour
   journal.close();
 }));
 
-test('a model failure after a confirmed derived write is uncertain, not failed or abstained', () => privateJournal(async directory => {
-  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+test('a failure after confirmed writes remains failed and requires reconciliation before retry', () => privateJournal(async directory => {
+  let journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
   const memory = journal.track({ async ingest() { return { id: 'turn' }; }, async enrich() { return { ok: true }; } });
   const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory,
     distiller: { memory, async run() { await memory.enrich('private', { records: [] }); throw new Error('model failed'); } } };
   const result = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
-  assert.deepEqual([result.disposition, result.cursor, journal.state().status], ['uncertain', null, 'uncertain']);
+  assert.deepEqual([result.disposition, result.cursor, journal.state().reconciliation_required], ['failed', null, true]);
+  journal.close();
+  journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  assert.throws(() => journal.begin({ cursor: null, through: 'a', retry: true }), /reconciliation_required/);
+  journal.reconcile({ id: result.id, disposition: 'failed', evidenceRef: 'fictional-confirmed-write-and-failure' });
+  assert.equal(journal.begin({ cursor: null, through: 'a', retry: true }), result.id);
+  journal.finish('failed');
+  journal.close();
+}));
+
+test('confirmed indexing alone does not imply a derived record', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async index() { return { status: 'ready' }; } });
+  journal.begin({ cursor: null, through: 'a' });
+  await memory.index('private', {});
+  assert.equal(journal.finish('abstained'), 'abstained');
   journal.close();
 }));
 

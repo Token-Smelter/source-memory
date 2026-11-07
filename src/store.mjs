@@ -206,6 +206,23 @@ export class Neo4jStore {
     });
   }
 
+  async recordVectorsVisible(scope, model, ids) {
+    const index = indexNames(scope).vectorRecords;
+    return this.transaction('read', async tx => {
+      for (const id of ids) {
+        const uid = identity('record', scope, id);
+        const stored = await tx.run('MATCH (r:SMRecord {uid:$uid,scope:$scope,embedding_key:$model}) RETURN r.embedding AS vector', { uid, scope, model });
+        const vector = stored.records[0]?.get('vector');
+        if (!Array.isArray(vector) || !vector.length) return false;
+        const hits = await tx.run(`CALL db.index.vector.queryNodes($index,$k,$vector) YIELD node
+          WHERE node.uid=$uid AND node.scope=$scope RETURN count(node) AS hits`,
+        { index, k: neo4j.int(256), vector, uid, scope });
+        if (hits.records[0]?.get('hits') !== 1) return false;
+      }
+      return true;
+    });
+  }
+
   async pendingEmbeddings(scope, model, limit) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope

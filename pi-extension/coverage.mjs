@@ -39,7 +39,7 @@ export function createCoverageJournal({ directory, sessionKey }) {
   const finished = new Map();
   function apply(row) {
     if (row.type === 'begin') {
-      if (active || (gap && (!['failed', 'unresolved_scope'].includes(gap.disposition) || row.id !== gap.id || !row.retry)) || finished.has(row.id)) throw fail('journal_invalid');
+      if (active || (gap && (gap.reconciliation_required || !['failed', 'unresolved_scope'].includes(gap.disposition) || row.id !== gap.id || !row.retry)) || finished.has(row.id)) throw fail('journal_invalid');
       active = { id: row.id, through: row.through, cursor: row.cursor, effects: new Map(), derived: false };
       gap = null;
     } else if (row.type === 'effect_begin') {
@@ -49,20 +49,23 @@ export function createCoverageJournal({ directory, sessionKey }) {
       const effect = active?.effects.get(row.effect);
       if (!effect || active.id !== row.id || effect.state !== 'pending' || !['confirmed', 'refused', 'unknown'].includes(row.outcome)) throw fail('journal_invalid');
       effect.state = row.outcome;
-      if (row.outcome === 'confirmed' && effect.method !== 'ingest') active.derived = true;
+      if (row.outcome === 'confirmed' && ['enrich', 'applyLinks', 'applyOutcome'].includes(effect.method)) active.derived = true;
     } else if (row.type === 'finish') {
       if (!active || active.id !== row.id || ![...covered, 'failed', 'uncertain', 'unresolved_scope'].includes(row.disposition)) throw fail('journal_invalid');
       if (covered.has(row.disposition)) finished.set(row.id, row.disposition);
-      else gap = { id: row.id, disposition: row.disposition, through: active.through, cursor: active.cursor };
+      else gap = { id: row.id, disposition: row.disposition, through: active.through, cursor: active.cursor,
+        ...(row.reconciliation_required ? { reconciliation_required: true } : {}) };
       active = null;
     } else if (row.type === 'reconcile') {
       if (active && active.id === row.id) {
         gap = { id: active.id, disposition: 'uncertain', through: active.through, cursor: active.cursor };
         active = null;
       }
-      if (!gap || gap.id !== row.id || gap.disposition !== 'uncertain' || !['committed', 'failed'].includes(row.disposition)) throw fail('journal_invalid');
+      if (!gap || gap.id !== row.id || !['uncertain', 'failed'].includes(gap.disposition)
+        || (gap.disposition === 'failed' && (!gap.reconciliation_required || row.disposition !== 'failed'))
+        || !['committed', 'failed'].includes(row.disposition)) throw fail('journal_invalid');
       if (row.disposition === 'committed') { finished.set(row.id, 'committed'); gap = null; }
-      else gap.disposition = 'failed';
+      else { gap.disposition = 'failed'; delete gap.reconciliation_required; }
     } else throw fail('journal_invalid');
   }
   function append(event) {
@@ -100,7 +103,7 @@ export function createCoverageJournal({ directory, sessionKey }) {
     begin({ through, cursor, retry = false }) {
       if (typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('checkpoint_invalid');
       const id = digest(['coverage-interval/v1', sessionKey, cursor, through]);
-      if (active || gap?.disposition === 'uncertain') throw fail('reconciliation_required');
+      if (active || gap?.disposition === 'uncertain' || gap?.reconciliation_required) throw fail('reconciliation_required');
       if (gap && (gap.id !== id || !['failed', 'unresolved_scope'].includes(gap.disposition) || !retry)) throw fail('coverage_gap');
       if (finished.has(id)) throw fail('interval_already_covered');
       append({ type: 'begin', id, through, cursor, retry });
@@ -139,15 +142,16 @@ export function createCoverageJournal({ directory, sessionKey }) {
       if (!active) throw fail('interval_not_started');
       const uncertain = [...active.effects.values()].some(row => !['confirmed', 'refused'].includes(row.state));
       if (!covered.has(disposition) && !['failed', 'unresolved_scope', 'uncertain'].includes(disposition)) throw fail('disposition_invalid');
-      if (uncertain || (active.derived && !covered.has(disposition))) disposition = 'uncertain';
-      if (disposition !== 'committed' && covered.has(disposition) && active.derived) disposition = 'uncertain';
+      if (uncertain) disposition = 'uncertain';
+      else if (disposition !== 'committed' && covered.has(disposition) && active.derived) disposition = 'failed';
       if (disposition === 'committed' && !active.derived) throw fail('disposition_invalid');
-      append({ type: 'finish', id: active.id, disposition, code });
+      const reconciliationRequired = active.derived && !covered.has(disposition) && disposition !== 'uncertain';
+      append({ type: 'finish', id: active.id, disposition, code, ...(reconciliationRequired ? { reconciliation_required: true } : {}) });
       return disposition;
     },
     reconcile({ id, disposition, evidenceRef }) {
       if (typeof evidenceRef !== 'string' || !evidenceRef.trim() || !['committed', 'failed'].includes(disposition)) throw fail('reconciliation_invalid');
-      if (!(active?.id === id || (gap?.id === id && gap.disposition === 'uncertain'))) throw fail('reconciliation_invalid');
+      if (!(active?.id === id || (gap?.id === id && (gap.disposition === 'uncertain' || gap.reconciliation_required)))) throw fail('reconciliation_invalid');
       append({ type: 'reconcile', id, disposition, evidence_ref: evidenceRef });
     },
     state() {

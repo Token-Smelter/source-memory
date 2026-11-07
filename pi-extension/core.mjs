@@ -190,7 +190,7 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
         write = await memory.enrich(scope, payload, { trigger: receipt.id });
         if (!recordIds.includes(record.id)) recordIds.push(record.id);
       }
-      if (typeof ensureIndexed === 'function') await ensureIndexed(memory, scope, write?.indexing);
+      if (typeof ensureIndexed === 'function') await ensureIndexed(memory, scope, write?.indexing, { recordIds: write?.records ?? [] });
       offer = null;
       choices = null;
       return { id: record.id, status: 'proposed' };
@@ -204,7 +204,8 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
             .map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text.slice(0, 500) }));
           const sources = offered.packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? ''))
             .slice(0, 128).map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text.slice(0, 500) }));
-          return { status: 'offer', records, sources, filtered: kinds.length > 0, completeness_guaranteed: false };
+          return { status: 'offer', records, sources, filtered: kinds.length > 0, completeness_guaranteed: false,
+            retrieval: offered.packet.retrieval ?? null };
         } catch (problem) { searchFailed = true; throw problem; }
       }
       try {

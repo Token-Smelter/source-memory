@@ -1,5 +1,8 @@
 import { createClient } from './ndjson.mjs';
 
+const noPersistentWrite = new Set(['status', 'recordVectorStatus', 'recall', 'beginLinks', 'finishLinks', 'cancelLinks', 'beginOutcome', 'cancelOutcome',
+  'searchDerived', 'resolveDerived', 'searchRaw']);
+
 /** Facade for one long-lived Memory subprocess; never exposes raw relation writes. */
 export function createMemoryClient({ input, output, timeoutMs, reviewContract = 'pi-memory-review/v1', onReceipt = () => {} }) {
   const client = createClient({ input, output, timeoutMs });
@@ -9,6 +12,7 @@ export function createMemoryClient({ input, output, timeoutMs, reviewContract = 
       onReceipt({ method, ok: true, value });
       return value;
     } catch (error) {
+      if (noPersistentWrite.has(method)) error.effect = 'none';
       if (error.remote_rejection === true && ((method === 'enrich' && error.code === 'outcome_referent_required')
         || (method === 'applyOutcome' && ['outcome_review_refused', 'outcome_context_changed'].includes(error.code)))) error.effect = 'refused';
       onReceipt({ method, ok: false, code: error.code ?? 'request_failed', effect: error.effect ?? 'unknown' });
@@ -18,6 +22,7 @@ export function createMemoryClient({ input, output, timeoutMs, reviewContract = 
   return {
     init: (scope, options) => call('init', { scope }, options),
     status: (scope, options) => call('status', { scope }, options),
+    recordVectorStatus: (scope, ids, options) => call('recordVectorStatus', { scope, ids }, options),
     index: (scope, input, options) => call('index', { scope, input }, options),
     ingest: (scope, turn, options) => call('ingest', { scope, turn }, options),
     recall: (scope, input, { signal, trigger } = {}) => call('recall', { scope, input, ...(trigger ? { trigger } : {}) }, { signal }),

@@ -173,7 +173,7 @@ async function main() {
     routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer } });
   let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v2', policy_version: seal.spec.policyVersion };
   let journal, sequenceResult, snapshot, failure = null;
-  const reportRows = [], caseSnapshots = {};
+  const reportRows = [], caseSnapshots = {}, checkpointSnapshots = {};
   const imageHashes = { database: image('neo4j:5.26.14-community'), driver: image('node:22-bookworm-slim') };
   const harness = await runNamespaceHarness({ docker, relay: { open: ({ socketPath }) => openUnixEmbeddingRelay({ socketPath, timeoutMs: 90000,
     onEvent: event => relayLog.append({ checkpoint: meta.checkpoint, ...event }) }) },
@@ -219,15 +219,23 @@ async function main() {
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
           imageArchive: createImageArchive({ directory: imageDir }),
-          ensureIndexed: (client, selectedScope, state) => ensureIndexed(client, selectedScope, state, { waitForVectors: true }),
+          ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state, { waitForVectors: true, ...options }),
           meterRuntime: (underlying, context) => budget.wrap(underlying, () => ({ ...meta,
-            purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v2' : 'link-review-r2-v1' })) });
+            purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v2' : 'link-review-r2-v2' })) });
         const evaluatorRuntime = budget.wrap(runtime, () => meta);
         sequenceResult = await runPilotSequence({ session, journal, checkpoints, cases: prepared, budget,
           async onBeforeCheckpoint(checkpoint) { meta = { purpose: 'candidate', arm: 'candidate', checkpoint: checkpoint.id,
             task_version: 'distiller-r2-v2', policy_version: seal.spec.policyVersion }; },
-          async onCheckpoint(row, state) { progress.append({ type: 'checkpoint', through: checkpointId(row), disposition: row.disposition,
-            image_limitation: row.omissions?.images ?? null, budget: state }); },
+          async onCheckpoint(row, state) {
+            const through = checkpointId(row);
+            let checkpointSnapshot = null;
+            if (['committed', 'abstained'].includes(row.disposition)) {
+              checkpointSnapshot = await docker.snapshot({ driver, scope, filename: `baseline-${runId}-${sha(through).slice(0, 16)}.json` });
+              checkpointSnapshots[through] = checkpointSnapshot;
+            }
+            progress.append({ type: 'checkpoint', through, disposition: row.disposition,
+              image_limitation: row.omissions?.images ?? null, snapshot: checkpointSnapshot, budget: state });
+          },
           async onCase(row, state) { progress.append({ type: 'case', case_id: row.case_id, status: row.status, budget: state }); },
           async evaluateCase(item, cursor) {
             const held = guarded.acquire(item.publicCase.queryTime);
@@ -294,6 +302,11 @@ async function main() {
   }
   if (snapshot?.path) { const bytes = readFileSync(snapshot.path); if (sha(bytes) !== snapshot.sha256) throw fail('snapshot_changed');
     artifacts.baseline_snapshot = { path: snapshot.path, sha256: snapshot.sha256, bytes: bytes.length, restore_verified: false }; }
+  artifacts.checkpoint_snapshots = Object.entries(checkpointSnapshots).map(([through, item]) => {
+    const bytes = readFileSync(item.path);
+    if (sha(bytes) !== item.sha256) throw fail('snapshot_changed');
+    return { through, path: item.path, sha256: item.sha256, bytes: bytes.length, restore_verified: false };
+  });
   artifacts.case_snapshots = Object.entries(caseSnapshots).map(([caseId, item]) => {
     const bytes = readFileSync(item.path);
     if (sha(bytes) !== item.sha256) throw fail('snapshot_changed');

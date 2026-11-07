@@ -1,9 +1,10 @@
 const fail = code => Object.assign(new Error(code), { code });
 
 /** Finish explicitly pending indexing; unavailable is a failure, not an automatic retry. */
-export async function ensureIndexed(memory, scope, initial, { maxRounds = 32, waitForVectors = false, maxPolls = 120, pollMs = 500 } = {}) {
+export async function ensureIndexed(memory, scope, initial, { maxRounds = 32, waitForVectors = false, recordIds = [], maxPolls = 120, pollMs = 500 } = {}) {
   if (!Number.isSafeInteger(maxRounds) || maxRounds < 1 || maxRounds > 128 || !Number.isSafeInteger(maxPolls) || maxPolls < 1 || maxPolls > 240
-    || !Number.isSafeInteger(pollMs) || pollMs < 0 || pollMs > 10000) throw fail('indexing_config_invalid');
+    || !Number.isSafeInteger(pollMs) || pollMs < 0 || pollMs > 10000 || !Array.isArray(recordIds)
+    || recordIds.length > 16 || new Set(recordIds).size !== recordIds.length || recordIds.some(id => typeof id !== 'string' || !id)) throw fail('indexing_config_invalid');
   let state = initial;
   for (let round = 0; round <= maxRounds; round++) {
     if (state?.status === 'ready') {
@@ -11,7 +12,13 @@ export async function ensureIndexed(memory, scope, initial, { maxRounds = 32, wa
       if (typeof memory.status !== 'function') throw fail('indexing_unavailable');
       for (let poll = 0; poll < maxPolls; poll++) {
         const status = await memory.status(scope);
-        if (status?.unindexed === 0 && status.vector_indexes?.chunk === 'online' && status.vector_indexes?.record === 'online') return state;
+        if (status?.unindexed === 0 && status.vector_indexes?.chunk === 'online' && status.vector_indexes?.record === 'online') {
+          if (!recordIds.length) return state;
+          if (typeof memory.recordVectorStatus !== 'function') throw fail('indexing_unavailable');
+          const visibility = await memory.recordVectorStatus(scope, recordIds);
+          if (visibility?.visible === true) return state;
+          if (visibility?.visible !== false) throw fail('indexing_incomplete');
+        }
         if (!Number.isSafeInteger(status?.unindexed) || status.unindexed > 0
           || ['missing', 'failed'].includes(status.vector_indexes?.chunk) || ['missing', 'failed'].includes(status.vector_indexes?.record)) throw fail('indexing_incomplete');
         if (pollMs) await new Promise(resolve => setTimeout(resolve, pollMs));

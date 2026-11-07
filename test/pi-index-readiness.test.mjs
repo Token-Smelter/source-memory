@@ -12,6 +12,22 @@ test('pending indexing completes and waits until both vector indexes are online'
   assert.deepEqual([result.status, indexCalls, polls], ['ready', 1, 2]);
 });
 
+test('newly written record vectors must be query-visible before link retrieval', async () => {
+  const observed = [];
+  const memory = { async status() { return { unindexed: 0, vector_indexes: { chunk: 'online', record: 'online' } }; },
+    async recordVectorStatus(scope, ids) { observed.push({ scope, ids }); return { visible: observed.length >= 2 }; } };
+  const result = await ensureIndexed(memory, 'fiction', { status: 'ready' },
+    { waitForVectors: true, recordIds: ['new-record'], maxPolls: 3, pollMs: 0 });
+  assert.deepEqual([result.status, observed], ['ready', [{ scope: 'fiction', ids: ['new-record'] }, { scope: 'fiction', ids: ['new-record'] }]]);
+});
+
+test('an invisible new record vector times out rather than permitting a link search', async () => {
+  const memory = { async status() { return { unindexed: 0, vector_indexes: { chunk: 'online', record: 'online' } }; },
+    async recordVectorStatus() { return { visible: false }; } };
+  await assert.rejects(ensureIndexed(memory, 'fiction', { status: 'ready' },
+    { waitForVectors: true, recordIds: ['new-record'], maxPolls: 2, pollMs: 0 }), /indexing_wait_timeout/);
+});
+
 test('unavailable embedding indexing reports its exact safe reason without retrying', async () => {
   let calls = 0;
   const memory = { async index() { calls++; } };

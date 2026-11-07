@@ -7,6 +7,7 @@ import { createNamespaceDocker } from '../pi-extension/namespace-docker.mjs';
 import { runNamespaceHarness } from '../pi-extension/namespace-harness.mjs';
 import { openUnixEmbeddingRelay } from '../pi-extension/unix-relay.mjs';
 import { openDockerMemory } from '../pi-extension/docker-memory.mjs';
+import { ensureIndexed } from '../pi-extension/index-readiness.mjs';
 
 // This opt-in smoke uses only invented content, an in-memory embedding response and owned disposable containers.
 const scratch = mkdtempSync(join(tmpdir(), 'pi-private-namespace-'));
@@ -49,8 +50,9 @@ try {
       const stored = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-turn',
         lineage_root: true, entries: [{ id: 'fictional-entry', role: 'user', text: 'The amber fictional key requires rotation.' }] });
       const recalled = await memory.recall('fiction', { query: 'amber fictional key', limit: 8 });
-      await memory.enrich('fiction', { records: [{ id: 'fictional-record', kind: 'observation', text: 'The amber key requires rotation.',
+      const firstRecord = await memory.enrich('fiction', { records: [{ id: 'fictional-record', kind: 'observation', text: 'The amber key requires rotation.',
         status: 'proposed', attribution: 'fiction', evidence: [{ turn: stored.id, entry_id: 'fictional-entry', start: 0, end: 42 }] }], relations: [] }, { trigger: stored.id });
+      await ensureIndexed(memory, 'fiction', firstRecord.indexing, { waitForVectors: true, recordIds: firstRecord.records });
       let derived;
       for (let attempt = 0; attempt < 30; attempt++) {
         try { derived = await memory.searchDerived('fiction', { query: 'amber key rotation', limit: 8 }); break; }
@@ -61,14 +63,10 @@ try {
       const updateText = 'Only during rehearsal, rotate the amber fictional key weekly.';
       const later = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-next',
         entries: [{ id: 'fictional-update', role: 'user', text: updateText }] });
-      await memory.enrich('fiction', { records: [{ id: 'fictional-update-record', kind: 'observation', text: updateText,
+      const updateRecord = await memory.enrich('fiction', { records: [{ id: 'fictional-update-record', kind: 'observation', text: updateText,
         status: 'proposed', attribution: 'fiction', evidence: [{ turn: later.id, entry_id: 'fictional-update', start: 0, end: updateText.length }] }], relations: [] }, { trigger: later.id });
-      let offer;
-      for (let attempt = 0; attempt < 30; attempt++) {
-        try { offer = await memory.beginLinks('fiction', later.id, ['fictional-update-record']); break; }
-        catch (error) { if (error.code !== 'link_retrieval_incomplete') throw error; await new Promise(resolve => setTimeout(resolve, 500)); }
-      }
-      if (!offer) throw new Error('link_offer_unavailable');
+      await ensureIndexed(memory, 'fiction', updateRecord.indexing, { waitForVectors: true, recordIds: updateRecord.records });
+      const offer = await memory.beginLinks('fiction', later.id, ['fictional-update-record']);
       const from = offer.packet.records.find(row => row.newly_retained)?.ref;
       const to = offer.packet.records.find(row => !row.newly_retained && row.text === 'The amber key requires rotation.')?.ref;
       const source = offer.packet.sources.find(row => row.trigger && row.text === updateText)?.ref;

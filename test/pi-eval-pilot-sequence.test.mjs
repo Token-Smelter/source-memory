@@ -21,7 +21,8 @@ test('pilot answers each case before processing the next source checkpoint', asy
     conversation_id: 'fiction', scopes: ['private'], memory, distiller: { memory, async run() { return { status: 'complete', disposition: 'abstained' }; } } };
     const result = await runPilotSequence({ session, journal, checkpoints: [{ id: 'a', time: '2030-01-01T00:00:00Z' }, { id: 'b', time: '2030-01-01T00:00:02Z' }],
       cases: [{ through: 'a', publicCase: { queryTime: '2030-01-01T00:00:01Z' } }], budget: { state: () => ({ stopped: null }) },
+      async onCheckpoint(row) { events.push(`snapshot:${checkpointId(row)}`); },
       async evaluateCase() { events.push('answer:a'); return { status: 'scored' }; } });
-    assert.deepEqual([result.status, events], ['complete', ['ingest:a', 'answer:a', 'ingest:b']]);
+    assert.deepEqual([result.status, events], ['complete', ['ingest:a', 'snapshot:a', 'answer:a', 'ingest:b', 'snapshot:b']]);
   } finally { journal.close(); rmSync(directory, { recursive: true, force: true }); }
 });

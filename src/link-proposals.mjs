@@ -1,7 +1,7 @@
 import { authorize, canonical, digest, integer, normalizeEnrichment, normalizeTurn,
   RELATIONS, requireThat, sourceExcerpt, text } from './core.mjs';
 
-export const LINK_PROPOSAL_CONTRACT = 'source-memory-links/v2';
+export const LINK_PROPOSAL_CONTRACT = 'source-memory-links/v3';
 export const LINK_PROPOSAL_LIMITS = Object.freeze({ new_records: 16, candidate_records: 32,
   retained_turns: 128, evidence_spans: 128, links: 16, prompt_bytes: 120000,
   desired_output_bytes: 2048, output_bytes: 16384 });
@@ -131,10 +131,12 @@ export async function proposeMemoryLinks({ memory, scope, turn, record_ids, revi
   const retrieved = await memory.recall(scope, { query, limit: 16, candidates: 64, max_chars: 120000,
     max_nodes: 32, max_hops: 2 });
   active(signal);
-  requireThat(retrieved?.scope === scope && ['ready', 'no_matches'].includes(retrieved.status)
-    && Array.isArray(retrieved.bundles) && retrieved.bundles.length <= 16
-    && retrieved.budget_omitted === 0 && retrieved.relationship_context_complete === true
-    && !Object.values(retrieved.channels ?? {}).some(row => ['partial', 'pending', 'unavailable'].includes(row.status)),
+  const bounded = retrieved?.status === 'budget_limited';
+  requireThat(retrieved?.scope === scope && ['ready', 'no_matches', 'budget_limited'].includes(retrieved.status)
+    && Array.isArray(retrieved.bundles) && retrieved.bundles.length <= 16 && retrieved.channels
+    && Number.isSafeInteger(retrieved.budget_omitted)
+    && (bounded ? retrieved.budget_omitted > 0 : retrieved.budget_omitted === 0 && retrieved.relationship_context_complete === true)
+    && !Object.values(retrieved.channels).some(row => ['partial', 'pending', 'unavailable'].includes(row.status)),
   'link_retrieval_incomplete');
   const ids = new Set(record_ids);
   for (const bundle of retrieved.bundles) {
@@ -174,7 +176,8 @@ export async function proposeMemoryLinks({ memory, scope, turn, record_ids, revi
   const packet = freeze({ contract: LINK_PROPOSAL_CONTRACT, review_contract, limits: { ...LINK_PROPOSAL_LIMITS },
     record_kinds: [...KINDS], relation_types: [...RELATIONS],
     records, sources, retrieval: { status: retrieved.status, retrieval_complete: retrieved.retrieval_complete,
-      channels: copy(retrieved.channels ?? {}), candidate_count: retrieved.candidate_count ?? null,
+      budget_omitted: retrieved.budget_omitted, relationship_context_complete: retrieved.relationship_context_complete,
+      channels: copy(retrieved.channels), candidate_count: retrieved.candidate_count ?? null,
       query_truncated: querySource.length > query.length, compared_records: records.length,
       bounded: true, completeness_guaranteed: false } });
   const prompt = memoryLinkPrompt(packet);
