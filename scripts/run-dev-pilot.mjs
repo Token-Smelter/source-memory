@@ -19,7 +19,7 @@ import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runti
 import { createAnswerer } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
-import { createPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { createPilotPlan, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
@@ -114,6 +114,7 @@ async function main() {
   const cases = input('development/cases.jsonl').trimEnd().split('\n').map(JSON.parse).filter(row => row.split === 'development' && row.pre_answer_store_snapshot?.source_key === sourceKey);
   if (!proofs.length || !cases.length || proofs.some(row => row.snapshot_path !== source.snapshot_path || row.source_sha256 !== source.source_sha256)) throw fail('dataset_invalid');
   const sourceBytes = pinned(source.snapshot_path, source.source_sha256);
+  pinned('/var/tmp/source-memory-retention-eval-design/INTERPRETATION-02.md', INTERPRETATION_02_SHA256, 100000);
   pinned(sdkIndex, sdkIndexSha, 5_000_000); pinned(sdkSession, sdkSessionSha, 5_000_000);
   const pi = await import(pathToFileURL(sdkIndex).href), builder = await import(pathToFileURL(sdkSession).href);
   const verified = proofs.map(proof => verifyChronologicalCheckpoint({ bytes: sourceBytes, proof, availability, pi: builder }));
@@ -245,7 +246,8 @@ async function main() {
   const remaining = 100000000000n - previous;
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
   const seal = createPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
-    codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null });
+    codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null,
+    interpretationSha256: INTERPRETATION_02_SHA256 });
   if (resume?.handbackRows.length) pairedReport({ seal, expectedDigest: seal.digest, rows: resume.handbackRows, dependencies: [],
     provenance: resume.originSeals.filter(row => row.digest !== seal.digest) });
   const runId = randomUUID(), dir = mkdtempSync(join(parent, 'pilot-'));
@@ -299,7 +301,8 @@ async function main() {
       writePrivate(join(dir, 'isolation.json'), isolation);
       if (!isolation.ok) return;
       const ready = { status: 'awaiting_go', run_id: runId, run_dir: dir, source_key: sourceKey, source_sha256: source.source_sha256,
-        dataset_sha256: manifestSha, code_sha: codeSha, seal_sha256: seal.digest, sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
+        dataset_sha256: manifestSha, code_sha: codeSha, seal_sha256: seal.digest, interpretation_sha256: INTERPRETATION_02_SHA256,
+        sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
         models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
         routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
         budget: { overall_effort_soft_usd: 250, share_soft_usd: 100, prior_spend_nano: previous.toString(),
@@ -360,7 +363,8 @@ async function main() {
             return item.type === 'checkpoint' && item.snapshot && index >= 0 && index < resumeValidation.prefixCount;
           })) {
             checkpointSnapshots[row.through] = row.snapshot;
-            progress.append({ type: 'checkpoint', through: row.through, disposition: row.disposition, inherited: true, snapshot: row.snapshot, budget: budget.state() });
+            progress.append({ type: 'checkpoint', through: row.through, disposition: row.disposition, inherited: true,
+              search_incomplete: row.search_incomplete ?? null, search_statuses: row.search_statuses ?? [], snapshot: row.snapshot, budget: budget.state() });
           }
         }
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
@@ -385,6 +389,7 @@ async function main() {
               checkpointSnapshots[through] = checkpointSnapshot;
             }
             progress.append({ type: 'checkpoint', through, disposition: row.disposition,
+              search_incomplete: row.search_incomplete ?? null, search_statuses: row.search_statuses ?? [],
               image_limitation: row.omissions?.images ?? null, snapshot: checkpointSnapshot, budget: state });
           },
           async onCase(row, state) { progress.append({ type: 'case', case_id: row.case_id, status: row.status, budget: state }); },
@@ -486,7 +491,8 @@ async function main() {
       processed: (resumeValidation?.prefixCount ?? 0) + sequenceResult.results.length, tail: sequenceResult.tail ?? null,
       dispositions: [...(resume ? (resume.report.coverage?.dispositions ?? resume.progress.filter(row => row.type === 'checkpoint')
         .map(row => ({ through: row.through, disposition: row.disposition, code: row.code ?? null }))).slice(0, resumeValidation.prefixCount) : []),
-        ...sequenceResult.results.map(row => ({ through: checkpointId(row), disposition: row.disposition, code: row.code ?? null }))] } : null,
+        ...sequenceResult.results.map(row => ({ through: checkpointId(row), disposition: row.disposition, code: row.code ?? null,
+          search_incomplete: row.search_incomplete ?? null, search_statuses: row.search_statuses ?? [] }))] } : null,
     scorecard, reference: 'pending_reference_freeze',
     stage_attribution: reportRows.map(row => ({ case_id: row.caseId, status: 'pending_reference_freeze',
       reason: 'Reference catalog and candidate-trace semantic comparison have not been validated.' })),

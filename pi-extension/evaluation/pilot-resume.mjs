@@ -13,6 +13,9 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   const original = verifySeal(seal, report.seal_sha256);
   const current = verifySeal(currentSeal, currentSeal?.digest);
   const evaluatorChange = current.resume?.transition === 'structured-evaluator-submission-only';
+  const clarification = current.resume?.transition === 'interpretation-02-abstention-clarification';
+  if (!clarification && hash(original.interpretation ?? null) !== hash(current.interpretation ?? null)) throw fail('resume_treatment_mismatch');
+  if (clarification && current.interpretation?.id !== 'INTERPRETATION-02') throw fail('resume_treatment_mismatch');
   const unchanged = ['policyVersion', 'policySha256', 'sourceSha256', 'datasetSha256', 'sdkSha256', 'rubric',
     'packetSchema', 'alternativeRule', 'baseline', 'stores', 'access', 'safety', 'cases', 'packets', 'dependenciesDigest', 'comparison', 'resampling',
     ...(!evaluatorChange ? ['answerer', 'scorer'] : [])];
@@ -35,7 +38,7 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
     || current.resume?.priorRunId !== report.run_id || current.resume?.priorSealDigest !== seal.digest
     || current.resume?.priorCodeSha !== original.codeSha || current.resume?.cursor !== cursor
     || current.resume?.snapshotSha256 !== snapshotSha256 || current.resume?.journalSha256 !== journalSha256
-    || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback'].includes(current.resume?.transition)
+    || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification'].includes(current.resume?.transition)
     || hash(current.resume?.ledgerReconciliationSha256s ?? []) !== hash(reconciliationSha256s)
     || hash(current.resume?.caseHandbacks ?? []) !== hash(caseHandbacks)) throw fail('resume_treatment_mismatch');
   if (original.sourceSha256 !== sourceSha256 || original.datasetSha256 !== datasetSha256

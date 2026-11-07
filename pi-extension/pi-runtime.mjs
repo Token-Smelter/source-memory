@@ -155,7 +155,6 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
         if (stats.search_failed || !stats.searches) throw fail('search_incomplete');
         if ((modelResult.result === 'done_with_writes') !== (stats.records > 0)) throw fail('disposition_invalid');
         const disposition = stats.records > 0 ? 'committed' : 'abstained';
-        if (disposition === 'abstained' && stats.incomplete_search && !stats.returned_prior_ids.length) throw fail('search_incomplete');
         const pending = currentTools.pendingLinks();
         let link = null;
         if (pending) {
@@ -169,8 +168,9 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           link = { mode: reviewMode, receipt: await memory.applyLinks(pending.token, review) };
         }
         return { status: 'complete', disposition, model_result: modelResult.result, evaluation_reason: modelResult.reason, policy_sha256: policy.sha256,
-          search_limitations: { incomplete: stats.incomplete_search, returned_prior_ids: stats.returned_prior_ids,
-            abstention_support: stats.incomplete_search && disposition === 'abstained' ? 'candidate_assessed_not_independently_verified' : null },
+          search_limitations: { incomplete: stats.incomplete_search, statuses: stats.search_statuses,
+            returned_prior_ids: stats.returned_prior_ids,
+            abstention_support: disposition === 'abstained' ? 'candidate_assessed_not_independently_verified' : null },
           usage: reply.usage ?? null, call_usage: budget?.receipts().slice(startReceipt) ?? [],
           records: currentTools.stats().records, reviewer_calls: reviewerCalls, breakpoint, link };
       } finally { currentTools = null; activeSession = null; busy = false; await session?.dispose?.(); }

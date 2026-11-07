@@ -24,6 +24,15 @@ test('a failed or degraded search cannot be converted into a record or successfu
   assert.deepEqual([writes, tools.stats().search_failed], [0, true]);
 });
 
+test('an unavailable search channel cannot become a successful bounded search', async () => {
+  const memory = { async recall() { return { status: 'budget_limited', budget_omitted: 1, bundles: [],
+    channels: { record_vector: { status: 'unavailable' } } }; } };
+  const tools = createTurnTools({ scope: 'fiction', requireSearch: true, memory,
+    turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
+  await assert.rejects(tools.search('fiction', []), /search_incomplete/);
+  assert.equal(tools.stats().search_failed, true);
+});
+
 test('bounded search exposes omissions and channel status without increasing its budget', async () => {
   const inputs = [];
   const memory = { async recall(_scope, input) { inputs.push(input); return { status: 'budget_limited', budget_omitted: 2,
@@ -35,7 +44,7 @@ test('bounded search exposes omissions and channel status without increasing its
     result.records[0].id, tools.stats().incomplete_search], [24000, 'budget_limited', 2, 'partial', 'prior', true]);
 });
 
-test('an incomplete search without a returned prior cannot justify abstention', async () => {
+test('a bounded successful search permits candidate-assessed abstention and records incompleteness', async () => {
   const tools = new Map();
   class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0]({ on() {}, registerTool(tool) { tools.set(tool.name, tool); } }); } }
   const manager = { getSessionId: () => 'fiction', branch() {}, buildSessionContext: () => ({ messages: [] }) };
@@ -48,7 +57,18 @@ test('an incomplete search without a returned prior cannot justify abstention', 
   const memory = { async recall() { return { status: 'budget_limited', budget_omitted: 1, channels: { record_lexical: { status: 'ready' } }, bundles: [{ records: [] }] }; } };
   const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
     workDir: '/fiction', model: {}, memory, scope: 'fiction' });
-  await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } }), /search_incomplete/);
+  const result = await runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
+  assert.deepEqual([result.disposition, result.search_limitations.incomplete, result.search_limitations.statuses[0].status],
+    ['abstained', true, 'budget_limited']);
+});
+
+test('a successful budget-limited search may return zero whole bundles', async () => {
+  const memory = { async recall() { return { status: 'budget_limited', budget_omitted: 3,
+    channels: { record_vector: { status: 'ready' } }, bundles: [] }; } };
+  const tools = createTurnTools({ scope: 'fiction', memory, requireSearch: true,
+    turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
+  const result = await tools.search('fiction', []);
+  assert.deepEqual([result.status, result.records.length, tools.stats().incomplete_search], ['budget_limited', 0, true]);
 });
 
 test('no memory tool may run after the final submission', async () => {

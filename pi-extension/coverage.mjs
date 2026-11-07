@@ -150,15 +150,17 @@ export function createCoverageJournal({ directory, sessionKey }) {
         },
       });
     },
-    finish(disposition, code = null) {
+    finish(disposition, code = null, search = null) {
       if (!active) throw fail('interval_not_started');
+      if (search !== null && (typeof search !== 'object' || typeof search.incomplete !== 'boolean' || !Array.isArray(search.statuses))) throw fail('search_status_invalid');
       const uncertain = [...active.effects.values()].some(row => !['confirmed', 'refused'].includes(row.state));
       if (!covered.has(disposition) && !['failed', 'unresolved_scope', 'uncertain'].includes(disposition)) throw fail('disposition_invalid');
       if (uncertain) disposition = 'uncertain';
       else if (disposition !== 'committed' && covered.has(disposition) && active.derived) disposition = 'failed';
       if (disposition === 'committed' && !active.derived) throw fail('disposition_invalid');
       const reconciliationRequired = active.derived && !covered.has(disposition) && disposition !== 'uncertain';
-      append({ type: 'finish', id: active.id, disposition, code, ...(reconciliationRequired ? { reconciliation_required: true } : {}) });
+      append({ type: 'finish', id: active.id, disposition, code, ...(search ? { search_incomplete: search.incomplete, search_statuses: search.statuses } : {}),
+        ...(reconciliationRequired ? { reconciliation_required: true } : {}) });
       return disposition;
     },
     reconcile({ id, disposition, evidenceRef }) {
@@ -191,9 +193,11 @@ export async function runCoveredInterval({ journal, session, through, cursor, al
     const result = await distillThrough(session, through, cursor, { allowInterrupted });
     const disposition = result.distillation.disposition;
     if (!covered.has(disposition)) throw fail('disposition_invalid');
-    const actual = journal.finish(disposition);
+    const limits = result.distillation.search_limitations;
+    const search = limits ? { incomplete: limits.incomplete, statuses: limits.statuses } : null;
+    const actual = journal.finish(disposition, null, search);
     if (!covered.has(actual)) return { id, through, cursor, disposition: actual, code: 'write_uncertain' };
-    return { ...result, id, disposition: actual };
+    return { ...result, id, disposition: actual, ...(search ? { search_incomplete: search.incomplete, search_statuses: search.statuses } : {}) };
   } catch (error) {
     const disposition = journal.finish(error?.code === 'scope_unresolved' ? 'unresolved_scope' : 'failed', safeCode(error));
     return { id, through, cursor, disposition, code: safeCode(error) };

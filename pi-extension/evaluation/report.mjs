@@ -97,6 +97,7 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies, provena
   const usedSeals = [...new Set(rows.map(row => row.sealDigest))];
   return { sealDigest: usedSeals.length === 1 ? usedSeals[0] : null,
     ...(usedSeals.length > 1 ? { provenance: { currentSealDigest: seal.digest, sourceSealDigests: usedSeals, mixedCandidateCode: true,
-      limitation: 'Cases were scored under compatible evaluator seals after a recorded candidate-method transition.' } } : {}), cases: rows.length, clusters: clusters.length,
+      interpretation: s.interpretation ?? null,
+      limitation: 'Cases were scored under compatible evaluator seals after recorded candidate-method or interpretation transitions.' } } : {}), cases: rows.length, clusters: clusters.length,
     clusterCases: clusters.map(group => group.map(row => row.caseId)), pairedDelta: paired.candidate, deltas: paired, sensitivity, confidence, safety };
 }

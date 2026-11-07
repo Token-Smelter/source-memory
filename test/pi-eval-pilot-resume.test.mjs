@@ -68,6 +68,17 @@ test('a sealed evaluator format transition preserves the old rubric and score ru
   assert.throws(() => validatePilotResume({ ...args, report, seal: previousSeal, currentSeal: sealComparison(changed) }), /resume_treatment_mismatch/);
 }));
 
+test('the owner-approved abstention interpretation is pinned as an explicit transition', () => fixture(async ({ args }) => {
+  const old = structuredClone(args.seal.spec); delete old.interpretation;
+  const previousSeal = sealComparison(old);
+  const currentSeal = createPilotPlan({ cases: args.cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
+    codeSha: 'e'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } },
+    resume: { priorRunId: args.report.run_id, priorSealDigest: previousSeal.digest, priorCodeSha: old.codeSha, cursor: 'a',
+      snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256, transition: 'interpretation-02-abstention-clarification' } });
+  const report = { ...args.report, seal_sha256: previousSeal.digest };
+  assert.equal(validatePilotResume({ ...args, report, seal: previousSeal, currentSeal }).transition, 'interpretation-02-abstention-clarification');
+}));
+
 test('resume refuses a snapshot or ledger that was not frozen by the prior run', () => fixture(async ({ args }) => {
   assert.throws(() => validatePilotResume({ ...args, snapshotSha256: '2'.repeat(64) }), /resume_treatment_mismatch/);
   assert.throws(() => validatePilotResume({ ...args, priorLedgerSha256s: [] }), /resume_provenance_mismatch/);

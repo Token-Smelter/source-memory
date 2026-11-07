@@ -124,6 +124,18 @@ test('a failure after confirmed archive only stays a failed scheduled gap', () =
   journal.close();
 }));
 
+test('a bounded successful search is recorded alongside an abstention', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async ingest() { return { id: 'turn' }; } });
+  const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory, distiller: { memory,
+    async run() { return { status: 'complete', disposition: 'abstained', search_limitations: { incomplete: true,
+      statuses: [{ status: 'budget_limited', budget_omitted: 2 }] } }; } } };
+  const result = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
+  const finish = readFileSync(journal.path, 'utf8').trimEnd().split('\n').map(JSON.parse).find(row => row.type === 'finish');
+  assert.deepEqual([result.disposition, finish.search_incomplete, finish.search_statuses[0].status], ['abstained', true, 'budget_limited']);
+  journal.close();
+}));
+
 test('successful silence advances the cursor without inventing a derived record', () => privateJournal(async directory => {
   const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
   const memory = journal.track({ async ingest() { return { id: 'turn' }; } });

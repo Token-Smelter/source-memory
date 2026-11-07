@@ -4,20 +4,21 @@ import { RUBRIC, RUBRIC_VERSION, WORKED_EXAMPLES } from './rubric.mjs';
 import { ANSWERER_TOOLS_SHA256, SCORER_TOOLS_SHA256, ANSWERER_FORMAT_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, SCORER_REPAIR } from './pi-calls.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
+export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
 const scorerInstructions = 'Judge each asserted answer or action clause against the supplied source evidence and frozen rubric. Preserve uncertainty and do not omit unsupported additions. Return JSON only, without a code fence: {"clauses":[{"id":"unique","text":"clause","requirementIds":["id"],"sourceIds":["id"],"action":false,"judgments":{"support":"pass|fail|uncertain","authority":"pass|fail|uncertain","scope":"pass|fail|uncertain","time":"pass|fail|uncertain","uncertainty":"pass|fail|uncertain"},"alternative":null,"relation":null}]}. For a source-supported alternative use {"rationale":"why equivalent and useful","sourceIds":["id"]}. For a required relationship use {"required":true,"recoverable":true|false|null,"itemIds":["returned item id"]}. Each field is required; no other text.';
 const answerInstructions = 'Answer the user using only the permitted retrieval tools. Preserve source attribution, authority, scope, time and uncertainty. If the returned information is insufficient, say so. Do not perform external actions.';
 
 /** Freeze the same fictional-calibrated prompt, tool and score contract before any candidate observation. */
 export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256, codeSha, routes,
-  capNano = '100000000000', priorSpendNano = '0', resume = null }) {
+  capNano = '100000000000', priorSpendNano = '0', resume = null, interpretationSha256 = INTERPRETATION_02_SHA256 }) {
   if (!Array.isArray(cases) || !cases.length || !/^[a-f0-9]{64}$/.test(sourceSha256 ?? '')
     || !/^[a-f0-9]{64}$/.test(datasetSha256 ?? '') || !/^[a-f0-9]{64}$/.test(sdkSha256 ?? '')
-    || !/^[a-f0-9]{40}$/.test(codeSha ?? '') || !routes?.candidate || !routes?.reviewer
+    || !/^[a-f0-9]{40}$/.test(codeSha ?? '') || interpretationSha256 !== INTERPRETATION_02_SHA256 || !routes?.candidate || !routes?.reviewer
     || !/^[1-9]\d*$/.test(capNano) || !/^(0|[1-9]\d*)$/.test(priorSpendNano)
     || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
       || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
-      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback'].includes(resume.transition)
+      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification'].includes(resume.transition)
       || (resume.ledgerReconciliationSha256s !== undefined && (!Array.isArray(resume.ledgerReconciliationSha256s)
         || resume.ledgerReconciliationSha256s.some(value => !/^[a-f0-9]{64}$/.test(value))))
       || (resume.caseHandbacks !== undefined && (!Array.isArray(resume.caseHandbacks) || resume.caseHandbacks.some(row =>
@@ -35,7 +36,8 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
   const settings = {
     version: 'memory-pilot-r2-v1', policyVersion: policy.value.id,
     freezeBasis: resume ? 'resume plan frozen after prior candidate observations; transition recorded' : 'before-candidate-observation',
-    sourceSha256, datasetSha256, sdkSha256, codeSha, policySha256: policy.sha256, ...(resume ? { resume } : {}),
+    sourceSha256, datasetSha256, sdkSha256, codeSha, policySha256: policy.sha256,
+    interpretation: { id: 'INTERPRETATION-02', sha256: interpretationSha256 }, ...(resume ? { resume } : {}),
     answerer: { route: 'anthropic', model: 'claude-sonnet-5-5', reasoning: 'low', version: 'answerer-r2-v2',
       contextPolicy: 'request-and-returned-item-evidence-only', retrievalInterface: 'returned-item-evidence-v1',
       instructions: answerInstructions + ANSWERER_FORMAT_SUFFIX, tools_sha256: ANSWERER_TOOLS_SHA256, repair_instruction: ANSWERER_REPAIR,

@@ -141,6 +141,7 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
   let searches = 0;
   let searchFailed = false;
   let incompleteSearch = false;
+  const searchStatuses = [];
   const returnedPriorIds = new Set();
   let offer = null;
   let choices = null;
@@ -187,6 +188,11 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       if (recordIds.length && typeof memory.beginLinks === 'function') {
         try {
           const offered = await this.offer();
+          const retrieval = offered.packet.retrieval ?? null;
+          if (retrieval?.status === 'budget_limited' || (retrieval?.omitted_prior_records ?? 0) > 0
+            || retrieval?.trigger_omissions?.some(row => row.reason === 'packet_budget')) incompleteSearch = true;
+          searchStatuses.push({ status: retrieval?.status ?? 'offer', budget_omitted: retrieval?.budget_omitted ?? 0,
+            omitted_prior_records: retrieval?.omitted_prior_records ?? 0, trigger_omitted: retrieval?.trigger_omissions?.length ?? 0 });
           const records = offered.packet.records.filter(row => !kinds.length || kinds.includes(row.kind)).slice(0, 32)
             .map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text }));
           const sources = offered.packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? ''))
@@ -198,12 +204,16 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       try {
         if (typeof memory.recall !== 'function') throw fail('search_unavailable');
         const result = await memory.recall(scope, { query, limit: 8, max_chars: 24000 }, { trigger: receipt.id });
-        if (!['ready', 'no_matches', 'budget_limited'].includes(result?.status) || !Array.isArray(result.bundles)) throw fail('search_incomplete');
+        if (!['ready', 'no_matches', 'budget_limited'].includes(result?.status) || !Array.isArray(result.bundles)
+          || Object.values(result.channels ?? {}).some(row => row.status === 'unavailable')) throw fail('search_incomplete');
         if (result.status === 'budget_limited') {
-          if (!Number.isSafeInteger(result.budget_omitted) || result.budget_omitted < 1 || !result.channels || !result.bundles.length) throw fail('search_incomplete');
+          if (!Number.isSafeInteger(result.budget_omitted) || result.budget_omitted < 1 || !result.channels) throw fail('search_incomplete');
           incompleteSearch = true;
         }
+        if (Object.values(result.channels ?? {}).some(row => ['partial', 'pending'].includes(row.status))) incompleteSearch = true;
         searches++;
+        searchStatuses.push({ status: result.status, budget_omitted: result.budget_omitted ?? 0,
+          partial_channels: Object.entries(result.channels ?? {}).filter(([, row]) => ['partial', 'pending'].includes(row.status)).map(([name]) => name) });
         const records = result.bundles.flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind))
           .slice(0, 32).map(row => ({ id: row.id, kind: row.kind, snippet: row.text,
             ...(row.kind === 'action' && row.action_handle ? { action_handle: row.action_handle } : {}) }));
@@ -233,6 +243,6 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
     },
     pendingLinks() { return offer && choices ? { token: offer.token, output: choices.output() } : null; },
     stats() { return { records: recordIds.length, searches, search_failed: searchFailed,
-      incomplete_search: incompleteSearch, returned_prior_ids: [...returnedPriorIds] }; },
+      incomplete_search: incompleteSearch, search_statuses: structuredClone(searchStatuses), returned_prior_ids: [...returnedPriorIds] }; },
   };
 }
