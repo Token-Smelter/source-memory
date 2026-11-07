@@ -48,11 +48,21 @@ try {
       const stored = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-turn',
         lineage_root: true, entries: [{ id: 'fictional-entry', role: 'user', text: 'The amber fictional key requires rotation.' }] });
       const recalled = await memory.recall('fiction', { query: 'amber fictional key', limit: 8 });
+      await memory.enrich('fiction', { records: [{ id: 'fictional-record', kind: 'observation', text: 'The amber key requires rotation.',
+        status: 'proposed', attribution: 'fiction', evidence: [{ turn: stored.id, entry_id: 'fictional-entry', start: 0, end: 42 }] }], relations: [] }, { trigger: stored.id });
+      let derived;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        try { derived = await memory.searchDerived('fiction', { query: 'amber key rotation', limit: 8 }); break; }
+        catch (error) { if (error.code !== 'search_incomplete') throw error; await new Promise(resolve => setTimeout(resolve, 500)); }
+      }
+      if (!derived?.length) throw new Error('derived_search_failed');
+      const resolved = await memory.resolveDerived('fiction', { item_id: derived[0].id, evidence_id: derived[0].evidence[0].id });
       return { retained: stored.retained, indexing: stored.indexing?.status, recall_status: recalled.status,
-        returned: recalled.bundles?.length ?? 0, relay_calls: relayCalls };
+        returned: recalled.bundles?.length ?? 0, derived_returned: derived.length,
+        evidence_resolved: resolved.text === 'The amber fictional key requires rotation.', relay_calls: relayCalls };
     } });
   if (result.status !== 'complete' || result.result?.retained !== true || result.result.indexing !== 'ready'
-    || result.result.returned < 1 || result.result.relay_calls < 1) process.exitCode = 1;
+    || result.result.returned < 1 || result.result.derived_returned < 1 || result.result.evidence_resolved !== true || result.result.relay_calls < 1) process.exitCode = 1;
   process.stdout.write(`${JSON.stringify({ ...result, run_id: runId, private_receipt_dir: scratch })}\n`);
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ status: 'failed', code: error?.code ?? 'smoke_failed' })}\n`);

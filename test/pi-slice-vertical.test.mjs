@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { runHarness } from '../pi-extension/bridge-harness.mjs';
 import { createSliceSession } from '../pi-extension/slice-runtime.mjs';
 import { createInputBudget } from '../pi-extension/budget.mjs';
+import { METERED_RUNTIME } from '../pi-extension/evaluation/pi-wrapper.mjs';
 
 const source = fileURLToPath(new URL('./fixtures/pi-extension-steer.jsonl', import.meta.url));
 const entries = readFileSync(source, 'utf8').trim().split('\n').slice(1).map(JSON.parse);
@@ -38,7 +39,8 @@ test('one fictional slice passes the gate, shared replay, fake Pi routing and me
     const budget = createInputBudget(20000000);
     const result = await runHarness({ docker, relay: { async open() { return { async close() {} }; } }, isolation: async () => gate, memory,
       sessionFactory: async () => [{ session: await createSliceSession({ pi, source, entries, conversationId: 'fiction', workDir: dir,
-        scope: 'private', memory, modelId: 'fake/haiku', reviewerId: 'fake/haiku', budget }), leaves: ['a2', 'a3'] }],
+        scope: 'private', memory, modelId: 'fake/haiku', reviewerId: 'fake/haiku', budget,
+        meterRuntime: runtime => new Proxy(runtime, { get(target, key) { return key === METERED_RUNTIME ? true : Reflect.get(target, key); } }) }), leaves: ['a2', 'a3'] }],
       cases: [{ id: 'case', query: 'fiction', asker_conversation_id: 'other' }] });
     assert.deepEqual([result.status, calls, budget.used(), result.replayed[0].results.length],
       ['complete', ['init', 'pi-memory', 'model', 'pi-memory', 'model'], 26, 2]);

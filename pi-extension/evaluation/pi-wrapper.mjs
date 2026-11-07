@@ -1,6 +1,39 @@
 import { modelFingerprint } from './seal.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
+export const METERED_RUNTIME = Symbol('metered-pi-runtime');
+
+/** Share one gate across roles when a pilot permits only one SDK call in flight. */
+export function createSingleFlightGate() {
+  let busy = false;
+  return {
+    wrap(runtime) {
+      if (runtime?.[METERED_RUNTIME] !== true) throw fail('metered_runtime_required');
+      return new Proxy(runtime, {
+        get(target, key) {
+          if (key !== 'streamSimple') {
+            const value = Reflect.get(target, key, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          }
+          return (...args) => {
+            if (busy) throw fail('model_call_in_flight');
+            busy = true;
+            try {
+              const stream = target.streamSimple(...args);
+              Promise.resolve(stream.result()).then(message => {
+                const usage = message?.usage;
+                if (['stop', 'length', 'toolUse'].includes(message?.stopReason)
+                  && ['input', 'output', 'cacheRead', 'cacheWrite'].every(key => Number.isSafeInteger(usage?.[key]) && usage[key] >= 0)) busy = false;
+              }, () => {});
+              return stream;
+            } catch (error) { throw error; }
+          };
+        },
+      });
+    },
+    busy: () => busy,
+  };
+}
 
 // The wrapped call remains synchronous and returns Pi's original event stream.
 export function wrapPiRuntime({ runtime, ledger, planId, nextSlot, boundInput, usageEvidence = () => null, onLedgerError = () => {} }) {
@@ -8,6 +41,7 @@ export function wrapPiRuntime({ runtime, ledger, planId, nextSlot, boundInput, u
     || typeof nextSlot !== 'function' || typeof boundInput !== 'function' || typeof usageEvidence !== 'function' || typeof onLedgerError !== 'function') throw fail('wrapper_invalid');
   return new Proxy(runtime, {
     get(target, key) {
+      if (key === METERED_RUNTIME) return true;
       if (['stream', 'complete', 'completeSimple', 'streamDeferred', 'fetchDeferred', 'cancelDeferred'].includes(key)) {
         return () => { throw fail('unmetered_api_refused'); };
       }

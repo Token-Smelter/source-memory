@@ -21,6 +21,11 @@ test('host model routing uses Pi runtime and rejects ambiguous routes without co
   assert.deepEqual([result.model.id, result.reviewerModel.id, checks], ['claude-haiku-5-5', 'claude-haiku-5-5', ['anthropic', 'anthropic']]);
 });
 
+test('a slice refuses to create a session without a metered Pi runtime', async () => {
+  const { createSliceSession } = await import('../pi-extension/slice-runtime.mjs');
+  await assert.rejects(createSliceSession({ pi: {}, reviewerId: 'fiction/reviewer' }), /metered_runtime_required/);
+});
+
 test('missing or unconfigured model route is refused before any Pi session', async () => {
   const { resolvePiModels } = await import('../pi-extension/slice-runtime.mjs');
   const pi = { ModelRuntime: { async create() { return { getModels: () => [], async checkAuth() { return true; } }; } } };

@@ -16,6 +16,7 @@ const NETWORK_DB = 'a'.repeat(64);
 const DRIVER = 'b'.repeat(64);
 const FOREIGN = 'c'.repeat(64);
 const IMAGE = `sha256:${'d'.repeat(64)}`;
+const DRIVER_IMAGE = `sha256:${'e'.repeat(64)}`;
 const RUN = '12345678-1234-1234';
 
 function unixRequest(socketPath, path, body = '') {
@@ -74,7 +75,7 @@ test('the namespace adapter inventories foreign endpoints and verifies matching 
   const calls = [];
   const execute = async argv => {
     calls.push(argv);
-    if (argv[0] === 'image') return JSON.stringify({ '/data': {}, '/logs': {} });
+    if (argv[0] === 'image') return argv[2] === DRIVER_IMAGE ? 'null' : JSON.stringify({ '/data': {}, '/logs': {} });
     if (argv[0] === 'volume' && argv[1] === 'create') return argv.at(-1);
     if (argv[0] === 'volume' && argv[1] === 'inspect') return JSON.stringify([{ Name: argv[2], Labels: { 'pi-memory.run': RUN } }]);
     if (argv[0] === 'create' && argv.includes('none')) return NETWORK_DB;
@@ -87,7 +88,7 @@ test('the namespace adapter inventories foreign endpoints and verifies matching 
     if (argv[0] === 'inspect' && argv[1] === NETWORK_DB) return JSON.stringify([{ Id: NETWORK_DB, Image: IMAGE, Config: { Labels: { 'pi-memory.run': RUN } },
       HostConfig: { NetworkMode: 'none', PortBindings: null }, NetworkSettings: { Networks: { none: {} } },
       Mounts: [{ Type: 'volume', Name: `pi-memory-${RUN}-data`, Destination: '/data' }, { Type: 'volume', Name: `pi-memory-${RUN}-logs`, Destination: '/logs' }] }]);
-    if (argv[0] === 'inspect' && argv[1] === DRIVER) return JSON.stringify([{ Id: DRIVER, Image: IMAGE, Config: { Labels: { 'pi-memory.run': RUN }, User: `${process.getuid()}:${process.getgid()}` },
+    if (argv[0] === 'inspect' && argv[1] === DRIVER) return JSON.stringify([{ Id: DRIVER, Image: DRIVER_IMAGE, Config: { Labels: { 'pi-memory.run': RUN }, User: `${process.getuid()}:${process.getgid()}` },
       HostConfig: { NetworkMode: `container:${NETWORK_DB}`, PortBindings: null, ReadonlyRootfs: true, CapDrop: ['ALL'] }, NetworkSettings: { Networks: {} },
       Mounts: [{ Type: 'bind', Source: '/fiction/memory', Destination: '/memory', RW: false },
         { Type: 'bind', Source: '/fiction/scratch', Destination: '/scratch', RW: true }] }]);
@@ -96,7 +97,7 @@ test('the namespace adapter inventories foreign endpoints and verifies matching 
   const probe = async (_id, targets) => ({ ok: true, namespace: 'net:[123]', interfaces: ['lo'], no_default_route: true,
     targets: targets.map(row => ({ ...row, outcome: 'error', errno: 'ENETUNREACH' })) });
   const docker = createNamespaceDocker({ execute, probe, hostInterfaces: () => ({ eth: [{ address: '192.0.2.1', internal: false }] }),
-    databaseImage: IMAGE, driverImage: IMAGE, mounts: { memory: '/fiction/memory', scratch: '/fiction/scratch' }, runId: RUN, onResource() {} });
+    databaseImage: IMAGE, driverImage: DRIVER_IMAGE, mounts: { memory: '/fiction/memory', scratch: '/fiction/scratch' }, runId: RUN, onResource() {} });
   const database = await docker.createDatabase();
   const driver = await docker.createDriver({ database });
   const gate = await docker.isolation({ database, driver, shimPort: 18000 });

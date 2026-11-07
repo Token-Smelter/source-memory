@@ -126,6 +126,8 @@ export function createNamespaceDocker({ execute = command, probe = probeDriver, 
     },
     async createDriver({ database }) {
       requireOwned(database);
+      const declared = await json(['image', 'inspect', driverImage, '--format', '{{json .Config.Volumes}}']);
+      if (declared !== null && (typeof declared !== 'object' || Object.keys(declared).length !== 0)) throw fail('volume_invalid');
       const name = `pi-memory-${runId}-driver`;
       record({ kind: 'container', phase: 'planned', id: name, run_id: runId });
       let id;
