@@ -16,7 +16,8 @@ import { createAnswerer } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
 import { createPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
-import { runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
+import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
+import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
 import { createScorer } from '../pi-extension/evaluation/scorer.mjs';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
@@ -140,7 +141,13 @@ async function main() {
   const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   if (execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim()) throw fail('working_tree_dirty');
   const routeRates = { candidate: rates(model), reviewer: rates(reviewerModel) };
-  const seal = createPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha, codeSha, routes: routeRates });
+  const priorPath = process.env.PILOT_PRIOR_LEDGER, priorSha = process.env.PILOT_PRIOR_LEDGER_SHA256;
+  if (Boolean(priorPath) !== Boolean(priorSha)) throw fail('prior_ledger_invalid');
+  const previous = priorPath ? BigInt(priorSoftSpend(pinned(priorPath, priorSha, 10_000_000).toString('utf8'))) : 0n;
+  const remaining = 100000000000n - previous;
+  if (remaining <= 0n) throw fail('soft_cap_exhausted');
+  const seal = createPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
+    codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString() });
   const runId = randomUUID(), dir = mkdtempSync(join(parent, 'pilot-'));
   const driverDir = join(dir, 'driver'), piDir = join(dir, 'pi'), imageDir = join(dir, 'image-blobs');
   mkdirSync(driverDir, { mode: 0o700 }); mkdirSync(piDir, { mode: 0o700 }); mkdirSync(imageDir, { mode: 0o700 });
@@ -154,7 +161,7 @@ async function main() {
   const image = name => execFileSync('/usr/bin/docker', ['image', 'inspect', name, '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
   const docker = createNamespaceDocker({ databaseImage: image('neo4j:5.26.14-community'), driverImage: image('node:22-bookworm-slim'),
     mounts: { memory: resolve('.'), scratch: driverDir }, runId, onResource: row => resources.append(row) });
-  const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: '100000000000', sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
+  const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
     routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer } });
   let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v1', policy_version: seal.spec.policyVersion };
   let journal, sequenceResult, snapshot, failure = null;
@@ -169,7 +176,8 @@ async function main() {
         dataset_sha256: manifestSha, code_sha: codeSha, seal_sha256: seal.digest, sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
         models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
         routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
-        budget: { overall_effort_soft_usd: 250, this_run_soft_usd: 100, one_call_in_flight: true, stop_unknown_usage: true,
+        budget: { overall_effort_soft_usd: 250, share_soft_usd: 100, prior_spend_nano: previous.toString(),
+          remaining_soft_nano: remaining.toString(), prior_ledger_sha256: priorSha ?? null, one_call_in_flight: true, stop_unknown_usage: true,
           stop_above_twice_estimate: true, gateway_attempt_ledger: 'partial: gateway-internal failover/retry attempts not correlatable', rate_card: routeRates },
         checkpoints: checkpoints.length, cases: prepared.length, isolation: { network_mode: isolation.network_mode,
           namespace: isolation.namespace, interfaces: isolation.interfaces, no_default_route: isolation.no_default_route,
@@ -200,7 +208,7 @@ async function main() {
         sequenceResult = await runPilotSequence({ session, journal, checkpoints, cases: prepared, budget,
           async onBeforeCheckpoint(checkpoint) { meta = { purpose: 'candidate', arm: 'candidate', checkpoint: checkpoint.id,
             task_version: 'distiller-r2-v1', policy_version: seal.spec.policyVersion }; },
-          async onCheckpoint(row, state) { progress.append({ type: 'checkpoint', through: row.cursor ?? row.through, disposition: row.disposition,
+          async onCheckpoint(row, state) { progress.append({ type: 'checkpoint', through: checkpointId(row), disposition: row.disposition,
             image_limitation: row.omissions?.images ?? null, budget: state }); },
           async onCase(row, state) { progress.append({ type: 'case', case_id: row.case_id, status: row.status, budget: state }); },
           async evaluateCase(item, cursor) {
@@ -282,11 +290,12 @@ async function main() {
   const final = { status: harness.status === 'complete' && !failure && sequenceResult?.status === 'complete' ? 'partial_reference_unavailable' : 'failed_or_partial',
     harness_status: harness.status, failure: failure ?? harness.code ?? null, coverage: sequenceResult ? { status: sequenceResult.status,
       scheduled: checkpoints.length, processed: sequenceResult.results.length, tail: sequenceResult.tail ?? null,
-      dispositions: sequenceResult.results.map(row => ({ through: row.cursor ?? row.through, disposition: row.disposition, code: row.code ?? null })) } : null,
+      dispositions: sequenceResult.results.map(row => ({ through: checkpointId(row), disposition: row.disposition, code: row.code ?? null })) } : null,
     scorecard, reference: 'pending_reference_freeze',
     stage_attribution: reportRows.map(row => ({ case_id: row.caseId, status: 'pending_reference_freeze',
       reason: 'Reference catalog and candidate-trace semantic comparison have not been validated.' })),
-    snapshot: snapshot ?? null, budget: budget.state(),
+    snapshot: snapshot ?? null, budget: { ...budget.state(), prior_spend_nano: previous.toString(),
+      total_spent_nano: (previous + BigInt(budget.state().spent_nano)).toString(), share_cap_nano: '100000000000' },
     ledger_completeness: 'partial: gateway-internal failover/retry attempts not correlatable',
     image_limitation: 'Original image blobs are archived by SHA-256; image content is not text-citable.', artifacts,
     run_dir: dir, run_id: runId, seal_sha256: seal.digest };

@@ -21,11 +21,14 @@ test('installed Pi SDK executes fictional Memory search and typed record tools t
       maxTokens: 1000, input: ['text'], reasoning: true, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
     const make = (content, stopReason) => ({ role: 'assistant', provider: model.provider, model: model.id, api: model.api, timestamp: Date.now(), stopReason, usage, content });
     const messages = [make([{ type: 'toolCall', id: 'search', name: 'memory_search', arguments: { query: 'fiction', kinds: [] } }], 'toolUse'),
+      make([{ type: 'toolCall', id: 'invalid', name: 'memory_record', arguments: { kind: 'issue', text: 'Fiction', evidence_labels: ['ref-000001'] } }], 'toolUse'),
       make([{ type: 'toolCall', id: 'record', name: 'memory_record', arguments: { kind: 'decision', text: 'A fictional decision', evidence_labels: ['ref-000001'] } }], 'toolUse'),
       make([{ type: 'text', text: '{"disposition":"committed"}' }], 'stop')];
     const offeredTools = [];
+    let offeredKinds;
     const runtime = { hasConfiguredAuth() { return true; }, streamSimple(_model, context) {
       offeredTools.push((context.tools ?? []).map(tool => tool.name));
+      offeredKinds ??= context.tools?.find(tool => tool.name === 'memory_record')?.parameters?.properties?.kind?.enum;
       const message = messages.shift();
       let finish;
       const result = new Promise(resolve => { finish = resolve; });
@@ -46,7 +49,8 @@ test('installed Pi SDK executes fictional Memory search and typed record tools t
     const result = await distiller.run({ throughEntryId: 'a2', turn: { turn_id: 'fiction', entries: [{ id: 'u', role: 'user', text: 'A fictional decision.' }] }, receipt: { id: 'turn' } });
     await new Promise(resolve => setImmediate(resolve));
     soft.close();
-    assert.deepEqual([result.disposition, calls, soft.state().calls_started, offeredTools[0]],
-      ['committed', ['search', 'decision'], 3, ['memory_search', 'memory_record', 'memory_link']]);
+    assert.deepEqual([result.disposition, calls, soft.state().calls_started, offeredTools[0], offeredKinds],
+      ['committed', ['search', 'decision'], 4, ['memory_search', 'memory_record', 'memory_link'],
+        ['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action']]);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

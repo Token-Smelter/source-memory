@@ -4,7 +4,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
-import { runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
+import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
+
+test('failed checkpoint reporting names the attempted leaf rather than the previous cursor', () => {
+  assert.equal(checkpointId({ through: 'attempted', cursor: 'previous' }), 'attempted');
+});
 
 test('pilot answers each case before processing the next source checkpoint', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'pi-pilot-sequence-'));

@@ -35,6 +35,10 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
     || typeof incremental.syncThrough !== 'function' || !workDir || !model) throw fail('runtime_invalid');
   if (!['separate', 'self_review'].includes(reviewMode)) throw fail('review_mode_invalid');
   const sessionId = incremental.sessionId;
+  const vocabulary = retentionPolicy().value;
+  const kind = { type: 'string', enum: vocabulary.item_types };
+  const kinds = { type: 'array', items: kind, maxItems: vocabulary.item_types.length, uniqueItems: true };
+  const evidenceLabels = { ...labels, minItems: 1, maxItems: 16, uniqueItems: true };
   let currentTools = null;
   let breakpoint = null;
   const factory = api => {
@@ -48,12 +52,14 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
         if (!currentTools) throw fail('tool_unavailable');
         return toolResult(await action(currentTools, args));
       } });
-    register('memory_search', 'Search private memory; returned link handles are scoped to the current offer.', { query: string, kinds: labels },
-      (tools, args) => tools.search(args.query, args.kinds));
-    register('memory_record', 'Record a proposed memory supported by current-turn reference labels.', { kind: string, text: string, evidence_labels: labels },
+    register('memory_search', 'Search private memory; returned link handles are scoped to the current offer.',
+      { query: { type: 'string', minLength: 1, maxLength: 4000 }, kinds }, (tools, args) => tools.search(args.query, args.kinds));
+    register('memory_record', 'Record a proposed memory supported by current-turn reference labels.',
+      { kind, text: { type: 'string', minLength: 1, maxLength: 16000 }, evidence_labels: evidenceLabels },
       (tools, args) => tools.record(args.kind, args.text, args.evidence_labels));
     register('memory_link', 'Propose a link using handles from the current offer; this does not approve it.',
-      { from: string, to: string, type: string, evidence: labels, support: string }, (tools, args) => tools.link(args));
+      { from: string, to: string, type: { type: 'string', enum: vocabulary.relationship_types }, evidence: evidenceLabels,
+        support: { type: 'string', enum: ['explicit', 'ambiguous', 'unsupported', 'chronology_only'] } }, (tools, args) => tools.link(args));
   };
   let resourceLoader = createOptions.resourceLoader;
   if (!resourceLoader && pi.DefaultResourceLoader && pi.SettingsManager) {

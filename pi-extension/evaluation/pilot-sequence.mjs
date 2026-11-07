@@ -2,6 +2,8 @@ import { runCoveredInterval } from '../coverage.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 
+export const checkpointId = result => result.through ?? result.cursor;
+
 /** Evaluate each case before any later checkpoint mutates its pre-answer store. */
 export async function runPilotSequence({ session, journal, checkpoints, cases, budget, evaluateCase, onBeforeCheckpoint = async () => {}, onCheckpoint = async () => {}, onCase = async () => {} }) {
   if (!session || !journal || !Array.isArray(checkpoints) || !checkpoints.length || !Array.isArray(cases)
