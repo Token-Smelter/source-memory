@@ -4,7 +4,7 @@ import { digest } from '../src/core.mjs';
 import { distillThrough } from './core.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
-const effects = new Set(['ingest', 'enrich', 'applyLinks', 'index']);
+const effects = new Set(['ingest', 'enrich', 'applyLinks', 'applyOutcome', 'index']);
 const tracking = Symbol('coverage-tracking');
 const covered = new Set(['committed', 'abstained', 'ineligible_by_policy']);
 const safeCode = error => typeof error?.code === 'string' && /^[a-z_]{1,80}$/.test(error.code) ? error.code : 'operation_failed';
@@ -47,7 +47,7 @@ export function createCoverageJournal({ directory, sessionKey }) {
       active.effects.set(row.effect, { method: row.method, state: 'pending' });
     } else if (row.type === 'effect_end') {
       const effect = active?.effects.get(row.effect);
-      if (!effect || active.id !== row.id || effect.state !== 'pending' || !['confirmed', 'unknown'].includes(row.outcome)) throw fail('journal_invalid');
+      if (!effect || active.id !== row.id || effect.state !== 'pending' || !['confirmed', 'refused', 'unknown'].includes(row.outcome)) throw fail('journal_invalid');
       effect.state = row.outcome;
       if (row.outcome === 'confirmed' && effect.method !== 'ingest') active.derived = true;
     } else if (row.type === 'finish') {
@@ -116,6 +116,7 @@ export function createCoverageJournal({ directory, sessionKey }) {
           if (!effects.has(key)) return value.bind(target);
           return async (...args) => {
             if (!active) throw fail('interval_not_started');
+            if ([...active.effects.values()].some(row => ['pending', 'unknown'].includes(row.state))) throw fail('write_reconciliation_required');
             const id = active.id;
             const effect = digest(['coverage-effect/v1', id, key, args]);
             if (active.effects.has(effect)) throw fail('effect_already_attempted');
@@ -125,7 +126,9 @@ export function createCoverageJournal({ directory, sessionKey }) {
               append({ type: 'effect_end', id, effect, outcome: 'confirmed', receipt_sha256: digest(result ?? null) });
               return result;
             } catch (problem) {
-              if (active?.effects.get(effect)?.state === 'pending') append({ type: 'effect_end', id, effect, outcome: 'unknown' });
+              const outcome = problem?.effect === 'refused' ? 'refused' : 'unknown';
+              if (active?.effects.get(effect)?.state === 'pending') append({ type: 'effect_end', id, effect, outcome });
+              if (outcome === 'unknown') throw Object.assign(fail('write_uncertain'), { write_outcome_unknown: true });
               throw problem;
             }
           };
@@ -134,7 +137,7 @@ export function createCoverageJournal({ directory, sessionKey }) {
     },
     finish(disposition, code = null) {
       if (!active) throw fail('interval_not_started');
-      const uncertain = [...active.effects.values()].some(row => row.state !== 'confirmed');
+      const uncertain = [...active.effects.values()].some(row => !['confirmed', 'refused'].includes(row.state));
       if (!covered.has(disposition) && !['failed', 'unresolved_scope', 'uncertain'].includes(disposition)) throw fail('disposition_invalid');
       if (uncertain || (active.derived && !covered.has(disposition))) disposition = 'uncertain';
       if (disposition !== 'committed' && covered.has(disposition) && active.derived) disposition = 'uncertain';

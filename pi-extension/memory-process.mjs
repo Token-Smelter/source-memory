@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { normalizeEnrichment } from '../src/core.mjs';
 import * as defaultLinks from '../src/link-proposals.mjs';
 import { searchDerived, resolveDerived, searchRaw } from './derived-retrieval.mjs';
+import { createAtomicOutcomes } from './atomic-outcome.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const deferred = () => {
@@ -16,6 +17,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
   if (!Number.isSafeInteger(offerTimeoutMs) || offerTimeoutMs <= 0) throw fail('timeout_invalid');
   const allowed = scope => { if (scope !== scopes[0]) throw fail('scope_denied'); };
   const slots = new Map();
+  const outcomes = createAtomicOutcomes({ memory, beforeAppend });
   const cancel = slot => {
     if (!slot || slot.closed) return false;
     slot.closed = true;
@@ -34,7 +36,17 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       if (turn?.source !== 'pi-memory') throw fail('source_invalid');
       return memory.ingest(scope, turn);
     },
-    async recall({ scope, input }) { allowed(scope); return memory.recall(scope, input); },
+    async recall({ scope, input, trigger }) {
+      allowed(scope);
+      const result = await memory.recall(scope, input);
+      return outcomes.offer(scope, trigger, result);
+    },
+    async beginOutcome({ scope, trigger, outcome, new_action, action_handle }) {
+      allowed(scope);
+      return outcomes.begin({ scope, trigger, outcome, new_action, action_handle });
+    },
+    async applyOutcome({ scope, token, review }) { allowed(scope); return outcomes.apply({ scope, token, review }); },
+    async cancelOutcome({ token }) { return outcomes.cancel(token); },
     async searchDerived({ scope, input }) { allowed(scope); return searchDerived(memory, scope, input); },
     async resolveDerived({ scope, input }) { allowed(scope); return resolveDerived(memory, scope, input); },
     async searchRaw({ scope, input }) { allowed(scope); return searchRaw(memory, scope, input); },
@@ -91,6 +103,6 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       } finally { cancel(slot); }
     },
     async cancelLinks({ token }) { return { cancelled: cancel(slots.get(token)) }; },
-    close() { for (const slot of [...slots.values()]) cancel(slot); },
+    close() { for (const slot of [...slots.values()]) cancel(slot); outcomes.close(); },
   };
 }

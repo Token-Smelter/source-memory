@@ -61,7 +61,7 @@ function rates(model) {
 }
 function trackSnapshot(memory) {
   let epoch = 0, lock = false, invalid = false;
-  const writes = new Set(['ingest', 'enrich', 'applyLinks', 'index']);
+  const writes = new Set(['ingest', 'enrich', 'applyLinks', 'applyOutcome', 'index']);
   const client = new Proxy(memory, { get(target, key) {
     const value = Reflect.get(target, key, target);
     if (typeof value !== 'function') return value;
@@ -69,7 +69,7 @@ function trackSnapshot(memory) {
     return async (...args) => {
       if (lock || invalid) throw fail('snapshot_locked');
       try { const result = await value.apply(target, args); epoch++; return result; }
-      catch (error) { invalid = true; throw error; }
+      catch (error) { if (error?.effect !== 'refused') invalid = true; throw error; }
     };
   } });
   return { client, acquire(queryTime) {

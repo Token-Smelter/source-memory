@@ -10,7 +10,7 @@ import { createInputBudget, boundPiRuntime } from '../pi-extension/budget.mjs';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
 
 const sdkPath = process.env.PI_SDK_MODULE;
-test('installed Pi SDK executes fictional Memory search and typed record tools through the metered runtime', { skip: !sdkPath }, async () => {
+test('installed Pi SDK executes an atomic fictional action and outcome through the metered runtime', { skip: !sdkPath }, async () => {
   const pi = await import(pathToFileURL(sdkPath).href);
   const directory = mkdtempSync(join(tmpdir(), 'pi-sdk-tools-'));
   try {
@@ -22,7 +22,8 @@ test('installed Pi SDK executes fictional Memory search and typed record tools t
     const make = (content, stopReason) => ({ role: 'assistant', provider: model.provider, model: model.id, api: model.api, timestamp: Date.now(), stopReason, usage, content });
     const messages = [make([{ type: 'toolCall', id: 'search', name: 'memory_search', arguments: { query: 'fiction', kinds: [] } }], 'toolUse'),
       make([{ type: 'toolCall', id: 'invalid', name: 'memory_record', arguments: { kind: 'issue', text: 'Fiction', evidence_labels: ['ref-000001'] } }], 'toolUse'),
-      make([{ type: 'toolCall', id: 'record', name: 'memory_record', arguments: { kind: 'decision', text: 'A fictional decision', evidence_labels: ['ref-000001'] } }], 'toolUse'),
+      make([{ type: 'toolCall', id: 'record', name: 'memory_record', arguments: { kind: 'outcome', text: 'Fictional result', evidence_labels: ['ref-000001'],
+        new_action: { text: 'Fictional action', evidence_labels: ['ref-000001'] } } }], 'toolUse'),
       make([{ type: 'text', text: '{"disposition":"committed"}' }], 'stop')];
     const offeredTools = [];
     let offeredKinds;
@@ -43,14 +44,16 @@ test('installed Pi SDK executes fictional Memory search and typed record tools t
     const budget = createInputBudget(1000000);
     const metered = soft.wrap(boundPiRuntime(runtime, budget), () => ({ purpose: 'candidate', arm: 'candidate', checkpoint: 'a2', task_version: 'fiction', policy_version: 'fiction' }));
     const calls = [];
+    let pending;
     const memory = { async recall() { calls.push('search'); return { status: 'no_matches', bundles: [] }; },
-      async enrich(_scope, data) { calls.push(data.records[0].kind); return { records: [data.records[0].id] }; } };
+      async beginOutcome(_scope, _trigger, outcome, action) { calls.push('begin'); pending = { outcome, action }; return { token: 'fiction', proposal: { requires_review: false } }; },
+      async applyOutcome() { calls.push('commit'); return { status: 'written', records: [pending.action.id, pending.outcome.id] }; } };
     const distiller = await createPiDistiller({ pi, incremental, workDir: directory, model, modelRuntime: metered, memory, scope: 'fiction', budget });
     const result = await distiller.run({ throughEntryId: 'a2', turn: { turn_id: 'fiction', entries: [{ id: 'u', role: 'user', text: 'A fictional decision.' }] }, receipt: { id: 'turn' } });
     await new Promise(resolve => setImmediate(resolve));
     soft.close();
     assert.deepEqual([result.disposition, calls, soft.state().calls_started, offeredTools[0], offeredKinds],
-      ['committed', ['search', 'decision'], 4, ['memory_search', 'memory_record', 'memory_link'],
+      ['committed', ['search', 'begin', 'commit'], 4, ['memory_search', 'memory_record', 'memory_link'],
         ['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action']]);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

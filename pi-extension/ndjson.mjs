@@ -29,7 +29,8 @@ export function createClient({ input, output, timeoutMs = 30000 }) {
     let message;
     try { message = JSON.parse(line); } catch { close(); return; }
     if (typeof message?.id !== 'string' || typeof message.ok !== 'boolean') { close(); return; }
-    finish(message.id, message.ok ? null : error(message.error ?? 'request_failed'), message.value);
+    const problem = message.ok ? null : Object.assign(error(message.error ?? 'request_failed'), { remote_rejection: true });
+    finish(message.id, problem, message.value);
   });
   function close() {
     if (closed) return;

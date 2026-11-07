@@ -8,6 +8,7 @@ const finished = row => row?.message?.role === 'assistant' && !['error', 'aborte
 function blockText(block) {
   if (typeof block === 'string') return block;
   if (!block || typeof block !== 'object') return '';
+  if (['thinking', 'redacted_thinking', 'reasoning'].includes(block.type)) return '';
   if (['text', 'input_text', 'output_text'].includes(block.type)) return typeof block.text === 'string' ? block.text : '';
   if (['toolCall', 'tool_use'].includes(block.type)) return `${typeof block.name === 'string' ? block.name : 'tool'} ${JSON.stringify(block.arguments ?? block.input ?? block.args ?? {})}`;
   if (typeof block.text === 'string') return block.text;
@@ -115,7 +116,7 @@ export function createLinkChoices(packet) {
 }
 
 /** Tool-facing labels name only entries of the just-retained cursor turn. */
-export function createTurnTools({ scope, turn, receipt, memory, requireSearch = false, ensureIndexed }) {
+export function createTurnTools({ scope, turn, receipt, memory, requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate' }) {
   if (typeof scope !== 'string' || !scope || !turn?.turn_id || !Array.isArray(turn.entries) || !receipt?.id || !memory) throw fail('invalid_input');
   const labels = new Map();
   const imageNotes = [];
@@ -139,6 +140,17 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
     add(previous, entry.text.length);
   }
   const recordIds = [];
+  const actionHandles = new Set();
+  const buildRecord = (kind, text, refs) => {
+    if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length || refs.some(ref => !labels.has(ref))) throw fail('label_not_offered');
+    const spans = refs.map(ref => {
+      const { entry, start, end } = labels.get(ref);
+      if (start === end) throw fail('label_empty');
+      return { turn: receipt.id, entry_id: entry.id, start, end };
+    });
+    return { id: `pi-memory-record-${digest(['pi-memory-record/v1', scope, turn.turn_id, kind, text, spans])}`,
+      kind, text, status: 'proposed', attribution: 'Pi distiller proposal; not operator acceptance', evidence: spans };
+  };
   let searches = 0;
   let searchFailed = false;
   let incompleteSearch = false;
@@ -148,21 +160,37 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
   return {
     labels() { return [...labels].map(([ref, span]) => ({ ref, role: span.entry.role, text: span.entry.text.slice(span.start, span.end) })); },
     imageNotes() { return structuredClone(imageNotes); },
-    async record(kind, text, refs) {
+    async record(kind, text, refs, options = {}) {
       if (requireSearch && (!searches || searchFailed)) throw fail('search_required');
-      if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length || refs.some(ref => !labels.has(ref))) throw fail('label_not_offered');
-      const spans = refs.map(ref => {
-        const { entry, start, end } = labels.get(ref);
-        if (start === end) throw fail('label_empty');
-        return { turn: receipt.id, entry_id: entry.id, start, end };
-      });
-      const record = { id: `pi-memory-record-${digest(['pi-memory-record/v1', scope, turn.turn_id, kind, text, spans])}`,
-        kind, text, status: 'proposed', attribution: 'Pi distiller proposal; not operator acceptance', evidence: spans };
-      const payload = normalizeEnrichment({ records: [record], relations: [] });
+      const record = buildRecord(kind, text, refs);
       if (offer && typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token);
-      const write = await memory.enrich(scope, payload, { trigger: receipt.id });
+      let write;
+      if (kind === 'outcome') {
+        const handle = options.action_handle;
+        const actionInput = options.new_action;
+        if (Boolean(handle) === Boolean(actionInput) || (handle && !actionHandles.has(handle))) throw fail('outcome_referent_required');
+        if (typeof memory.beginOutcome !== 'function' || typeof memory.applyOutcome !== 'function') throw fail('outcome_unavailable');
+        const action = actionInput ? buildRecord('action', actionInput.text, actionInput.evidence_labels) : null;
+        const offered = await memory.beginOutcome(scope, receipt.id, record, action, handle ?? null);
+        let review = null;
+        if (offered.proposal?.requires_review) {
+          if (reviewMode !== 'separate' || typeof reviewer?.review !== 'function') throw fail('review_required');
+          const decision = await reviewer.review({ proposal: offered.proposal, mode: reviewMode });
+          if (!decision || !Array.isArray(decision.approved) || typeof decision.reviewer !== 'string' || typeof decision.decision_ref !== 'string') throw fail('review_invalid');
+          if (!decision.approved.includes(0)) { await memory.cancelOutcome(offered.token); return { status: 'refused', reason: 'review_rejected' }; }
+          review = { reviewer: `separate:${decision.reviewer}`, decision_ref: decision.decision_ref,
+            proposal_sha256: offered.proposal.proposal_sha256, approved: [0] };
+        }
+        write = await memory.applyOutcome(scope, offered.token, review);
+        if (write?.status !== 'written' || !write.records?.includes(record.id)) throw fail('outcome_write_unknown');
+        for (const id of write.records) if (!recordIds.includes(id)) recordIds.push(id);
+      } else {
+        if (options.action_handle || options.new_action) throw fail('invalid_input');
+        const payload = normalizeEnrichment({ records: [record], relations: [] });
+        write = await memory.enrich(scope, payload, { trigger: receipt.id });
+        if (!recordIds.includes(record.id)) recordIds.push(record.id);
+      }
       if (typeof ensureIndexed === 'function') await ensureIndexed(memory, scope, write?.indexing);
-      if (!recordIds.includes(record.id)) recordIds.push(record.id);
       offer = null;
       choices = null;
       return { id: record.id, status: 'proposed' };
@@ -181,7 +209,7 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
       }
       try {
         if (typeof memory.recall !== 'function') throw fail('search_unavailable');
-        const result = await memory.recall(scope, { query, limit: 8, max_chars: 24000 });
+        const result = await memory.recall(scope, { query, limit: 8, max_chars: 24000 }, { trigger: receipt.id });
         if (!['ready', 'no_matches', 'budget_limited'].includes(result?.status) || !Array.isArray(result.bundles)) throw fail('search_incomplete');
         if (result.status === 'budget_limited') {
           if (!Number.isSafeInteger(result.budget_omitted) || result.budget_omitted < 1 || !result.channels || !result.bundles.length) throw fail('search_incomplete');
@@ -189,8 +217,12 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
         }
         searches++;
         const records = result.bundles.flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind))
-          .slice(0, 32).map(row => ({ id: row.id, kind: row.kind, snippet: row.text.slice(0, 500) }));
-        for (const row of records) if (typeof row.id === 'string' && row.id) returnedPriorIds.add(row.id);
+          .slice(0, 32).map(row => ({ id: row.id, kind: row.kind, snippet: row.text.slice(0, 500),
+            ...(row.kind === 'action' && row.action_handle ? { action_handle: row.action_handle } : {}) }));
+        for (const row of records) {
+          if (typeof row.id === 'string' && row.id) returnedPriorIds.add(row.id);
+          if (typeof row.action_handle === 'string' && row.action_handle) actionHandles.add(row.action_handle);
+        }
         const channels = result.channels ? Object.fromEntries(Object.entries(result.channels).map(([name, value]) => [name,
           { status: value.status, ...(value.reason ? { reason: value.reason } : {}) }])) : null;
         return { status: result.status, records, filtered: kinds.length > 0, completeness_guaranteed: false,

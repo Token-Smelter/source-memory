@@ -18,13 +18,25 @@ test('uncertain-write fixture blocks dependent progress and retry across journal
   let journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
   const memory = journal.track({ async enrich() { throw Object.assign(new Error('timeout'), { code: 'request_timeout' }); } });
   const id = journal.begin({ cursor: null, through: 'a' });
-  await assert.rejects(memory.enrich('fiction', {}), /timeout/);
+  await assert.rejects(memory.enrich('fiction', {}), /write_uncertain/);
+  await assert.rejects(memory.enrich('fiction', { different: true }), /write_reconciliation_required/);
   assert.equal(journal.finish('failed'), fixture.disposition);
   journal.close();
   journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
   assert.throws(() => journal.begin({ cursor: 'a', through: 'b' }), /reconciliation_required/);
   assert.throws(() => journal.begin({ cursor: null, through: 'a', retry: true }), /reconciliation_required/);
   assert.deepEqual([journal.state().id, journal.state().cursor], [id, null]);
+  journal.close();
+}));
+
+test('a confirmed pre-write refusal permits a corrected write in the same interval', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  let calls = 0;
+  const memory = journal.track({ async enrich() { calls++; if (calls === 1) throw Object.assign(new Error('refused'), { effect: 'refused' }); return { records: ['fiction'] }; } });
+  journal.begin({ cursor: null, through: 'a' });
+  await assert.rejects(memory.enrich('fiction', { first: true }), /refused/);
+  await memory.enrich('fiction', { second: true });
+  assert.deepEqual([journal.finish('committed'), calls], ['committed', 2]);
   journal.close();
 }));
 

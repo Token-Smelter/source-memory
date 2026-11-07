@@ -79,14 +79,35 @@ try {
         review_contract: proposal.review_contract, operation_id: proposal.operation_id, context_sha256: proposal.context_sha256,
         semantic_proposal_sha256: proposal.semantic_proposal_sha256, proposal_sha256: proposal.proposal_sha256, approved: [0] };
       const linked = await memory.applyLinks(offer.token, review);
+      const actionText = 'The fictional beacon was inspected and the test passed.';
+      const actionTurn = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-outcome',
+        entries: [{ id: 'fictional-outcome-source', role: 'user', text: actionText }] });
+      const actionEvidence = [{ turn: actionTurn.id, entry_id: 'fictional-outcome-source', start: 0, end: actionText.length }];
+      const newAction = { id: 'fictional-action', kind: 'action', text: 'Inspect the fictional beacon.', status: 'proposed', attribution: 'fiction', evidence: actionEvidence };
+      const newOutcome = { id: 'fictional-outcome-record', kind: 'outcome', text: 'The fictional beacon test passed.', status: 'proposed', attribution: 'fiction', evidence: actionEvidence };
+      const atomic = await memory.beginOutcome('fiction', actionTurn.id, newOutcome, newAction, null);
+      const atomicResult = await memory.applyOutcome('fiction', atomic.token, null);
+      const followText = 'The fictional beacon inspection later confirmed another pass.';
+      const follow = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-prior-outcome',
+        entries: [{ id: 'fictional-prior-source', role: 'user', text: followText }] });
+      const priorSearch = await memory.recall('fiction', { query: 'fictional beacon inspected', limit: 8 }, { trigger: follow.id });
+      const priorHandle = priorSearch.bundles.flatMap(row => row.records).find(row => row.id === 'fictional-action')?.action_handle;
+      if (!priorHandle) throw new Error('prior_action_unavailable');
+      const priorOutcome = { id: 'fictional-prior-outcome-record', kind: 'outcome', text: 'Another fictional test passed.', status: 'proposed', attribution: 'fiction',
+        evidence: [{ turn: follow.id, entry_id: 'fictional-prior-source', start: 0, end: followText.length }] };
+      const priorProposal = await memory.beginOutcome('fiction', follow.id, priorOutcome, null, priorHandle);
+      const priorReview = { reviewer: 'separate:fiction', decision_ref: 'fictional-review', proposal_sha256: priorProposal.proposal.proposal_sha256, approved: [0] };
+      const priorResult = await memory.applyOutcome('fiction', priorProposal.token, priorReview);
       const snapshot = await docker.snapshot({ driver, scope: 'fiction', filename: `baseline-${runId}.json` });
       return { retained: stored.retained, indexing: stored.indexing?.status, recall_status: recalled.status,
         returned: recalled.bundles?.length ?? 0, derived_returned: derived.length,
-        evidence_resolved: resolved.text === 'The amber fictional key requires rotation.', link_status: linked.status, snapshot, relay_calls: relayCalls };
+        evidence_resolved: resolved.text === 'The amber fictional key requires rotation.', link_status: linked.status,
+        atomic_new_status: atomicResult.status, atomic_prior_status: priorResult.status, snapshot, relay_calls: relayCalls };
     } });
   if (result.status !== 'complete' || result.result?.retained !== true || result.result.indexing !== 'ready'
     || result.result.returned < 1 || result.result.derived_returned < 1 || result.result.evidence_resolved !== true
-    || result.result.link_status !== 'written' || result.result.snapshot?.nodes < 1 || result.result.relay_calls < 1) process.exitCode = 1;
+    || result.result.link_status !== 'written' || result.result.atomic_new_status !== 'written' || result.result.atomic_prior_status !== 'written'
+    || result.result.snapshot?.nodes < 1 || result.result.relay_calls < 1) process.exitCode = 1;
   process.stdout.write(`${JSON.stringify({ ...result, run_id: runId, private_receipt_dir: scratch })}\n`);
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ status: 'failed', code: error?.code ?? 'smoke_failed' })}\n`);

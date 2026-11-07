@@ -9,7 +9,9 @@ export function createMemoryClient({ input, output, timeoutMs, reviewContract = 
       onReceipt({ method, ok: true, value });
       return value;
     } catch (error) {
-      onReceipt({ method, ok: false, code: error.code ?? 'request_failed' });
+      if (error.remote_rejection === true && ((method === 'enrich' && error.code === 'outcome_referent_required')
+        || (method === 'applyOutcome' && ['outcome_review_refused', 'outcome_context_changed'].includes(error.code)))) error.effect = 'refused';
+      onReceipt({ method, ok: false, code: error.code ?? 'request_failed', effect: error.effect ?? 'unknown' });
       throw error;
     }
   };
@@ -18,7 +20,11 @@ export function createMemoryClient({ input, output, timeoutMs, reviewContract = 
     status: (scope, options) => call('status', { scope }, options),
     index: (scope, input, options) => call('index', { scope, input }, options),
     ingest: (scope, turn, options) => call('ingest', { scope, turn }, options),
-    recall: (scope, input, options) => call('recall', { scope, input }, options),
+    recall: (scope, input, { signal, trigger } = {}) => call('recall', { scope, input, ...(trigger ? { trigger } : {}) }, { signal }),
+    beginOutcome: (scope, trigger, outcome, newAction, actionHandle, options) => call('beginOutcome',
+      { scope, trigger, outcome, new_action: newAction, action_handle: actionHandle }, options),
+    applyOutcome: (scope, token, review, options) => call('applyOutcome', { scope, token, review }, options),
+    cancelOutcome: (token, options) => call('cancelOutcome', { token }, options),
     searchDerived: (scope, input, options) => call('searchDerived', { scope, input }, options),
     resolveDerived: (scope, input, options) => call('resolveDerived', { scope, input }, options),
     searchRaw: (scope, input, options) => call('searchRaw', { scope, input }, options),
