@@ -29,6 +29,19 @@ test('fixed Pi answerer uses metered SDK calls and only declared retrieval tools
     fake.calls[1].context.messages.at(-1).toolName, fake.calls[0].options.maxRetries], ['Fictional answer', 2, 'Fictional question', 'memory_search', 0]);
 });
 
+test('the fixed item limit is returned as a tool result without another retrieval', async () => {
+  const fake = fakeMetered([message([{ type: 'toolCall', id: 'one', name: 'memory_search', arguments: { query: 'fiction one' } },
+    { type: 'toolCall', id: 'two', name: 'memory_search', arguments: { query: 'fiction two' } }], 'toolUse'),
+    message([{ type: 'toolCall', id: 'submit', name: 'submit_answer', arguments: { answer: 'Uncertain.' } }], 'toolUse')]);
+  let calls = 0, retrievals = 0;
+  const respond = createPiAnswererResponder({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', expectedToolsSha256: ANSWERER_TOOLS_SHA256 });
+  const result = await respond({ request: 'Fiction?', instructions: 'Use the tools.', route: 'fiction', model: 'one', reasoning: 'low',
+    inputTokens: 100, costNano: '10000', outputTokens: 20, modelCalls: 2,
+    tools: { async search() { calls++; if (calls === 2) throw Object.assign(new Error('item_limit'), { code: 'item_limit' }); retrievals++; return Array(12).fill({ id: 'fixture' }); }, async resolve() {} } });
+  const toolReply = fake.calls[1].context.messages.find(row => row.role === 'toolResult' && row.toolCallId === 'two');
+  assert.deepEqual([result.text, retrievals, JSON.parse(toolReply.content[0].text).status], ['Uncertain.', 1, 'item_budget_exhausted']);
+});
+
 test('scorer uses a structured metered Pi SDK judgment submission', async () => {
   const fake = fakeMetered([message([{ type: 'toolCall', id: 'score', name: 'submit_score', arguments: { clauses: [] } }], 'toolUse')]);
   const judge = createPiScorerJudge({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });

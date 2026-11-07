@@ -1,4 +1,5 @@
 import { hash, verifySeal } from './seal.mjs';
+import { answererBudgetFormatCompatible } from './pi-calls.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const text = value => typeof value === 'string' && value.length > 0;
@@ -12,11 +13,12 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies, provena
   const s = verifySeal(seal, expectedDigest);
   if (!Array.isArray(provenance)) throw fail('report_invalid');
   const origins = new Map([[seal.digest, s]]);
-  const comparable = ['policyVersion', 'policySha256', 'sourceSha256', 'datasetSha256', 'sdkSha256', 'answerer', 'scorer', 'rubric',
+  const comparable = ['policyVersion', 'policySha256', 'sourceSha256', 'datasetSha256', 'sdkSha256', 'scorer', 'rubric',
     'packetSchema', 'alternativeRule', 'baseline', 'stores', 'access', 'safety', 'cases', 'packets', 'dependenciesDigest', 'comparison', 'resampling'];
   for (const prior of provenance) {
     const spec = verifySeal(prior, prior?.digest);
     if (comparable.some(key => spec[key] === undefined || s[key] === undefined ? spec[key] !== s[key] : hash(spec[key]) !== hash(s[key]))
+      || (hash(spec.answerer) !== hash(s.answerer) && !answererBudgetFormatCompatible(spec.answerer, s.answerer))
       || origins.has(prior.digest)) throw fail('provenance_mismatch');
     origins.set(prior.digest, spec);
   }
@@ -97,7 +99,7 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies, provena
   const usedSeals = [...new Set(rows.map(row => row.sealDigest))];
   return { sealDigest: usedSeals.length === 1 ? usedSeals[0] : null,
     ...(usedSeals.length > 1 ? { provenance: { currentSealDigest: seal.digest, sourceSealDigests: usedSeals, mixedCandidateCode: true,
-      interpretation: s.interpretation ?? null,
-      limitation: 'Cases were scored under compatible evaluator seals after recorded candidate-method or interpretation transitions.' } } : {}), cases: rows.length, clusters: clusters.length,
+      mixedAnswererFormat: usedSeals.some(id => hash(origins.get(id).answerer) !== hash(s.answerer)), interpretation: s.interpretation ?? null,
+      limitation: 'Cases were scored under compatible evaluator seals after recorded candidate-method, answerer-format or interpretation transitions.' } } : {}), cases: rows.length, clusters: clusters.length,
     clusterCases: clusters.map(group => group.map(row => row.caseId)), pairedDelta: paired.candidate, deltas: paired, sensitivity, confidence, safety };
 }

@@ -187,6 +187,11 @@ async function main() {
     const progressBytes = pinned(request.progressPath, request.progressSha256, 10_000_000);
     const journalBytes = pinned(request.journalPath, request.journalSha256, 20_000_000);
     const snapshotBytes = pinned(request.snapshotPath, request.snapshotSha256, 128_000_000);
+    if (Boolean(request.driftPath) !== Boolean(request.driftSha256)) throw fail('resume_invalid');
+    const driftPath = request.driftPath ?? report.source_tree_drift?.artifact ?? null;
+    const driftSha = request.driftSha256 ?? report.source_tree_drift?.sha256 ?? null;
+    if (Boolean(driftPath) !== Boolean(driftSha) || (driftPath && dirname(driftPath) !== priorDir)) throw fail('resume_invalid');
+    const driftBytes = driftPath ? pinned(driftPath, driftSha, 100000) : null;
     const progress = progressBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
     const cursorIndex = checkpoints.findIndex(row => row.id === request.cursor);
     if (cursorIndex < 0) throw fail('resume_invalid');
@@ -225,22 +230,31 @@ async function main() {
     }
     const plan = { priorRunId: report.run_id, priorSealDigest: priorSeal.digest, priorCodeSha: priorSeal.spec?.codeSha,
       cursor: request.cursor, snapshotSha256: request.snapshotSha256, journalSha256: request.journalSha256,
-      transition: request.transition, ledgerReconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: handbacks };
+      transition: request.transition, ledgerReconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean),
+      caseHandbacks: handbacks, ...(driftBytes ? { sourceTreeDriftSha256: driftSha } : {}) };
     let superseded = null;
     const pendingCases = prepared.filter(item => item.through === request.cursor && !completedCases.includes(item));
     if (pendingCases.length) {
       const priorResults = report.artifacts?.['case-results.jsonl'];
       const resultBytes = pinned(priorResults?.path, priorResults?.sha256, 20_000_000);
-      if (resultBytes.length) throw fail('resume_prior_cases_unsupported');
+      const priorRows = resultBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
+      if (priorRows.some(row => pendingCases.some(item => item.publicCase.id === row.case_id))) throw fail('resume_partial_case_unsupported');
       const priorLedger = report.artifacts?.['ledger.jsonl'];
       const ledgerRows = pinned(priorLedger?.path, priorLedger?.sha256, 20_000_000).toString('utf8').trimEnd().split('\n').map(JSON.parse);
       const calls = ledgerRows.filter(row => row.type === 'started' && row.checkpoint === request.cursor && ['answerer', 'scorer'].includes(row.purpose))
         .map(row => ({ id: row.id, purpose: row.purpose, arm: row.arm, context_sha256: row.context_sha256, at: row.at }));
+      const priorOutputs = report.artifacts?.['model-outputs.jsonl'];
+      const outputAvailable = Boolean(priorOutputs && calls.length && calls.every(call => {
+        const rows = pinned(priorOutputs.path, priorOutputs.sha256, 128_000_000).toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
+        return rows.some(row => row.id === call.id && row.message);
+      }));
       superseded = { schema: 'superseded-case-attempt/v1', prior_run_id: report.run_id, case_ids: pendingCases.map(item => item.publicCase.id),
         pre_answer_snapshot_sha256: request.snapshotSha256, prior_ledger_sha256: priorLedger.sha256, calls,
-        status: 'superseded', output_available: false, limitation: 'The earlier harness did not persist answer or scorer raw outputs.' };
+        status: 'superseded', output_available: outputAvailable,
+        ...(outputAvailable ? { prior_output_path: priorOutputs.path, prior_output_sha256: priorOutputs.sha256 }
+          : { limitation: 'The earlier harness did not persist answer or scorer raw outputs.' }) };
     }
-    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, plan, superseded,
+    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, driftBytes, plan, superseded,
       handbacks, handbackRows, carriedRows, carriedSnapshots, originSeals, carriedCases, originBundles };
   }
   const remaining = 100000000000n - previous;
@@ -259,6 +273,7 @@ async function main() {
   let resumeValidation = null;
   if (resume) {
     if (resume.superseded) writePrivate(join(dir, 'superseded-case-attempt.json'), resume.superseded);
+    if (resume.driftBytes) writePrivate(join(dir, 'prior-source-tree-drift.json'), resume.driftBytes);
     if (resume.carriedCases.length) {
       const copies = [];
       for (const [originSha, bundle] of resume.originBundles) for (const [name, bytes] of Object.entries(bundle)) {
@@ -276,7 +291,8 @@ async function main() {
       resumeValidation = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal: priorJournal,
         checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
         sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
-        reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks });
+        reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks,
+        sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
     } finally { priorJournal.close(); }
   }
   writePrivate(join(driverDir, 'config.json'), { neo4j: { uri: 'bolt://127.0.0.1:7687', auth: 'none' }, scopes: { read: [scope], write: [scope] },
@@ -342,7 +358,8 @@ async function main() {
           const current = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal,
             checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
             sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
-            reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks });
+            reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks,
+            sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
           if (JSON.stringify(current) !== JSON.stringify(resumeValidation)) throw fail('resume_provenance_mismatch');
           const output = execFileSync('/usr/bin/docker', ['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/restore-scope.mjs',
             '/scratch/resume-snapshot.json', resume.plan.snapshotSha256, scope], { encoding: 'utf8', timeout: 180000, maxBuffer: 100000 });
@@ -414,7 +431,7 @@ async function main() {
               const scorer = createScorer({ seal, expectedDigest: seal.digest, judge });
               const arms = {};
               for (const arm of ['candidate', 'baseline', 'empty', 'raw-only']) {
-                meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: 'answerer-r2-v2', policy_version: seal.spec.policyVersion };
+                meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: 'answerer-r2-v3', policy_version: seal.spec.policyVersion };
                 const answer = await answerer.run({ arm, case: item.publicCase });
                 results.append({ type: 'answer', case_id: item.publicCase.id, arm, answer });
                 meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: 'scorer-r2-v2', policy_version: seal.spec.policyVersion };
@@ -453,7 +470,7 @@ async function main() {
   try { budget.close(); } catch { failure ??= 'ledger_close_failed'; }
   for (const writer of [resources, progress, memoryLog, results, relayLog, rawOutputs]) writer.close();
   const artifactNames = ['seal.json', 'ledger.jsonl', 'progress.jsonl', 'memory-receipts.jsonl', 'case-results.jsonl', 'model-outputs.jsonl', 'resources.jsonl',
-    'isolation.json', 'embedding-relay.jsonl', 'environment.json', 'resume-restore.json', 'superseded-case-attempt.json', 'case-handback.json'];
+    'isolation.json', 'embedding-relay.jsonl', 'environment.json', 'resume-restore.json', 'superseded-case-attempt.json', 'case-handback.json', 'prior-source-tree-drift.json'];
   const artifacts = {};
   for (const name of artifactNames) {
     try { const bytes = readFileSync(join(dir, name)); artifacts[name] = { path: join(dir, name), sha256: sha(bytes), bytes: bytes.length }; }
@@ -487,6 +504,8 @@ async function main() {
   });
   const final = { status: harness.status === 'complete' && !failure && sequenceResult?.status === 'complete' ? 'partial_reference_unavailable' : 'failed_or_partial',
     harness_status: harness.status, failure: failure ?? harness.code ?? null, resume: resumeValidation, resume_restore: resumeRestore ?? null,
+    source_tree_drift: resume?.driftBytes ? { sha256: sha(resume.driftBytes), artifact: join(dir, 'prior-source-tree-drift.json'),
+      limitation: 'The preceding run experienced disclosed additive source-tree drift; see the retained incident.' } : null,
     coverage: sequenceResult ? { status: sequenceResult.status, scheduled: checkpoints.length,
       processed: (resumeValidation?.prefixCount ?? 0) + sequenceResult.results.length, tail: sequenceResult.tail ?? null,
       dispositions: [...(resume ? (resume.report.coverage?.dispositions ?? resume.progress.filter(row => row.type === 'checkpoint')

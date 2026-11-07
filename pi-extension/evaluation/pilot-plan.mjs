@@ -1,7 +1,7 @@
 import { retentionPolicy } from '../policy.mjs';
 import { hash, sealComparison } from './seal.mjs';
 import { RUBRIC, RUBRIC_VERSION, WORKED_EXAMPLES } from './rubric.mjs';
-import { ANSWERER_TOOLS_SHA256, SCORER_TOOLS_SHA256, ANSWERER_FORMAT_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, SCORER_REPAIR } from './pi-calls.mjs';
+import { ANSWERER_TOOLS_SHA256, SCORER_TOOLS_SHA256, ANSWERER_FORMAT_SUFFIX, ANSWERER_BUDGET_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, SCORER_REPAIR } from './pi-calls.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
@@ -18,7 +18,8 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
       || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
-      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification'].includes(resume.transition)
+      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only'].includes(resume.transition)
+      || (resume.sourceTreeDriftSha256 !== undefined && !/^[a-f0-9]{64}$/.test(resume.sourceTreeDriftSha256))
       || (resume.ledgerReconciliationSha256s !== undefined && (!Array.isArray(resume.ledgerReconciliationSha256s)
         || resume.ledgerReconciliationSha256s.some(value => !/^[a-f0-9]{64}$/.test(value))))
       || (resume.caseHandbacks !== undefined && (!Array.isArray(resume.caseHandbacks) || resume.caseHandbacks.some(row =>
@@ -38,9 +39,9 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     freezeBasis: resume ? 'resume plan frozen after prior candidate observations; transition recorded' : 'before-candidate-observation',
     sourceSha256, datasetSha256, sdkSha256, codeSha, policySha256: policy.sha256,
     interpretation: { id: 'INTERPRETATION-02', sha256: interpretationSha256 }, ...(resume ? { resume } : {}),
-    answerer: { route: 'anthropic', model: 'claude-sonnet-5-5', reasoning: 'low', version: 'answerer-r2-v2',
+    answerer: { route: 'anthropic', model: 'claude-sonnet-5-5', reasoning: 'low', version: 'answerer-r2-v3',
       contextPolicy: 'request-and-returned-item-evidence-only', retrievalInterface: 'returned-item-evidence-v1',
-      instructions: answerInstructions + ANSWERER_FORMAT_SUFFIX, tools_sha256: ANSWERER_TOOLS_SHA256, repair_instruction: ANSWERER_REPAIR,
+      instructions: answerInstructions + ANSWERER_FORMAT_SUFFIX + ANSWERER_BUDGET_SUFFIX, tools_sha256: ANSWERER_TOOLS_SHA256, repair_instruction: ANSWERER_REPAIR,
       limits: { searchCalls: 4, resolveCalls: 8, returnedItems: 12, evidenceBytes: 128000, retrievalBytes: 128000,
         queryBytes: 4000, responseBytes: 32000, inputTokens: 3000000, outputTokens: 2048, modelCalls: 4, formatRepairCalls: 1, costNano: '10000000000' } },
     scorer: { route: 'anthropic', model: 'claude-sonnet-5-5', reasoning: 'low',
@@ -56,7 +57,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
       maxSlotsPerPlan: 1, maxPlans: 1000, routes: { [candidateRoute]: routes.candidate, [evaluatorRoute]: routes.reviewer },
       purposes: { candidate: { taskVersion: 'distiller-r2-v4', route: candidateRoute },
         reviewer: { taskVersion: 'link-review-r2-v3', route: evaluatorRoute },
-        answerer: { taskVersion: 'answerer-r2-v2', route: evaluatorRoute }, scorer: { taskVersion: 'scorer-r2-v2', route: evaluatorRoute } } },
+        answerer: { taskVersion: 'answerer-r2-v3', route: evaluatorRoute }, scorer: { taskVersion: 'scorer-r2-v2', route: evaluatorRoute } } },
     cases: Object.fromEntries(cases.map(row => [row.publicCase.id, hash(row.publicCase)])),
     packets: Object.fromEntries(cases.map(row => [row.publicCase.id, hash(row.packet)])),
     dependenciesDigest: hash([]), comparison: { primary: 'candidate-minus-named-baseline', uncertainty: 'conservative', caseWeight: 'equal' },

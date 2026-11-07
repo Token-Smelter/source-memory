@@ -10,17 +10,28 @@ const judgmentSchema = schema({ clauses: { type: 'array', items: schema({ id: st
   alternative: { anyOf: [{ type: 'null' }, schema({ rationale: string, sourceIds: strings })] },
   relation: { anyOf: [{ type: 'null' }, schema({ required: { type: 'boolean' }, recoverable: { anyOf: [{ type: 'boolean' }, { type: 'null' }] }, itemIds: strings })] } }) } });
 export const ANSWERER_TOOLS = Object.freeze([
-  { name: 'memory_search', description: 'Search the permitted derived-memory items.', parameters: schema({ query: string }) },
+  { name: 'memory_search', description: 'Search permitted derived-memory items; after the fixed item budget is spent, later searches return a budget-exhausted result.', parameters: schema({ query: string }) },
   { name: 'memory_resolve', description: 'Resolve evidence for an item returned by memory_search.', parameters: schema({ item_id: string, evidence_id: string }) },
   { name: 'submit_answer', description: 'Submit the final answer after using any necessary retrieval tools.', parameters: schema({ answer: string }) },
 ]);
 export const SCORER_TOOLS = Object.freeze([{ name: 'submit_score', description: 'Submit the complete clause-level judgment.', parameters: judgmentSchema }]);
 export const ANSWERER_TOOLS_SHA256 = hash(ANSWERER_TOOLS);
+export const ANSWERER_TOOLS_V2_SHA256 = hash([{ ...ANSWERER_TOOLS[0], description: 'Search the permitted derived-memory items.' }, ...ANSWERER_TOOLS.slice(1)]);
 export const SCORER_TOOLS_SHA256 = hash(SCORER_TOOLS);
 export const ANSWERER_FORMAT_SUFFIX = ' Submit the final answer with the submit_answer tool.';
+export const ANSWERER_BUDGET_SUFFIX = ' If the item budget is exhausted, answer from retrieved items or state uncertainty.';
 export const SCORER_FORMAT_SUFFIX = ' Submit the complete judgment with the submit_score tool.';
 export const ANSWERER_REPAIR = 'The previous output was not a valid final submission. Call submit_answer with the complete answer; do not change its substance merely to fix formatting.';
 export const SCORER_REPAIR = 'The previous submission was invalid. Call submit_score with the complete judgment matching the schema and supplied IDs; retain substantive judgments unless correction is required for validity.';
+
+export function answererBudgetFormatCompatible(previous, current) {
+  if (previous?.version !== 'answerer-r2-v2' || previous.tools_sha256 !== ANSWERER_TOOLS_V2_SHA256
+    || current?.version !== 'answerer-r2-v3' || current.tools_sha256 !== ANSWERER_TOOLS_SHA256
+    || current.instructions !== previous.instructions + ANSWERER_BUDGET_SUFFIX) return false;
+  const a = structuredClone(previous), b = structuredClone(current);
+  for (const key of ['version', 'tools_sha256', 'instructions']) { delete a[key]; delete b[key]; }
+  return hash(a) === hash(b);
+}
 
 function check({ runtime, model, sessionId }) {
   if (runtime?.[METERED_RUNTIME] !== true || typeof runtime.streamSimple !== 'function'
@@ -89,7 +100,12 @@ export function createPiAnswererResponder({ runtime, model, sessionId, expectedT
         if (tool.name === 'submit_answer' && calls.length === 1 && index === 0 && exact(args, ['answer'])
           && typeof args.answer === 'string' && args.answer.trim() && Buffer.byteLength(args.answer) <= 32000 && !invalid) return { text: args.answer };
         if (tool.name === 'memory_search' && exact(args, ['query']) && typeof args.query === 'string' && !invalid) {
-          context.messages.push(toolResult(tool, await tools.search(args.query)));
+          try { context.messages.push(toolResult(tool, await tools.search(args.query))); }
+          catch (error) {
+            if (error?.code !== 'item_limit') throw error;
+            context.messages.push(toolResult(tool, { status: 'item_budget_exhausted',
+              instruction: 'Answer from retrieved items or state uncertainty.' }));
+          }
         } else if (tool.name === 'memory_resolve' && exact(args, ['item_id', 'evidence_id'])
           && typeof args.item_id === 'string' && typeof args.evidence_id === 'string' && !invalid) {
           context.messages.push(toolResult(tool, await tools.resolve(args.item_id, args.evidence_id)));

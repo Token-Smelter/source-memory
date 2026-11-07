@@ -4,6 +4,7 @@ import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
 import { scoreCase as scoreAnchored, disagreement, createScorer as createAnchoredScorer, auditAlternatives as auditAnchored } from '../pi-extension/evaluation/scorer.mjs';
 import { pairedReport as reportAnchored } from '../pi-extension/evaluation/report.mjs';
 import { fictionalSettings, scoringPacket, fictionalTrace, clause } from '../pi-extension/evaluation/fictional.mjs';
+import { ANSWERER_BUDGET_SUFFIX, ANSWERER_TOOLS_V2_SHA256, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
 
 const withDigest = options => ({ ...options, expectedDigest: options.seal.digest });
 const scoreCase = options => scoreAnchored(withDigest({ ...options, trace: options.trace ?? fictionalTrace() }));
@@ -76,6 +77,9 @@ test('paired sensitivity recomputes uncertain requirements rather than accepting
 test('paired reports retain original seals for compatible carried cases', () => {
   const oldSettings = fictionalSettings(), newSettings = fictionalSettings();
   oldSettings.codeSha = 'a'.repeat(40); newSettings.codeSha = 'b'.repeat(40);
+  oldSettings.answerer.version = 'answerer-r2-v2'; oldSettings.answerer.tools_sha256 = ANSWERER_TOOLS_V2_SHA256;
+  newSettings.answerer.version = 'answerer-r2-v3'; newSettings.answerer.tools_sha256 = ANSWERER_TOOLS_SHA256;
+  newSettings.answerer.instructions = oldSettings.answerer.instructions + ANSWERER_BUDGET_SUFFIX;
   const oldSeal = sealComparison(oldSettings);
   newSettings.resume = { caseHandbacks: [{ caseId: 'c1', sourceSealDigest: oldSeal.digest, sourceCodeSha: oldSettings.codeSha }] };
   const seal = sealComparison(newSettings);
@@ -87,7 +91,7 @@ test('paired reports retain original seals for compatible carried cases', () => 
       baseline: { ...shared, usefulness: { credited: 0, uncertain: 0, total: 2 } } } };
   };
   const result = pairedReport({ seal, provenance: [oldSeal], rows: [row('c1', oldSeal), row('c2', seal)], dependencies: [['s1', 's2']] });
-  assert.deepEqual([result.sealDigest, result.provenance.mixedCandidateCode, result.cases], [null, true, 2]);
+  assert.deepEqual([result.sealDigest, result.provenance.mixedCandidateCode, result.provenance.mixedAnswererFormat, result.cases], [null, true, true, 2]);
   const changed = structuredClone(oldSettings); changed.rubric.instructions += ' changed';
   assert.throws(() => pairedReport({ seal, provenance: [sealComparison(changed)], rows: [row('c1', oldSeal)], dependencies: [['s1', 's2']] }), /provenance_mismatch/);
 });

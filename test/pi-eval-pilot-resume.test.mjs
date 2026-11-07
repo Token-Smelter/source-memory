@@ -9,7 +9,7 @@ import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs
 import { runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { fictionalCase, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
 import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
-import { ANSWERER_FORMAT_SUFFIX, SCORER_FORMAT_SUFFIX } from '../pi-extension/evaluation/pi-calls.mjs';
+import { ANSWERER_FORMAT_SUFFIX, ANSWERER_BUDGET_SUFFIX, ANSWERER_TOOLS_V2_SHA256, SCORER_FORMAT_SUFFIX } from '../pi-extension/evaluation/pi-calls.mjs';
 
 async function fixture(fn) {
   const directory = mkdtempSync(join(tmpdir(), 'pi-resume-'));
@@ -52,19 +52,36 @@ test('resume validates the prior seal, covered journal prefix, clean snapshot an
 
 test('a sealed evaluator format transition preserves the old rubric and score rules', () => fixture(async ({ args }) => {
   const old = structuredClone(args.seal.spec);
-  old.answerer.version = 'answerer-r2-v1'; old.answerer.instructions = old.answerer.instructions.slice(0, -ANSWERER_FORMAT_SUFFIX.length);
+  old.answerer.version = 'answerer-r2-v1'; old.answerer.instructions = old.answerer.instructions.slice(0, -ANSWERER_BUDGET_SUFFIX.length).slice(0, -ANSWERER_FORMAT_SUFFIX.length);
   delete old.answerer.repair_instruction; delete old.answerer.limits.formatRepairCalls; old.answerer.tools_sha256 = 'a'.repeat(64);
   old.scorer.version = 'scorer-r2-v1'; old.scorer.instructions = old.scorer.instructions.slice(0, -SCORER_FORMAT_SUFFIX.length)
     .replace('Use this JSON object schema:', 'Return JSON only, without a code fence:');
   delete old.scorer.tools_sha256; delete old.scorer.repair_instruction; delete old.scorer.formatRepairCalls;
   const previousSeal = sealComparison(old);
+  const currentSpec = structuredClone(createPilotPlan({ cases: args.cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
+    codeSha: 'e'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } },
+    resume: { priorRunId: args.report.run_id, priorSealDigest: previousSeal.digest, priorCodeSha: old.codeSha, cursor: 'a',
+      snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256, transition: 'structured-evaluator-submission-only' } }).spec);
+  currentSpec.answerer.version = 'answerer-r2-v2'; currentSpec.answerer.instructions = currentSpec.answerer.instructions.slice(0, -ANSWERER_BUDGET_SUFFIX.length);
+  currentSpec.answerer.tools_sha256 = ANSWERER_TOOLS_V2_SHA256;
+  const currentSeal = sealComparison(currentSpec), report = { ...args.report, seal_sha256: previousSeal.digest };
+  assert.equal(validatePilotResume({ ...args, report, seal: previousSeal, currentSeal }).cursor, 'a');
+  const changed = structuredClone(currentSeal.spec); changed.rubric.instructions += ' changed';
+  assert.throws(() => validatePilotResume({ ...args, report, seal: previousSeal, currentSeal: sealComparison(changed) }), /resume_treatment_mismatch/);
+}));
+
+test('a sealed item-budget result transition preserves answerer limits and scorer rules', () => fixture(async ({ args }) => {
+  const old = structuredClone(args.seal.spec);
+  old.answerer.version = 'answerer-r2-v2'; old.answerer.instructions = old.answerer.instructions.slice(0, -ANSWERER_BUDGET_SUFFIX.length);
+  old.answerer.tools_sha256 = ANSWERER_TOOLS_V2_SHA256;
+  const previousSeal = sealComparison(old);
   const currentSeal = createPilotPlan({ cases: args.cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
     codeSha: 'e'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } },
     resume: { priorRunId: args.report.run_id, priorSealDigest: previousSeal.digest, priorCodeSha: old.codeSha, cursor: 'a',
-      snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256, transition: 'structured-evaluator-submission-only' } });
+      snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256, transition: 'answerer-item-budget-result-only' } });
   const report = { ...args.report, seal_sha256: previousSeal.digest };
-  assert.equal(validatePilotResume({ ...args, report, seal: previousSeal, currentSeal }).cursor, 'a');
-  const changed = structuredClone(currentSeal.spec); changed.rubric.instructions += ' changed';
+  assert.equal(validatePilotResume({ ...args, report, seal: previousSeal, currentSeal }).transition, 'answerer-item-budget-result-only');
+  const changed = structuredClone(currentSeal.spec); changed.answerer.limits.returnedItems++;
   assert.throws(() => validatePilotResume({ ...args, report, seal: previousSeal, currentSeal: sealComparison(changed) }), /resume_treatment_mismatch/);
 }));
 
@@ -90,6 +107,18 @@ test('resume at an unscored case requires its exact pre-answer snapshot', () => 
     case_snapshots: [{ case_id: pending[0].publicCase.id, sha256: args.snapshotSha256 }] } };
   assert.equal(validatePilotResume({ ...args, report, cases: pending }).cursor, 'a');
   assert.throws(() => validatePilotResume({ ...args, report: { ...report, artifacts: { ...report.artifacts, case_snapshots: [] } }, cases: pending }), /resume_case_snapshot_mismatch/);
+}));
+
+test('a pending case can run from the final checkpoint without replaying source', () => fixture(async ({ journal, memory, checkpoints, args }) => {
+  const gap = journal.state();
+  journal.begin({ through: 'b', cursor: 'a', retry: true }); journal.finish('abstained');
+  journal.begin({ through: 'c', cursor: 'b' }); journal.finish('abstained');
+  const session = { entries: [], conversation_id: 'fiction', scopes: ['fiction'], memory,
+    distiller: { memory, async run() { throw new Error('must_not_redistill'); } } };
+  const cases = [{ through: 'c', publicCase: { ...args.cases[0].publicCase, queryTime: '2030-01-01T00:00:05Z' } }];
+  const result = await runPilotSequence({ session, journal, checkpoints, cases, initialCursor: 'c',
+    budget: { state: () => ({ stopped: null }) }, async evaluateCase() { return { status: 'scored' }; } });
+  assert.deepEqual([gap.status, result.status, result.cursor, result.evaluated.length], ['failed', 'complete', 'c', 1]);
 }));
 
 test('a resumed sequence answers a pending cursor case before the next source interval', () => fixture(async ({ journal, memory, checkpoints, args }) => {

@@ -14,7 +14,7 @@ import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs
 import { runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { fictionalCase, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
 import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
-import { ANSWERER_FORMAT_SUFFIX, SCORER_FORMAT_SUFFIX } from '../pi-extension/evaluation/pi-calls.mjs';
+import { ANSWERER_FORMAT_SUFFIX, ANSWERER_BUDGET_SUFFIX, ANSWERER_TOOLS_V2_SHA256, SCORER_FORMAT_SUFFIX } from '../pi-extension/evaluation/pi-calls.mjs';
 
 const root = realpathSync(process.cwd()), scope = 'fiction', sha = b => createHash('sha256').update(b).digest('hex');
 const image = name => execFileSync('/usr/bin/docker', ['image', 'inspect', name, '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
@@ -26,7 +26,7 @@ const publicCase = { ...fictionalCase(), queryTime: '2030-01-01T00:00:01Z' };
 const cases = [{ through: 'a', publicCase, packet: scoringPacket() }];
 const prior = structuredClone(createPilotPlan({ cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
   codeSha: 'd'.repeat(40), routes: { candidate: { mode: 'fiction' }, reviewer: { mode: 'fiction' } } }).spec);
-prior.answerer.version = 'answerer-r2-v1'; prior.answerer.instructions = prior.answerer.instructions.slice(0, -ANSWERER_FORMAT_SUFFIX.length);
+prior.answerer.version = 'answerer-r2-v1'; prior.answerer.instructions = prior.answerer.instructions.slice(0, -ANSWERER_BUDGET_SUFFIX.length).slice(0, -ANSWERER_FORMAT_SUFFIX.length);
 delete prior.answerer.repair_instruction; delete prior.answerer.limits.formatRepairCalls; prior.answerer.tools_sha256 = 'a'.repeat(64);
 prior.scorer.version = 'scorer-r2-v1'; prior.scorer.instructions = prior.scorer.instructions.slice(0, -SCORER_FORMAT_SUFFIX.length)
   .replace('Use this JSON object schema:', 'Return JSON only, without a code fence:');
@@ -87,10 +87,13 @@ const report = { status: 'failed_or_partial', run_id: first.runId, seal_sha256: 
     checkpoint_snapshots: [{ through: 'a', sha256: checkpointSnapshot.sha256 }],
     case_snapshots: [{ case_id: publicCase.id, sha256: checkpointSnapshot.sha256 }] } };
 const progress = [{ type: 'checkpoint', through: 'a', disposition: 'committed', snapshot: { sha256: checkpointSnapshot.sha256 } }];
-const currentSeal = createPilotPlan({ cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
+const currentSpec = structuredClone(createPilotPlan({ cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
   codeSha: 'e'.repeat(40), routes: { candidate: { mode: 'fiction' }, reviewer: { mode: 'fiction' } },
   resume: { priorRunId: first.runId, priorSealDigest: seal.digest, priorCodeSha: 'd'.repeat(40), cursor: 'a',
-    snapshotSha256: checkpointSnapshot.sha256, journalSha256: journalSha, transition: 'structured-evaluator-submission-only' } });
+    snapshotSha256: checkpointSnapshot.sha256, journalSha256: journalSha, transition: 'structured-evaluator-submission-only' } }).spec);
+currentSpec.answerer.version = 'answerer-r2-v2'; currentSpec.answerer.instructions = currentSpec.answerer.instructions.slice(0, -ANSWERER_BUDGET_SUFFIX.length);
+currentSpec.answerer.tools_sha256 = ANSWERER_TOOLS_V2_SHA256;
+const currentSeal = sealComparison(currentSpec);
 const second = environment();
 copyFileSync(checkpointSnapshot.path, join(second.dir, 'snapshot.json'));
 copyFileSync(journalPath, join(second.dir, journalPath.split('/').at(-1)));
