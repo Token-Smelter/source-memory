@@ -5,7 +5,8 @@ const fail = code => Object.assign(new Error(code), { code });
 export const checkpointId = result => result.through ?? result.cursor;
 
 /** Evaluate each case before any later checkpoint mutates its pre-answer store. */
-export async function runPilotSequence({ session, journal, checkpoints, cases, budget, evaluateCase, onBeforeCheckpoint = async () => {}, onCheckpoint = async () => {}, onCase = async () => {} }) {
+export async function runPilotSequence({ session, journal, checkpoints, cases, budget, evaluateCase, initialCursor = null, retryFirst = false,
+  onBeforeCheckpoint = async () => {}, onCheckpoint = async () => {}, onCase = async () => {} }) {
   if (!session || !journal || !Array.isArray(checkpoints) || !checkpoints.length || !Array.isArray(cases)
     || typeof budget?.state !== 'function' || typeof evaluateCase !== 'function' || typeof onBeforeCheckpoint !== 'function'
     || typeof onCheckpoint !== 'function' || typeof onCase !== 'function') throw fail('pilot_invalid');
@@ -21,12 +22,18 @@ export async function runPilotSequence({ session, journal, checkpoints, cases, b
       || Date.parse(item.publicCase.queryTime) < Date.parse(checkpoints[index].time)
       || (checkpoints[index + 1] && Date.parse(item.publicCase.queryTime) >= Date.parse(checkpoints[index + 1].time))) throw fail('case_schedule_invalid');
   }
-  let cursor = null;
+  if (initialCursor !== null && (typeof initialCursor !== 'string' || !initialCursor)) throw fail('resume_invalid');
+  const startIndex = initialCursor === null ? 0 : checkpoints.findIndex(row => row.id === initialCursor) + 1;
+  if (initialCursor !== null && startIndex === 0) throw fail('resume_invalid');
+  if (initialCursor !== null && cases.some(item => checkpoints.findIndex(row => row.id === item.through) < startIndex)) throw fail('resume_prior_cases_unsupported');
+  if (typeof retryFirst !== 'boolean' || (retryFirst && startIndex >= checkpoints.length)) throw fail('resume_invalid');
+  let cursor = initialCursor;
   const results = [], evaluated = [];
-  for (const checkpoint of checkpoints) {
+  for (const [index, checkpoint] of checkpoints.slice(startIndex).entries()) {
     if (budget.state().stopped) return { status: 'budget_stopped', cursor, results, evaluated };
     await onBeforeCheckpoint(checkpoint);
-    const result = await runCoveredInterval({ journal, session, through: checkpoint.id, cursor, allowInterrupted: checkpoint.interrupted === true });
+    const result = await runCoveredInterval({ journal, session, through: checkpoint.id, cursor, allowInterrupted: checkpoint.interrupted === true,
+      retry: retryFirst && index === 0 });
     results.push(result);
     await onCheckpoint(result, budget.state());
     if (!['committed', 'abstained', 'ineligible_by_policy'].includes(result.disposition)) return { status: result.disposition, cursor, results, evaluated };

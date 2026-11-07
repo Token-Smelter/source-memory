@@ -4,6 +4,7 @@ import { constants, closeSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, ope
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { loadavg } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { digest } from '../src/core.mjs';
 import { verifyChronologicalCheckpoint } from '../pi-extension/chronology.mjs';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createImageArchive } from '../pi-extension/image-archive.mjs';
@@ -19,6 +20,7 @@ import { prepareDevelopmentCases } from '../pi-extension/evaluation/dev-dataset.
 import { createPiAnswererResponder, createPiScorerJudge, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
 import { createPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
+import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
 import { createScorer } from '../pi-extension/evaluation/scorer.mjs';
@@ -151,16 +153,49 @@ async function main() {
   }
   if (!Array.isArray(priorLedgers) || new Set(priorLedgers.map(row => row?.sha256)).size !== priorLedgers.length) throw fail('prior_ledger_invalid');
   const previous = priorLedgers.reduce((sum, row) => sum + BigInt(priorSoftSpend(pinned(row.path, row.sha256, 10_000_000).toString('utf8'))), 0n);
+  let resume = null;
+  if (process.env.PILOT_RESUME) {
+    let request;
+    try { request = JSON.parse(process.env.PILOT_RESUME); } catch { throw fail('resume_invalid'); }
+    if (!request || typeof request !== 'object' || Array.isArray(request)) throw fail('resume_invalid');
+    const report = JSON.parse(pinned(request.reportPath, request.reportSha256, 10_000_000).toString('utf8'));
+    const priorDir = dirname(request.reportPath);
+    if (dirname(priorDir) !== parent || report.run_dir !== priorDir
+      || request.sealPath !== report.artifacts?.['seal.json']?.path || request.sealSha256 !== report.artifacts?.['seal.json']?.sha256
+      || request.progressPath !== report.artifacts?.['progress.jsonl']?.path || request.progressSha256 !== report.artifacts?.['progress.jsonl']?.sha256
+      || request.journalPath !== join(priorDir, `coverage-${digest(['coverage-session/v1', sourceKey])}.jsonl`)
+      || !report.artifacts?.checkpoint_snapshots?.some(row => row.through === request.cursor && row.path === request.snapshotPath && row.sha256 === request.snapshotSha256)) throw fail('resume_provenance_mismatch');
+    const priorSeal = JSON.parse(pinned(request.sealPath, request.sealSha256, 10_000_000).toString('utf8'));
+    const progressBytes = pinned(request.progressPath, request.progressSha256, 10_000_000);
+    const journalBytes = pinned(request.journalPath, request.journalSha256, 20_000_000);
+    const snapshotBytes = pinned(request.snapshotPath, request.snapshotSha256, 128_000_000);
+    const progress = progressBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
+    const plan = { priorRunId: report.run_id, priorSealDigest: priorSeal.digest, priorCodeSha: priorSeal.spec?.codeSha,
+      cursor: request.cursor, snapshotSha256: request.snapshotSha256, journalSha256: request.journalSha256,
+      transition: 'structured-submission-format-only' };
+    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, plan };
+  }
   const remaining = 100000000000n - previous;
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
   const seal = createPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
-    codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString() });
+    codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null });
   const runId = randomUUID(), dir = mkdtempSync(join(parent, 'pilot-'));
   const driverDir = join(dir, 'driver'), piDir = join(dir, 'pi'), imageDir = join(dir, 'image-blobs');
   mkdirSync(driverDir, { mode: 0o700 }); mkdirSync(piDir, { mode: 0o700 }); mkdirSync(imageDir, { mode: 0o700 });
   mkdirSync(join(driverDir, 'intents'), { mode: 0o700 });
   const sourceCopy = join(dir, 'source.jsonl'); writePrivate(sourceCopy, sourceBytes);
   writePrivate(join(dir, 'seal.json'), seal);
+  let resumeValidation = null;
+  if (resume) {
+    writePrivate(join(driverDir, 'resume-snapshot.json'), resume.snapshotBytes);
+    writePrivate(join(dir, `coverage-${digest(['coverage-session/v1', sourceKey])}.jsonl`), resume.journalBytes);
+    const priorJournal = createCoverageJournal({ directory: dir, sessionKey: sourceKey });
+    try {
+      resumeValidation = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal: priorJournal,
+        checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
+        sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256) });
+    } finally { priorJournal.close(); }
+  }
   writePrivate(join(driverDir, 'config.json'), { neo4j: { uri: 'bolt://127.0.0.1:7687', auth: 'none' }, scopes: { read: [scope], write: [scope] },
     chunking: { words: 256, overlap: 32 }, embedding: { url: 'http://127.0.0.1:18080/v1/embeddings', model: 'embeddinggemma', dimensions: 768, timeout_ms: 120000 }, index_on_write: true });
   const resources = privateWriter(join(dir, 'resources.jsonl')), progress = privateWriter(join(dir, 'progress.jsonl'));
@@ -171,8 +206,8 @@ async function main() {
     mounts: { memory: resolve('.'), scratch: driverDir }, runId, onResource: row => resources.append(row) });
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
     routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer } });
-  let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v2', policy_version: seal.spec.policyVersion };
-  let journal, sequenceResult, snapshot, failure = null;
+  let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v3', policy_version: seal.spec.policyVersion };
+  let journal, sequenceResult, snapshot, resumeRestore, failure = null;
   const reportRows = [], caseSnapshots = {}, checkpointSnapshots = {};
   const imageHashes = { database: image('neo4j:5.26.14-community'), driver: image('node:22-bookworm-slim') };
   const harness = await runNamespaceHarness({ docker, relay: { open: ({ socketPath }) => openUnixEmbeddingRelay({ socketPath, timeoutMs: 90000,
@@ -188,7 +223,8 @@ async function main() {
         budget: { overall_effort_soft_usd: 250, share_soft_usd: 100, prior_spend_nano: previous.toString(),
           remaining_soft_nano: remaining.toString(), prior_ledger_sha256s: priorLedgers.map(row => row.sha256), one_call_in_flight: true, stop_unknown_usage: true,
           stop_above_twice_estimate: true, gateway_attempt_ledger: 'partial: gateway-internal failover/retry attempts not correlatable', rate_card: routeRates },
-        checkpoints: checkpoints.length, cases: prepared.length, isolation: { network_mode: isolation.network_mode,
+        checkpoints: checkpoints.length, cases: prepared.length, resume: resumeValidation ? { ...resumeValidation, restore: 'pending' } : null,
+        isolation: { network_mode: isolation.network_mode,
           namespace: isolation.namespace, interfaces: isolation.interfaces, no_default_route: isolation.no_default_route,
           probes: isolation.targets.length, connected: isolation.targets.filter(row => row.outcome === 'connected').length,
           unprobeable_link_local: isolation.unprobeable_link_local.length }, images: imageHashes };
@@ -216,16 +252,41 @@ async function main() {
       const guarded = trackSnapshot(memory);
       journal = createCoverageJournal({ directory: dir, sessionKey: sourceKey });
       try {
+        if (resume) {
+          const current = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal,
+            checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
+            sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256) });
+          if (JSON.stringify(current) !== JSON.stringify(resumeValidation)) throw fail('resume_provenance_mismatch');
+          const output = execFileSync('/usr/bin/docker', ['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/restore-scope.mjs',
+            '/scratch/resume-snapshot.json', resume.plan.snapshotSha256, scope], { encoding: 'utf8', timeout: 180000, maxBuffer: 100000 });
+          const restored = JSON.parse(output);
+          if (restored.equivalent !== true || restored.source_sha256 !== resume.plan.snapshotSha256) throw fail('resume_restore_unverified');
+          const restoredIds = JSON.parse(resume.snapshotBytes).nodes.filter(row => row.labels?.includes('SMRecord')).map(row => row.properties?.record_id);
+          if (restoredIds.some(id => typeof id !== 'string' || !id)) throw fail('resume_restore_unverified');
+          for (let i = 0; i < restoredIds.length; i += 16) await ensureIndexed(memory, scope, { status: 'ready' },
+            { waitForVectors: true, recordIds: restoredIds.slice(i, i + 16) });
+          resumeRestore = { ...restored, ...resumeValidation };
+          writePrivate(join(dir, 'resume-restore.json'), resumeRestore);
+          progress.append({ type: 'resume', ...resumeValidation, restored_sha256: restored.restored_sha256, equivalent: true });
+          for (const row of resume.progress.filter(item => {
+            const index = checkpoints.findIndex(cp => cp.id === item.through);
+            return item.type === 'checkpoint' && item.snapshot && index >= 0 && index < resumeValidation.prefixCount;
+          })) {
+            checkpointSnapshots[row.through] = row.snapshot;
+            progress.append({ type: 'checkpoint', through: row.through, disposition: row.disposition, inherited: true, snapshot: row.snapshot, budget: budget.state() });
+          }
+        }
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
           imageArchive: createImageArchive({ directory: imageDir }),
           ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state, { waitForVectors: true, ...options }),
           meterRuntime: (underlying, context) => budget.wrap(underlying, () => ({ ...meta,
-            purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v2' : 'link-review-r2-v2' })) });
+            purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v3' : 'link-review-r2-v2' })) });
         const evaluatorRuntime = budget.wrap(runtime, () => meta);
         sequenceResult = await runPilotSequence({ session, journal, checkpoints, cases: prepared, budget,
+          initialCursor: resumeValidation?.cursor ?? null, retryFirst: resumeValidation?.retryFirst ?? false,
           async onBeforeCheckpoint(checkpoint) { meta = { purpose: 'candidate', arm: 'candidate', checkpoint: checkpoint.id,
-            task_version: 'distiller-r2-v2', policy_version: seal.spec.policyVersion }; },
+            task_version: 'distiller-r2-v3', policy_version: seal.spec.policyVersion }; },
           async onCheckpoint(row, state) {
             const through = checkpointId(row);
             let checkpointSnapshot = null;
@@ -294,7 +355,7 @@ async function main() {
   try { budget.close(); } catch { failure ??= 'ledger_close_failed'; }
   for (const writer of [resources, progress, memoryLog, results, relayLog]) writer.close();
   const artifactNames = ['seal.json', 'ledger.jsonl', 'progress.jsonl', 'memory-receipts.jsonl', 'case-results.jsonl', 'resources.jsonl',
-    'isolation.json', 'embedding-relay.jsonl', 'environment.json'];
+    'isolation.json', 'embedding-relay.jsonl', 'environment.json', 'resume-restore.json'];
   const artifacts = {};
   for (const name of artifactNames) {
     try { const bytes = readFileSync(join(dir, name)); artifacts[name] = { path: join(dir, name), sha256: sha(bytes), bytes: bytes.length }; }
@@ -305,7 +366,8 @@ async function main() {
   artifacts.checkpoint_snapshots = Object.entries(checkpointSnapshots).map(([through, item]) => {
     const bytes = readFileSync(item.path);
     if (sha(bytes) !== item.sha256) throw fail('snapshot_changed');
-    return { through, path: item.path, sha256: item.sha256, bytes: bytes.length, restore_verified: false };
+    return { through, path: item.path, sha256: item.sha256, bytes: bytes.length,
+      restore_verified: resumeRestore?.equivalent === true && item.sha256 === resumeRestore.source_sha256 };
   });
   artifacts.case_snapshots = Object.entries(caseSnapshots).map(([caseId, item]) => {
     const bytes = readFileSync(item.path);
@@ -320,9 +382,11 @@ async function main() {
     return { path, sha256: digest, bytes: bytes.length };
   });
   const final = { status: harness.status === 'complete' && !failure && sequenceResult?.status === 'complete' ? 'partial_reference_unavailable' : 'failed_or_partial',
-    harness_status: harness.status, failure: failure ?? harness.code ?? null, coverage: sequenceResult ? { status: sequenceResult.status,
-      scheduled: checkpoints.length, processed: sequenceResult.results.length, tail: sequenceResult.tail ?? null,
-      dispositions: sequenceResult.results.map(row => ({ through: checkpointId(row), disposition: row.disposition, code: row.code ?? null })) } : null,
+    harness_status: harness.status, failure: failure ?? harness.code ?? null, resume: resumeValidation, resume_restore: resumeRestore ?? null,
+    coverage: sequenceResult ? { status: sequenceResult.status, scheduled: checkpoints.length,
+      processed: (resumeValidation?.prefixCount ?? 0) + sequenceResult.results.length, tail: sequenceResult.tail ?? null,
+      dispositions: [...(resume ? resume.report.coverage.dispositions.slice(0, resumeValidation.prefixCount) : []),
+        ...sequenceResult.results.map(row => ({ through: checkpointId(row), disposition: row.disposition, code: row.code ?? null }))] } : null,
     scorecard, reference: 'pending_reference_freeze',
     stage_attribution: reportRows.map(row => ({ case_id: row.caseId, status: 'pending_reference_freeze',
       reason: 'Reference catalog and candidate-trace semantic comparison have not been validated.' })),

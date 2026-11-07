@@ -1,7 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTurnTools, entryText } from '../pi-extension/core.mjs';
-import { createPiDistiller } from '../pi-extension/pi-runtime.mjs';
+import { createPiDistiller, parseFinalResult } from '../pi-extension/pi-runtime.mjs';
+
+test('fallback accepts one fenced JSON object but refuses surrounding commentary', () => {
+  const body = '{"result":"done_with_writes","reason":"fiction"}';
+  assert.deepEqual(parseFinalResult(`\`\`\`json\n${body}\n\`\`\``), JSON.parse(body));
+  assert.throws(() => parseFinalResult(`prefix\n\`\`\`json\n${body}\n\`\`\``), /disposition_invalid/);
+});
 
 test('opaque and summarized thinking blocks are never included in citable source text', () => {
   const row = { message: { content: [{ type: 'thinking', text: 'fictional private reasoning' }, { type: 'text', text: 'visible fiction' }] } };
@@ -43,6 +49,24 @@ test('an incomplete search without a returned prior cannot justify abstention', 
   const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
     workDir: '/fiction', model: {}, memory, scope: 'fiction' });
   await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } }), /search_incomplete/);
+});
+
+test('no memory tool may run after the final submission', async () => {
+  const tools = new Map();
+  class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0]({ on() {}, registerTool(tool) { tools.set(tool.name, tool); } }); } }
+  const manager = { getSessionId: () => 'fiction', branch() {}, buildSessionContext: () => ({ messages: [] }) };
+  const session = { sessionId: 'fiction', agent: { sessionId: 'fiction', state: {} }, messages: [], async prompt() {
+    await tools.get('memory_search').execute('search', { query: 'fiction', kinds: [] });
+    await tools.get('memory_submit').execute('submit', { result: 'done_nothing_qualifies', reason: 'fiction' });
+    await assert.rejects(tools.get('memory_search').execute('late', { query: 'fiction', kinds: [] }), /evaluation_already_submitted/);
+    this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'submitted' }] }];
+  } };
+  const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
+    async createAgentSession() { return { session }; } };
+  const memory = { async recall() { return { status: 'no_matches', bundles: [] }; } };
+  const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
+    workDir: '/fiction', model: {}, memory, scope: 'fiction' });
+  await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } }), /disposition_invalid/);
 });
 
 test('the model cannot declare operational uncertainty as its result', async () => {

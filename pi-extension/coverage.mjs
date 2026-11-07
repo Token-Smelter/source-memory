@@ -154,6 +154,10 @@ export function createCoverageJournal({ directory, sessionKey }) {
       if (!(active?.id === id || (gap?.id === id && (gap.disposition === 'uncertain' || gap.reconciliation_required)))) throw fail('reconciliation_invalid');
       append({ type: 'reconcile', id, disposition, evidence_ref: evidenceRef });
     },
+    coveredDisposition({ through, cursor }) {
+      if (typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('checkpoint_invalid');
+      return finished.get(digest(['coverage-interval/v1', sessionKey, cursor, through])) ?? null;
+    },
     state() {
       if (active) return { status: 'uncertain', id: active.id, cursor: active.cursor, through: active.through, reason: 'unfinished_interval' };
       return gap ? { status: gap.disposition, ...gap } : { status: 'ready' };

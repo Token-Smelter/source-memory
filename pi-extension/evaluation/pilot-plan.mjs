@@ -9,12 +9,15 @@ const answerInstructions = 'Answer the user using only the permitted retrieval t
 
 /** Freeze the same fictional-calibrated prompt, tool and score contract before any candidate observation. */
 export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256, codeSha, routes,
-  capNano = '100000000000', priorSpendNano = '0' }) {
+  capNano = '100000000000', priorSpendNano = '0', resume = null }) {
   if (!Array.isArray(cases) || !cases.length || !/^[a-f0-9]{64}$/.test(sourceSha256 ?? '')
     || !/^[a-f0-9]{64}$/.test(datasetSha256 ?? '') || !/^[a-f0-9]{64}$/.test(sdkSha256 ?? '')
     || !/^[a-f0-9]{40}$/.test(codeSha ?? '') || !routes?.candidate || !routes?.reviewer
     || !/^[1-9]\d*$/.test(capNano) || !/^(0|[1-9]\d*)$/.test(priorSpendNano)
-    || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n) throw fail('pilot_plan_invalid');
+    || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
+    || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
+      || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
+      || typeof resume.cursor !== 'string' || !resume.cursor || typeof resume.priorRunId !== 'string' || !resume.priorRunId))) throw fail('pilot_plan_invalid');
   const scopes = cases[0].publicCase.readScopes;
   if (!Array.isArray(scopes) || !scopes.length || cases.some(row => hash(row.publicCase.readScopes) !== hash(scopes)
     || hash(row.publicCase.evidenceScopes) !== hash(scopes))) throw fail('pilot_scope_invalid');
@@ -22,8 +25,9 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
   const candidateRoute = 'anthropic/claude-haiku-5-5', evaluatorRoute = 'anthropic/claude-sonnet-5-5';
   const cap = capNano;
   const settings = {
-    version: 'memory-pilot-r2-v1', policyVersion: policy.value.id, freezeBasis: 'before-candidate-observation',
-    sourceSha256, datasetSha256, sdkSha256, codeSha, policySha256: policy.sha256,
+    version: 'memory-pilot-r2-v1', policyVersion: policy.value.id,
+    freezeBasis: resume ? 'resume plan frozen after prior candidate observations; format-only transition' : 'before-candidate-observation',
+    sourceSha256, datasetSha256, sdkSha256, codeSha, policySha256: policy.sha256, ...(resume ? { resume } : {}),
     answerer: { route: 'anthropic', model: 'claude-sonnet-5-5', reasoning: 'low', version: 'answerer-r2-v1',
       contextPolicy: 'request-and-returned-item-evidence-only', retrievalInterface: 'returned-item-evidence-v1',
       instructions: answerInstructions, tools_sha256: ANSWERER_TOOLS_SHA256,
@@ -38,7 +42,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     safety: { unsupportedActions: 0, unsupportedClaims: 0, authorityInflation: 0, scopeViolations: 0 },
     budget: { version: 'soft-sdk-ledger/v1', capNano: cap, priorSpendNano, shareCapNano: '100000000000', rateCardVersion: 'sdk-max-tier-observed-preflight',
       maxSlotsPerPlan: 1, maxPlans: 1000, routes: { [candidateRoute]: routes.candidate, [evaluatorRoute]: routes.reviewer },
-      purposes: { candidate: { taskVersion: 'distiller-r2-v2', route: candidateRoute },
+      purposes: { candidate: { taskVersion: 'distiller-r2-v3', route: candidateRoute },
         reviewer: { taskVersion: 'link-review-r2-v2', route: evaluatorRoute },
         answerer: { taskVersion: 'answerer-r2-v1', route: evaluatorRoute }, scorer: { taskVersion: 'scorer-r2-v1', route: evaluatorRoute } } },
     cases: Object.fromEntries(cases.map(row => [row.publicCase.id, hash(row.publicCase)])),

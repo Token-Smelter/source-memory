@@ -25,7 +25,8 @@ test('installed Pi SDK executes an atomic fictional action and outcome through t
       make([{ type: 'toolCall', id: 'invalid', name: 'memory_record', arguments: { kind: 'issue', text: 'Fiction', evidence_labels: ['ref-000001'] } }], 'toolUse'),
       make([{ type: 'toolCall', id: 'record', name: 'memory_record', arguments: { kind: 'outcome', text: 'Fictional result', evidence_labels: ['ref-000001'],
         new_action: { text: 'Fictional action', evidence_labels: ['ref-000001'] } } }], 'toolUse'),
-      make([{ type: 'text', text: '{"result":"done_with_writes","reason":"Supported change."}' }], 'stop')];
+      make([{ type: 'toolCall', id: 'submit', name: 'memory_submit', arguments: { result: 'done_with_writes', reason: 'Supported change.' } }], 'toolUse'),
+      make([{ type: 'text', text: 'Submitted.' }], 'stop')];
     const offeredTools = [];
     let offeredKinds;
     const runtime = { hasConfiguredAuth() { return true; }, streamSimple(_model, context) {
@@ -55,7 +56,7 @@ test('installed Pi SDK executes an atomic fictional action and outcome through t
     await new Promise(resolve => setImmediate(resolve));
     soft.close();
     assert.deepEqual([result.disposition, calls, soft.state().calls_started, offeredTools[0], offeredKinds, maxInFlight],
-      ['committed', ['search', 'search', 'begin', 'commit'], 4, ['memory_search', 'memory_record', 'memory_link'],
+      ['committed', ['search', 'search', 'begin', 'commit'], 5, ['memory_search', 'memory_record', 'memory_link', 'memory_submit'],
         ['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action'], 1]);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
