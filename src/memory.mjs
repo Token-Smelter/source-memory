@@ -93,6 +93,12 @@ export class Memory {
       ...(Object.keys(errors).length ? { vector_index_errors: errors } : {}) };
   }
 
+  async sourceChunks(scope, turn) {
+    authorize(this.config, scope);
+    text(turn, 256);
+    return this.store.sourceChunks(scope, turn);
+  }
+
   async turnVectorStatus(scope, turn) {
     authorize(this.config, scope);
     text(turn, 256);

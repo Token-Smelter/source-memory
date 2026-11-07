@@ -176,7 +176,7 @@ for (const mode of ['separate', 'self_review']) {
     const api = { on() {}, registerTool(tool) { registered.set(tool.name, tool); } };
     class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0](api); } }
     const manager = { getSessionId: () => 'distiller-id', branch() {}, buildSessionContext: () => ({ messages: [] }) };
-    const result = { contract: 'source-memory-links/v3', review_contract: 'fictional', operation_id: 'operation', context_sha256: 'a',
+    const result = { contract: 'source-memory-links/v4', review_contract: 'fictional', operation_id: 'operation', context_sha256: 'a',
       semantic_proposal_sha256: 'b', proposal_sha256: 'c', proposals: [{}] };
     const memory = { async recall() { return { status: 'no_matches', bundles: [] }; }, async enrich() {}, async beginLinks() { return { token: 'offer', packet: { records: [{ ref: 'r0', kind: 'decision', text: 'A' },
       { ref: 'r1', kind: 'decision', text: 'B' }], sources: [{ ref: 's0', role: 'user', trigger: true, text: 'Fiction' }] } }; },

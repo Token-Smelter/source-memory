@@ -123,7 +123,12 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           if (++reviewerCalls > 2) throw fail('review_limit');
           return reviewer.review(request);
         } } : null;
-        currentTools = createTurnTools({ scope, turn: input.turn, receipt: input.receipt, memory, requireSearch: true,
+        let sourceChunks = [];
+        if (input.turn.entries.some(entry => entry.text.length > 16000)) {
+          if (typeof memory.sourceChunks !== 'function') throw fail('evidence_chunks_unavailable');
+          sourceChunks = await memory.sourceChunks(scope, input.receipt.id);
+        }
+        currentTools = createTurnTools({ scope, turn: input.turn, receipt: input.receipt, memory, sourceChunks, requireSearch: true,
           ensureIndexed, reviewer: boundedReviewer, reviewMode });
         breakpoint = null;
         submittedResult = null;

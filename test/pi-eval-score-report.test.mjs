@@ -73,6 +73,25 @@ test('paired sensitivity recomputes uncertain requirements rather than accepting
   assert.deepEqual(report.sensitivity, { conservative: 0, excluded: 0.5, inclusive: 0.5, excludedCases: 0 });
 });
 
+test('paired reports retain original seals for compatible carried cases', () => {
+  const oldSettings = fictionalSettings(), newSettings = fictionalSettings();
+  oldSettings.codeSha = 'a'.repeat(40); newSettings.codeSha = 'b'.repeat(40);
+  const oldSeal = sealComparison(oldSettings);
+  newSettings.resume = { caseHandbacks: [{ caseId: 'c1', sourceSealDigest: oldSeal.digest, sourceCodeSha: oldSettings.codeSha }] };
+  const seal = sealComparison(newSettings);
+  const row = (caseId, origin) => {
+    const shared = { sealDigest: origin.digest, packetDigest: origin.spec.packets[caseId] };
+    return { caseId, sessions: ['same-source'], ...shared, arms: {
+      candidate: { ...shared, usefulness: { credited: 1, uncertain: 0, total: 2 },
+        safety: { unsupportedActions: 0, unsupportedClaims: 0, authorityInflation: 0, scopeViolations: 0 } },
+      baseline: { ...shared, usefulness: { credited: 0, uncertain: 0, total: 2 } } } };
+  };
+  const result = pairedReport({ seal, provenance: [oldSeal], rows: [row('c1', oldSeal), row('c2', seal)], dependencies: [['s1', 's2']] });
+  assert.deepEqual([result.sealDigest, result.provenance.mixedCandidateCode, result.cases], [null, true, 2]);
+  const changed = structuredClone(oldSettings); changed.rubric.instructions += ' changed';
+  assert.throws(() => pairedReport({ seal, provenance: [sealComparison(changed)], rows: [row('c1', oldSeal)], dependencies: [['s1', 's2']] }), /provenance_mismatch/);
+});
+
 test('paired report resamples connected source histories jointly and applies safety separately', () => {
   const seal = sealComparison(fictionalSettings());
   const rows = [

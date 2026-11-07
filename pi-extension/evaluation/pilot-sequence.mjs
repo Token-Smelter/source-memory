@@ -5,7 +5,7 @@ const fail = code => Object.assign(new Error(code), { code });
 export const checkpointId = result => result.through ?? result.cursor;
 
 /** Evaluate each case before any later checkpoint mutates its pre-answer store. */
-export async function runPilotSequence({ session, journal, checkpoints, cases, budget, evaluateCase, initialCursor = null, retryFirst = false,
+export async function runPilotSequence({ session, journal, checkpoints, cases, budget, evaluateCase, initialCursor = null, retryFirst = false, completedCaseIds = [],
   onBeforeCheckpoint = async () => {}, onCheckpoint = async () => {}, onCase = async () => {} }) {
   if (!session || !journal || !Array.isArray(checkpoints) || !checkpoints.length || !Array.isArray(cases)
     || typeof budget?.state !== 'function' || typeof evaluateCase !== 'function' || typeof onBeforeCheckpoint !== 'function'
@@ -25,11 +25,15 @@ export async function runPilotSequence({ session, journal, checkpoints, cases, b
   if (initialCursor !== null && (typeof initialCursor !== 'string' || !initialCursor)) throw fail('resume_invalid');
   const startIndex = initialCursor === null ? 0 : checkpoints.findIndex(row => row.id === initialCursor) + 1;
   if (initialCursor !== null && startIndex === 0) throw fail('resume_invalid');
-  if (initialCursor !== null && cases.some(item => checkpoints.findIndex(row => row.id === item.through) < startIndex - 1)) throw fail('resume_prior_cases_unsupported');
+  if (!Array.isArray(completedCaseIds) || new Set(completedCaseIds).size !== completedCaseIds.length
+    || completedCaseIds.some(id => !cases.some(item => item.publicCase.id === id))) throw fail('resume_invalid');
+  const completed = new Set(completedCaseIds);
+  if (initialCursor !== null && cases.some(item => checkpoints.findIndex(row => row.id === item.through) < startIndex - 1
+    && !completed.has(item.publicCase.id))) throw fail('resume_prior_cases_unsupported');
   if (typeof retryFirst !== 'boolean' || (retryFirst && startIndex >= checkpoints.length)) throw fail('resume_invalid');
   let cursor = initialCursor;
   const results = [], evaluated = [];
-  if (initialCursor !== null) for (const item of cases.filter(row => row.through === initialCursor)) {
+  if (initialCursor !== null) for (const item of cases.filter(row => row.through === initialCursor && !completed.has(row.publicCase.id))) {
     if (budget.state().stopped) return { status: 'budget_stopped', cursor, results, evaluated };
     let outcome;
     try { outcome = await evaluateCase(item, cursor); }
@@ -46,7 +50,7 @@ export async function runPilotSequence({ session, journal, checkpoints, cases, b
     await onCheckpoint(result, budget.state());
     if (!['committed', 'abstained', 'ineligible_by_policy'].includes(result.disposition)) return { status: result.disposition, cursor, results, evaluated };
     cursor = result.cursor;
-    for (const item of cases.filter(row => row.through === cursor)) {
+    for (const item of cases.filter(row => row.through === cursor && !completed.has(row.publicCase.id))) {
       if (budget.state().stopped) return { status: 'budget_stopped', cursor, results, evaluated };
       let outcome;
       try { outcome = await evaluateCase(item, cursor); }

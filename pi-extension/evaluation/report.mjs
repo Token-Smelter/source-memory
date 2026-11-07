@@ -8,8 +8,18 @@ const validUsefulness = value => Number.isSafeInteger(value?.credited) && value.
 const valueFor = (value, mode) => mode === 'inclusive' ? (value.credited + value.uncertain) / value.total
   : mode === 'excluded' ? (value.total === value.uncertain ? null : value.credited / (value.total - value.uncertain)) : value.credited / value.total;
 
-export function pairedReport({ seal, expectedDigest, rows, dependencies }) {
+export function pairedReport({ seal, expectedDigest, rows, dependencies, provenance = [] }) {
   const s = verifySeal(seal, expectedDigest);
+  if (!Array.isArray(provenance)) throw fail('report_invalid');
+  const origins = new Map([[seal.digest, s]]);
+  const comparable = ['policyVersion', 'policySha256', 'sourceSha256', 'datasetSha256', 'sdkSha256', 'answerer', 'scorer', 'rubric',
+    'packetSchema', 'alternativeRule', 'baseline', 'stores', 'access', 'safety', 'cases', 'packets', 'dependenciesDigest', 'comparison', 'resampling'];
+  for (const prior of provenance) {
+    const spec = verifySeal(prior, prior?.digest);
+    if (comparable.some(key => spec[key] === undefined || s[key] === undefined ? spec[key] !== s[key] : hash(spec[key]) !== hash(s[key]))
+      || origins.has(prior.digest)) throw fail('provenance_mismatch');
+    origins.set(prior.digest, spec);
+  }
   if (!Array.isArray(rows) || !rows.length || !Array.isArray(dependencies)) throw fail('report_invalid');
   if (hash(dependencies) !== s.dependenciesDigest) throw fail('dependency_seal_mismatch');
   const parent = new Map();
@@ -30,8 +40,11 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies }) {
     if (!text(row?.caseId) || ids.has(row.caseId) || !Array.isArray(row.sessions) || !row.sessions.length || !row.sessions.every(text)
       || Object.keys(row.arms ?? {}).sort().join('\0') !== armNames.join('\0') || armNames.some(arm => !validUsefulness(row.arms[arm]?.usefulness))
       || armNames.some(arm => row.arms[arm].usefulness.total !== row.arms.baseline.usefulness.total)) throw fail('unpaired_data');
-    if (row.sealDigest !== seal.digest || !s.packets[row.caseId] || row.packetDigest !== s.packets[row.caseId]
-      || armNames.some(arm => row.arms[arm].sealDigest !== seal.digest || row.arms[arm].packetDigest !== row.packetDigest)) throw fail('packet_seal_mismatch');
+    const origin = origins.get(row.sealDigest);
+    const handedBack = row.sealDigest === seal.digest || s.resume?.caseHandbacks?.some(item => item.caseId === row.caseId
+      && item.sourceSealDigest === row.sealDigest && item.sourceCodeSha === origin?.codeSha);
+    if (!origin || !handedBack || !s.packets[row.caseId] || row.packetDigest !== s.packets[row.caseId] || row.packetDigest !== origin.packets[row.caseId]
+      || armNames.some(arm => row.arms[arm].sealDigest !== row.sealDigest || row.arms[arm].packetDigest !== row.packetDigest)) throw fail('packet_seal_mismatch');
     ids.add(row.caseId);
     root(row.sessions[0]);
     for (const id of row.sessions.slice(1)) union(row.sessions[0], id);
@@ -81,6 +94,9 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies }) {
     const rate = cases / rows.length, ceiling = s.safety[key];
     return [key, { cases, denominator: rows.length, rate, ceiling, uncertainCases: uncertain, passes: rate > ceiling ? false : uncertain ? null : true }];
   }));
-  return { sealDigest: seal.digest, cases: rows.length, clusters: clusters.length,
+  const usedSeals = [...new Set(rows.map(row => row.sealDigest))];
+  return { sealDigest: usedSeals.length === 1 ? usedSeals[0] : null,
+    ...(usedSeals.length > 1 ? { provenance: { currentSealDigest: seal.digest, sourceSealDigests: usedSeals, mixedCandidateCode: true,
+      limitation: 'Cases were scored under compatible evaluator seals after a recorded candidate-method transition.' } } : {}), cases: rows.length, clusters: clusters.length,
     clusterCases: clusters.map(group => group.map(row => row.caseId)), pairedDelta: paired.candidate, deltas: paired, sensitivity, confidence, safety };
 }

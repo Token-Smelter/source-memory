@@ -33,6 +33,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
     async status({ scope }) { allowed(scope); return memory.status(scope); },
     async recordVectorStatus({ scope, ids }) { allowed(scope); return memory.recordVectorStatus(scope, ids); },
     async turnVectorStatus({ scope, turn }) { allowed(scope); return memory.turnVectorStatus(scope, turn); },
+    async sourceChunks({ scope, turn }) { allowed(scope); return memory.sourceChunks(scope, turn); },
     async index({ scope, input }) {
       allowed(scope);
       const flight = indexing ??= Promise.resolve().then(() => memory.index(scope, input));

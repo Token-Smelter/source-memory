@@ -1,5 +1,6 @@
 import { digest, normalizeEnrichment, normalizeTurn, RELATIONS } from '../src/core.mjs';
 import { imageBlock } from './image-archive.mjs';
+import { evidenceSpansForEntry } from '../src/evidence-spans.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const finished = row => row?.message?.role === 'assistant' && !['error', 'aborted', 'toolUse'].includes(row.message.stopReason)
@@ -116,28 +117,14 @@ export function createLinkChoices(packet) {
 }
 
 /** Tool-facing labels name only entries of the just-retained cursor turn. */
-export function createTurnTools({ scope, turn, receipt, memory, requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate' }) {
+export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [], requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate' }) {
   if (typeof scope !== 'string' || !scope || !turn?.turn_id || !Array.isArray(turn.entries) || !receipt?.id || !memory) throw fail('invalid_input');
   const labels = new Map();
   const imageNotes = [];
   for (const entry of turn.entries) {
-    const ranges = entry.uncitable_ranges ?? [];
-    const add = (first, last) => {
-      for (let start = first; start < last;) {
-        let end = Math.min(start + 8000, last);
-        if (end < last && /[\uD800-\uDBFF]/u.test(entry.text[end - 1]) && /[\uDC00-\uDFFF]/u.test(entry.text[end])) end--;
-        labels.set(`ref-${String(labels.size + 1).padStart(6, '0')}`, { entry, start, end });
-        start = end;
-      }
-    };
-    let previous = 0;
-    for (const range of ranges) {
-      if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) || range.start < previous || range.end > entry.text.length || range.end <= range.start) throw fail('image_range_invalid');
-      add(previous, range.start);
-      imageNotes.push({ entry_id: entry.id, reason: 'image_not_citable', placeholder: entry.text.slice(range.start, range.end) });
-      previous = range.end;
-    }
-    add(previous, entry.text.length);
+    const offered = evidenceSpansForEntry(entry, sourceChunks);
+    for (const span of offered.spans) labels.set(`ref-${String(labels.size + 1).padStart(6, '0')}`, { entry, start: span.start, end: span.end });
+    imageNotes.push(...offered.omissions);
   }
   const recordIds = [];
   const actionHandles = new Set();
@@ -201,9 +188,9 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
         try {
           const offered = await this.offer();
           const records = offered.packet.records.filter(row => !kinds.length || kinds.includes(row.kind)).slice(0, 32)
-            .map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text.slice(0, 500) }));
+            .map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text }));
           const sources = offered.packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? ''))
-            .slice(0, 128).map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text.slice(0, 500) }));
+            .slice(0, 128).map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text }));
           return { status: 'offer', records, sources, filtered: kinds.length > 0, completeness_guaranteed: false,
             retrieval: offered.packet.retrieval ?? null };
         } catch (problem) { searchFailed = true; throw problem; }
@@ -218,7 +205,7 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
         }
         searches++;
         const records = result.bundles.flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind))
-          .slice(0, 32).map(row => ({ id: row.id, kind: row.kind, snippet: row.text.slice(0, 500),
+          .slice(0, 32).map(row => ({ id: row.id, kind: row.kind, snippet: row.text,
             ...(row.kind === 'action' && row.action_handle ? { action_handle: row.action_handle } : {}) }));
         for (const row of records) {
           if (typeof row.id === 'string' && row.id) returnedPriorIds.add(row.id);

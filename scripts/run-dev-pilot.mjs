@@ -22,6 +22,7 @@ import { createPiAnswererResponder, createPiScorerJudge, ANSWERER_TOOLS_SHA256 }
 import { createPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
+import { validateCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
 import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
 import { createScorer } from '../pi-extension/evaluation/scorer.mjs';
@@ -186,11 +187,46 @@ async function main() {
     const journalBytes = pinned(request.journalPath, request.journalSha256, 20_000_000);
     const snapshotBytes = pinned(request.snapshotPath, request.snapshotSha256, 128_000_000);
     const progress = progressBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
+    const cursorIndex = checkpoints.findIndex(row => row.id === request.cursor);
+    if (cursorIndex < 0) throw fail('resume_invalid');
+    const completedCases = prepared.filter(item => checkpoints.findIndex(row => row.id === item.through) <= cursorIndex
+      && progress.some(row => row.type === 'case' && row.case_id === item.publicCase.id && row.status === 'scored'));
+    const handbacks = [], handbackRows = [], carriedRows = [], carriedSnapshots = [], originSeals = [], carriedCases = [], originBundles = new Map();
+    for (const item of completedCases) {
+      const priorCarried = report.artifacts?.carried_cases?.find(row => row.caseId === item.publicCase.id);
+      const originPath = priorCarried?.sourceReportPath ?? request.reportPath;
+      const originSha = priorCarried?.sourceReportSha256 ?? request.reportSha256;
+      if (basename(originPath ?? '') !== 'REPORT.json' || dirname(dirname(originPath)) !== parent) throw fail('handback_invalid');
+      const origin = JSON.parse(pinned(originPath, originSha, 10_000_000).toString('utf8'));
+      if (origin.run_dir !== dirname(originPath)) throw fail('handback_invalid');
+      const readArtifact = key => {
+        const descriptor = origin.artifacts?.[key];
+        return pinned(descriptor?.path, descriptor?.sha256, 128_000_000);
+      };
+      const sealBytes = readArtifact('seal.json'), resultsBytes = readArtifact('case-results.jsonl'), outputsBytes = readArtifact('model-outputs.jsonl');
+      const originSeal = JSON.parse(sealBytes.toString('utf8'));
+      const originProgress = readArtifact('progress.jsonl').toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
+      const originResults = resultsBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
+      const originOutputs = outputsBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
+      const originLedger = readArtifact('ledger.jsonl').toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
+      if (!originBundles.has(originSha)) originBundles.set(originSha, { sealBytes, resultsBytes, outputsBytes });
+      const caseSnapshot = origin.artifacts?.case_snapshots?.find(row => row.case_id === item.publicCase.id);
+      pinned(caseSnapshot?.path, caseSnapshot?.sha256, 128_000_000);
+      const handback = validateCaseHandback({ report: origin, reportSha256: originSha, seal: originSeal, progress: originProgress,
+        resultRows: originResults, outputRows: originOutputs, ledgerRows: originLedger, cases: [item], checkpoints, cursor: request.cursor, sourceKey });
+      if (handback.descriptors.length !== 1) throw fail('handback_invalid');
+      handbacks.push(handback.descriptors[0]); handbackRows.push(...handback.reportRows); carriedRows.push(...handback.carriedRows);
+      carriedSnapshots.push(...handback.caseSnapshots);
+      if (!originSeals.some(row => row.digest === originSeal.digest)) originSeals.push(originSeal);
+      carriedCases.push({ ...handback.descriptors[0], sourceReportPath: originPath,
+        sourceResultsPath: origin.artifacts['case-results.jsonl'].path, sourceOutputsPath: origin.artifacts['model-outputs.jsonl'].path,
+        sourceLedgerPath: origin.artifacts['ledger.jsonl'].path, sourceSealPath: origin.artifacts['seal.json'].path, sourceSnapshotPath: caseSnapshot.path });
+    }
     const plan = { priorRunId: report.run_id, priorSealDigest: priorSeal.digest, priorCodeSha: priorSeal.spec?.codeSha,
       cursor: request.cursor, snapshotSha256: request.snapshotSha256, journalSha256: request.journalSha256,
-      transition: request.transition, ledgerReconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean) };
+      transition: request.transition, ledgerReconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: handbacks };
     let superseded = null;
-    const pendingCases = prepared.filter(item => item.through === request.cursor);
+    const pendingCases = prepared.filter(item => item.through === request.cursor && !completedCases.includes(item));
     if (pendingCases.length) {
       const priorResults = report.artifacts?.['case-results.jsonl'];
       const resultBytes = pinned(priorResults?.path, priorResults?.sha256, 20_000_000);
@@ -203,12 +239,15 @@ async function main() {
         pre_answer_snapshot_sha256: request.snapshotSha256, prior_ledger_sha256: priorLedger.sha256, calls,
         status: 'superseded', output_available: false, limitation: 'The earlier harness did not persist answer or scorer raw outputs.' };
     }
-    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, plan, superseded };
+    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, plan, superseded,
+      handbacks, handbackRows, carriedRows, carriedSnapshots, originSeals, carriedCases, originBundles };
   }
   const remaining = 100000000000n - previous;
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
   const seal = createPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
     codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null });
+  if (resume?.handbackRows.length) pairedReport({ seal, expectedDigest: seal.digest, rows: resume.handbackRows, dependencies: [],
+    provenance: resume.originSeals.filter(row => row.digest !== seal.digest) });
   const runId = randomUUID(), dir = mkdtempSync(join(parent, 'pilot-'));
   const driverDir = join(dir, 'driver'), piDir = join(dir, 'pi'), imageDir = join(dir, 'image-blobs');
   mkdirSync(driverDir, { mode: 0o700 }); mkdirSync(piDir, { mode: 0o700 }); mkdirSync(imageDir, { mode: 0o700 });
@@ -218,6 +257,16 @@ async function main() {
   let resumeValidation = null;
   if (resume) {
     if (resume.superseded) writePrivate(join(dir, 'superseded-case-attempt.json'), resume.superseded);
+    if (resume.carriedCases.length) {
+      const copies = [];
+      for (const [originSha, bundle] of resume.originBundles) for (const [name, bytes] of Object.entries(bundle)) {
+        const path = join(dir, `handback-${originSha.slice(0, 16)}-${name}.${name === 'sealBytes' ? 'json' : 'jsonl'}`);
+        writePrivate(path, bytes);
+        copies.push({ originReportSha256: originSha, kind: name, path, sha256: sha(bytes), bytes: bytes.length });
+      }
+      resume.handbackCopies = copies;
+      writePrivate(join(dir, 'case-handback.json'), { schema: 'case-handback/v1', cases: resume.carriedCases, copies });
+    }
     writePrivate(join(driverDir, 'resume-snapshot.json'), resume.snapshotBytes);
     writePrivate(join(dir, `coverage-${digest(['coverage-session/v1', sourceKey])}.jsonl`), resume.journalBytes);
     const priorJournal = createCoverageJournal({ directory: dir, sessionKey: sourceKey });
@@ -225,7 +274,7 @@ async function main() {
       resumeValidation = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal: priorJournal,
         checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
         sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
-        reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean) });
+        reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks });
     } finally { priorJournal.close(); }
   }
   writePrivate(join(driverDir, 'config.json'), { neo4j: { uri: 'bolt://127.0.0.1:7687', auth: 'none' }, scopes: { read: [scope], write: [scope] },
@@ -238,9 +287,10 @@ async function main() {
     mounts: { memory: resolve('.'), scratch: driverDir }, runId, onResource: row => resources.append(row) });
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
     routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => rawOutputs.append(row) });
-  let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v3', policy_version: seal.spec.policyVersion };
+  let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v4', policy_version: seal.spec.policyVersion };
   let journal, sequenceResult, snapshot, resumeRestore, failure = null;
-  const reportRows = [], caseSnapshots = {}, checkpointSnapshots = {};
+  const reportRows = resume ? [...resume.handbackRows] : [],
+    caseSnapshots = Object.fromEntries((resume?.carriedSnapshots ?? []).map(row => [row.case_id, row])), checkpointSnapshots = {};
   const imageHashes = { database: image('neo4j:5.26.14-community'), driver: image('node:22-bookworm-slim') };
   const harness = await runNamespaceHarness({ docker, relay: { open: ({ socketPath }) => openUnixEmbeddingRelay({ socketPath, timeoutMs: 90000,
     onEvent: event => relayLog.append({ checkpoint: meta.checkpoint, ...event }) }) },
@@ -289,7 +339,7 @@ async function main() {
           const current = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal,
             checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
             sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
-            reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean) });
+            reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks });
           if (JSON.stringify(current) !== JSON.stringify(resumeValidation)) throw fail('resume_provenance_mismatch');
           const output = execFileSync('/usr/bin/docker', ['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/restore-scope.mjs',
             '/scratch/resume-snapshot.json', resume.plan.snapshotSha256, scope], { encoding: 'utf8', timeout: 180000, maxBuffer: 100000 });
@@ -302,6 +352,9 @@ async function main() {
           resumeRestore = { ...restored, ...resumeValidation };
           writePrivate(join(dir, 'resume-restore.json'), resumeRestore);
           progress.append({ type: 'resume', ...resumeValidation, restored_sha256: restored.restored_sha256, equivalent: true });
+          for (const row of resume.carriedRows) results.append(row);
+          for (const handback of resume.handbacks) progress.append({ type: 'case', case_id: handback.caseId, status: 'scored', inherited: true,
+            source_seal_digest: handback.sourceSealDigest, snapshot_sha256: handback.snapshotSha256, budget: budget.state() });
           for (const row of resume.progress.filter(item => {
             const index = checkpoints.findIndex(cp => cp.id === item.through);
             return item.type === 'checkpoint' && item.snapshot && index >= 0 && index < resumeValidation.prefixCount;
@@ -317,12 +370,13 @@ async function main() {
           ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state,
             { waitForVectors: true, batchLimit: 16, maxRounds: 128, maxIndexRetries: 2, ...options }),
           meterRuntime: (underlying, context) => budget.wrap(underlying, () => ({ ...meta,
-            purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v3' : 'link-review-r2-v2' })) });
+            purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v4' : 'link-review-r2-v3' })) });
         const evaluatorRuntime = budget.wrap(runtime, () => meta);
         sequenceResult = await runPilotSequence({ session, journal, checkpoints, cases: prepared, budget,
           initialCursor: resumeValidation?.cursor ?? null, retryFirst: resumeValidation?.retryFirst ?? false,
+          completedCaseIds: resume?.handbacks.map(row => row.caseId) ?? [],
           async onBeforeCheckpoint(checkpoint) { meta = { purpose: 'candidate', arm: 'candidate', checkpoint: checkpoint.id,
-            task_version: 'distiller-r2-v3', policy_version: seal.spec.policyVersion }; },
+            task_version: 'distiller-r2-v4', policy_version: seal.spec.policyVersion }; },
           async onCheckpoint(row, state) {
             const through = checkpointId(row);
             let checkpointSnapshot = null;
@@ -389,11 +443,12 @@ async function main() {
       return { sequence: sequenceResult, failure, snapshot, reference: 'pending_reference_freeze' };
     } });
   let scorecard = null;
-  if (reportRows.length) scorecard = pairedReport({ seal, expectedDigest: seal.digest, rows: reportRows, dependencies: [] });
+  if (reportRows.length) scorecard = pairedReport({ seal, expectedDigest: seal.digest, rows: reportRows, dependencies: [],
+    provenance: (resume?.originSeals ?? []).filter(row => row.digest !== seal.digest) });
   try { budget.close(); } catch { failure ??= 'ledger_close_failed'; }
   for (const writer of [resources, progress, memoryLog, results, relayLog, rawOutputs]) writer.close();
   const artifactNames = ['seal.json', 'ledger.jsonl', 'progress.jsonl', 'memory-receipts.jsonl', 'case-results.jsonl', 'model-outputs.jsonl', 'resources.jsonl',
-    'isolation.json', 'embedding-relay.jsonl', 'environment.json', 'resume-restore.json', 'superseded-case-attempt.json'];
+    'isolation.json', 'embedding-relay.jsonl', 'environment.json', 'resume-restore.json', 'superseded-case-attempt.json', 'case-handback.json'];
   const artifacts = {};
   for (const name of artifactNames) {
     try { const bytes = readFileSync(join(dir, name)); artifacts[name] = { path: join(dir, name), sha256: sha(bytes), bytes: bytes.length }; }
@@ -406,6 +461,12 @@ async function main() {
     if (sha(bytes) !== item.sha256) throw fail('snapshot_changed');
     return { through, path: item.path, sha256: item.sha256, bytes: bytes.length,
       restore_verified: resumeRestore?.equivalent === true && item.sha256 === resumeRestore.source_sha256 };
+  });
+  artifacts.carried_cases = resume?.carriedCases ?? [];
+  artifacts.handback_copies = (resume?.handbackCopies ?? []).map(item => {
+    const bytes = readFileSync(item.path);
+    if (sha(bytes) !== item.sha256) throw fail('handback_changed');
+    return item;
   });
   artifacts.case_snapshots = Object.entries(caseSnapshots).map(([caseId, item]) => {
     const bytes = readFileSync(item.path);

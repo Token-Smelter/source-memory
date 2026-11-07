@@ -50,6 +50,9 @@ export function createCoverageJournal({ directory, sessionKey }) {
       if (!effect || active.id !== row.id || effect.state !== 'pending' || !['confirmed', 'refused', 'unknown'].includes(row.outcome)) throw fail('journal_invalid');
       effect.state = row.outcome;
       if (row.outcome === 'confirmed' && ['enrich', 'applyLinks', 'applyOutcome'].includes(effect.method)) active.derived = true;
+    } else if (row.type === 'offer_limit') {
+      if (!active || active.id !== row.id || !Number.isSafeInteger(row.omitted_prior_records) || row.omitted_prior_records < 0
+        || !Number.isSafeInteger(row.omitted_prior_spans) || row.omitted_prior_spans < 0 || !Array.isArray(row.trigger_omissions)) throw fail('journal_invalid');
     } else if (row.type === 'finish') {
       if (!active || active.id !== row.id || ![...covered, 'failed', 'uncertain', 'unresolved_scope'].includes(row.disposition)) throw fail('journal_invalid');
       if (covered.has(row.disposition)) finished.set(row.id, row.disposition);
@@ -116,6 +119,15 @@ export function createCoverageJournal({ directory, sessionKey }) {
           if (key === tracking) return api;
           const value = Reflect.get(target, key, target);
           if (typeof value !== 'function') return value;
+          if (key === 'beginLinks') return async (...args) => {
+            if (!active) throw fail('interval_not_started');
+            const result = await value.apply(target, args), info = result?.packet?.retrieval;
+            if (info && ((info.omitted_prior_records ?? 0) > 0 || (info.omitted_prior_spans ?? 0) > 0 || info.trigger_omissions?.length)) {
+              append({ type: 'offer_limit', id: active.id, omitted_prior_records: info.omitted_prior_records ?? 0,
+                omitted_prior_spans: info.omitted_prior_spans ?? 0, trigger_omissions: info.trigger_omissions ?? [] });
+            }
+            return result;
+          };
           if (!effects.has(key)) return value.bind(target);
           return async (...args) => {
             if (!active) throw fail('interval_not_started');

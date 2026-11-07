@@ -1,7 +1,8 @@
 import { authorize, canonical, digest, integer, normalizeEnrichment, normalizeTurn,
   RELATIONS, requireThat, sourceExcerpt, text } from './core.mjs';
+import { evidenceSpansForEntry } from './evidence-spans.mjs';
 
-export const LINK_PROPOSAL_CONTRACT = 'source-memory-links/v3';
+export const LINK_PROPOSAL_CONTRACT = 'source-memory-links/v4';
 export const LINK_PROPOSAL_LIMITS = Object.freeze({ new_records: 16, candidate_records: 32,
   retained_turns: 128, evidence_spans: 128, links: 16, prompt_bytes: 120000,
   desired_output_bytes: 2048, output_bytes: 16384 });
@@ -145,43 +146,93 @@ export async function proposeMemoryLinks({ memory, scope, turn, record_ids, revi
   }
   requireThat(ids.size <= 32, 'link_candidate_bound');
   for (const id of [...ids].sort()) await readRecord(id);
-  const sourceMap = new Map();
-  const sources = [];
+  const sourceMap = new Map(), sources = [], records = [], recordRefs = new Map();
+  const triggerEntries = trigger.entries.filter(row => row.role !== 'derived' && row.text.length > 0);
+  const needsChunks = triggerEntries.some(entry => entry.text.length > 16000);
+  requireThat(!needsChunks || typeof memory.sourceChunks === 'function', 'evidence_chunks_unavailable');
+  const triggerChunks = needsChunks ? await memory.sourceChunks(scope, turn) : [];
+  const triggerCandidates = [], triggerOmissions = [];
+  for (const entry of triggerEntries) {
+    const offered = evidenceSpansForEntry(entry, triggerChunks);
+    triggerOmissions.push(...offered.omissions);
+    triggerCandidates.push(...offered.spans.map(span => ({ turn, ...span })));
+  }
+  for (const span of triggerCandidates) triggerOmissions.push({ ...span, reason: 'packet_budget' });
+  const priorIds = [...ids].filter(id => !record_ids.includes(id)).sort();
+  let omittedPriorRecords = priorIds.length, omittedPriorSpans = priorIds.reduce((sum, id) => sum + recordPins.get(id).evidence.length, 0);
   const offerSpan = async span => {
     const key = spanKey(span);
     if (!sourceMap.has(key)) {
       requireThat(sources.length < LINK_PROPOSAL_LIMITS.evidence_spans, 'link_evidence_bound');
-      const source = await readTurn(span.turn);
-      const excerpt = sourceExcerpt(source, span);
-      const ref = `s${sources.length}`;
+      const source = await readTurn(span.turn), excerpt = sourceExcerpt(source, span), ref = `s${sources.length}`;
       sourceMap.set(key, ref);
       sources.push({ ref, role: excerpt.role, occurred_at: excerpt.occurred_at, text: excerpt.text, trigger: span.turn === turn });
     }
     return sourceMap.get(key);
   };
-  const records = [], recordRefs = new Map();
-  for (const id of [...ids].sort()) {
-    const record = recordPins.get(id), ref = `r${records.length}`;
-    recordRefs.set(ref, id);
-    const evidence = [];
+  const packetValue = () => ({ contract: LINK_PROPOSAL_CONTRACT, review_contract, limits: { ...LINK_PROPOSAL_LIMITS },
+    record_kinds: [...KINDS], relation_types: [...RELATIONS], records, sources,
+    retrieval: { status: retrieved.status, retrieval_complete: retrieved.retrieval_complete, budget_omitted: retrieved.budget_omitted,
+      relationship_context_complete: retrieved.relationship_context_complete, channels: copy(retrieved.channels),
+      candidate_count: retrieved.candidate_count ?? null, query_truncated: querySource.length > query.length,
+      compared_records: records.length, omitted_prior_records: omittedPriorRecords, omitted_prior_spans: omittedPriorSpans,
+      trigger_omissions: triggerOmissions,
+      bounded: true, completeness_guaranteed: false } });
+  const fits = () => Buffer.byteLength(memoryLinkPrompt(packetValue())) <= LINK_PROPOSAL_LIMITS.prompt_bytes;
+  const removeCoveredOmissions = () => {
+    for (let i = triggerOmissions.length - 1; i >= 0; i--) {
+      const row = triggerOmissions[i];
+      if (row.reason === 'packet_budget' && sourceMap.has(spanKey(row))) triggerOmissions.splice(i, 1);
+    }
+  };
+  const addRecord = async id => {
+    const record = recordPins.get(id), ref = `r${records.length}`, evidence = [];
     for (const span of record.evidence) evidence.push(await offerSpan(span));
+    recordRefs.set(ref, id);
     records.push({ ref, kind: record.kind, status: record.status, attribution: record.attribution,
       text: record.text, evidence, newly_retained: record_ids.includes(id) });
+    removeCoveredOmissions();
+  };
+  const rollback = (size, keys, omissions) => {
+    while (sources.length > size) sources.pop();
+    for (const key of [...sourceMap.keys()]) if (!keys.has(key)) sourceMap.delete(key);
+    triggerOmissions.splice(0, triggerOmissions.length, ...omissions);
+  };
+  for (const id of [...record_ids].sort()) {
+    await addRecord(id);
+    requireThat(fits(), 'link_mandatory_evidence_bound');
   }
-  for (const entry of trigger.entries.filter(row => row.role !== 'derived' && row.text.length > 0)) {
-    // Never silently trim the trigger's correction text to fit a model context.
-    requireThat(entry.text.length <= 16000, 'link_trigger_bound');
-    await offerSpan({ turn, entry_id: entry.id, start: 0, end: entry.text.length });
+  for (const id of priorIds) {
+    const size = sources.length, keys = new Set(sourceMap.keys()), omissions = [...triggerOmissions], recordSize = records.length;
+    try {
+      await addRecord(id);
+      if (!fits()) throw Object.assign(new Error('link_prompt_bound'), { code: 'link_prompt_bound' });
+      omittedPriorRecords--; omittedPriorSpans -= recordPins.get(id).evidence.length;
+    } catch (error) {
+      if (!['link_prompt_bound', 'link_evidence_bound'].includes(error?.code)) throw error;
+      if (records.length > recordSize) { recordRefs.delete(records.at(-1).ref); records.pop(); }
+      rollback(size, keys, omissions);
+    }
   }
-  const packet = freeze({ contract: LINK_PROPOSAL_CONTRACT, review_contract, limits: { ...LINK_PROPOSAL_LIMITS },
-    record_kinds: [...KINDS], relation_types: [...RELATIONS],
-    records, sources, retrieval: { status: retrieved.status, retrieval_complete: retrieved.retrieval_complete,
-      budget_omitted: retrieved.budget_omitted, relationship_context_complete: retrieved.relationship_context_complete,
-      channels: copy(retrieved.channels), candidate_count: retrieved.candidate_count ?? null,
-      query_truncated: querySource.length > query.length, compared_records: records.length,
-      bounded: true, completeness_guaranteed: false } });
-  const prompt = memoryLinkPrompt(packet);
-  requireThat(Buffer.byteLength(prompt) <= 120000, 'link_prompt_bound');
+  for (const span of triggerCandidates) {
+    const key = spanKey(span), omissionIndex = triggerOmissions.findIndex(row => row.reason === 'packet_budget' && spanKey(row) === key);
+    if (omissionIndex < 0) continue;
+    const omission = triggerOmissions[omissionIndex];
+    if (sourceMap.has(key)) { triggerOmissions.splice(omissionIndex, 1); continue; }
+    const size = sources.length, keys = new Set(sourceMap.keys());
+    triggerOmissions.splice(omissionIndex, 1);
+    try {
+      await offerSpan(span);
+      if (!fits()) throw Object.assign(new Error('link_prompt_bound'), { code: 'link_prompt_bound' });
+    } catch (error) {
+      if (!['link_prompt_bound', 'link_evidence_bound'].includes(error?.code)) throw error;
+      while (sources.length > size) sources.pop();
+      for (const added of [...sourceMap.keys()]) if (!keys.has(added)) sourceMap.delete(added);
+      triggerOmissions.splice(omissionIndex, 0, omission);
+    }
+  }
+  const packet = freeze(packetValue()), prompt = memoryLinkPrompt(packet);
+  requireThat(Buffer.byteLength(prompt) <= LINK_PROPOSAL_LIMITS.prompt_bytes, 'link_mandatory_evidence_bound');
   active(signal);
   const compared = await compare({ contract: LINK_PROPOSAL_CONTRACT, prompt, packet,
     desired_output_bytes: LINK_PROPOSAL_LIMITS.desired_output_bytes, output_bytes: LINK_PROPOSAL_LIMITS.output_bytes, signal });

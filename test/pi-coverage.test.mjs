@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCoverageJournal, runCoveredInterval } from '../pi-extension/coverage.mjs';
@@ -26,6 +26,19 @@ test('uncertain-write fixture blocks dependent progress and retry across journal
   assert.throws(() => journal.begin({ cursor: 'a', through: 'b' }), /reconciliation_required/);
   assert.throws(() => journal.begin({ cursor: null, through: 'a', retry: true }), /reconciliation_required/);
   assert.deepEqual([journal.state().id, journal.state().cursor], [id, null]);
+  journal.close();
+}));
+
+test('bounded link-offer omissions are recorded in the active journal', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async beginLinks() { return { token: 'fiction', packet: { retrieval: {
+    omitted_prior_records: 1, omitted_prior_spans: 2, trigger_omissions: [{ entry_id: 'u', start: 10, end: 20, reason: 'packet_budget' }] } } }; } });
+  journal.begin({ cursor: null, through: 'a' });
+  await memory.beginLinks('fiction', 'turn', ['record']);
+  journal.finish('failed');
+  const rows = readFileSync(journal.path, 'utf8').trimEnd().split('\n').map(JSON.parse);
+  assert.deepEqual(rows.find(row => row.type === 'offer_limit')?.trigger_omissions,
+    [{ entry_id: 'u', start: 10, end: 20, reason: 'packet_budget' }]);
   journal.close();
 }));
 

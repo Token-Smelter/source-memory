@@ -17,9 +17,14 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
       || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
-      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only'].includes(resume.transition)
+      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback'].includes(resume.transition)
       || (resume.ledgerReconciliationSha256s !== undefined && (!Array.isArray(resume.ledgerReconciliationSha256s)
         || resume.ledgerReconciliationSha256s.some(value => !/^[a-f0-9]{64}$/.test(value))))
+      || (resume.caseHandbacks !== undefined && (!Array.isArray(resume.caseHandbacks) || resume.caseHandbacks.some(row =>
+        typeof row?.caseId !== 'string' || !row.caseId || typeof row.sourceRunId !== 'string' || !row.sourceRunId
+        || !/^[a-f0-9]{64}$/.test(row.sourceReportSha256 ?? '')
+        || !/^[a-f0-9]{64}$/.test(row.sourceSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(row.sourceCodeSha ?? '')
+        || !['snapshotSha256', 'resultsSha256', 'outputsSha256', 'ledgerSha256'].every(key => /^[a-f0-9]{64}$/.test(row[key] ?? '')))))
       || typeof resume.cursor !== 'string' || !resume.cursor || typeof resume.priorRunId !== 'string' || !resume.priorRunId))) throw fail('pilot_plan_invalid');
   const scopes = cases[0].publicCase.readScopes;
   if (!Array.isArray(scopes) || !scopes.length || cases.some(row => hash(row.publicCase.readScopes) !== hash(scopes)
@@ -47,8 +52,8 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     safety: { unsupportedActions: 0, unsupportedClaims: 0, authorityInflation: 0, scopeViolations: 0 },
     budget: { version: 'soft-sdk-ledger/v1', capNano: cap, priorSpendNano, shareCapNano: '100000000000', rateCardVersion: 'sdk-max-tier-observed-preflight',
       maxSlotsPerPlan: 1, maxPlans: 1000, routes: { [candidateRoute]: routes.candidate, [evaluatorRoute]: routes.reviewer },
-      purposes: { candidate: { taskVersion: 'distiller-r2-v3', route: candidateRoute },
-        reviewer: { taskVersion: 'link-review-r2-v2', route: evaluatorRoute },
+      purposes: { candidate: { taskVersion: 'distiller-r2-v4', route: candidateRoute },
+        reviewer: { taskVersion: 'link-review-r2-v3', route: evaluatorRoute },
         answerer: { taskVersion: 'answerer-r2-v2', route: evaluatorRoute }, scorer: { taskVersion: 'scorer-r2-v2', route: evaluatorRoute } } },
     cases: Object.fromEntries(cases.map(row => [row.publicCase.id, hash(row.publicCase)])),
     packets: Object.fromEntries(cases.map(row => [row.publicCase.id, hash(row.packet)])),

@@ -112,6 +112,16 @@ export class Neo4jStore {
     });
   }
 
+  async sourceChunks(scope, turn) {
+    return this.transaction('read', async tx => {
+      const exists = await tx.run('MATCH (t:SMTurn {scope:$scope,uid:$turn}) RETURN count(t) AS count', { scope, turn });
+      requireThat(exists.records[0]?.get('count') === 1, 'not_found');
+      const rows = await tx.run(`MATCH (t:SMTurn {scope:$scope,uid:$turn})-[:SM_HAS_CHUNK]->(c:SMChunk {scope:$scope})
+        RETURN c.entry_id AS entry_id,c.start AS start,c.end AS end,c.ordinal AS ordinal ORDER BY ordinal`, { scope, turn });
+      return rows.records.map(row => row.toObject());
+    });
+  }
+
   async childTurns(scope, turn, limit) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (t:SMTurn {scope:$scope, source:$source, conversation_id:$conversation, parent_turn_id:$parent})

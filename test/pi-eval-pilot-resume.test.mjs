@@ -93,6 +93,30 @@ test('a resumed sequence answers a pending cursor case before the next source in
   assert.deepEqual([result.status, events], ['complete', ['case:a', 'distill:b', 'distill:c']]);
 }));
 
+test('a scored earlier case requires an exactly sealed handback descriptor', () => fixture(async ({ args }) => {
+  const completed = [{ ...args.cases[0], through: 'a' }];
+  const descriptor = { caseId: completed[0].publicCase.id, sourceRunId: 'fiction-run', sourceReportSha256: '1'.repeat(64),
+    sourceSealDigest: args.seal.digest, sourceCodeSha: args.seal.spec.codeSha, snapshotSha256: args.snapshotSha256,
+    resultsSha256: '2'.repeat(64), outputsSha256: '3'.repeat(64), ledgerSha256: 'f'.repeat(64) };
+  const spec = structuredClone(args.currentSeal.spec); spec.resume.caseHandbacks = [descriptor];
+  const currentSeal = sealComparison(spec);
+  assert.equal(validatePilotResume({ ...args, currentSeal, cases: completed, caseHandbacks: [descriptor] }).cursor, 'a');
+  assert.throws(() => validatePilotResume({ ...args, currentSeal, cases: completed, caseHandbacks: [] }), /resume_treatment_mismatch/);
+}));
+
+test('a carried scored case is not re-evaluated during resume', () => fixture(async ({ journal, memory, checkpoints, args }) => {
+  const events = [];
+  const entries = ['a', 'b', 'c'].map((id, i) => ({ type: 'message', id, parentId: i ? ['a', 'b'][i - 1] : null,
+    message: { role: 'assistant', content: 'fiction', stopReason: 'stop' } }));
+  const session = { entries, conversation_id: 'fiction', scopes: ['fiction'], memory,
+    distiller: { memory, async run({ throughEntryId }) { events.push(throughEntryId); return { status: 'complete', disposition: 'abstained' }; } } };
+  const cases = [{ through: 'a', publicCase: { ...args.cases[0].publicCase, queryTime: '2030-01-01T00:00:01Z' } }];
+  const result = await runPilotSequence({ session, journal, checkpoints, cases, initialCursor: 'a', retryFirst: true,
+    completedCaseIds: [cases[0].publicCase.id], budget: { state: () => ({ stopped: null }) },
+    async evaluateCase() { throw new Error('must_not_reevaluate'); } });
+  assert.deepEqual([result.status, events], ['complete', ['b', 'c']]);
+}));
+
 test('a resumed sequence retries only the first failed interval and never reprocesses its prefix', () => fixture(async ({ journal, memory, checkpoints }) => {
   const events = [];
   const entries = ['a', 'b', 'c'].map((id, i) => ({ type: 'message', id, parentId: i ? ['a', 'b'][i - 1] : null,

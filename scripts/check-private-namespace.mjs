@@ -8,6 +8,7 @@ import { runNamespaceHarness } from '../pi-extension/namespace-harness.mjs';
 import { openUnixEmbeddingRelay } from '../pi-extension/unix-relay.mjs';
 import { openDockerMemory } from '../pi-extension/docker-memory.mjs';
 import { ensureIndexed } from '../pi-extension/index-readiness.mjs';
+import { evidenceSpansForEntry } from '../src/evidence-spans.mjs';
 
 // This opt-in smoke uses only invented content, an in-memory embedding response and owned disposable containers.
 const scratch = mkdtempSync(join(tmpdir(), 'pi-private-namespace-'));
@@ -96,11 +97,24 @@ try {
       const priorProposal = await memory.beginOutcome('fiction', follow.id, priorOutcome, null, priorHandle);
       const priorReview = { reviewer: 'separate:fiction', decision_ref: 'fictional-review', proposal_sha256: priorProposal.proposal.proposal_sha256, approved: [0] };
       const priorResult = await memory.applyOutcome('fiction', priorProposal.token, priorReview);
+      const longText = 'fiction '.repeat(2600), longEntry = { id: 'fiction-long-entry', role: 'user', text: longText };
+      const longTurn = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-long', entries: [longEntry] });
+      await ensureIndexed(memory, 'fiction', longTurn.indexing, { waitForVectors: true, turnId: longTurn.id });
+      const chunks = await memory.sourceChunks('fiction', longTurn.id);
+      const labels = evidenceSpansForEntry(longEntry, chunks);
+      if (longText.length <= 16000 || labels.spans.length < 2 || labels.spans.some(span => !chunks.some(chunk => chunk.entry_id === span.entry_id
+        && chunk.start === span.start && chunk.end === span.end))) throw new Error('chunk_labels_invalid');
+      const longRecord = await memory.enrich('fiction', { records: [{ id: 'fiction-long-record', kind: 'observation', text: 'Fictional long source.',
+        status: 'proposed', attribution: 'fiction', evidence: [{ turn: longTurn.id, ...labels.spans[0] }] }], relations: [] }, { trigger: longTurn.id });
+      await ensureIndexed(memory, 'fiction', longRecord.indexing, { waitForVectors: true, recordIds: longRecord.records });
+      const longOffer = await memory.beginLinks('fiction', longTurn.id, ['fiction-long-record']);
+      if (!longOffer.packet.sources.some(row => row.trigger && row.text === longText.slice(labels.spans[0].start, labels.spans[0].end))) throw new Error('chunk_offer_invalid');
+      await memory.cancelLinks(longOffer.token);
       const snapshot = await docker.snapshot({ driver, scope: 'fiction', filename: `baseline-${runId}.json` });
       return { retained: stored.retained, indexing: stored.indexing?.status, recall_status: recalled.status,
         returned: recalled.bundles?.length ?? 0, derived_returned: derived.length,
         evidence_resolved: resolved.text === 'The amber fictional key requires rotation.', link_status: linked.status,
-        atomic_new_status: atomicResult.status, atomic_prior_status: priorResult.status, snapshot, relay_calls: relayCalls };
+        atomic_new_status: atomicResult.status, atomic_prior_status: priorResult.status, long_chunk_labels: labels.spans.length, snapshot, relay_calls: relayCalls };
     } });
   if (result.status !== 'complete' || result.result?.retained !== true || result.result.indexing !== 'ready'
     || result.result.returned < 1 || result.result.derived_returned < 1 || result.result.evidence_resolved !== true

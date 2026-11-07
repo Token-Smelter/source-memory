@@ -61,12 +61,9 @@ for (const fixture of fictionalCoverage().value.cases.filter(row => row.entries 
   });
 }
 
-test('long eligible evidence is offered in Unicode-safe bounded labels rather than silently dropped', async () => {
-  const records = [];
+test('an oversized retained chunk cannot be cited by inventing smaller offsets', () => {
   const text = `${'x'.repeat(7999)}😀${'y'.repeat(8100)}`;
-  const tools = createTurnTools({ scope: 'fiction', turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text }] },
-    receipt: { id: 'turn' }, memory: { async enrich(_scope, payload) { records.push(payload.records[0]); } } });
-  const labels = tools.labels();
-  await tools.record('observation', 'Fictional observation', labels.map(row => row.ref));
-  assert.deepEqual([labels.map(row => row.text).join(''), records[0].evidence.map(span => text.slice(span.start, span.end)).join('')], [text, text]);
+  assert.throws(() => createTurnTools({ scope: 'fiction', turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text }] },
+    receipt: { id: 'turn' }, sourceChunks: [{ entry_id: 'u', start: 0, end: text.length, ordinal: 0 }],
+    memory: { async enrich() {} } }), /evidence_chunk_invalid/);
 });
