@@ -48,7 +48,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
       breakpoint = addHistoryBreakpoint(event.payload);
       return event.payload;
     });
-    const register = (name, description, properties, action, required) => api.registerTool({ name, label: name, description,
+    const register = (name, description, properties, action, required) => api.registerTool({ name, label: name, description, executionMode: 'sequential',
       parameters: object(properties, required), async execute(_id, args) {
         if (!currentTools) throw fail('tool_unavailable');
         try { return toolResult(await action(currentTools, args)); }
