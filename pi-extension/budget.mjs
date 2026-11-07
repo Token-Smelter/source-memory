@@ -53,7 +53,8 @@ export function boundPiRuntime(runtime, budget) {
   return new Proxy(runtime, {
     get(target, key) {
       if (key === 'streamSimple') return (model, ...args) => {
-        budget.beforeCall();
+        try { budget.beforeCall(); }
+        catch (error) { error.dispatch_prevented = true; throw error; }
         return target.streamSimple(model, ...args);
       };
       const value = Reflect.get(target, key, target);

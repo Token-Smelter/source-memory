@@ -17,7 +17,9 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
       || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
-      || !['structured-submission-format-only', 'deferred-bounded-indexing-only'].includes(resume.transition)
+      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only'].includes(resume.transition)
+      || (resume.ledgerReconciliationSha256s !== undefined && (!Array.isArray(resume.ledgerReconciliationSha256s)
+        || resume.ledgerReconciliationSha256s.some(value => !/^[a-f0-9]{64}$/.test(value))))
       || typeof resume.cursor !== 'string' || !resume.cursor || typeof resume.priorRunId !== 'string' || !resume.priorRunId))) throw fail('pilot_plan_invalid');
   const scopes = cases[0].publicCase.readScopes;
   if (!Array.isArray(scopes) || !scopes.length || cases.some(row => hash(row.publicCase.readScopes) !== hash(scopes)

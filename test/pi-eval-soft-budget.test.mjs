@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
+import { boundPiRuntime, createInputBudget } from '../pi-extension/budget.mjs';
 
 async function withBudget(action) {
   const directory = mkdtempSync(join(tmpdir(), 'pi-soft-budget-'));
@@ -29,6 +30,16 @@ test('soft ledger enforces one in-flight call and records SDK usage without cach
   await new Promise(resolve => setImmediate(resolve));
   const result = readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse).at(-1);
   assert.deepEqual([budget.state().spent_nano, result.api_equivalent_nano, result.usage.inclusion], ['11', '11', 'Pi Anthropic input excludes cache classes']);
+}));
+
+test('a locally prevented input-limit dispatch is typed as not sent', () => withBudget(async (budget, path) => {
+  let upstream = 0;
+  const input = createInputBudget(1);
+  input.beforeCall(); input.record({ input: 1, cacheRead: 0, cacheWrite: 0 });
+  const runtime = budget.wrap(boundPiRuntime({ streamSimple() { upstream++; } }, input), metadata);
+  assert.throws(() => runtime.streamSimple(model, { messages: [] }), /input_budget_exhausted/);
+  const result = readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse).at(-1);
+  assert.deepEqual([upstream, result.outcome, result.reason, budget.state().stopped], [0, 'not_sent', 'input_budget_exhausted', 'input_budget_exhausted']);
 }));
 
 test('unknown received usage stops further admission', () => withBudget(async budget => {

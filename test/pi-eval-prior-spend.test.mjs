@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
 
 const line = value => JSON.stringify(value);
@@ -13,4 +14,23 @@ test('a completed prior ledger is included in the next soft reservation', () => 
 
 test('an unknown prior effect cannot be hidden by starting a fresh ledger', () => {
   assert.throws(() => priorSoftSpend(known.replace('"outcome":"received"', '"outcome":"unknown"')), /prior_ledger_unresolved/);
+});
+
+test('a pinned local pre-dispatch reconciliation preserves known prior spend', () => {
+  const ledger = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ type: 'started', id: 1 }),
+    line({ type: 'result', id: 1, outcome: 'received', stop: null, api_equivalent_nano: '23' }), line({ type: 'started', id: 2 }),
+    line({ type: 'result', id: 2, outcome: 'unknown', stop: 'dispatch_unknown' }),
+    line({ type: 'close', in_flight: false, stopped: 'dispatch_unknown', calls_started: 2, spent_nano: '23' })].join('\n');
+  const receipt = { schema: 'soft-ledger-reconciliation/v1', ledger_sha256: createHash('sha256').update(ledger).digest('hex'),
+    call_id: 2, decision: 'not_sent', reported_error: 'input_budget_exhausted', additional_upstream_request: false,
+    transcript_row_sha256: 'a'.repeat(64), budget_code_sha256: 'b'.repeat(64), gateway_correlation_sha256: 'c'.repeat(64) };
+  assert.equal(priorSoftSpend(ledger, { reconciliations: [receipt] }), '23');
+  assert.throws(() => priorSoftSpend(ledger, { reconciliations: [{ ...receipt, ledger_sha256: 'd'.repeat(64) }] }), /prior_ledger_unresolved/);
+});
+
+test('a typed pre-dispatch stop requires no fabricated usage', () => {
+  const ledger = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ type: 'started', id: 1 }),
+    line({ type: 'result', id: 1, outcome: 'not_sent', reason: 'input_budget_exhausted', stop: 'input_budget_exhausted', provenance: 'bound-runtime-pre-dispatch' }),
+    line({ type: 'close', in_flight: false, stopped: 'input_budget_exhausted', calls_started: 1, spent_nano: '0' })].join('\n');
+  assert.equal(priorSoftSpend(ledger), '0');
 });

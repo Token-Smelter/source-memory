@@ -5,7 +5,7 @@ const clean = new Set(['committed', 'abstained', 'ineligible_by_policy']);
 
 /** Check the immutable prefix and a reconciled gap before restoring any data. */
 export function validatePilotResume({ report, seal, currentSeal, progress, journal, checkpoints, cases, cursor, snapshotSha256, journalSha256,
-  sourceSha256, datasetSha256, priorLedgerSha256s }) {
+  sourceSha256, datasetSha256, priorLedgerSha256s, reconciliationSha256s = [] }) {
   if (!report || report.status !== 'failed_or_partial' || !Array.isArray(progress) || !Array.isArray(checkpoints) || !Array.isArray(cases)
     || !journal || !/^[a-f0-9]{64}$/.test(snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(journalSha256 ?? '')
     || !Array.isArray(priorLedgerSha256s)) throw fail('resume_invalid');
@@ -18,7 +18,8 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
     || current.resume?.priorRunId !== report.run_id || current.resume?.priorSealDigest !== seal.digest
     || current.resume?.priorCodeSha !== original.codeSha || current.resume?.cursor !== cursor
     || current.resume?.snapshotSha256 !== snapshotSha256 || current.resume?.journalSha256 !== journalSha256
-    || !['structured-submission-format-only', 'deferred-bounded-indexing-only'].includes(current.resume?.transition)) throw fail('resume_treatment_mismatch');
+    || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only'].includes(current.resume?.transition)
+    || hash(current.resume?.ledgerReconciliationSha256s ?? []) !== hash(reconciliationSha256s)) throw fail('resume_treatment_mismatch');
   if (original.sourceSha256 !== sourceSha256 || original.datasetSha256 !== datasetSha256
     || report.artifacts?.source_snapshot?.sha256 !== sourceSha256
     || !priorLedgerSha256s.includes(report.artifacts?.['ledger.jsonl']?.sha256)) throw fail('resume_provenance_mismatch');
@@ -43,5 +44,5 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   if (gap.status !== 'ready' && (gap.status !== 'failed' || gap.cursor !== cursor || gap.through !== checkpoints[index + 1].id)) throw fail('resume_gap_mismatch');
   return { priorRunId: report.run_id, priorSealDigest: seal.digest, priorCodeSha: original.codeSha,
     cursor, snapshotSha256, journalSha256, retryFirst: gap.status === 'failed', prefixCount: index + 1,
-    transition: current.resume.transition };
+    transition: current.resume.transition, ledgerReconciliationSha256s: [...reconciliationSha256s] };
 }

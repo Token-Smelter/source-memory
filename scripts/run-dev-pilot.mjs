@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { digest } from '../src/core.mjs';
 import { verifyChronologicalCheckpoint } from '../pi-extension/chronology.mjs';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
+import { createInputBudget } from '../pi-extension/budget.mjs';
 import { createImageArchive } from '../pi-extension/image-archive.mjs';
 import { ensureIndexed } from '../pi-extension/index-readiness.mjs';
 import { createDerivedAdapter } from '../pi-extension/derived-retrieval.mjs';
@@ -152,7 +153,18 @@ async function main() {
     try { priorLedgers = JSON.parse(process.env.PILOT_PRIOR_LEDGERS); } catch { throw fail('prior_ledger_invalid'); }
   }
   if (!Array.isArray(priorLedgers) || new Set(priorLedgers.map(row => row?.sha256)).size !== priorLedgers.length) throw fail('prior_ledger_invalid');
-  const previous = priorLedgers.reduce((sum, row) => sum + BigInt(priorSoftSpend(pinned(row.path, row.sha256, 10_000_000).toString('utf8'))), 0n);
+  const previous = priorLedgers.reduce((sum, row) => {
+    if (Boolean(row.reconciliationPath) !== Boolean(row.reconciliationSha256)) throw fail('prior_ledger_invalid');
+    const reconciliations = [];
+    if (row.reconciliationPath) {
+      if (dirname(row.reconciliationPath) !== dirname(row.path)) throw fail('prior_ledger_invalid');
+      const receipt = JSON.parse(pinned(row.reconciliationPath, row.reconciliationSha256, 100000).toString('utf8'));
+      if (dirname(receipt.gateway_correlation_path ?? '') !== dirname(row.path)) throw fail('prior_ledger_invalid');
+      pinned(receipt.gateway_correlation_path, receipt.gateway_correlation_sha256, 100000);
+      reconciliations.push(receipt);
+    }
+    return sum + BigInt(priorSoftSpend(pinned(row.path, row.sha256, 10_000_000).toString('utf8'), { reconciliations }));
+  }, 0n);
   let resume = null;
   if (process.env.PILOT_RESUME) {
     let request;
@@ -172,7 +184,7 @@ async function main() {
     const progress = progressBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
     const plan = { priorRunId: report.run_id, priorSealDigest: priorSeal.digest, priorCodeSha: priorSeal.spec?.codeSha,
       cursor: request.cursor, snapshotSha256: request.snapshotSha256, journalSha256: request.journalSha256,
-      transition: request.transition };
+      transition: request.transition, ledgerReconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean) };
     resume = { report, priorSeal, progress, journalBytes, snapshotBytes, plan };
   }
   const remaining = 100000000000n - previous;
@@ -193,7 +205,8 @@ async function main() {
     try {
       resumeValidation = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal: priorJournal,
         checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
-        sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256) });
+        sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
+        reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean) });
     } finally { priorJournal.close(); }
   }
   writePrivate(join(driverDir, 'config.json'), { neo4j: { uri: 'bolt://127.0.0.1:7687', auth: 'none' }, scopes: { read: [scope], write: [scope] },
@@ -221,7 +234,8 @@ async function main() {
         models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
         routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
         budget: { overall_effort_soft_usd: 250, share_soft_usd: 100, prior_spend_nano: previous.toString(),
-          remaining_soft_nano: remaining.toString(), prior_ledger_sha256s: priorLedgers.map(row => row.sha256), one_call_in_flight: true, stop_unknown_usage: true,
+          remaining_soft_nano: remaining.toString(), prior_ledger_sha256s: priorLedgers.map(row => row.sha256),
+          prior_reconciliation_sha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), one_call_in_flight: true, stop_unknown_usage: true,
           stop_above_twice_estimate: true, gateway_attempt_ledger: 'partial: gateway-internal failover/retry attempts not correlatable', rate_card: routeRates },
         checkpoints: checkpoints.length, cases: prepared.length, resume: resumeValidation ? { ...resumeValidation, restore: 'pending' } : null,
         isolation: { network_mode: isolation.network_mode,
@@ -255,7 +269,8 @@ async function main() {
         if (resume) {
           const current = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal,
             checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
-            sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256) });
+            sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
+            reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean) });
           if (JSON.stringify(current) !== JSON.stringify(resumeValidation)) throw fail('resume_provenance_mismatch');
           const output = execFileSync('/usr/bin/docker', ['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/restore-scope.mjs',
             '/scratch/resume-snapshot.json', resume.plan.snapshotSha256, scope], { encoding: 'utf8', timeout: 180000, maxBuffer: 100000 });
@@ -278,6 +293,7 @@ async function main() {
         }
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
+          budget: createInputBudget(Number.MAX_SAFE_INTEGER),
           imageArchive: createImageArchive({ directory: imageDir }),
           ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state,
             { waitForVectors: true, batchLimit: 16, maxRounds: 128, maxIndexRetries: 2, ...options }),

@@ -110,8 +110,10 @@ export function createSoftBudget({ path, capNano, routes, sessionKey, sealSha256
               }).catch(() => { stopped = 'ledger_write_unknown'; });
               return stream;
             } catch (error) {
-              stopped = 'dispatch_unknown';
-              record({ type: 'result', id, outcome: 'unknown', usage: null, provider_charge: null, stop: stopped, at: new Date().toISOString() });
+              const prevented = error?.dispatch_prevented === true && ['input_budget_exhausted', 'input_budget_unknown'].includes(error.code);
+              stopped = prevented ? error.code : 'dispatch_unknown';
+              record({ type: 'result', id, outcome: prevented ? 'not_sent' : 'unknown', usage: null, provider_charge: null,
+                ...(prevented ? { reason: error.code, provenance: 'bound-runtime-pre-dispatch' } : {}), stop: stopped, at: new Date().toISOString() });
               active = null;
               throw error;
             }
