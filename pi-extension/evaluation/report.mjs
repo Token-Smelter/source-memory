@@ -45,8 +45,18 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies, provena
     const origin = origins.get(row.sealDigest);
     const handedBack = row.sealDigest === seal.digest || s.resume?.caseHandbacks?.some(item => item.caseId === row.caseId
       && item.sourceSealDigest === row.sealDigest && item.sourceCodeSha === origin?.codeSha);
+    const partial = s.resume?.partialCaseHandback;
+    const validArm = arm => {
+      const score = row.arms[arm], armOrigin = origins.get(score.sealDigest);
+      if (!armOrigin || score.packetDigest !== row.packetDigest || armOrigin.packets[row.caseId] !== row.packetDigest) return false;
+      if (score.sealDigest === row.sealDigest) return true;
+      if (!partial || partial.caseId !== row.caseId || partial.sourceSealDigest !== score.sealDigest || partial.sourceCodeSha !== armOrigin.codeSha) return false;
+      if (arm === 'candidate') return hash(score) === partial.candidateScoreSha256;
+      return arm === 'baseline' && row.repair?.arm === 'baseline' && row.repair?.format === partial.repairFormat
+        && row.repair?.repairSealDigest === seal.digest;
+    };
     if (!origin || !handedBack || !s.packets[row.caseId] || row.packetDigest !== s.packets[row.caseId] || row.packetDigest !== origin.packets[row.caseId]
-      || armNames.some(arm => row.arms[arm].sealDigest !== row.sealDigest || row.arms[arm].packetDigest !== row.packetDigest)) throw fail('packet_seal_mismatch');
+      || armNames.some(arm => !validArm(arm))) throw fail('packet_seal_mismatch');
     ids.add(row.caseId);
     root(row.sessions[0]);
     for (const id of row.sessions.slice(1)) union(row.sessions[0], id);
@@ -96,10 +106,11 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies, provena
     const rate = cases / rows.length, ceiling = s.safety[key];
     return [key, { cases, denominator: rows.length, rate, ceiling, uncertainCases: uncertain, passes: rate > ceiling ? false : uncertain ? null : true }];
   }));
-  const usedSeals = [...new Set(rows.map(row => row.sealDigest))];
+  const usedSeals = [...new Set(rows.flatMap(row => [row.sealDigest, ...Object.values(row.arms).map(score => score.sealDigest)]))];
   return { sealDigest: usedSeals.length === 1 ? usedSeals[0] : null,
     ...(usedSeals.length > 1 ? { provenance: { currentSealDigest: seal.digest, sourceSealDigests: usedSeals, mixedCandidateCode: true,
-      mixedAnswererFormat: usedSeals.some(id => hash(origins.get(id).answerer) !== hash(s.answerer)), interpretation: s.interpretation ?? null,
-      limitation: 'Cases were scored under compatible evaluator seals after recorded candidate-method, answerer-format or interpretation transitions.' } } : {}), cases: rows.length, clusters: clusters.length,
+      mixedAnswererFormat: usedSeals.some(id => hash(origins.get(id).answerer) !== hash(s.answerer)),
+      specificScorerRepair: rows.some(row => row.repair?.format === 'scorer-r2-v3-specific-repair'), interpretation: s.interpretation ?? null,
+      limitation: 'Cases were scored under compatible evaluator seals after recorded candidate-method, answerer-format, repair or interpretation transitions.' } } : {}), cases: rows.length, clusters: clusters.length,
     clusterCases: clusters.map(group => group.map(row => row.caseId)), pairedDelta: paired.candidate, deltas: paired, sensitivity, confidence, safety };
 }

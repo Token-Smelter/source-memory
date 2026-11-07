@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiAnswererResponder, createPiScorerJudge, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
+import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
 import { createSingleFlightGate, wrapPiRuntime } from '../pi-extension/evaluation/pi-wrapper.mjs';
 import { fictionalModel } from '../pi-extension/evaluation/fictional.mjs';
 
@@ -77,6 +77,31 @@ test('scorer refuses a second invalid judgment rather than fabricating a score',
   const judge = createPiScorerJudge({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });
   await assert.rejects(judge({ packet: { caseId: 'fiction' }, answer: { text: 'answer' }, trace: {},
     scorer: { route: 'fiction', model: 'one', reasoning: 'low', instructions: 'Grade.' }, rubric: {}, packetSchema: {} }), /scorer_output_invalid/);
+});
+
+test('specific scorer repair makes one call bound to the offending clause', async () => {
+  const clause = { id: 'fiction-clause', text: 'fiction', requirementIds: [], sourceIds: [], action: true,
+    judgments: { support: 'pass', authority: 'pass', scope: 'pass', time: 'pass', uncertainty: 'pass' }, alternative: null, relation: null };
+  const previousMessage = message([{ type: 'toolCall', id: 'old', name: 'submit_score', arguments: { clauses: [clause] } }], 'toolUse');
+  const repaired = structuredClone(clause); repaired.judgments.support = 'uncertain';
+  const fake = fakeMetered([message([{ type: 'toolCall', id: 'new', name: 'submit_score', arguments: { clauses: [repaired] } }], 'toolUse')]);
+  const judge = createPiScorerSpecificRepair({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });
+  const result = await judge({ packet: {}, answer: { text: 'fiction' }, trace: {}, scorer: { route: 'fiction', model: 'one', instructions: 'Grade.' },
+    rubric: {}, packetSchema: {}, previousMessage, clauseId: clause.id, validate() {} });
+  assert.deepEqual([result.clauses[0].judgments.support, fake.calls.length, fake.calls[0].context.messages.at(-1).content.includes('fiction-clause')],
+    ['uncertain', 1, true]);
+});
+
+test('specific scorer repair does not silently correct a still-invalid judgment', async () => {
+  const clause = { id: 'fiction-clause', text: 'fiction', requirementIds: [], sourceIds: [], action: true,
+    judgments: { support: 'pass', authority: 'pass', scope: 'pass', time: 'pass', uncertainty: 'pass' }, alternative: null, relation: null };
+  const previousMessage = message([{ type: 'toolCall', id: 'old', name: 'submit_score', arguments: { clauses: [clause] } }], 'toolUse');
+  const fake = fakeMetered([message([{ type: 'toolCall', id: 'new', name: 'submit_score', arguments: { clauses: [clause] } }], 'toolUse')]);
+  const judge = createPiScorerSpecificRepair({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });
+  await assert.rejects(judge({ packet: {}, answer: { text: 'fiction' }, trace: {}, scorer: { route: 'fiction', model: 'one', instructions: 'Grade.' },
+    rubric: {}, packetSchema: {}, previousMessage, clauseId: clause.id,
+    validate() { throw Object.assign(new Error('judgment_invalid'), { code: 'judgment_invalid' }); } }), /scorer_output_invalid/);
+  assert.equal(fake.calls.length, 1);
 });
 
 test('shared Pi gate prevents parallel calls and remains closed on unknown usage', async () => {

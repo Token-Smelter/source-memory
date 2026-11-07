@@ -23,6 +23,7 @@ export const ANSWERER_BUDGET_SUFFIX = ' If the item budget is exhausted, answer 
 export const SCORER_FORMAT_SUFFIX = ' Submit the complete judgment with the submit_score tool.';
 export const ANSWERER_REPAIR = 'The previous output was not a valid final submission. Call submit_answer with the complete answer; do not change its substance merely to fix formatting.';
 export const SCORER_REPAIR = 'The previous submission was invalid. Call submit_score with the complete judgment matching the schema and supplied IDs; retain substantive judgments unless correction is required for validity.';
+export const SCORER_SPECIFIC_REPAIR = 'For clause {clause_id}: support=pass requires at least one packet source ID; if no packet source supports the clause, choose fail or uncertain. Submit the complete judgment with submit_score.';
 
 export function answererBudgetFormatCompatible(previous, current) {
   if (previous?.version !== 'answerer-r2-v2' || previous.tools_sha256 !== ANSWERER_TOOLS_V2_SHA256
@@ -117,6 +118,36 @@ export function createPiAnswererResponder({ runtime, model, sessionId, expectedT
       }
     }
     throw fail('model_call_limit');
+  };
+}
+
+/** Re-score a retained answer with one specific rule-only correction request. */
+export function createPiScorerSpecificRepair({ runtime, model, sessionId, outputTokens, onRaw = async () => {} }) {
+  check({ runtime, model, sessionId });
+  if (!Number.isSafeInteger(outputTokens) || outputTokens < 1 || typeof onRaw !== 'function') throw fail('scorer_invalid');
+  return async ({ packet, answer, trace, scorer, rubric, packetSchema, validate, previousMessage, clauseId }) => {
+    if (scorer?.route !== model.provider || scorer?.model !== model.id || typeof scorer.instructions !== 'string'
+      || typeof clauseId !== 'string' || !clauseId || clauseId.length > 256 || !Array.isArray(previousMessage?.content)) throw fail('scorer_invalid');
+    const calls = previousMessage.content.filter(part => part.type === 'toolCall');
+    const prior = calls.length === 1 && calls[0].name === 'submit_score' ? calls[0] : null;
+    const invalid = prior?.arguments?.clauses?.filter(row => row.id === clauseId && row.judgments?.support === 'pass'
+      && Array.isArray(row.sourceIds) && row.sourceIds.length === 0) ?? [];
+    if (invalid.length !== 1) throw fail('scorer_repair_unbound');
+    const previous = structuredClone(previousMessage);
+    const instruction = SCORER_SPECIFIC_REPAIR.replace('{clause_id}', JSON.stringify(clauseId));
+    const context = { systemPrompt: scorer.instructions, tools: SCORER_TOOLS, messages: [
+      { role: 'user', content: JSON.stringify({ packet, answer, trace, rubric, packet_schema: packetSchema }), timestamp: Date.now() },
+      previous, toolResult(prior, { error: 'invalid_submission' }, true), { role: 'user', content: instruction, timestamp: Date.now() }] };
+    const message = await call(runtime, model, context, { maxTokens: outputTokens, reasoning: scorer.reasoning, maxRetries: 0, sessionId }, onRaw,
+      { role: 'scorer', attempt: 1, repair: 'specific-rule' });
+    const submitted = message.content.filter(part => part.type === 'toolCall');
+    if (message.stopReason !== 'toolUse' || submitted.length !== 1 || submitted[0].name !== 'submit_score' || !validScore(submitted[0].arguments)) throw fail('scorer_output_invalid');
+    try { if (typeof validate === 'function') validate(submitted[0].arguments); }
+    catch (error) {
+      if (!['judgment_invalid', 'alternative_unlinked', 'relation_invalid', 'relation_trace_missing'].includes(error?.code)) throw error;
+      throw fail('scorer_output_invalid');
+    }
+    return submitted[0].arguments;
   };
 }
 

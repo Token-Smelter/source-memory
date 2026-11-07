@@ -18,14 +18,14 @@ import { openDockerMemory } from '../pi-extension/docker-memory.mjs';
 import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runtime.mjs';
 import { createAnswerer } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases } from '../pi-extension/evaluation/dev-dataset.mjs';
-import { createPiAnswererResponder, createPiScorerJudge, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
+import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_TOOLS_SHA256, SCORER_SPECIFIC_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
 import { createPilotPlan, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
-import { validateCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
+import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
 import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
-import { createScorer } from '../pi-extension/evaluation/scorer.mjs';
+import { createScorer, scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -174,7 +174,9 @@ async function main() {
     if (!request || typeof request !== 'object' || Array.isArray(request)) throw fail('resume_invalid');
     const report = JSON.parse(pinned(request.reportPath, request.reportSha256, 10_000_000).toString('utf8'));
     const priorDir = dirname(request.reportPath);
-    const checkpointMatch = report.artifacts?.checkpoint_snapshots?.some(row => row.through === request.cursor && row.sha256 === request.snapshotSha256);
+    const checkpointMatch = report.artifacts?.checkpoint_snapshots?.some(row => row.through === request.cursor
+      && (row.sha256 === request.snapshotSha256 || (report.resume_restore?.equivalent === true
+        && report.resume_restore.source_sha256 === row.sha256 && report.resume_restore.restored_sha256 === request.snapshotSha256)));
     const snapshotPathMatch = report.artifacts?.checkpoint_snapshots?.some(row => row.through === request.cursor && row.path === request.snapshotPath && row.sha256 === request.snapshotSha256)
       || report.artifacts?.case_snapshots?.some(row => row.path === request.snapshotPath && row.sha256 === request.snapshotSha256
         && prepared.some(item => item.through === request.cursor && item.publicCase.id === row.case_id));
@@ -232,29 +234,40 @@ async function main() {
       cursor: request.cursor, snapshotSha256: request.snapshotSha256, journalSha256: request.journalSha256,
       transition: request.transition, ledgerReconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean),
       caseHandbacks: handbacks, ...(driftBytes ? { sourceTreeDriftSha256: driftSha } : {}) };
-    let superseded = null;
+    let superseded = null, partialCase = null;
     const pendingCases = prepared.filter(item => item.through === request.cursor && !completedCases.includes(item));
     if (pendingCases.length) {
       const priorResults = report.artifacts?.['case-results.jsonl'];
       const resultBytes = pinned(priorResults?.path, priorResults?.sha256, 20_000_000);
       const priorRows = resultBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
-      if (priorRows.some(row => pendingCases.some(item => item.publicCase.id === row.case_id))) throw fail('resume_partial_case_unsupported');
       const priorLedger = report.artifacts?.['ledger.jsonl'];
       const ledgerRows = pinned(priorLedger?.path, priorLedger?.sha256, 20_000_000).toString('utf8').trimEnd().split('\n').map(JSON.parse);
-      const calls = ledgerRows.filter(row => row.type === 'started' && row.checkpoint === request.cursor && ['answerer', 'scorer'].includes(row.purpose))
-        .map(row => ({ id: row.id, purpose: row.purpose, arm: row.arm, context_sha256: row.context_sha256, at: row.at }));
       const priorOutputs = report.artifacts?.['model-outputs.jsonl'];
-      const outputAvailable = Boolean(priorOutputs && calls.length && calls.every(call => {
-        const rows = pinned(priorOutputs.path, priorOutputs.sha256, 128_000_000).toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
-        return rows.some(row => row.id === call.id && row.message);
-      }));
-      superseded = { schema: 'superseded-case-attempt/v1', prior_run_id: report.run_id, case_ids: pendingCases.map(item => item.publicCase.id),
-        pre_answer_snapshot_sha256: request.snapshotSha256, prior_ledger_sha256: priorLedger.sha256, calls,
-        status: 'superseded', output_available: outputAvailable,
-        ...(outputAvailable ? { prior_output_path: priorOutputs.path, prior_output_sha256: priorOutputs.sha256 }
-          : { limitation: 'The earlier harness did not persist answer or scorer raw outputs.' }) };
+      const outputBytes = priorOutputs ? pinned(priorOutputs.path, priorOutputs.sha256, 128_000_000) : null;
+      const outputRows = outputBytes ? outputBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse) : [];
+      if (priorRows.some(row => pendingCases.some(item => item.publicCase.id === row.case_id))) {
+        if (pendingCases.length !== 1 || request.transition !== 'specific-scorer-repair-and-arm-handback') throw fail('resume_partial_case_unsupported');
+        partialCase = validatePartialCaseHandback({ report, reportSha256: request.reportSha256, seal: priorSeal,
+          resultRows: priorRows, outputRows, ledgerRows, item: pendingCases[0] });
+        if (partialCase.descriptor.snapshotSha256 !== request.snapshotSha256) throw fail('handback_snapshot_invalid');
+        plan.partialCaseHandback = partialCase.descriptor;
+        plan.specificScorerRepair = { instruction: SCORER_SPECIFIC_REPAIR, maxCalls: 1, format: 'scorer-r2-v3-specific-repair' };
+        carriedRows.push(partialCase.candidateAnswer, partialCase.candidateJudgment, partialCase.baselineAnswer);
+        if (!originSeals.some(row => row.digest === priorSeal.digest)) originSeals.push(priorSeal);
+        if (!originBundles.has(request.reportSha256)) originBundles.set(request.reportSha256,
+          { sealBytes: pinned(request.sealPath, request.sealSha256, 10_000_000), resultsBytes: resultBytes, outputsBytes: outputBytes });
+      } else {
+        const calls = ledgerRows.filter(row => row.type === 'started' && row.checkpoint === request.cursor && ['answerer', 'scorer'].includes(row.purpose))
+          .map(row => ({ id: row.id, purpose: row.purpose, arm: row.arm, context_sha256: row.context_sha256, at: row.at }));
+        const outputAvailable = Boolean(priorOutputs && calls.length && calls.every(call => outputRows.some(row => row.id === call.id && row.message)));
+        superseded = { schema: 'superseded-case-attempt/v1', prior_run_id: report.run_id, case_ids: pendingCases.map(item => item.publicCase.id),
+          pre_answer_snapshot_sha256: request.snapshotSha256, prior_ledger_sha256: priorLedger.sha256, calls,
+          status: 'superseded', output_available: outputAvailable,
+          ...(outputAvailable ? { prior_output_path: priorOutputs.path, prior_output_sha256: priorOutputs.sha256 }
+            : { limitation: 'The earlier harness did not persist answer or scorer raw outputs.' }) };
+      }
     }
-    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, driftBytes, plan, superseded,
+    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, driftBytes, plan, superseded, partialCase,
       handbacks, handbackRows, carriedRows, carriedSnapshots, originSeals, carriedCases, originBundles };
   }
   const remaining = 100000000000n - previous;
@@ -273,6 +286,7 @@ async function main() {
   let resumeValidation = null;
   if (resume) {
     if (resume.superseded) writePrivate(join(dir, 'superseded-case-attempt.json'), resume.superseded);
+    if (resume.partialCase) writePrivate(join(dir, 'partial-case-handback.json'), { schema: 'partial-case-handback/v1', ...resume.partialCase.descriptor });
     if (resume.driftBytes) writePrivate(join(dir, 'prior-source-tree-drift.json'), resume.driftBytes);
     if (resume.carriedCases.length) {
       const copies = [];
@@ -292,7 +306,7 @@ async function main() {
         checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
         sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
         reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks,
-        sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
+        partialCaseHandback: resume.partialCase?.descriptor ?? null, sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
     } finally { priorJournal.close(); }
   }
   writePrivate(join(driverDir, 'config.json'), { neo4j: { uri: 'bolt://127.0.0.1:7687', auth: 'none' }, scopes: { read: [scope], write: [scope] },
@@ -306,7 +320,7 @@ async function main() {
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
     routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => rawOutputs.append(row) });
   let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v4', policy_version: seal.spec.policyVersion };
-  let journal, sequenceResult, snapshot, resumeRestore, failure = null;
+  let journal, sequenceResult, snapshot, resumeRestore, partialCaseResult = null, failure = null;
   const reportRows = resume ? [...resume.handbackRows] : [],
     caseSnapshots = Object.fromEntries((resume?.carriedSnapshots ?? []).map(row => [row.case_id, row])), checkpointSnapshots = {};
   const imageHashes = { database: image('neo4j:5.26.14-community'), driver: image('node:22-bookworm-slim') };
@@ -359,7 +373,7 @@ async function main() {
             checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
             sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
             reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks,
-            sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
+            partialCaseHandback: resume.partialCase?.descriptor ?? null, sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
           if (JSON.stringify(current) !== JSON.stringify(resumeValidation)) throw fail('resume_provenance_mismatch');
           const output = execFileSync('/usr/bin/docker', ['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/restore-scope.mjs',
             '/scratch/resume-snapshot.json', resume.plan.snapshotSha256, scope], { encoding: 'utf8', timeout: 180000, maxBuffer: 100000 });
@@ -429,8 +443,30 @@ async function main() {
               const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: adapter, archive, respond });
               const judge = createPiScorerJudge({ runtime: evaluatorRuntime, model: reviewerModel, sessionId: `score-${runId}-${item.publicCase.id}`, outputTokens: 4096 });
               const scorer = createScorer({ seal, expectedDigest: seal.digest, judge });
-              const arms = {};
+              const partial = resume?.partialCase?.descriptor.caseId === item.publicCase.id ? resume.partialCase : null;
+              const arms = {}, failedArms = [];
               for (const arm of ['candidate', 'baseline', 'empty', 'raw-only']) {
+                if (partial && arm === 'candidate') { arms.candidate = partial.candidateJudgment.score; continue; }
+                if (partial && arm === 'baseline') {
+                  const oldAnswer = partial.baselineAnswer.answer;
+                  const repair = createPiScorerSpecificRepair({ runtime: evaluatorRuntime, model: reviewerModel,
+                    sessionId: `score-repair-${runId}-${item.publicCase.id}`, outputTokens: 4096 });
+                  const priorScorer = createScorer({ seal: resume.priorSeal, expectedDigest: resume.priorSeal.digest,
+                    judge: request => repair({ ...request, previousMessage: partial.previousMessage, clauseId: partial.clauseId }) });
+                  meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: 'scorer-r2-v3-specific-repair', policy_version: seal.spec.policyVersion };
+                  try {
+                    const judged = await priorScorer.score({ packet: item.packet, answer: oldAnswer.answer, trace: oldAnswer.trace });
+                    arms.baseline = judged.score;
+                    results.append({ type: 'judgment', case_id: item.publicCase.id, arm, judgment: judged.judgment, score: judged.score,
+                      repair: { format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest } });
+                  } catch (error) {
+                    if (error?.code !== 'scorer_output_invalid') throw error;
+                    failedArms.push(arm);
+                    results.append({ type: 'scorer_failed', case_id: item.publicCase.id, arm,
+                      reason: 'specific_repair_still_invalid', repairSealDigest: seal.digest });
+                  }
+                  continue;
+                }
                 meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: 'answerer-r2-v3', policy_version: seal.spec.policyVersion };
                 const answer = await answerer.run({ arm, case: item.publicCase });
                 results.append({ type: 'answer', case_id: item.publicCase.id, arm, answer });
@@ -439,12 +475,18 @@ async function main() {
                 arms[arm] = judged.score;
                 results.append({ type: 'judgment', case_id: item.publicCase.id, arm, judgment: judged.judgment, score: judged.score });
               }
-              reportRows.push({ caseId: item.publicCase.id, sessions: [sourceKey], sealDigest: seal.digest, packetDigest: arms.candidate.packetDigest, arms });
+              if (failedArms.length) {
+                partialCaseResult = { case_id: item.publicCase.id, status: 'partial', failed_arms: failedArms, arms,
+                  source_snapshot_sha256: partial?.descriptor.snapshotSha256 ?? null };
+                return { case_id: item.publicCase.id, status: 'partial', failed_arms: failedArms, reference: 'pending_reference_freeze', snapshot: caseSnapshots[item.publicCase.id] };
+              }
+              reportRows.push({ caseId: item.publicCase.id, sessions: [sourceKey], sealDigest: seal.digest, packetDigest: arms.candidate.packetDigest, arms,
+                ...(partial ? { repair: { arm: 'baseline', format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest } } : {}) });
               return { case_id: item.publicCase.id, status: 'scored', reference: 'pending_reference_freeze', snapshot: caseSnapshots[item.publicCase.id] };
             } finally { held.release(); }
           } });
         if (sequenceResult.failure) failure = sequenceResult.failure;
-        if (sequenceResult.status === 'complete' && source.leaf_entry_id !== sequenceResult.cursor) {
+        if (['complete', 'complete_with_partial_cases'].includes(sequenceResult.status) && source.leaf_entry_id !== sequenceResult.cursor) {
           const tail = [];
           for (let id = source.leaf_entry_id; id && id !== sequenceResult.cursor;) {
             const row = byId.get(id);
@@ -470,7 +512,8 @@ async function main() {
   try { budget.close(); } catch { failure ??= 'ledger_close_failed'; }
   for (const writer of [resources, progress, memoryLog, results, relayLog, rawOutputs]) writer.close();
   const artifactNames = ['seal.json', 'ledger.jsonl', 'progress.jsonl', 'memory-receipts.jsonl', 'case-results.jsonl', 'model-outputs.jsonl', 'resources.jsonl',
-    'isolation.json', 'embedding-relay.jsonl', 'environment.json', 'resume-restore.json', 'superseded-case-attempt.json', 'case-handback.json', 'prior-source-tree-drift.json'];
+    'isolation.json', 'embedding-relay.jsonl', 'environment.json', 'resume-restore.json', 'superseded-case-attempt.json', 'case-handback.json',
+    'partial-case-handback.json', 'prior-source-tree-drift.json'];
   const artifacts = {};
   for (const name of artifactNames) {
     try { const bytes = readFileSync(join(dir, name)); artifacts[name] = { path: join(dir, name), sha256: sha(bytes), bytes: bytes.length }; }
@@ -502,17 +545,20 @@ async function main() {
     if (`${digest}.blob` !== name) throw fail('image_archive_conflict');
     return { path, sha256: digest, bytes: bytes.length };
   });
-  const final = { status: harness.status === 'complete' && !failure && sequenceResult?.status === 'complete' ? 'partial_reference_unavailable' : 'failed_or_partial',
+  const final = { status: harness.status === 'complete' && !failure && sequenceResult?.status === 'complete' ? 'partial_reference_unavailable'
+    : harness.status === 'complete' && !failure && sequenceResult?.status === 'complete_with_partial_cases' ? 'partial_scorer_failed' : 'failed_or_partial',
     harness_status: harness.status, failure: failure ?? harness.code ?? null, resume: resumeValidation, resume_restore: resumeRestore ?? null,
     source_tree_drift: resume?.driftBytes ? { sha256: sha(resume.driftBytes), artifact: join(dir, 'prior-source-tree-drift.json'),
       limitation: 'The preceding run experienced disclosed additive source-tree drift; see the retained incident.' } : null,
+    future_scorer_instruction: { path: resolve('pi-extension/evaluation/next-round-scorer-instructions.md'),
+      sha256: sha(readFileSync('pi-extension/evaluation/next-round-scorer-instructions.md')), applies: 'future rounds; current pilot repair only' },
     coverage: sequenceResult ? { status: sequenceResult.status, scheduled: checkpoints.length,
       processed: (resumeValidation?.prefixCount ?? 0) + sequenceResult.results.length, tail: sequenceResult.tail ?? null,
       dispositions: [...(resume ? (resume.report.coverage?.dispositions ?? resume.progress.filter(row => row.type === 'checkpoint')
         .map(row => ({ through: row.through, disposition: row.disposition, code: row.code ?? null }))).slice(0, resumeValidation.prefixCount) : []),
         ...sequenceResult.results.map(row => ({ through: checkpointId(row), disposition: row.disposition, code: row.code ?? null,
           search_incomplete: row.search_incomplete ?? null, search_statuses: row.search_statuses ?? [] }))] } : null,
-    scorecard, reference: 'pending_reference_freeze',
+    scorecard, partial_case: partialCaseResult, reference: 'pending_reference_freeze',
     stage_attribution: reportRows.map(row => ({ case_id: row.caseId, status: 'pending_reference_freeze',
       reason: 'Reference catalog and candidate-trace semantic comparison have not been validated.' })),
     snapshot: snapshot ?? null, budget: { ...budget.state(), prior_spend_nano: previous.toString(),

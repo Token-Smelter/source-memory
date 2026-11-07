@@ -107,6 +107,10 @@ test('resume at an unscored case requires its exact pre-answer snapshot', () => 
     case_snapshots: [{ case_id: pending[0].publicCase.id, sha256: args.snapshotSha256 }] } };
   assert.equal(validatePilotResume({ ...args, report, cases: pending }).cursor, 'a');
   assert.throws(() => validatePilotResume({ ...args, report: { ...report, artifacts: { ...report.artifacts, case_snapshots: [] } }, cases: pending }), /resume_case_snapshot_mismatch/);
+  const changedSnapshot = '9'.repeat(64), spec = structuredClone(args.currentSeal.spec); spec.resume.snapshotSha256 = changedSnapshot;
+  const restoredReport = { ...report, resume_restore: { equivalent: true, source_sha256: args.snapshotSha256, restored_sha256: changedSnapshot },
+    artifacts: { ...report.artifacts, case_snapshots: [{ case_id: pending[0].publicCase.id, sha256: changedSnapshot }] } };
+  assert.equal(validatePilotResume({ ...args, report: restoredReport, currentSeal: sealComparison(spec), cases: pending, snapshotSha256: changedSnapshot }).cursor, 'a');
 }));
 
 test('a pending case can run from the final checkpoint without replaying source', () => fixture(async ({ journal, memory, checkpoints, args }) => {

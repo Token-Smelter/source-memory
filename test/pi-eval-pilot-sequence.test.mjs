@@ -10,6 +10,20 @@ test('failed checkpoint reporting names the attempted leaf rather than the previ
   assert.equal(checkpointId({ through: 'attempted', cursor: 'previous' }), 'attempted');
 });
 
+test('a scored source checkpoint with a failed scorer stays explicitly partial', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pi-pilot-partial-'));
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  try {
+    const memory = journal.track({ async ingest() { return { id: 'turn' }; } });
+    const session = { entries: [{ type: 'message', id: 'a', parentId: null, message: { role: 'assistant', content: 'fiction', stopReason: 'stop' } }],
+      conversation_id: 'fiction', scopes: ['private'], memory, distiller: { memory, async run() { return { status: 'complete', disposition: 'abstained' }; } } };
+    const result = await runPilotSequence({ session, journal, checkpoints: [{ id: 'a', time: '2030-01-01T00:00:00Z' }],
+      cases: [{ through: 'a', publicCase: { id: 'fiction', queryTime: '2030-01-01T00:00:01Z' } }], budget: { state: () => ({ stopped: null }) },
+      async evaluateCase() { return { status: 'partial', failed_arms: ['baseline'] }; } });
+    assert.deepEqual([result.status, result.cursor, result.evaluated[0].failed_arms], ['complete_with_partial_cases', 'a', ['baseline']]);
+  } finally { journal.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('pilot answers each case before processing the next source checkpoint', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'pi-pilot-sequence-'));
   const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });

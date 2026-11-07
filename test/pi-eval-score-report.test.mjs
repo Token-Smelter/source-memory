@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
+import { hash, sealComparison } from '../pi-extension/evaluation/seal.mjs';
 import { scoreCase as scoreAnchored, disagreement, createScorer as createAnchoredScorer, auditAlternatives as auditAnchored } from '../pi-extension/evaluation/scorer.mjs';
 import { pairedReport as reportAnchored } from '../pi-extension/evaluation/report.mjs';
 import { fictionalSettings, scoringPacket, fictionalTrace, clause } from '../pi-extension/evaluation/fictional.mjs';
@@ -94,6 +94,24 @@ test('paired reports retain original seals for compatible carried cases', () => 
   assert.deepEqual([result.sealDigest, result.provenance.mixedCandidateCode, result.provenance.mixedAnswererFormat, result.cases], [null, true, true, 2]);
   const changed = structuredClone(oldSettings); changed.rubric.instructions += ' changed';
   assert.throws(() => pairedReport({ seal, provenance: [sealComparison(changed)], rows: [row('c1', oldSeal)], dependencies: [['s1', 's2']] }), /provenance_mismatch/);
+});
+
+test('a partial case keeps its original candidate score and identifies the one-call scorer repair', () => {
+  const old = fictionalSettings(), current = fictionalSettings(); old.codeSha = 'a'.repeat(40); current.codeSha = 'b'.repeat(40);
+  const previous = sealComparison(old), packetDigest = previous.spec.packets.c3;
+  const score = (sealDigest, safety = false) => ({ sealDigest, packetDigest, usefulness: { credited: 1, uncertain: 0, total: 2 },
+    ...(safety ? { safety: { unsupportedActions: 0, unsupportedClaims: 0, authorityInflation: 0, scopeViolations: 0 } } : {}) });
+  const candidate = score(previous.digest, true);
+  current.resume = { partialCaseHandback: { caseId: 'c3', sourceSealDigest: previous.digest, sourceCodeSha: old.codeSha,
+    candidateScoreSha256: hash(candidate), repairFormat: 'scorer-r2-v3-specific-repair' } };
+  const seal = sealComparison(current);
+  const row = { caseId: 'c3', sessions: ['s3'], sealDigest: seal.digest, packetDigest,
+    arms: { candidate, baseline: score(previous.digest), empty: score(seal.digest), 'raw-only': score(seal.digest) },
+    repair: { arm: 'baseline', format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest } };
+  const out = pairedReport({ seal, provenance: [previous], rows: [row], dependencies: [['s1', 's2']] });
+  assert.equal(out.provenance.specificScorerRepair, true);
+  row.arms.candidate.usefulness.credited = 0;
+  assert.throws(() => pairedReport({ seal, provenance: [previous], rows: [row], dependencies: [['s1', 's2']] }), /packet_seal_mismatch/);
 });
 
 test('paired report resamples connected source histories jointly and applies safety separately', () => {

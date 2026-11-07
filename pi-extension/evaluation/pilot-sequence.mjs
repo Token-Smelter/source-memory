@@ -59,5 +59,5 @@ export async function runPilotSequence({ session, journal, checkpoints, cases, b
       await onCase(outcome, budget.state());
     }
   }
-  return { status: 'complete', cursor, results, evaluated };
+  return { status: evaluated.some(row => row?.status === 'partial') ? 'complete_with_partial_cases' : 'complete', cursor, results, evaluated };
 }

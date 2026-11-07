@@ -7,7 +7,7 @@ const clean = new Set(['committed', 'abstained', 'ineligible_by_policy']);
 
 /** Check the immutable prefix and a reconciled gap before restoring any data. */
 export function validatePilotResume({ report, seal, currentSeal, progress, journal, checkpoints, cases, cursor, snapshotSha256, journalSha256,
-  sourceSha256, datasetSha256, priorLedgerSha256s, reconciliationSha256s = [], caseHandbacks = [], sourceTreeDriftSha256 = null }) {
+  sourceSha256, datasetSha256, priorLedgerSha256s, reconciliationSha256s = [], caseHandbacks = [], partialCaseHandback = null, sourceTreeDriftSha256 = null }) {
   if (!report || report.status !== 'failed_or_partial' || !Array.isArray(progress) || !Array.isArray(checkpoints) || !Array.isArray(cases)
     || !journal || !/^[a-f0-9]{64}$/.test(snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(journalSha256 ?? '')
     || !Array.isArray(priorLedgerSha256s)) throw fail('resume_invalid');
@@ -41,9 +41,10 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
     || current.resume?.priorRunId !== report.run_id || current.resume?.priorSealDigest !== seal.digest
     || current.resume?.priorCodeSha !== original.codeSha || current.resume?.cursor !== cursor
     || current.resume?.snapshotSha256 !== snapshotSha256 || current.resume?.journalSha256 !== journalSha256
-    || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only'].includes(current.resume?.transition)
+    || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback'].includes(current.resume?.transition)
     || hash(current.resume?.ledgerReconciliationSha256s ?? []) !== hash(reconciliationSha256s)
     || hash(current.resume?.caseHandbacks ?? []) !== hash(caseHandbacks)
+    || hash(current.resume?.partialCaseHandback ?? null) !== hash(partialCaseHandback)
     || (current.resume?.sourceTreeDriftSha256 ?? null) !== sourceTreeDriftSha256) throw fail('resume_treatment_mismatch');
   if (original.sourceSha256 !== sourceSha256 || original.datasetSha256 !== datasetSha256
     || report.artifacts?.source_snapshot?.sha256 !== sourceSha256
@@ -54,6 +55,8 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   if (handbackIds.size !== caseHandbacks.length) throw fail('handback_invalid');
   if (cases.some(item => checkpoints.findIndex(row => row.id === item.through) < index && !handbackIds.has(item.publicCase.id))) throw fail('resume_prior_cases_unsupported');
   const atCursor = cases.filter(item => item.through === cursor && !handbackIds.has(item.publicCase.id));
+  if (partialCaseHandback && !atCursor.some(item => item.publicCase.id === partialCaseHandback.caseId
+    && partialCaseHandback.snapshotSha256 === snapshotSha256)) throw fail('handback_snapshot_invalid');
   if (index + 1 >= checkpoints.length && !atCursor.length) throw fail('resume_invalid');
   for (const item of atCursor) {
     if (progress.some(row => row.type === 'case' && row.case_id === item.publicCase.id && row.status === 'scored')
@@ -61,10 +64,13 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   }
   if (caseHandbacks.some(row => !cases.some(item => item.publicCase.id === row.caseId
     && checkpoints.findIndex(cp => cp.id === item.through) <= index))) throw fail('handback_invalid');
-  const saved = report.artifacts?.checkpoint_snapshots?.filter(row => row.through === cursor && row.sha256 === snapshotSha256);
+  const saved = report.artifacts?.checkpoint_snapshots?.filter(row => row.through === cursor);
   const rows = progress.filter(row => row.type === 'checkpoint');
   const lastClean = rows.filter(row => clean.has(row.disposition)).at(-1);
-  if (saved?.length !== 1 || lastClean?.through !== cursor || lastClean.snapshot?.sha256 !== snapshotSha256) throw fail('resume_snapshot_mismatch');
+  const same = saved?.length === 1 && (saved[0].sha256 === snapshotSha256 || (atCursor.length > 0
+    && report.resume_restore?.equivalent === true && report.resume_restore.source_sha256 === saved[0].sha256
+    && report.resume_restore.restored_sha256 === snapshotSha256));
+  if (!same || lastClean?.through !== cursor || lastClean.snapshot?.sha256 !== saved[0].sha256) throw fail('resume_snapshot_mismatch');
   let priorCursor = null;
   for (let i = 0; i <= index; i++) {
     const checkpoint = checkpoints[i];
@@ -80,5 +86,5 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   return { priorRunId: report.run_id, priorSealDigest: seal.digest, priorCodeSha: original.codeSha,
     cursor, snapshotSha256, journalSha256, retryFirst: gap.status === 'failed', prefixCount: index + 1,
     transition: current.resume.transition, ledgerReconciliationSha256s: [...reconciliationSha256s], caseHandbacks,
-    sourceTreeDriftSha256 };
+    partialCaseHandback, sourceTreeDriftSha256 };
 }

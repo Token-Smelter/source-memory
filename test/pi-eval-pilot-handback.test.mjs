@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
+import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
 import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
 import { scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { fictionalSettings, fictionalCase, fictionalTrace, scoringPacket, clause } from '../pi-extension/evaluation/fictional.mjs';
@@ -30,6 +30,22 @@ test('case handback recomputes all arms under the original seal and binds the sn
   const result = validateCaseHandback(fixture());
   assert.deepEqual([result.descriptors.length, result.reportRows.length, result.carriedRows.length,
     result.descriptors[0].snapshotSha256, result.descriptors[0].outputsSha256], [1, 1, 8, 'a'.repeat(64), 'c'.repeat(64)]);
+});
+
+test('partial case handback preserves candidate score, baseline answer and exact invalid scorer submission', () => {
+  const f = fixture(), id = 'c1';
+  const rows = f.resultRows.filter(row => row.arm === 'candidate' || (row.arm === 'baseline' && row.type === 'answer'));
+  const bad = { id: 'bad-clause', judgments: { support: 'pass' }, sourceIds: [] };
+  const message = { content: [{ type: 'toolCall', name: 'submit_score', arguments: { clauses: [bad] } }] };
+  const prior = f.ledgerRows.filter(row => row.type !== 'started' || row.arm !== 'baseline' || row.purpose !== 'scorer');
+  const starts = [{ type: 'started', id: 50, checkpoint: 'a', arm: 'baseline', purpose: 'scorer' },
+    { type: 'started', id: 51, checkpoint: 'a', arm: 'baseline', purpose: 'scorer' }];
+  const ledgerRows = [...prior.filter(row => ![4].includes(row.id)), ...starts,
+    ...starts.map(row => ({ type: 'result', id: row.id, outcome: 'received' }))];
+  const outputRows = [...f.outputRows.filter(row => row.id !== 4), ...starts.map(row => ({ id: row.id, arm: 'baseline', purpose: 'scorer', message }))];
+  const result = validatePartialCaseHandback({ report: f.report, reportSha256: f.reportSha256, seal: f.seal, resultRows: rows,
+    outputRows, ledgerRows, item: f.cases[0] });
+  assert.deepEqual([result.descriptor.caseId, result.clauseId, result.candidateJudgment.score.usefulness.credited], [id, 'bad-clause', 1]);
 });
 
 test('case handback refuses a missing raw model output or altered score', () => {
