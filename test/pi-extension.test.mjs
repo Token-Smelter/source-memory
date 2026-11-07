@@ -95,6 +95,18 @@ test('link tool uses current offer handles and never invokes raw relation writes
   assert.equal(writes.every(payload => payload.relations.length === 0), true);
 });
 
+test('concurrent indexing retries share the same in-flight idempotent operation', async () => {
+  const { createMemoryHandlers } = await import('../pi-extension/memory-process.mjs');
+  let calls = 0, finish;
+  const memory = { async index() { calls++; return new Promise(resolve => { finish = resolve; }); } };
+  const handlers = createMemoryHandlers({ memory, scopes: ['private'] });
+  const first = handlers.index({ scope: 'private', input: { limit: 16 } });
+  const second = handlers.index({ scope: 'private', input: { limit: 16 } });
+  await new Promise(resolve => setImmediate(resolve));
+  finish({ status: 'ready' });
+  assert.deepEqual([await first, await second, calls], [{ status: 'ready' }, { status: 'ready' }, 1]);
+});
+
 test('pending Memory proposal exposes exact offer, accepts compare, and retains the in-process apply object', async () => {
   const { createMemoryHandlers } = await import('../pi-extension/memory-process.mjs');
   const candidate = { token: 'same-object', proposals: [{ from: 'r1', to: 'r0' }] };

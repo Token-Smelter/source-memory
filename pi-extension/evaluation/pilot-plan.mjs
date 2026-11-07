@@ -17,6 +17,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
       || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
+      || !['structured-submission-format-only', 'deferred-bounded-indexing-only'].includes(resume.transition)
       || typeof resume.cursor !== 'string' || !resume.cursor || typeof resume.priorRunId !== 'string' || !resume.priorRunId))) throw fail('pilot_plan_invalid');
   const scopes = cases[0].publicCase.readScopes;
   if (!Array.isArray(scopes) || !scopes.length || cases.some(row => hash(row.publicCase.readScopes) !== hash(scopes)
@@ -26,7 +27,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
   const cap = capNano;
   const settings = {
     version: 'memory-pilot-r2-v1', policyVersion: policy.value.id,
-    freezeBasis: resume ? 'resume plan frozen after prior candidate observations; format-only transition' : 'before-candidate-observation',
+    freezeBasis: resume ? 'resume plan frozen after prior candidate observations; transition recorded' : 'before-candidate-observation',
     sourceSha256, datasetSha256, sdkSha256, codeSha, policySha256: policy.sha256, ...(resume ? { resume } : {}),
     answerer: { route: 'anthropic', model: 'claude-sonnet-5-5', reasoning: 'low', version: 'answerer-r2-v1',
       contextPolicy: 'request-and-returned-item-evidence-only', retrievalInterface: 'returned-item-evidence-v1',

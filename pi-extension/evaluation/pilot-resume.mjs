@@ -18,7 +18,7 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
     || current.resume?.priorRunId !== report.run_id || current.resume?.priorSealDigest !== seal.digest
     || current.resume?.priorCodeSha !== original.codeSha || current.resume?.cursor !== cursor
     || current.resume?.snapshotSha256 !== snapshotSha256 || current.resume?.journalSha256 !== journalSha256
-    || current.resume?.transition !== 'structured-submission-format-only') throw fail('resume_treatment_mismatch');
+    || !['structured-submission-format-only', 'deferred-bounded-indexing-only'].includes(current.resume?.transition)) throw fail('resume_treatment_mismatch');
   if (original.sourceSha256 !== sourceSha256 || original.datasetSha256 !== datasetSha256
     || report.artifacts?.source_snapshot?.sha256 !== sourceSha256
     || !priorLedgerSha256s.includes(report.artifacts?.['ledger.jsonl']?.sha256)) throw fail('resume_provenance_mismatch');
@@ -43,5 +43,5 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   if (gap.status !== 'ready' && (gap.status !== 'failed' || gap.cursor !== cursor || gap.through !== checkpoints[index + 1].id)) throw fail('resume_gap_mismatch');
   return { priorRunId: report.run_id, priorSealDigest: seal.digest, priorCodeSha: original.codeSha,
     cursor, snapshotSha256, journalSha256, retryFirst: gap.status === 'failed', prefixCount: index + 1,
-    transition: 'structured-submission-format-only' };
+    transition: current.resume.transition };
 }

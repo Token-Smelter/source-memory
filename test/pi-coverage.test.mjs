@@ -89,6 +89,18 @@ test('confirmed indexing alone does not imply a derived record', () => privateJo
   journal.close();
 }));
 
+test('a timed-out idempotent index does not make confirmed source ingestion uncertain', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async ingest() { return { id: 'turn', indexing: { status: 'deferred' } }; },
+    async index() { throw Object.assign(new Error('timeout'), { code: 'request_timeout' }); } });
+  const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory,
+    async ensureIndexed(client) { await client.index('private', { limit: 16 }); },
+    distiller: { memory, async run() { throw new Error('must_not_run'); } } };
+  const result = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
+  assert.deepEqual([result.disposition, result.code, journal.state().status], ['failed', 'request_timeout', 'failed']);
+  journal.close();
+}));
+
 test('a failure after confirmed archive only stays a failed scheduled gap', () => privateJournal(async directory => {
   const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
   const memory = journal.track({ async ingest() { return { id: 'turn' }; } });

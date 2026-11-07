@@ -12,6 +12,15 @@ test('pending indexing completes and waits until both vector indexes are online'
   assert.deepEqual([result.status, indexCalls, polls], ['ready', 1, 2]);
 });
 
+test('new source chunk vectors must be query-visible before searches', async () => {
+  const calls = [];
+  const memory = { async status() { return { unindexed: 0, vector_indexes: { chunk: 'online', record: 'online' } }; },
+    async turnVectorStatus(scope, turn) { calls.push({ scope, turn }); return { visible: calls.length === 2 }; } };
+  const result = await ensureIndexed(memory, 'fiction', { status: 'ready' },
+    { waitForVectors: true, turnId: 'fiction-turn', maxPolls: 3, pollMs: 0 });
+  assert.deepEqual([result.status, calls], ['ready', [{ scope: 'fiction', turn: 'fiction-turn' }, { scope: 'fiction', turn: 'fiction-turn' }]]);
+});
+
 test('newly written record vectors must be query-visible before link retrieval', async () => {
   const observed = [];
   const memory = { async status() { return { unindexed: 0, vector_indexes: { chunk: 'online', record: 'online' } }; },
@@ -26,6 +35,15 @@ test('an invisible new record vector times out rather than permitting a link sea
     async recordVectorStatus() { return { visible: false }; } };
   await assert.rejects(ensureIndexed(memory, 'fiction', { status: 'ready' },
     { waitForVectors: true, recordIds: ['new-record'], maxPolls: 2, pollMs: 0 }), /indexing_wait_timeout/);
+});
+
+test('deferred indexing retries a timed-out idempotent batch before visibility checks', async () => {
+  const calls = [];
+  const memory = { async index(_scope, input) { calls.push(input.limit); if (calls.length === 1) throw Object.assign(new Error('timeout'), { code: 'request_timeout' }); return { status: 'ready' }; },
+    async status() { return { unindexed: 0, vector_indexes: { chunk: 'online', record: 'online' } }; } };
+  const result = await ensureIndexed(memory, 'fiction', { status: 'deferred' },
+    { waitForVectors: true, batchLimit: 16, maxIndexRetries: 1, pollMs: 0 });
+  assert.deepEqual([result.status, calls], ['ready', [16, 16]]);
 });
 
 test('unavailable embedding indexing reports its exact safe reason without retrying', async () => {

@@ -71,7 +71,7 @@ function trackSnapshot(memory) {
     return async (...args) => {
       if (lock || invalid) throw fail('snapshot_locked');
       try { const result = await value.apply(target, args); epoch++; return result; }
-      catch (error) { if (error?.effect !== 'refused') invalid = true; throw error; }
+      catch (error) { if (error?.effect !== 'refused' && !(key === 'index' && error?.code === 'request_timeout')) invalid = true; throw error; }
     };
   } });
   return { client, acquire(queryTime) {
@@ -172,7 +172,7 @@ async function main() {
     const progress = progressBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse);
     const plan = { priorRunId: report.run_id, priorSealDigest: priorSeal.digest, priorCodeSha: priorSeal.spec?.codeSha,
       cursor: request.cursor, snapshotSha256: request.snapshotSha256, journalSha256: request.journalSha256,
-      transition: 'structured-submission-format-only' };
+      transition: request.transition };
     resume = { report, priorSeal, progress, journalBytes, snapshotBytes, plan };
   }
   const remaining = 100000000000n - previous;
@@ -197,7 +197,7 @@ async function main() {
     } finally { priorJournal.close(); }
   }
   writePrivate(join(driverDir, 'config.json'), { neo4j: { uri: 'bolt://127.0.0.1:7687', auth: 'none' }, scopes: { read: [scope], write: [scope] },
-    chunking: { words: 256, overlap: 32 }, embedding: { url: 'http://127.0.0.1:18080/v1/embeddings', model: 'embeddinggemma', dimensions: 768, timeout_ms: 120000 }, index_on_write: true });
+    chunking: { words: 256, overlap: 32 }, embedding: { url: 'http://127.0.0.1:18080/v1/embeddings', model: 'embeddinggemma', dimensions: 768, timeout_ms: 120000 }, index_on_write: false });
   const resources = privateWriter(join(dir, 'resources.jsonl')), progress = privateWriter(join(dir, 'progress.jsonl'));
   const memoryLog = privateWriter(join(dir, 'memory-receipts.jsonl')), results = privateWriter(join(dir, 'case-results.jsonl'));
   const relayLog = privateWriter(join(dir, 'embedding-relay.jsonl'));
@@ -247,7 +247,7 @@ async function main() {
       progress.append({ type: 'embedding_warm', ...result });
     },
     async memoryFactory({ driver }) { return openDockerMemory({ containerId: driver, scope, configPath: '/scratch/config.json', intentDir: '/scratch/intents',
-      timeoutMs: 180000, offerTimeoutMs: 120000, onReceipt: event => memoryLog.append({ checkpoint: meta.checkpoint, ...event }) }); },
+      timeoutMs: 180000, indexTimeoutMs: 600000, offerTimeoutMs: 120000, onReceipt: event => memoryLog.append({ checkpoint: meta.checkpoint, ...event }) }); },
     async work({ memory, driver }) {
       const guarded = trackSnapshot(memory);
       journal = createCoverageJournal({ directory: dir, sessionKey: sourceKey });
@@ -279,7 +279,8 @@ async function main() {
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
           imageArchive: createImageArchive({ directory: imageDir }),
-          ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state, { waitForVectors: true, ...options }),
+          ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state,
+            { waitForVectors: true, batchLimit: 16, maxRounds: 128, maxIndexRetries: 2, ...options }),
           meterRuntime: (underlying, context) => budget.wrap(underlying, () => ({ ...meta,
             purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v3' : 'link-review-r2-v2' })) });
         const evaluatorRuntime = budget.wrap(runtime, () => meta);

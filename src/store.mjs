@@ -206,6 +206,27 @@ export class Neo4jStore {
     });
   }
 
+  async turnVectorsVisible(scope, model, turn) {
+    const index = indexNames(scope).vectorChunks;
+    const session = this.driver.session({ database: this.database });
+    try {
+      return await session.executeRead(async tx => {
+        const exists = await tx.run('MATCH (t:SMTurn {scope:$scope,uid:$turn}) RETURN count(t) AS count', { scope, turn });
+        requireThat(exists.records[0]?.get('count') === 1, 'not_found');
+        const stored = await tx.run('MATCH (c:SMChunk {scope:$scope,turn_uid:$turn}) RETURN c.uid AS uid,c.embedding AS vector,c.embedding_key AS model', { scope, turn });
+        for (const row of stored.records) {
+          const uid = row.get('uid'), vector = row.get('vector');
+          if (row.get('model') !== model || !Array.isArray(vector) || !vector.length) return false;
+          const hits = await tx.run(`CALL db.index.vector.queryNodes($index,$k,$vector) YIELD node
+            WHERE node.uid=$uid AND node.scope=$scope RETURN count(node) AS hits`,
+          { index, k: neo4j.int(4096), vector, uid, scope });
+          if (hits.records[0]?.get('hits') !== 1) return false;
+        }
+        return true;
+      }, { timeout: 120000 });
+    } finally { await session.close(); }
+  }
+
   async recordVectorsVisible(scope, model, ids) {
     const index = indexNames(scope).vectorRecords;
     return this.transaction('read', async tx => {
@@ -216,7 +237,7 @@ export class Neo4jStore {
         if (!Array.isArray(vector) || !vector.length) return false;
         const hits = await tx.run(`CALL db.index.vector.queryNodes($index,$k,$vector) YIELD node
           WHERE node.uid=$uid AND node.scope=$scope RETURN count(node) AS hits`,
-        { index, k: neo4j.int(256), vector, uid, scope });
+        { index, k: neo4j.int(4096), vector, uid, scope });
         if (hits.records[0]?.get('hits') !== 1) return false;
       }
       return true;

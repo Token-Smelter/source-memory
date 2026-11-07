@@ -40,9 +40,11 @@ export function createClient({ input, output, timeoutMs = 30000 }) {
   }
   lines.on('close', close);
   return {
-    request(method, args, { signal } = {}) {
+    request(method, args, { signal, timeoutMs: overrideTimeout } = {}) {
       if (closed) return Promise.reject(error('transport_closed'));
       if (signal?.aborted) return Promise.reject(error('request_cancelled'));
+      const deadline = overrideTimeout ?? timeoutMs;
+      if (!Number.isSafeInteger(deadline) || deadline <= 0 || deadline > 3600000) return Promise.reject(error('timeout_invalid'));
       const id = String(++next);
       return new Promise((resolve, reject) => {
         const cancel = code => {
@@ -50,7 +52,7 @@ export function createClient({ input, output, timeoutMs = 30000 }) {
           finish(id, error(code));
         };
         const abort = () => cancel('request_cancelled');
-        const timer = setTimeout(() => cancel('request_timeout'), timeoutMs);
+        const timer = setTimeout(() => cancel('request_timeout'), deadline);
         pending.set(id, { resolve, reject, timer, signal, abort });
         signal?.addEventListener('abort', abort, { once: true });
         try { write(output, { id, method, args }); } catch (problem) { finish(id, problem); }

@@ -17,6 +17,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
   if (!Number.isSafeInteger(offerTimeoutMs) || offerTimeoutMs <= 0) throw fail('timeout_invalid');
   const allowed = scope => { if (scope !== scopes[0]) throw fail('scope_denied'); };
   const slots = new Map();
+  let indexing = null;
   const outcomes = createAtomicOutcomes({ memory, beforeAppend });
   const cancel = slot => {
     if (!slot || slot.closed) return false;
@@ -31,7 +32,12 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
     async init({ scope }) { allowed(scope); return memory.init(scope); },
     async status({ scope }) { allowed(scope); return memory.status(scope); },
     async recordVectorStatus({ scope, ids }) { allowed(scope); return memory.recordVectorStatus(scope, ids); },
-    async index({ scope, input }) { allowed(scope); return memory.index(scope, input); },
+    async turnVectorStatus({ scope, turn }) { allowed(scope); return memory.turnVectorStatus(scope, turn); },
+    async index({ scope, input }) {
+      allowed(scope);
+      const flight = indexing ??= Promise.resolve().then(() => memory.index(scope, input));
+      try { return await flight; } finally { if (indexing === flight) indexing = null; }
+    },
     async ingest({ scope, turn }) {
       allowed(scope);
       if (turn?.source !== 'pi-memory') throw fail('source_invalid');

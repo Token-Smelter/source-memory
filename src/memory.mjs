@@ -93,6 +93,14 @@ export class Memory {
       ...(Object.keys(errors).length ? { vector_index_errors: errors } : {}) };
   }
 
+  async turnVectorStatus(scope, turn) {
+    authorize(this.config, scope);
+    text(turn, 256);
+    const key = embeddingIdentity(this.config.embedding);
+    requireThat(key, 'embedding_unconfigured');
+    return { visible: await this.store.turnVectorsVisible(scope, key, turn) };
+  }
+
   async recordVectorStatus(scope, ids) {
     authorize(this.config, scope);
     requireThat(Array.isArray(ids) && ids.length > 0 && ids.length <= 16 && new Set(ids).size === ids.length, 'invalid_input');

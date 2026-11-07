@@ -91,7 +91,7 @@ export async function distillThrough(session, throughEntryId, cursor, { allowInt
   }
   const receipt = await session.memory.ingest(session.scopes[0], turn);
   if (typeof receipt?.id !== 'string' || !receipt.id) throw fail('ingest_receipt_invalid');
-  if (typeof session.ensureIndexed === 'function') await session.ensureIndexed(session.memory, session.scopes[0], receipt.indexing);
+  if (typeof session.ensureIndexed === 'function') await session.ensureIndexed(session.memory, session.scopes[0], receipt.indexing, { turnId: receipt.id });
   const result = await session.distiller.run({ turn, receipt, throughEntryId, cursor, scope: session.scopes[0] });
   if (result?.status !== 'complete') throw fail('distillation_incomplete');
   return { cursor: throughEntryId, turn_id: turn.turn_id, receipt, omissions, distillation: result };
