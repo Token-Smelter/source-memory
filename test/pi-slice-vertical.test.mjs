@@ -25,7 +25,7 @@ test('one fictional slice passes the gate, shared replay, fake Pi routing and me
       return { session: { sessionId: sessionManager.getSessionId(), agent: { sessionId: sessionManager.getSessionId(), state: {} }, messages: [],
         subscribe(fn) { subscriber = fn; }, async prompt() {
           modelRuntime.streamSimple(selected, {});
-          const message = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'fiction' }], usage: { input: 10, cacheRead: 3, cacheWrite: 0, output: 2 } };
+          const message = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"disposition":"abstained"}' }], usage: { input: 10, cacheRead: 3, cacheWrite: 0, output: 2 } };
           this.messages.push(message); subscriber({ type: 'turn_end', message });
         } } };
     } };

@@ -40,5 +40,9 @@ export async function main(argv = process.argv.slice(2), { input = process.stdin
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch(() => { process.stderr.write('{"ok":false,"error":"memory_process_failed"}\n'); process.exitCode = 1; });
+  main().catch(error => {
+    const code = typeof error?.code === 'string' && /^[a-zA-Z_]{1,80}$/.test(error.code) ? error.code : 'unknown';
+    process.stderr.write(`${JSON.stringify({ ok: false, error: 'memory_process_failed', code })}\n`);
+    process.exitCode = 1;
+  });
 }

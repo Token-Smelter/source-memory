@@ -1,0 +1,16 @@
+{
+  "id": "memory-retention/r2-v1",
+  "contract_sha256": "5b0c1fc1d3a94117c9518b8180b7587551514460ec0c9e47a35275063c5eaa6e",
+  "invariants": {
+    "selection": "Retain knowledge only when it affects an identifiable ongoing activity or recurring need, forgetting it plausibly causes harm, wasted work, a wrong answer or lost necessary context, and its meaning is absent or inadequately represented in accessible memory.",
+    "evidence": "Support each item and relationship with currently eligible original source evidence or offered prior-item handles. Evidence that someone reported a claim does not establish that the claim is true.",
+    "authority_status": "Preserve the speaker, authority and status, including suggestion, report, commitment, accepted decision and uncertainty.",
+    "scope_time": "Honor read, write, endpoint and evidence-resolution permissions, applicability scope, availability time and effective time. A scoped replacement does not erase unaffected applicability.",
+    "availability": "Use only material proven available and eligible on the selected active branch at the checkpoint. A summary is admissible only when its full dependency closure is permitted.",
+    "processing": "Distinguish committed writes, successful abstention, policy ineligibility, failure, uncertainty and unresolved scope. Zero derived writes is normal; failed search is not abstention. Reconcile partial or uncertain writes before retry."
+  },
+  "task_prefix": "At this chronological checkpoint, examine newly eligible source material in the supplied Pi context under the declared read, write, relationship endpoint and evidence-resolution scopes. Retain only knowledge that affects an identifiable ongoing activity or recurring need, would plausibly cause harm or wasted work if forgotten, and is absent or inadequately represented in accessible memory. Evidence must support the attributed meaning, but evidence alone does not justify retention or make a report true.\n\nZero derived writes is successful when nothing qualifies. Do not create a summary, record or relationship merely because a checkpoint occurred. Before potentially overlapping writes, use the actual Memory retrieval tools within the declared budget. Reuse adequate retrieved knowledge. Restore useful knowledge absent from your store when supported by currently eligible source. Empty results do not prove global absence, and failed searches are not successful abstention.\n\nPreserve speaker, authority, status, uncertainty, applicability and time. Treat suggestions as suggestions, reports as reports and replacements as scoped replacements. Cite eligible source handles; use retrieved prior-item handles for relationships only when their meaning and direction are supported. Context, recalled advice and derived summaries are not original evidence. Return a processing disposition distinguishing committed writes, successful abstention, policy ineligibility, failure and uncertainty.",
+  "item_types": ["decision", "observation", "outcome", "question", "intention", "episode", "action"],
+  "relationship_types": ["supersedes", "qualifies", "contradicts", "depends_on", "outcome_of"],
+  "dispositions": ["committed", "abstained", "ineligible_by_policy", "failed", "uncertain", "unresolved_scope"]
+}

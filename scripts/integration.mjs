@@ -2,24 +2,39 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, writeFile, mkdir } from 'node:fs/promises';
+import { closeSync, constants, fsyncSync, openSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import neo4j from 'neo4j-driver';
 import { runIntegration } from '../test/integration.mjs';
+import { integrationResources } from './integration-resources.mjs';
 
 const exec = promisify(execFile);
-const name = `source-memory-test-${randomUUID()}`;
+const runId = randomUUID();
+const name = `source-memory-test-${runId}`;
 const scratch = await mkdtemp(join(tmpdir(), 'source-memory-test-'));
+const receiptPath = join(scratch, 'resources.jsonl');
+const receipt = openSync(receiptPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
+const directory = openSync(scratch, constants.O_RDONLY | constants.O_DIRECTORY);
+try { fsyncSync(directory); } finally { closeSync(directory); }
+const record = event => {
+  const bytes = Buffer.from(`${JSON.stringify(event)}\n`);
+  for (let offset = 0; offset < bytes.length;) offset += writeSync(receipt, bytes, offset, bytes.length - offset);
+  fsyncSync(receipt);
+};
+const resources = integrationResources({ runId, execute: exec, record });
 const startedAt = new Date().toISOString();
-let owned = false;
+let creationInFlight = false;
+let creationUnknown = false;
 let stopped = false;
 let results = [];
 let failure = null;
 let container = null;
 
 async function stop() {
-  if (!owned || stopped) return;
-  await exec('docker', ['stop', '--time', '10', name], { timeout: 30000 });
+  if (stopped) return;
+  if (creationInFlight || creationUnknown) throw new Error('owned_resource_creation_unknown');
+  await resources.cleanup();
   stopped = true;
 }
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
@@ -28,14 +43,10 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
 
 try {
   await mkdir('.memory-local', { recursive: true, mode: 0o700 });
-  await exec('docker', ['run', '--detach', '--rm', '--name', name,
-    '--publish', '127.0.0.1::7687', '--memory', '1536m', '--cpus', '2',
-    '--env', 'NEO4J_AUTH=none',
-    '--env', 'NEO4J_server_memory_heap_initial__size=512m',
-    '--env', 'NEO4J_server_memory_heap_max__size=512m',
-    '--env', 'NEO4J_server_memory_pagecache_size=128m',
-    'neo4j:5.26.14-community'], { timeout: 90000 });
-  owned = true;
+  creationInFlight = true;
+  try { await resources.create(); }
+  catch (error) { creationUnknown = ['creation_unknown', 'resource_receipt_unknown'].includes(error.code); throw error; }
+  finally { creationInFlight = false; }
   const mapping = (await exec('docker', ['port', name, '7687/tcp'], { timeout: 10000 })).stdout.trim();
   if (!/^127\.0\.0\.1:\d+$/.test(mapping)) throw new Error('unexpected private port mapping');
   const uri = `bolt://${mapping}`;
@@ -66,9 +77,10 @@ try {
   const report = { started_at: startedAt, finished_at: new Date().toISOString(),
     fixture: 'disposable Neo4j 5.26.14; fictional content; deterministic HTTP model fixtures',
     semantic_quality_measured: false, tests: results, failure,
-    owned_container: name, container, container_stopped: stopped, scratch };
+    owned_container: name, container, container_stopped: stopped, resource_receipt: receiptPath, creation_unknown: creationUnknown, scratch };
   const reportPath = `.memory-local/integration-${startedAt.replaceAll(':', '-')}.json`;
   await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 });
   console.log(`integration report: ${reportPath}`);
+  closeSync(receipt);
   if (!failure) console.log(`integration: ${results.length} checks passed; private container stopped=${stopped}`);
 }

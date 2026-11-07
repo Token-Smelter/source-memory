@@ -38,11 +38,12 @@ export async function resolvePiModels({ pi, modelId = 'anthropic/claude-haiku-5-
 
 /** Builds the same incremental private session used by the live adapter and replay core. */
 export async function createSliceSession({ pi, source, entries, conversationId, workDir, scope, memory,
-  modelId = 'anthropic/claude-haiku-5-5', reviewerId, reviewMode = 'separate', budget = createInputBudget() }) {
+  modelId = 'anthropic/claude-haiku-5-5', reviewerId, reviewMode = 'separate', budget = createInputBudget(), coverageJournal }) {
   const { runtime, model, reviewerModel } = await resolvePiModels({ pi, modelId, reviewerId });
   const boundedRuntime = boundPiRuntime(runtime, budget);
   const incremental = await createIncrementalSession({ source, workDir });
+  const trackedMemory = coverageJournal ? coverageJournal.track(memory) : memory;
   const reviewer = createPiReviewer({ pi, workDir, model: reviewerModel, modelRuntime: boundedRuntime, budget });
-  const distiller = await createPiDistiller({ pi, incremental, workDir, model, modelRuntime: boundedRuntime, memory, scope, reviewer, budget, reviewMode });
-  return { entries, conversation_id: conversationId, scopes: [scope], memory, distiller, budget };
+  const distiller = await createPiDistiller({ pi, incremental, workDir, model, modelRuntime: boundedRuntime, memory: trackedMemory, scope, reviewer, budget, reviewMode });
+  return { entries, conversation_id: conversationId, scopes: [scope], memory: trackedMemory, distiller, budget, coverageJournal };
 }

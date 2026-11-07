@@ -18,7 +18,7 @@ function entryText(row) {
   return typeof content === 'string' ? content : Array.isArray(content) ? content.map(blockText).filter(Boolean).join('\n') : '';
 }
 
-function turnAt(entries, through, cursor, conversation) {
+function turnAt(entries, through, cursor, conversation, { allowInterrupted = false } = {}) {
   if (!Array.isArray(entries) || typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('invalid_input');
   const byId = new Map();
   for (const row of entries) {
@@ -27,19 +27,20 @@ function turnAt(entries, through, cursor, conversation) {
   }
   const reply = byId.get(through);
   if (!reply) throw fail('source_unavailable');
-  if (!finished(reply)) throw fail('turn_incomplete');
-  const chain = [];
+  if (reply.type !== 'message' || !reply.message) throw fail('turn_incomplete');
+  if (!finished(reply) && !allowInterrupted) throw fail('turn_incomplete');
+  const ancestry = [];
   const seen = new Set();
-  let current = through;
-  while (current && current !== cursor) {
+  for (let current = through; current; current = byId.get(current)?.parentId) {
     const row = byId.get(current);
     if (!row || seen.has(current)) throw fail('cursor_unresolved');
     seen.add(current);
     if (['compaction', 'branch_summary'].includes(row.type)) throw fail('source_boundary_unresolved');
-    chain.unshift(row);
-    current = row.parentId;
+    ancestry.unshift(row);
   }
-  if (current !== cursor || !chain.length) throw fail('cursor_unresolved');
+  const position = cursor === null ? -1 : ancestry.findIndex(row => row.id === cursor);
+  if ((cursor !== null && position < 0) || position === ancestry.length - 1) throw fail('cursor_unresolved');
+  const chain = ancestry.slice(position + 1);
   const sourceEntries = chain.filter(row => row.type === 'message' && row.message).map(row => {
     const role = row.message.role === 'toolResult' ? 'tool' : row.message.role;
     if (!['user', 'assistant', 'tool', 'system'].includes(role)) throw fail('source_role_unsupported');
@@ -53,11 +54,11 @@ function turnAt(entries, through, cursor, conversation) {
 }
 
 /** The same cursor-bounded source turn is retained before either live or replay distillation. */
-export async function distillThrough(session, throughEntryId, cursor) {
+export async function distillThrough(session, throughEntryId, cursor, { allowInterrupted = false } = {}) {
   if (!session || !Array.isArray(session.scopes) || session.scopes.length !== 1
     || typeof session.scopes[0] !== 'string' || !session.scopes[0]) throw fail('scope_unresolved');
   if (!session.memory || typeof session.memory.ingest !== 'function' || !session.distiller || typeof session.distiller.run !== 'function') throw fail('invalid_input');
-  const { turn, omissions } = turnAt(session.entries, throughEntryId, cursor, session.conversation_id);
+  const { turn, omissions } = turnAt(session.entries, throughEntryId, cursor, session.conversation_id, { allowInterrupted });
   const receipt = await session.memory.ingest(session.scopes[0], turn);
   if (typeof receipt?.id !== 'string' || !receipt.id) throw fail('ingest_receipt_invalid');
   const result = await session.distiller.run({ turn, receipt, throughEntryId, cursor, scope: session.scopes[0] });
@@ -84,19 +85,32 @@ export function createLinkChoices(packet) {
 }
 
 /** Tool-facing labels name only entries of the just-retained cursor turn. */
-export function createTurnTools({ scope, turn, receipt, memory }) {
+export function createTurnTools({ scope, turn, receipt, memory, requireSearch = false }) {
   if (typeof scope !== 'string' || !scope || !turn?.turn_id || !Array.isArray(turn.entries) || !receipt?.id || !memory) throw fail('invalid_input');
-  const labels = new Map(turn.entries.map((entry, index) => [`ref-${String(index + 1).padStart(6, '0')}`, entry]));
+  const labels = new Map();
+  for (const entry of turn.entries) {
+    let start = 0;
+    do {
+      let end = Math.min(start + 8000, entry.text.length);
+      if (end < entry.text.length && /[\uD800-\uDBFF]/u.test(entry.text[end - 1]) && /[\uDC00-\uDFFF]/u.test(entry.text[end])) end--;
+      labels.set(`ref-${String(labels.size + 1).padStart(6, '0')}`, { entry, start, end });
+      start = end;
+    } while (start < entry.text.length);
+  }
   const recordIds = [];
+  let searches = 0;
+  let searchFailed = false;
   let offer = null;
   let choices = null;
   return {
-    labels() { return [...labels].map(([ref, entry]) => ({ ref, role: entry.role, text: entry.text })); },
+    labels() { return [...labels].map(([ref, span]) => ({ ref, role: span.entry.role, text: span.entry.text.slice(span.start, span.end) })); },
     async record(kind, text, refs) {
+      if (requireSearch && (!searches || searchFailed)) throw fail('search_required');
       if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length || refs.some(ref => !labels.has(ref))) throw fail('label_not_offered');
       const spans = refs.map(ref => {
-        const entry = labels.get(ref);
-        return { turn: receipt.id, entry_id: entry.id, start: 0, end: entry.text.length };
+        const { entry, start, end } = labels.get(ref);
+        if (start === end) throw fail('label_empty');
+        return { turn: receipt.id, entry_id: entry.id, start, end };
       });
       const record = { id: `pi-memory-record-${digest(['pi-memory-record/v1', scope, turn.turn_id, kind, text, spans])}`,
         kind, text, status: 'proposed', attribution: 'Pi distiller proposal; not operator acceptance', evidence: spans };
@@ -111,17 +125,23 @@ export function createTurnTools({ scope, turn, receipt, memory }) {
     async search(query, kinds) {
       if (typeof query !== 'string' || !query || !Array.isArray(kinds) || kinds.some(kind => typeof kind !== 'string')) throw fail('invalid_input');
       if (recordIds.length && typeof memory.beginLinks === 'function') {
-        const offered = await this.offer();
-        const records = offered.packet.records.filter(row => !kinds.length || kinds.includes(row.kind)).slice(0, 32)
-          .map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text.slice(0, 500) }));
-        const sources = offered.packet.sources.slice(0, 128).map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text.slice(0, 500) }));
-        return { status: 'offer', records, sources, filtered: kinds.length > 0, completeness_guaranteed: false };
+        try {
+          const offered = await this.offer();
+          const records = offered.packet.records.filter(row => !kinds.length || kinds.includes(row.kind)).slice(0, 32)
+            .map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text.slice(0, 500) }));
+          const sources = offered.packet.sources.slice(0, 128).map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text.slice(0, 500) }));
+          return { status: 'offer', records, sources, filtered: kinds.length > 0, completeness_guaranteed: false };
+        } catch (problem) { searchFailed = true; throw problem; }
       }
-      if (typeof memory.recall !== 'function') throw fail('search_unavailable');
-      const result = await memory.recall(scope, { query, limit: 8, max_chars: 24000 });
-      const records = (result.bundles ?? []).flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind))
-        .slice(0, 32).map(row => ({ kind: row.kind, snippet: row.text.slice(0, 500) }));
-      return { status: result.status, records, filtered: kinds.length > 0, completeness_guaranteed: false };
+      try {
+        if (typeof memory.recall !== 'function') throw fail('search_unavailable');
+        const result = await memory.recall(scope, { query, limit: 8, max_chars: 24000 });
+        if (!['ready', 'no_matches'].includes(result?.status)) throw fail('search_incomplete');
+        searches++;
+        const records = (result.bundles ?? []).flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind))
+          .slice(0, 32).map(row => ({ kind: row.kind, snippet: row.text.slice(0, 500) }));
+        return { status: result.status, records, filtered: kinds.length > 0, completeness_guaranteed: false };
+      } catch (problem) { searchFailed = true; throw problem; }
     },
     async offer() {
       if (!recordIds.length || typeof memory.beginLinks !== 'function') throw fail('offer_unavailable');
@@ -138,6 +158,6 @@ export function createTurnTools({ scope, turn, receipt, memory }) {
       return { status: 'pending_review' };
     },
     pendingLinks() { return offer && choices ? { token: offer.token, output: choices.output() } : null; },
-    stats() { return { records: recordIds.length }; },
+    stats() { return { records: recordIds.length, searches, search_failed: searchFailed }; },
   };
 }

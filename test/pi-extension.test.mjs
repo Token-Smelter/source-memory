@@ -146,7 +146,7 @@ test('incremental fake Pi distiller reopens the same private session and branche
   const manager = { getSessionId: () => 'distiller-id', branch(id) { calls.push(['branch', id]); this.leaf = id; },
     buildSessionContext() { return { messages: [{ role: 'user', content: this.leaf }] }; } };
   const makeSession = () => ({ sessionId: 'distiller-id', agent: { sessionId: 'distiller-id', state: {} }, messages: [],
-    async prompt() { calls.push(['prompt', this.agent.state.messages[0].content]); this.messages = [{ role: 'assistant', content: [{ type: 'text', text: 'done' }], stopReason: 'stop' }]; } });
+    async prompt() { calls.push(['prompt', this.agent.state.messages[0].content]); this.messages = [{ role: 'assistant', content: [{ type: 'text', text: '{"disposition":"abstained"}' }], stopReason: 'stop' }]; } });
   const pi = { SessionManager: { open: () => { calls.push(['open']); return manager; } }, async createAgentSession() { return { session: makeSession() }; } };
   const runtime = await createPiDistiller({ pi, incremental, workDir: '/fiction/work', model: {}, memory: {}, scope: 'private', createOptions: {} });
   for (const id of ['a2', 'a3']) await runtime.run({ throughEntryId: id, turn: { turn_id: id, entries: [] }, receipt: { id: 'turn' } });
@@ -163,15 +163,16 @@ for (const mode of ['separate', 'self_review']) {
     const manager = { getSessionId: () => 'distiller-id', branch() {}, buildSessionContext: () => ({ messages: [] }) };
     const result = { contract: 'source-memory-links/v2', review_contract: 'fictional', operation_id: 'operation', context_sha256: 'a',
       semantic_proposal_sha256: 'b', proposal_sha256: 'c', proposals: [{}] };
-    const memory = { async enrich() {}, async beginLinks() { return { token: 'offer', packet: { records: [{ ref: 'r0', kind: 'decision', text: 'A' },
+    const memory = { async recall() { return { status: 'no_matches', bundles: [] }; }, async enrich() {}, async beginLinks() { return { token: 'offer', packet: { records: [{ ref: 'r0', kind: 'decision', text: 'A' },
       { ref: 'r1', kind: 'decision', text: 'B' }], sources: [{ ref: 's0', role: 'user', trigger: true, text: 'Fiction' }] } }; },
     async finishLinks(_token, output) { calls.push(['compare', JSON.parse(output).links.length]); return result; },
     async applyLinks(_token, review) { calls.push(['apply', review.reviewer]); return { status: 'written' }; } };
     const session = { sessionId: 'distiller-id', agent: { sessionId: 'distiller-id', state: {} }, messages: [], async prompt() {
+      await registered.get('memory_search').execute('0', { query: 'Choice', kinds: ['decision'] });
       await registered.get('memory_record').execute('1', { kind: 'decision', text: 'Choice', evidence_labels: ['ref-000001'] });
       await registered.get('memory_search').execute('2', { query: 'Choice', kinds: ['decision'] });
       await registered.get('memory_link').execute('3', { from: 'r0', to: 'r1', type: 'qualifies', evidence: ['s0'], support: 'explicit' });
-      this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'done' }] }];
+      this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"disposition":"committed"}' }] }];
     } };
     const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
       async createAgentSession() { return { session }; } };

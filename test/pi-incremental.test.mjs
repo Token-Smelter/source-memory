@@ -95,7 +95,7 @@ test('incremental private session reopens each source leaf with no prior task or
   } }, async createAgentSession({ sessionManager }) {
     return { session: { sessionId: 'fictional-private-id', agent: { sessionId: 'fictional-private-id', state: {} }, messages: [], async prompt() {
       contexts.push(this.agent.state.messages.map(row => row.source_id)); sessionManager.appendTask();
-      this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'fiction result' }] }];
+      this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"disposition":"abstained"}' }] }];
     } } };
   } };
   const runtime = await createPiDistiller({ pi, incremental, workDir: dir, model: {}, memory: {}, scope: 'private' });

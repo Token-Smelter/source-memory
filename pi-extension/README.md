@@ -1,16 +1,19 @@
 # Pi Memory extension — experimental core
 
-**This is source-only scaffolding, not an installable or production-ready Pi extension.** It provides a cursor-bounded turn function, an incremental private-session copy, a Pi SDK adapter, a long-lived Memory NDJSON process and a fake-tested Docker/relay adapter. The standalone Pi bootstrap, durable cursor recovery, reviewed vertical-slice run script and real end-to-end qualification remain unimplemented. No fake test establishes actual container isolation.
+**This remains experimental scaffolding, not a production-ready Pi extension or authorization for a paid run.** It provides a versioned retention policy, fictional drift and coverage fixtures, cursor-bounded processing, a durable coverage journal, a Pi SDK adapter, and a private network-namespace harness. The legacy input-token budget is a soft between-call cap, not a hard spend reservation. Live provider bounds, shared metering, chronological dataset admission, fixed answerer/scorer integration and a real end-to-end evaluation remain unqualified.
 
 ## Interfaces
 
 | Module | Role |
 |---|---|
-| `core.mjs` | `distillThrough(session, throughEntryId, cursor)` ingests one `pi-memory` turn and invokes the injected distiller; a single scope is required. `createTurnTools` resolves current-turn evidence labels and exact link-offer handles. |
+| `policy/`, `policy.mjs` | Frozen invariant policy, fictional calibration and coverage fixtures, and explicit treatment-drift assessment. |
+| `core.mjs`, `coverage.mjs` | Cursor-bounded source processing and a private append-only coverage journal. Explicit interruption is supported; unproved compaction, overflow, scope errors and uncertain effects remain gaps. The session and distiller must share the journal-tracked Memory facade. |
 | `incremental.mjs` | Copies complete source JSONL entry lines into a private Pi-session file, preserving entry IDs. Prefix rewrites rebuild the private copy if old entry identities remain equal; changed identities and collisions refuse. State is in memory and does not recover after process restart. |
 | `pi-runtime.mjs` | Reopens that private session, branches to the target leaf and runs an injected Pi SDK session. Anthropic history breakpoint logic is included. |
 | `ndjson.mjs`, `memory-client.mjs`, `memory-process.mjs`, `serve.mjs` | Correlated, cancellable requests to one Memory process; link proposal objects remain in that process for validated reviewed apply. |
 | `index.mjs`, `replay.mjs` | Injectable nonblocking settled-event registration and replay over the same core. |
-| `bridge-harness.mjs`, `docker-adapter.mjs`, `docker-memory.mjs` | Fake-tested bridge/relay orchestration, exact-ID Docker and process adapters. No concrete end-to-end run has qualified their isolation, cleanup or endpoint identity. |
+| `namespace-docker.mjs`, `namespace-probe.mjs`, `namespace-harness.mjs` | Disposable Neo4j with `network none`, a driver sharing its namespace, and loopback/no-route and foreign-endpoint checks. Labelled resources are recorded before use and cleaned by exact identity. |
+| `unix-relay.mjs`, `embedding-shim.mjs`, `docker-memory.mjs` | Private Unix-socket embedding relay, loopback shim and long-lived Memory subprocess. `scripts/check-private-namespace.mjs` exercises actual isolated Neo4j using fictional content and a fake embedding response. |
+| `bridge-harness.mjs`, `docker-adapter.mjs` | Earlier bridge prototype; not the qualified private namespace path. |
 
-The host must provide trusted configuration, an isolated source snapshot, durable cursor storage, model routing and a reviewer. Errors and unconfirmed writes must not advance a cursor. Separate review and self-review are labelled distinctly; a model proposal is not operator acceptance. Docker, gateway, `docker exec`, Pi SDK and Memory integration have only fake tests; no real container, model or Memory process has qualified them. The input-token cap is checked between reported model calls; one already-started call may overshoot the 20M ceiling. Missing usage stops further calls rather than assuming zero.
+The host must provide trusted configuration, a frozen source snapshot and availability proof, model routing, a reviewer and a hard, shared, pre-call spend reservation. Errors and unconfirmed writes do not advance the journaled cursor. Separate review and self-review are labelled distinctly; a model proposal is not operator acceptance. Network probes are sanity checks, not exhaustive evidence. The namespace harness verifies the structural isolation before opening Memory, but a fictional infrastructure smoke does not qualify an experiment, a provider route or a live spend cap.
