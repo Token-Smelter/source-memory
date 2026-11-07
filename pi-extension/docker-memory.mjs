@@ -4,12 +4,13 @@ import { createMemoryClient } from './memory-client.mjs';
 const fail = code => Object.assign(new Error(code), { code });
 
 /** The host owns one docker-exec child; no DB socket or credential is exposed to the model process. */
-export function openDockerMemory({ containerId, scope, configPath, intentDir, spawnFn = spawn, timeoutMs = 30000, onReceipt }) {
+export function openDockerMemory({ containerId, scope, configPath, intentDir, spawnFn = spawn, timeoutMs = 30000, offerTimeoutMs = 30000, onReceipt }) {
   if (!/^[a-f0-9]{64}$/.test(containerId ?? '') || typeof scope !== 'string' || !scope
     || !/^\/scratch\/[A-Za-z0-9._/-]+$/.test(configPath ?? '') || !/^\/scratch\/[A-Za-z0-9._/-]+$/.test(intentDir ?? '')
-    || configPath.split('/').includes('..') || intentDir.split('/').includes('..')) throw fail('binding_invalid');
+    || configPath.split('/').includes('..') || intentDir.split('/').includes('..')
+    || !Number.isSafeInteger(offerTimeoutMs) || offerTimeoutMs < 1 || offerTimeoutMs > 180000) throw fail('binding_invalid');
   const child = spawnFn('/usr/bin/docker', ['exec', '-i', containerId, '/usr/local/bin/node', '/memory/pi-extension/serve.mjs',
-    '--config', configPath, '--scope', scope, '--intent-dir', intentDir],
+    '--config', configPath, '--scope', scope, '--intent-dir', intentDir, '--offer-timeout-ms', String(offerTimeoutMs)],
   { shell: false, env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' }, stdio: ['pipe', 'pipe', 'pipe'] });
   child.stderr.resume();
   const client = createMemoryClient({ input: child.stdout, output: child.stdin, timeoutMs, onReceipt });

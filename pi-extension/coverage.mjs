@@ -4,7 +4,7 @@ import { digest } from '../src/core.mjs';
 import { distillThrough } from './core.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
-const effects = new Set(['ingest', 'enrich', 'applyLinks']);
+const effects = new Set(['ingest', 'enrich', 'applyLinks', 'index']);
 const tracking = Symbol('coverage-tracking');
 const covered = new Set(['committed', 'abstained', 'ineligible_by_policy']);
 const safeCode = error => typeof error?.code === 'string' && /^[a-z_]{1,80}$/.test(error.code) ? error.code : 'operation_failed';

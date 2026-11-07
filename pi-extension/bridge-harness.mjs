@@ -29,16 +29,20 @@ export async function verifyPilotIsolation({ gateway, pilotIps, connect }) {
 }
 
 /** Bounded relay protocol; the caller owns binding a server to the admitted bridge gateway. */
-export function createEmbeddingHandler({ fetchFn = fetch, timeoutMs = 10000, maxBytes = 256000 } = {}) {
+export function createEmbeddingHandler({ fetchFn = fetch, timeoutMs = 10000, maxBytes = 256000, onEvent = () => {} } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120000 || !Number.isSafeInteger(maxBytes) || maxBytes < 1
+    || typeof onEvent !== 'function') throw fail('relay_config_invalid');
   let busy = false;
   return async (request, response) => {
     const send = (status, body) => { response.writeHead(status, { 'content-type': 'application/json' }); response.end(body); };
     if (request.method !== 'POST' || request.url !== '/v1/embeddings') return send(404, '{"error":"not_found"}');
-    if (busy) return send(429, '{"error":"busy"}');
+    if (busy) { try { onEvent({ outcome: 'failed', code: 'relay_busy' }); } catch {} return send(429, '{"error":"busy"}'); }
     busy = true;
+    const started = Date.now();
+    let bytes = 0, upstreamStatus = null;
+    const event = value => { try { onEvent(value); } catch {} };
     try {
       const chunks = [];
-      let bytes = 0;
       for await (const chunk of request) {
         const data = Buffer.from(chunk);
         bytes += data.length;
@@ -50,7 +54,8 @@ export function createEmbeddingHandler({ fetchFn = fetch, timeoutMs = 10000, max
         || typeof body.model !== 'string' || !Array.isArray(body.input) || body.input.some(item => typeof item !== 'string')) throw fail('request_invalid');
       const result = await fetchFn('http://127.0.0.1:11434/v1/embeddings', { method: 'POST', redirect: 'error',
         headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
-      if (!result.ok || !result.body) throw fail('relay_unavailable');
+      upstreamStatus = result.status;
+      if (!result.ok || !result.body) throw fail('relay_upstream_http');
       const output = [];
       let received = 0;
       for await (const part of result.body) {
@@ -59,9 +64,14 @@ export function createEmbeddingHandler({ fetchFn = fetch, timeoutMs = 10000, max
         if (received > 8_000_000) throw fail('response_too_large');
         output.push(data);
       }
+      event({ outcome: 'complete', request_bytes: bytes, upstream_status: upstreamStatus, response_bytes: received, elapsed_ms: Date.now() - started });
       return send(200, Buffer.concat(output).toString('utf8'));
-    } catch { return send(502, '{"error":"relay_unavailable"}'); }
-    finally { busy = false; }
+    } catch (error) {
+      const code = typeof error?.code === 'string' && /^[a-z_]+$/.test(error.code) ? error.code
+        : ['TimeoutError', 'AbortError'].includes(error?.name) ? 'relay_timeout' : 'relay_unavailable';
+      event({ outcome: 'failed', code, request_bytes: bytes, upstream_status: upstreamStatus, elapsed_ms: Date.now() - started });
+      return send(502, '{"error":"relay_unavailable"}');
+    } finally { busy = false; }
   };
 }
 

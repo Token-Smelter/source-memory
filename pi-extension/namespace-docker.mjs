@@ -11,7 +11,7 @@ const validImage = value => typeof value === 'string' && /^sha256:[a-f0-9]{64}$/
 const validPath = value => typeof value === 'string' && isAbsolute(value) && !/[,\x00-\x1f]/.test(value);
 
 async function command(argv) {
-  const result = await exec('/usr/bin/docker', argv, { timeout: 90000, maxBuffer: 4_000_000,
+  const result = await exec('/usr/bin/docker', argv, { timeout: 150000, maxBuffer: 4_000_000,
     env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } });
   return result.stdout.trim();
 }
@@ -200,6 +200,13 @@ export function createNamespaceDocker({ execute = command, probe = probeDriver, 
       requireOwned(driver);
       const result = await json(['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/driver-ready.mjs', '127.0.0.1', '7687', String(port)]);
       if (result?.ready !== true) throw fail('database_unavailable');
+    },
+    async warmEmbedding({ driver, port, model = 'embeddinggemma', dimensions = 768 }) {
+      requireOwned(driver);
+      if (typeof model !== 'string' || !model || !Number.isSafeInteger(dimensions) || dimensions < 1 || dimensions > 4096) throw fail('embedding_unavailable');
+      const result = await json(['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/warm-embedding.mjs', String(port), model, String(dimensions)]);
+      if (result?.ready !== true || !Number.isSafeInteger(result.elapsed_ms)) throw fail('embedding_unavailable');
+      return result;
     },
     removeContainer: remove,
     async removeVolumes() {

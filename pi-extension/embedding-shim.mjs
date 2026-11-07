@@ -15,7 +15,7 @@ export function createEmbeddingShim({ socketPath, requestFn = httpRequest }) {
       response.writeHead(result.statusCode ?? 502, { 'content-type': 'application/json' });
       result.pipe(response);
     });
-    upstream.setTimeout(15000, () => upstream.destroy());
+    upstream.setTimeout(100000, () => upstream.destroy());
     upstream.on('error', () => { if (!response.headersSent) response.writeHead(502, { 'content-type': 'application/json' }); response.end('{"error":"relay_unavailable"}'); });
     request.on('error', () => upstream.destroy());
     request.pipe(upstream);

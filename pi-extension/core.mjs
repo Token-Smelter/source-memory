@@ -90,6 +90,7 @@ export async function distillThrough(session, throughEntryId, cursor, { allowInt
   }
   const receipt = await session.memory.ingest(session.scopes[0], turn);
   if (typeof receipt?.id !== 'string' || !receipt.id) throw fail('ingest_receipt_invalid');
+  if (typeof session.ensureIndexed === 'function') await session.ensureIndexed(session.memory, session.scopes[0], receipt.indexing);
   const result = await session.distiller.run({ turn, receipt, throughEntryId, cursor, scope: session.scopes[0] });
   if (result?.status !== 'complete') throw fail('distillation_incomplete');
   return { cursor: throughEntryId, turn_id: turn.turn_id, receipt, omissions, distillation: result };
@@ -114,7 +115,7 @@ export function createLinkChoices(packet) {
 }
 
 /** Tool-facing labels name only entries of the just-retained cursor turn. */
-export function createTurnTools({ scope, turn, receipt, memory, requireSearch = false }) {
+export function createTurnTools({ scope, turn, receipt, memory, requireSearch = false, ensureIndexed }) {
   if (typeof scope !== 'string' || !scope || !turn?.turn_id || !Array.isArray(turn.entries) || !receipt?.id || !memory) throw fail('invalid_input');
   const labels = new Map();
   const imageNotes = [];
@@ -140,6 +141,8 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
   const recordIds = [];
   let searches = 0;
   let searchFailed = false;
+  let incompleteSearch = false;
+  const returnedPriorIds = new Set();
   let offer = null;
   let choices = null;
   return {
@@ -157,7 +160,8 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
         kind, text, status: 'proposed', attribution: 'Pi distiller proposal; not operator acceptance', evidence: spans };
       const payload = normalizeEnrichment({ records: [record], relations: [] });
       if (offer && typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token);
-      await memory.enrich(scope, payload, { trigger: receipt.id });
+      const write = await memory.enrich(scope, payload, { trigger: receipt.id });
+      if (typeof ensureIndexed === 'function') await ensureIndexed(memory, scope, write?.indexing);
       if (!recordIds.includes(record.id)) recordIds.push(record.id);
       offer = null;
       choices = null;
@@ -178,11 +182,19 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
       try {
         if (typeof memory.recall !== 'function') throw fail('search_unavailable');
         const result = await memory.recall(scope, { query, limit: 8, max_chars: 24000 });
-        if (!['ready', 'no_matches'].includes(result?.status)) throw fail('search_incomplete');
+        if (!['ready', 'no_matches', 'budget_limited'].includes(result?.status) || !Array.isArray(result.bundles)) throw fail('search_incomplete');
+        if (result.status === 'budget_limited') {
+          if (!Number.isSafeInteger(result.budget_omitted) || result.budget_omitted < 1 || !result.channels || !result.bundles.length) throw fail('search_incomplete');
+          incompleteSearch = true;
+        }
         searches++;
-        const records = (result.bundles ?? []).flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind))
-          .slice(0, 32).map(row => ({ kind: row.kind, snippet: row.text.slice(0, 500) }));
-        return { status: result.status, records, filtered: kinds.length > 0, completeness_guaranteed: false };
+        const records = result.bundles.flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind))
+          .slice(0, 32).map(row => ({ id: row.id, kind: row.kind, snippet: row.text.slice(0, 500) }));
+        for (const row of records) if (typeof row.id === 'string' && row.id) returnedPriorIds.add(row.id);
+        const channels = result.channels ? Object.fromEntries(Object.entries(result.channels).map(([name, value]) => [name,
+          { status: value.status, ...(value.reason ? { reason: value.reason } : {}) }])) : null;
+        return { status: result.status, records, filtered: kinds.length > 0, completeness_guaranteed: false,
+          budget_omitted: result.budget_omitted ?? null, retrieval_complete: result.retrieval_complete ?? false, channels };
       } catch (problem) { searchFailed = true; throw problem; }
     },
     async offer() {
@@ -200,6 +212,7 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
       return { status: 'pending_review' };
     },
     pendingLinks() { return offer && choices ? { token: offer.token, output: choices.output() } : null; },
-    stats() { return { records: recordIds.length, searches, search_failed: searchFailed }; },
+    stats() { return { records: recordIds.length, searches, search_failed: searchFailed,
+      incomplete_search: incompleteSearch, returned_prior_ids: [...returnedPriorIds] }; },
   };
 }

@@ -30,11 +30,14 @@ export function createIntentWriter(directory) {
 }
 
 export async function main(argv = process.argv.slice(2), { input = process.stdin, output = process.stdout, store } = {}) {
-  if (argv.length !== 6 || argv[0] !== '--config' || argv[2] !== '--scope' || argv[4] !== '--intent-dir') throw new Error('invalid_arguments');
+  if (![6, 8].includes(argv.length) || argv[0] !== '--config' || argv[2] !== '--scope' || argv[4] !== '--intent-dir'
+    || (argv.length === 8 && argv[6] !== '--offer-timeout-ms')) throw new Error('invalid_arguments');
   const [configPath, scope, intentDir] = [argv[1], argv[3], argv[5]];
+  const offerTimeoutMs = argv.length === 8 ? Number(argv[7]) : 30000;
+  if (!Number.isSafeInteger(offerTimeoutMs) || offerTimeoutMs < 1 || offerTimeoutMs > 180000) throw new Error('invalid_arguments');
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
   const memory = new Memory(config, store);
-  const handlers = createMemoryHandlers({ memory, scopes: [scope], beforeAppend: createIntentWriter(intentDir) });
+  const handlers = createMemoryHandlers({ memory, scopes: [scope], beforeAppend: createIntentWriter(intentDir), offerTimeoutMs });
   try { await serve({ input, output, handlers }); }
   finally { handlers.close(); await memory.close(); }
 }

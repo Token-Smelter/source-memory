@@ -37,6 +37,7 @@ try {
     return new Response(JSON.stringify({ model: 'fictional-embedding', data: input.map((_item, index) => ({ index, embedding: [1, 0] })) }));
   } }); } };
   result = await runNamespaceHarness({ docker, relay, socketPath: join(scratch, 'embeddings.sock'), shimPort: 18080,
+    warm: { model: 'fictional-embedding', dimensions: 2 },
     memoryFactory: async ({ driver }) => openDockerMemory({ containerId: driver, scope: 'fiction', configPath: '/scratch/config.json', intentDir: '/scratch/intents',
       spawnFn(program, args, options) {
         const child = spawn(program, args, options);

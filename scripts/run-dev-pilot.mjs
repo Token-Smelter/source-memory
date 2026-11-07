@@ -2,10 +2,12 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, closeSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { loadavg } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { verifyChronologicalCheckpoint } from '../pi-extension/chronology.mjs';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createImageArchive } from '../pi-extension/image-archive.mjs';
+import { ensureIndexed } from '../pi-extension/index-readiness.mjs';
 import { createDerivedAdapter } from '../pi-extension/derived-retrieval.mjs';
 import { createNamespaceDocker } from '../pi-extension/namespace-docker.mjs';
 import { runNamespaceHarness } from '../pi-extension/namespace-harness.mjs';
@@ -59,7 +61,7 @@ function rates(model) {
 }
 function trackSnapshot(memory) {
   let epoch = 0, lock = false, invalid = false;
-  const writes = new Set(['ingest', 'enrich', 'applyLinks']);
+  const writes = new Set(['ingest', 'enrich', 'applyLinks', 'index']);
   const client = new Proxy(memory, { get(target, key) {
     const value = Reflect.get(target, key, target);
     if (typeof value !== 'function') return value;
@@ -142,8 +144,13 @@ async function main() {
   if (execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim()) throw fail('working_tree_dirty');
   const routeRates = { candidate: rates(model), reviewer: rates(reviewerModel) };
   const priorPath = process.env.PILOT_PRIOR_LEDGER, priorSha = process.env.PILOT_PRIOR_LEDGER_SHA256;
-  if (Boolean(priorPath) !== Boolean(priorSha)) throw fail('prior_ledger_invalid');
-  const previous = priorPath ? BigInt(priorSoftSpend(pinned(priorPath, priorSha, 10_000_000).toString('utf8'))) : 0n;
+  if (Boolean(priorPath) !== Boolean(priorSha) || (process.env.PILOT_PRIOR_LEDGERS && priorPath)) throw fail('prior_ledger_invalid');
+  let priorLedgers = priorPath ? [{ path: priorPath, sha256: priorSha }] : [];
+  if (process.env.PILOT_PRIOR_LEDGERS) {
+    try { priorLedgers = JSON.parse(process.env.PILOT_PRIOR_LEDGERS); } catch { throw fail('prior_ledger_invalid'); }
+  }
+  if (!Array.isArray(priorLedgers) || new Set(priorLedgers.map(row => row?.sha256)).size !== priorLedgers.length) throw fail('prior_ledger_invalid');
+  const previous = priorLedgers.reduce((sum, row) => sum + BigInt(priorSoftSpend(pinned(row.path, row.sha256, 10_000_000).toString('utf8'))), 0n);
   const remaining = 100000000000n - previous;
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
   const seal = createPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
@@ -155,9 +162,10 @@ async function main() {
   const sourceCopy = join(dir, 'source.jsonl'); writePrivate(sourceCopy, sourceBytes);
   writePrivate(join(dir, 'seal.json'), seal);
   writePrivate(join(driverDir, 'config.json'), { neo4j: { uri: 'bolt://127.0.0.1:7687', auth: 'none' }, scopes: { read: [scope], write: [scope] },
-    chunking: { words: 256, overlap: 32 }, embedding: { url: 'http://127.0.0.1:18080/v1/embeddings', model: 'embeddinggemma', dimensions: 768, timeout_ms: 30000 }, index_on_write: true });
+    chunking: { words: 256, overlap: 32 }, embedding: { url: 'http://127.0.0.1:18080/v1/embeddings', model: 'embeddinggemma', dimensions: 768, timeout_ms: 120000 }, index_on_write: true });
   const resources = privateWriter(join(dir, 'resources.jsonl')), progress = privateWriter(join(dir, 'progress.jsonl'));
   const memoryLog = privateWriter(join(dir, 'memory-receipts.jsonl')), results = privateWriter(join(dir, 'case-results.jsonl'));
+  const relayLog = privateWriter(join(dir, 'embedding-relay.jsonl'));
   const image = name => execFileSync('/usr/bin/docker', ['image', 'inspect', name, '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
   const docker = createNamespaceDocker({ databaseImage: image('neo4j:5.26.14-community'), driverImage: image('node:22-bookworm-slim'),
     mounts: { memory: resolve('.'), scratch: driverDir }, runId, onResource: row => resources.append(row) });
@@ -167,7 +175,8 @@ async function main() {
   let journal, sequenceResult, snapshot, failure = null;
   const reportRows = [], caseSnapshots = {};
   const imageHashes = { database: image('neo4j:5.26.14-community'), driver: image('node:22-bookworm-slim') };
-  const harness = await runNamespaceHarness({ docker, relay: { open: ({ socketPath }) => openUnixEmbeddingRelay({ socketPath }) },
+  const harness = await runNamespaceHarness({ docker, relay: { open: ({ socketPath }) => openUnixEmbeddingRelay({ socketPath, timeoutMs: 90000,
+    onEvent: event => relayLog.append({ checkpoint: meta.checkpoint, ...event }) }) },
     socketPath: join(driverDir, 'embeddings.sock'), shimPort: 18080,
     async onIsolation(isolation) {
       writePrivate(join(dir, 'isolation.json'), isolation);
@@ -177,7 +186,7 @@ async function main() {
         models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
         routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
         budget: { overall_effort_soft_usd: 250, share_soft_usd: 100, prior_spend_nano: previous.toString(),
-          remaining_soft_nano: remaining.toString(), prior_ledger_sha256: priorSha ?? null, one_call_in_flight: true, stop_unknown_usage: true,
+          remaining_soft_nano: remaining.toString(), prior_ledger_sha256s: priorLedgers.map(row => row.sha256), one_call_in_flight: true, stop_unknown_usage: true,
           stop_above_twice_estimate: true, gateway_attempt_ledger: 'partial: gateway-internal failover/retry attempts not correlatable', rate_card: routeRates },
         checkpoints: checkpoints.length, cases: prepared.length, isolation: { network_mode: isolation.network_mode,
           namespace: isolation.namespace, interfaces: isolation.interfaces, no_default_route: isolation.no_default_route,
@@ -193,8 +202,16 @@ async function main() {
       }
       throw fail('preflight_go_timeout');
     },
+    async onWarm(result) {
+      const sample = { at: new Date().toISOString(), host_load_average: loadavg(), ollama_ps: null, gpu_utilization_memory: null };
+      try { sample.ollama_ps = execFileSync('/usr/local/bin/ollama', ['ps'], { encoding: 'utf8', timeout: 5000 }); } catch {}
+      try { sample.gpu_utilization_memory = execFileSync('/usr/bin/nvidia-smi', ['--query-gpu=utilization.gpu,memory.used,memory.total', '--format=csv,noheader,nounits'],
+        { encoding: 'utf8', timeout: 5000 }); } catch {}
+      writePrivate(join(dir, 'environment.json'), sample);
+      progress.append({ type: 'embedding_warm', ...result });
+    },
     async memoryFactory({ driver }) { return openDockerMemory({ containerId: driver, scope, configPath: '/scratch/config.json', intentDir: '/scratch/intents',
-      onReceipt: event => memoryLog.append({ checkpoint: meta.checkpoint, ...event }) }); },
+      timeoutMs: 180000, offerTimeoutMs: 120000, onReceipt: event => memoryLog.append({ checkpoint: meta.checkpoint, ...event }) }); },
     async work({ memory, driver }) {
       const guarded = trackSnapshot(memory);
       journal = createCoverageJournal({ directory: dir, sessionKey: sourceKey });
@@ -202,6 +219,7 @@ async function main() {
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
           imageArchive: createImageArchive({ directory: imageDir }),
+          ensureIndexed: (client, selectedScope, state) => ensureIndexed(client, selectedScope, state, { waitForVectors: true }),
           meterRuntime: (underlying, context) => budget.wrap(underlying, () => ({ ...meta,
             purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v1' : 'link-review-r2-v1' })) });
         const evaluatorRuntime = budget.wrap(runtime, () => meta);
@@ -266,8 +284,9 @@ async function main() {
   let scorecard = null;
   if (reportRows.length) scorecard = pairedReport({ seal, expectedDigest: seal.digest, rows: reportRows, dependencies: [] });
   try { budget.close(); } catch { failure ??= 'ledger_close_failed'; }
-  for (const writer of [resources, progress, memoryLog, results]) writer.close();
-  const artifactNames = ['seal.json', 'ledger.jsonl', 'progress.jsonl', 'memory-receipts.jsonl', 'case-results.jsonl', 'resources.jsonl', 'isolation.json'];
+  for (const writer of [resources, progress, memoryLog, results, relayLog]) writer.close();
+  const artifactNames = ['seal.json', 'ledger.jsonl', 'progress.jsonl', 'memory-receipts.jsonl', 'case-results.jsonl', 'resources.jsonl',
+    'isolation.json', 'embedding-relay.jsonl', 'environment.json'];
   const artifacts = {};
   for (const name of artifactNames) {
     try { const bytes = readFileSync(join(dir, name)); artifacts[name] = { path: join(dir, name), sha256: sha(bytes), bytes: bytes.length }; }
@@ -297,7 +316,8 @@ async function main() {
     snapshot: snapshot ?? null, budget: { ...budget.state(), prior_spend_nano: previous.toString(),
       total_spent_nano: (previous + BigInt(budget.state().spent_nano)).toString(), share_cap_nano: '100000000000' },
     ledger_completeness: 'partial: gateway-internal failover/retry attempts not correlatable',
-    image_limitation: 'Original image blobs are archived by SHA-256; image content is not text-citable.', artifacts,
+    image_limitation: 'Original image blobs are archived by SHA-256; image content is not text-citable.',
+    latency_limitation: 'Local embedding latency is environment-sensitive; a later sample showed 100% GPU and elevated host load, not proof of contention during any call.', artifacts,
     run_dir: dir, run_id: runId, seal_sha256: seal.digest };
   writePrivate(join(dir, 'REPORT.json'), final);
   process.stdout.write(`${JSON.stringify({ status: final.status, run_id: runId, run_dir: dir, failure: final.failure })}\n`);

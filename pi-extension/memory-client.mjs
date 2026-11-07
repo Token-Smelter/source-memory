@@ -15,6 +15,8 @@ export function createMemoryClient({ input, output, timeoutMs, reviewContract = 
   };
   return {
     init: (scope, options) => call('init', { scope }, options),
+    status: (scope, options) => call('status', { scope }, options),
+    index: (scope, input, options) => call('index', { scope, input }, options),
     ingest: (scope, turn, options) => call('ingest', { scope, turn }, options),
     recall: (scope, input, options) => call('recall', { scope, input }, options),
     searchDerived: (scope, input, options) => call('searchDerived', { scope, input }, options),

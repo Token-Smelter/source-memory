@@ -1,12 +1,13 @@
 const fail = code => Object.assign(new Error(code), { code });
 
 /** Neither Memory nor the work callback is opened before namespace isolation has been verified. */
-export async function runNamespaceHarness({ docker, relay, socketPath, shimPort, memoryFactory, work, onIsolation = async () => {} }) {
+export async function runNamespaceHarness({ docker, relay, socketPath, shimPort, memoryFactory, work,
+  onIsolation = async () => {}, onWarm = async () => {}, warm = {} }) {
   let database, driver, listener, memory;
   let outcome = { status: 'failed' };
   let cleanupFailed = false;
   try {
-    if (typeof memoryFactory !== 'function' || typeof work !== 'function' || typeof onIsolation !== 'function') throw fail('input_invalid');
+    if (typeof memoryFactory !== 'function' || typeof work !== 'function' || typeof onIsolation !== 'function' || typeof onWarm !== 'function') throw fail('input_invalid');
     database = await docker.createDatabase();
     driver = await docker.createDriver({ database });
     const gate = await docker.isolation({ database, driver, shimPort });
@@ -19,6 +20,7 @@ export async function runNamespaceHarness({ docker, relay, socketPath, shimPort,
       listener = await relay.open({ socketPath });
       await docker.startShim({ driver, port: shimPort });
       await docker.waitReady({ driver, port: shimPort });
+      if (typeof docker.warmEmbedding === 'function') await onWarm(await docker.warmEmbedding({ driver, port: shimPort, ...warm }));
       memory = await memoryFactory({ database, driver });
       if (!memory || typeof memory.init !== 'function' || typeof memory.close !== 'function') throw fail('memory_invalid');
       await memory.init();

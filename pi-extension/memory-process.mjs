@@ -27,6 +27,8 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
   };
   return {
     async init({ scope }) { allowed(scope); return memory.init(scope); },
+    async status({ scope }) { allowed(scope); return memory.status(scope); },
+    async index({ scope, input }) { allowed(scope); return memory.index(scope, input); },
     async ingest({ scope, turn }) {
       allowed(scope);
       if (turn?.source !== 'pi-memory') throw fail('source_invalid');
