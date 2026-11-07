@@ -15,10 +15,12 @@ const entries = readFileSync(source, 'utf8').trim().split('\n').slice(1).map(JSO
 test('one fictional slice passes the gate, shared replay, fake Pi routing and memory process interface', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pi-slice-'));
   try {
-    const calls = [];
+    const calls = [], registered = new Map();
+    class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0]({ on() {}, registerTool(tool) { registered.set(tool.name, tool); } }); } }
     const model = { provider: 'fake', id: 'haiku', api: 'fake', contextWindow: 1000 };
     const hostRuntime = { getModels: () => [model], async checkAuth() { return true; }, streamSimple() { calls.push('model'); } };
-    const pi = { ModelRuntime: { async create() { return hostRuntime; } }, SessionManager: { open(file) {
+    const pi = { ModelRuntime: { async create() { return hostRuntime; } }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
+      SessionManager: { open(file) {
       const rows = readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
       return { getSessionId: () => rows[0].id, branch() {}, buildSessionContext: () => ({ messages: [] }) };
     } }, async createAgentSession({ sessionManager, modelRuntime, model: selected }) {
@@ -26,7 +28,8 @@ test('one fictional slice passes the gate, shared replay, fake Pi routing and me
       return { session: { sessionId: sessionManager.getSessionId(), agent: { sessionId: sessionManager.getSessionId(), state: {} }, messages: [],
         subscribe(fn) { subscriber = fn; }, async prompt() {
           modelRuntime.streamSimple(selected, {});
-          const message = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"disposition":"abstained"}' }], usage: { input: 10, cacheRead: 3, cacheWrite: 0, output: 2 } };
+          await registered.get('memory_search').execute('s', { query: 'fiction', kinds: [] });
+          const message = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"result":"done_nothing_qualifies","reason":"No useful change."}' }], usage: { input: 10, cacheRead: 3, cacheWrite: 0, output: 2 } };
           this.messages.push(message); subscriber({ type: 'turn_end', message });
         } } };
     } };

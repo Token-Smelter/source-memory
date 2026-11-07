@@ -25,7 +25,7 @@ test('installed Pi SDK executes an atomic fictional action and outcome through t
       make([{ type: 'toolCall', id: 'invalid', name: 'memory_record', arguments: { kind: 'issue', text: 'Fiction', evidence_labels: ['ref-000001'] } }], 'toolUse'),
       make([{ type: 'toolCall', id: 'record', name: 'memory_record', arguments: { kind: 'outcome', text: 'Fictional result', evidence_labels: ['ref-000001'],
         new_action: { text: 'Fictional action', evidence_labels: ['ref-000001'] } } }], 'toolUse'),
-      make([{ type: 'text', text: '{"disposition":"committed"}' }], 'stop')];
+      make([{ type: 'text', text: '{"result":"done_with_writes","reason":"Supported change."}' }], 'stop')];
     const offeredTools = [];
     let offeredKinds;
     const runtime = { hasConfiguredAuth() { return true; }, streamSimple(_model, context) {

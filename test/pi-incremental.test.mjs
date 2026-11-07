@@ -82,9 +82,10 @@ test('incremental private session reopens each source leaf with no prior task or
   const source = join(dir, 'source.jsonl');
   writeFileSync(source, fixture.join('\n') + '\n');
   const incremental = await createIncrementalSession({ source, workDir: dir, sessionId: 'fictional-private-id' });
-  const contexts = [];
+  const contexts = [], registered = new Map();
+  class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0]({ on() {}, registerTool(tool) { registered.set(tool.name, tool); } }); } }
   let serial = 0;
-  const pi = { SessionManager: { open(file) {
+  const pi = { SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader, SessionManager: { open(file) {
     const rows = readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
     const byId = new Map(rows.slice(1).map(row => [row.id, row]));
     return { getSessionId: () => rows[0].id, branch(id) { this.leaf = id; }, buildSessionContext() {
@@ -95,10 +96,12 @@ test('incremental private session reopens each source leaf with no prior task or
   } }, async createAgentSession({ sessionManager }) {
     return { session: { sessionId: 'fictional-private-id', agent: { sessionId: 'fictional-private-id', state: {} }, messages: [], async prompt() {
       contexts.push(this.agent.state.messages.map(row => row.source_id)); sessionManager.appendTask();
-      this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"disposition":"abstained"}' }] }];
+      await registered.get('memory_search').execute('s', { query: 'fiction', kinds: [] });
+      this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"result":"done_nothing_qualifies","reason":"No useful change."}' }] }];
     } } };
   } };
-  const runtime = await createPiDistiller({ pi, incremental, workDir: dir, model: {}, memory: {}, scope: 'private' });
+  const runtime = await createPiDistiller({ pi, incremental, workDir: dir, model: {},
+    memory: { async recall() { return { status: 'no_matches', bundles: [] }; } }, scope: 'private' });
   for (const leaf of ['a2', 'a3']) await runtime.run({ throughEntryId: leaf, turn: { turn_id: leaf, entries: [] }, receipt: { id: 'turn' } });
   assert.deepEqual(contexts, [['u1', 'a1', 't1', 'u2', 'a2'], ['u1', 'a1', 't1', 'u2', 'a2', 'u3', 'a3']]);
 }));

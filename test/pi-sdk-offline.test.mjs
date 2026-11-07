@@ -19,26 +19,29 @@ test('installed Pi SDK runs the fictional distiller with a fake provider and sof
     const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 2, totalTokens: 12, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
     const model = { provider: 'fiction', id: 'model', api: 'anthropic-messages', baseUrl: 'http://127.0.0.1:1', contextWindow: 100000,
       maxTokens: 1000, input: ['text'], reasoning: true, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
-    const message = { role: 'assistant', provider: model.provider, model: model.id, api: model.api, timestamp: Date.now(),
-      stopReason: 'stop', usage, content: [{ type: 'text', text: '{"disposition":"abstained"}' }] };
+    const make = (content, stopReason) => ({ role: 'assistant', provider: model.provider, model: model.id, api: model.api, timestamp: Date.now(), stopReason, usage, content });
+    const messages = [make([{ type: 'toolCall', id: 's', name: 'memory_search', arguments: { query: 'fiction', kinds: [] } }], 'toolUse'),
+      make([{ type: 'text', text: '{"result":"done_nothing_qualifies","reason":"No useful change."}' }], 'stop')];
     const runtime = { hasConfiguredAuth() { return true; }, streamSimple() {
+      const message = messages.shift();
       let finish;
       const result = new Promise(resolve => { finish = resolve; });
       return { result: () => result, async *[Symbol.asyncIterator]() {
         yield { type: 'start', partial: message };
         finish(message);
-        yield { type: 'done', reason: 'stop', message };
+        yield { type: 'done', reason: message.stopReason, message };
       } };
     } };
     const soft = createSoftBudget({ path: join(directory, 'ledger.jsonl'), capNano: '1000000', sessionKey: 'fiction', sealSha256: 'a'.repeat(64),
       routes: { 'fiction/model': { maxOutputTokens: 1000, ratesNanoPerToken: { input: 1, cacheRead: 1, cacheWrite: 1, output: 1 }, rateEvidence: 'fiction' } } });
     const tokenBudget = createInputBudget(1000000);
     const metered = soft.wrap(boundPiRuntime(runtime, tokenBudget), () => ({ purpose: 'candidate', arm: 'candidate', checkpoint: 'a2', task_version: 'fiction', policy_version: 'fiction' }));
-    const distiller = await createPiDistiller({ pi, incremental, workDir: directory, model, modelRuntime: metered, memory: {}, scope: 'fiction', budget: tokenBudget });
+    const distiller = await createPiDistiller({ pi, incremental, workDir: directory, model, modelRuntime: metered,
+      memory: { async recall() { return { status: 'no_matches', bundles: [] }; } }, scope: 'fiction', budget: tokenBudget });
     const result = await distiller.run({ throughEntryId: 'a2', turn: { turn_id: 'fiction', entries: [] }, receipt: { id: 'fiction' } });
     await new Promise(resolve => setImmediate(resolve));
     soft.close();
     assert.deepEqual([result.disposition, soft.state().calls_started, readFileSync(join(directory, 'ledger.jsonl'), 'utf8').includes('"outcome":"received"')],
-      ['abstained', 1, true]);
+      ['abstained', 2, true]);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

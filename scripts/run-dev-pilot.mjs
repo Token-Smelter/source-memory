@@ -171,7 +171,7 @@ async function main() {
     mounts: { memory: resolve('.'), scratch: driverDir }, runId, onResource: row => resources.append(row) });
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
     routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer } });
-  let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v1', policy_version: seal.spec.policyVersion };
+  let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v2', policy_version: seal.spec.policyVersion };
   let journal, sequenceResult, snapshot, failure = null;
   const reportRows = [], caseSnapshots = {};
   const imageHashes = { database: image('neo4j:5.26.14-community'), driver: image('node:22-bookworm-slim') };
@@ -221,11 +221,11 @@ async function main() {
           imageArchive: createImageArchive({ directory: imageDir }),
           ensureIndexed: (client, selectedScope, state) => ensureIndexed(client, selectedScope, state, { waitForVectors: true }),
           meterRuntime: (underlying, context) => budget.wrap(underlying, () => ({ ...meta,
-            purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v1' : 'link-review-r2-v1' })) });
+            purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v2' : 'link-review-r2-v1' })) });
         const evaluatorRuntime = budget.wrap(runtime, () => meta);
         sequenceResult = await runPilotSequence({ session, journal, checkpoints, cases: prepared, budget,
           async onBeforeCheckpoint(checkpoint) { meta = { purpose: 'candidate', arm: 'candidate', checkpoint: checkpoint.id,
-            task_version: 'distiller-r2-v1', policy_version: seal.spec.policyVersion }; },
+            task_version: 'distiller-r2-v2', policy_version: seal.spec.policyVersion }; },
           async onCheckpoint(row, state) { progress.append({ type: 'checkpoint', through: checkpointId(row), disposition: row.disposition,
             image_limitation: row.omissions?.images ?? null, budget: state }); },
           async onCase(row, state) { progress.append({ type: 'case', case_id: row.case_id, status: row.status, budget: state }); },

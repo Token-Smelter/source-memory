@@ -141,14 +141,17 @@ test('Memory process rejects a record citing a different turn before writes', as
 
 test('incremental fake Pi distiller reopens the same private session and branches at each source leaf', async () => {
   const { createPiDistiller } = await import('../pi-extension/pi-runtime.mjs');
-  const calls = [];
+  const calls = [], registered = new Map();
+  class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0]({ on() {}, registerTool(tool) { registered.set(tool.name, tool); } }); } }
   const incremental = { sessionId: 'distiller-id', async syncThrough(id) { calls.push(['sync', id]); return { file: '/fiction/private' }; } };
   const manager = { getSessionId: () => 'distiller-id', branch(id) { calls.push(['branch', id]); this.leaf = id; },
     buildSessionContext() { return { messages: [{ role: 'user', content: this.leaf }] }; } };
   const makeSession = () => ({ sessionId: 'distiller-id', agent: { sessionId: 'distiller-id', state: {} }, messages: [],
-    async prompt() { calls.push(['prompt', this.agent.state.messages[0].content]); this.messages = [{ role: 'assistant', content: [{ type: 'text', text: '{"disposition":"abstained"}' }], stopReason: 'stop' }]; } });
-  const pi = { SessionManager: { open: () => { calls.push(['open']); return manager; } }, async createAgentSession() { return { session: makeSession() }; } };
-  const runtime = await createPiDistiller({ pi, incremental, workDir: '/fiction/work', model: {}, memory: {}, scope: 'private', createOptions: {} });
+    async prompt() { calls.push(['prompt', this.agent.state.messages[0].content]); await registered.get('memory_search').execute('s', { query: 'fiction', kinds: [] });
+      this.messages = [{ role: 'assistant', content: [{ type: 'text', text: '{"result":"done_nothing_qualifies","reason":"No useful change."}' }], stopReason: 'stop' }]; } });
+  const pi = { SessionManager: { open: () => { calls.push(['open']); return manager; } }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
+    async createAgentSession() { return { session: makeSession() }; } };
+  const runtime = await createPiDistiller({ pi, incremental, workDir: '/fiction/work', model: {}, memory: { async recall() { return { status: 'no_matches', bundles: [] }; } }, scope: 'private', createOptions: {} });
   for (const id of ['a2', 'a3']) await runtime.run({ throughEntryId: id, turn: { turn_id: id, entries: [] }, receipt: { id: 'turn' } });
   assert.deepEqual(calls, [['sync', 'a2'], ['open'], ['branch', 'a2'], ['prompt', 'a2'], ['sync', 'a3'], ['open'], ['branch', 'a3'], ['prompt', 'a3']]);
 });
@@ -172,7 +175,7 @@ for (const mode of ['separate', 'self_review']) {
       await registered.get('memory_record').execute('1', { kind: 'decision', text: 'Choice', evidence_labels: ['ref-000001'] });
       await registered.get('memory_search').execute('2', { query: 'Choice', kinds: ['decision'] });
       await registered.get('memory_link').execute('3', { from: 'r0', to: 'r1', type: 'qualifies', evidence: ['s0'], support: 'explicit' });
-      this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"disposition":"committed"}' }] }];
+      this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"result":"done_with_writes","reason":"Supported change."}' }] }];
     } };
     const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
       async createAgentSession() { return { session }; } };

@@ -35,7 +35,7 @@ test('an incomplete search without a returned prior cannot justify abstention', 
   const manager = { getSessionId: () => 'fiction', branch() {}, buildSessionContext: () => ({ messages: [] }) };
   const session = { sessionId: 'fiction', agent: { sessionId: 'fiction', state: {} }, messages: [], async prompt() {
     await tools.get('memory_search').execute('search', { query: 'fiction', kinds: [] });
-    this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"disposition":"abstained"}' }] }];
+    this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"result":"done_nothing_qualifies","reason":"No useful change."}' }] }];
   } };
   const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
     async createAgentSession() { return { session }; } };
@@ -43,6 +43,22 @@ test('an incomplete search without a returned prior cannot justify abstention', 
   const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
     workDir: '/fiction', model: {}, memory, scope: 'fiction' });
   await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } }), /search_incomplete/);
+});
+
+test('the model cannot declare operational uncertainty as its result', async () => {
+  const tools = new Map();
+  class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0]({ on() {}, registerTool(tool) { tools.set(tool.name, tool); } }); } }
+  const manager = { getSessionId: () => 'fiction', branch() {}, buildSessionContext: () => ({ messages: [] }) };
+  const session = { sessionId: 'fiction', agent: { sessionId: 'fiction', state: {} }, messages: [], async prompt() {
+    await tools.get('memory_search').execute('search', { query: 'fiction', kinds: [] });
+    this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"disposition":"uncertain"}' }] }];
+  } };
+  const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
+    async createAgentSession() { return { session }; } };
+  const memory = { async recall() { return { status: 'no_matches', bundles: [] }; } };
+  const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
+    workDir: '/fiction', model: {}, memory, scope: 'fiction' });
+  await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } }), /disposition_invalid/);
 });
 
 test('an unknown write aborts the Pi tool loop immediately', async () => {
