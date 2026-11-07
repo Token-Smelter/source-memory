@@ -1,7 +1,7 @@
 import { retentionPolicy } from '../policy.mjs';
 import { hash, sealComparison } from './seal.mjs';
 import { RUBRIC, RUBRIC_VERSION, WORKED_EXAMPLES } from './rubric.mjs';
-import { ANSWERER_TOOLS_SHA256, SCORER_TOOLS_SHA256, ANSWERER_FORMAT_SUFFIX, ANSWERER_BUDGET_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, SCORER_REPAIR, SCORER_SPECIFIC_REPAIR } from './pi-calls.mjs';
+import { ANSWERER_TOOLS_SHA256, SCORER_TOOLS_SHA256, ANSWERER_FORMAT_SUFFIX, ANSWERER_BUDGET_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, SCORER_REPAIR, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from './pi-calls.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
@@ -18,12 +18,20 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
       || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
-      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback'].includes(resume.transition)
+      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback', 'specific-scorer-repair-continuation'].includes(resume.transition)
       || (resume.sourceTreeDriftSha256 !== undefined && !/^[a-f0-9]{64}$/.test(resume.sourceTreeDriftSha256))
+      || (resume.checkpointSnapshotSha256 !== undefined && !/^[a-f0-9]{64}$/.test(resume.checkpointSnapshotSha256))
       || (resume.partialCaseHandback !== undefined && (!resume.partialCaseHandback || resume.partialCaseHandback.repairFormat !== 'scorer-r2-v3-specific-repair'
         || !['sourceReportSha256', 'sourceSealDigest', 'snapshotSha256', 'resultsSha256', 'outputsSha256', 'ledgerSha256', 'candidateScoreSha256',
           'baselineAnswerSha256', 'previousMessageSha256', 'offendingClauseIdSha256'].every(key => /^[a-f0-9]{64}$/.test(resume.partialCaseHandback[key] ?? ''))
-        || resume.specificScorerRepair?.instruction !== SCORER_SPECIFIC_REPAIR || resume.specificScorerRepair?.maxCalls !== 1))
+        || resume.specificScorerRepair?.instruction !== SCORER_SPECIFIC_REPAIR || resume.specificScorerRepair?.maxCalls !== 1
+        || (resume.transition === 'specific-scorer-repair-continuation' && (resume.specificScorerRepair?.multiInstruction !== SCORER_MULTI_REPAIR
+          || resume.specificScorerRepair?.scope !== 'per-arm' || JSON.stringify(resume.specificScorerRepair?.allowedArms) !== JSON.stringify(['empty', 'raw-only'])
+          || !['baselineScoreSha256', 'emptyAnswerSha256', 'originalCaseSealDigest'].every(key => /^[a-f0-9]{64}$/.test(resume.partialCaseHandback[key] ?? ''))
+          || !/^[a-f0-9]{40}$/.test(resume.partialCaseHandback.originalCaseCodeSha ?? '')
+          || resume.partialCaseHandback.armOrigins?.candidate !== resume.partialCaseHandback.originalCaseSealDigest
+          || resume.partialCaseHandback.armOrigins?.baseline !== resume.partialCaseHandback.originalCaseSealDigest
+          || resume.partialCaseHandback.armOrigins?.empty !== resume.partialCaseHandback.sourceSealDigest))))
       || (resume.ledgerReconciliationSha256s !== undefined && (!Array.isArray(resume.ledgerReconciliationSha256s)
         || resume.ledgerReconciliationSha256s.some(value => !/^[a-f0-9]{64}$/.test(value))))
       || (resume.caseHandbacks !== undefined && (!Array.isArray(resume.caseHandbacks) || resume.caseHandbacks.some(row =>

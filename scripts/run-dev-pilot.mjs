@@ -9,6 +9,7 @@ import { verifyChronologicalCheckpoint } from '../pi-extension/chronology.mjs';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createInputBudget } from '../pi-extension/budget.mjs';
 import { createImageArchive } from '../pi-extension/image-archive.mjs';
+import { sameLogicalSnapshot } from '../pi-extension/restore-scope.mjs';
 import { ensureIndexed } from '../pi-extension/index-readiness.mjs';
 import { createDerivedAdapter } from '../pi-extension/derived-retrieval.mjs';
 import { createNamespaceDocker } from '../pi-extension/namespace-docker.mjs';
@@ -18,11 +19,12 @@ import { openDockerMemory } from '../pi-extension/docker-memory.mjs';
 import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runtime.mjs';
 import { createAnswerer } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases } from '../pi-extension/evaluation/dev-dataset.mjs';
-import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_TOOLS_SHA256, SCORER_SPECIFIC_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
+import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_TOOLS_SHA256, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
 import { createPilotPlan, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
+import { validateCaseContinuation } from '../pi-extension/evaluation/pilot-continuation.mjs';
 import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
 import { createScorer, scoreCase } from '../pi-extension/evaluation/scorer.mjs';
@@ -174,9 +176,8 @@ async function main() {
     if (!request || typeof request !== 'object' || Array.isArray(request)) throw fail('resume_invalid');
     const report = JSON.parse(pinned(request.reportPath, request.reportSha256, 10_000_000).toString('utf8'));
     const priorDir = dirname(request.reportPath);
-    const checkpointMatch = report.artifacts?.checkpoint_snapshots?.some(row => row.through === request.cursor
-      && (row.sha256 === request.snapshotSha256 || (report.resume_restore?.equivalent === true
-        && report.resume_restore.source_sha256 === row.sha256 && report.resume_restore.restored_sha256 === request.snapshotSha256)));
+    const checkpointsAtCursor = report.artifacts?.checkpoint_snapshots?.filter(row => row.through === request.cursor) ?? [];
+    const checkpointMatch = checkpointsAtCursor.length === 1;
     const snapshotPathMatch = report.artifacts?.checkpoint_snapshots?.some(row => row.through === request.cursor && row.path === request.snapshotPath && row.sha256 === request.snapshotSha256)
       || report.artifacts?.case_snapshots?.some(row => row.path === request.snapshotPath && row.sha256 === request.snapshotSha256
         && prepared.some(item => item.through === request.cursor && item.publicCase.id === row.case_id));
@@ -189,6 +190,11 @@ async function main() {
     const progressBytes = pinned(request.progressPath, request.progressSha256, 10_000_000);
     const journalBytes = pinned(request.journalPath, request.journalSha256, 20_000_000);
     const snapshotBytes = pinned(request.snapshotPath, request.snapshotSha256, 128_000_000);
+    const checkpointRef = checkpointsAtCursor[0];
+    const checkpointBytes = checkpointRef.sha256 === request.snapshotSha256 ? snapshotBytes : pinned(checkpointRef.path, checkpointRef.sha256, 128_000_000);
+    const checkpointSnapshotEquivalent = checkpointRef.sha256 === request.snapshotSha256
+      || sameLogicalSnapshot(JSON.parse(checkpointBytes), JSON.parse(snapshotBytes));
+    if (!checkpointSnapshotEquivalent) throw fail('resume_snapshot_mismatch');
     if (Boolean(request.driftPath) !== Boolean(request.driftSha256)) throw fail('resume_invalid');
     const driftPath = request.driftPath ?? report.source_tree_drift?.artifact ?? null;
     const driftSha = request.driftSha256 ?? report.source_tree_drift?.sha256 ?? null;
@@ -233,7 +239,7 @@ async function main() {
     const plan = { priorRunId: report.run_id, priorSealDigest: priorSeal.digest, priorCodeSha: priorSeal.spec?.codeSha,
       cursor: request.cursor, snapshotSha256: request.snapshotSha256, journalSha256: request.journalSha256,
       transition: request.transition, ledgerReconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean),
-      caseHandbacks: handbacks, ...(driftBytes ? { sourceTreeDriftSha256: driftSha } : {}) };
+      caseHandbacks: handbacks, checkpointSnapshotSha256: checkpointRef.sha256, ...(driftBytes ? { sourceTreeDriftSha256: driftSha } : {}) };
     let superseded = null, partialCase = null;
     const pendingCases = prepared.filter(item => item.through === request.cursor && !completedCases.includes(item));
     if (pendingCases.length) {
@@ -246,13 +252,37 @@ async function main() {
       const outputBytes = priorOutputs ? pinned(priorOutputs.path, priorOutputs.sha256, 128_000_000) : null;
       const outputRows = outputBytes ? outputBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse) : [];
       if (priorRows.some(row => pendingCases.some(item => item.publicCase.id === row.case_id))) {
-        if (pendingCases.length !== 1 || request.transition !== 'specific-scorer-repair-and-arm-handback') throw fail('resume_partial_case_unsupported');
-        partialCase = validatePartialCaseHandback({ report, reportSha256: request.reportSha256, seal: priorSeal,
-          resultRows: priorRows, outputRows, ledgerRows, item: pendingCases[0] });
+        if (pendingCases.length !== 1) throw fail('resume_partial_case_unsupported');
+        if (request.transition === 'specific-scorer-repair-and-arm-handback') {
+          partialCase = validatePartialCaseHandback({ report, reportSha256: request.reportSha256, seal: priorSeal,
+            resultRows: priorRows, outputRows, ledgerRows, item: pendingCases[0] });
+          carriedRows.push(partialCase.candidateAnswer, partialCase.candidateJudgment, partialCase.baselineAnswer);
+        } else if (request.transition === 'specific-scorer-repair-continuation') {
+          const descriptor = report.resume?.partialCaseHandback, originPath = request.partialOriginReportPath;
+          if (!descriptor || basename(originPath ?? '') !== 'REPORT.json' || dirname(dirname(originPath)) !== parent) throw fail('handback_invalid');
+          const originBytes = pinned(originPath, descriptor.sourceReportSha256, 10_000_000), originReport = JSON.parse(originBytes);
+          if (originReport.run_id !== descriptor.sourceRunId || originReport.run_dir !== dirname(originPath)) throw fail('handback_invalid');
+          const originArtifact = key => { const row = originReport.artifacts?.[key]; return pinned(row?.path, row?.sha256, 128_000_000); };
+          const oldSealBytes = originArtifact('seal.json'), oldResultsBytes = originArtifact('case-results.jsonl'), oldOutputsBytes = originArtifact('model-outputs.jsonl');
+          const originalSeal = JSON.parse(oldSealBytes.toString('utf8'));
+          const originalPartial = validatePartialCaseHandback({ report: originReport, reportSha256: descriptor.sourceReportSha256, seal: originalSeal,
+            resultRows: oldResultsBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse),
+            outputRows: oldOutputsBytes.toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse),
+            ledgerRows: originArtifact('ledger.jsonl').toString('utf8').trimEnd().split('\n').filter(Boolean).map(JSON.parse), item: pendingCases[0] });
+          partialCase = validateCaseContinuation({ report, reportSha256: request.reportSha256, seal: priorSeal, resultRows: priorRows,
+            outputRows, ledgerRows, item: pendingCases[0], originalPartial, originalSeal });
+          partialCase.originalSeal = originalSeal;
+          carriedRows.push(partialCase.candidateAnswer, partialCase.candidateJudgment, partialCase.baselineAnswer,
+            partialCase.baselineJudgment, partialCase.emptyAnswer);
+          if (!originSeals.some(row => row.digest === originalSeal.digest)) originSeals.push(originalSeal);
+          if (!originBundles.has(descriptor.sourceReportSha256)) originBundles.set(descriptor.sourceReportSha256,
+            { sealBytes: oldSealBytes, resultsBytes: oldResultsBytes, outputsBytes: oldOutputsBytes });
+        } else throw fail('resume_partial_case_unsupported');
         if (partialCase.descriptor.snapshotSha256 !== request.snapshotSha256) throw fail('handback_snapshot_invalid');
         plan.partialCaseHandback = partialCase.descriptor;
-        plan.specificScorerRepair = { instruction: SCORER_SPECIFIC_REPAIR, maxCalls: 1, format: 'scorer-r2-v3-specific-repair' };
-        carriedRows.push(partialCase.candidateAnswer, partialCase.candidateJudgment, partialCase.baselineAnswer);
+        plan.specificScorerRepair = { instruction: SCORER_SPECIFIC_REPAIR, ...(request.transition === 'specific-scorer-repair-continuation'
+          ? { multiInstruction: SCORER_MULTI_REPAIR, scope: 'per-arm', allowedArms: ['empty', 'raw-only'] } : {}),
+          maxCalls: 1, format: 'scorer-r2-v3-specific-repair' };
         if (!originSeals.some(row => row.digest === priorSeal.digest)) originSeals.push(priorSeal);
         if (!originBundles.has(request.reportSha256)) originBundles.set(request.reportSha256,
           { sealBytes: pinned(request.sealPath, request.sealSha256, 10_000_000), resultsBytes: resultBytes, outputsBytes: outputBytes });
@@ -267,7 +297,7 @@ async function main() {
             : { limitation: 'The earlier harness did not persist answer or scorer raw outputs.' }) };
       }
     }
-    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, driftBytes, plan, superseded, partialCase,
+    resume = { report, priorSeal, progress, journalBytes, snapshotBytes, checkpointSnapshotEquivalent, driftBytes, plan, superseded, partialCase,
       handbacks, handbackRows, carriedRows, carriedSnapshots, originSeals, carriedCases, originBundles };
   }
   const remaining = 100000000000n - previous;
@@ -306,7 +336,8 @@ async function main() {
         checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
         sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
         reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks,
-        partialCaseHandback: resume.partialCase?.descriptor ?? null, sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
+        partialCaseHandback: resume.partialCase?.descriptor ?? null, checkpointSnapshotEquivalent: resume.checkpointSnapshotEquivalent,
+        sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
     } finally { priorJournal.close(); }
   }
   writePrivate(join(driverDir, 'config.json'), { neo4j: { uri: 'bolt://127.0.0.1:7687', auth: 'none' }, scopes: { read: [scope], write: [scope] },
@@ -373,7 +404,8 @@ async function main() {
             checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
             sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
             reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks,
-            partialCaseHandback: resume.partialCase?.descriptor ?? null, sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
+            partialCaseHandback: resume.partialCase?.descriptor ?? null, checkpointSnapshotEquivalent: resume.checkpointSnapshotEquivalent,
+            sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
           if (JSON.stringify(current) !== JSON.stringify(resumeValidation)) throw fail('resume_provenance_mismatch');
           const output = execFileSync('/usr/bin/docker', ['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/restore-scope.mjs',
             '/scratch/resume-snapshot.json', resume.plan.snapshotSha256, scope], { encoding: 'utf8', timeout: 180000, maxBuffer: 100000 });
@@ -444,36 +476,57 @@ async function main() {
               const judge = createPiScorerJudge({ runtime: evaluatorRuntime, model: reviewerModel, sessionId: `score-${runId}-${item.publicCase.id}`, outputTokens: 4096 });
               const scorer = createScorer({ seal, expectedDigest: seal.digest, judge });
               const partial = resume?.partialCase?.descriptor.caseId === item.publicCase.id ? resume.partialCase : null;
-              const arms = {}, failedArms = [];
+              const arms = {}, failedArms = [], repairs = [];
+              const specific = async (arm, answer, originSeal, previousMessage, clauseIds) => {
+                const repair = createPiScorerSpecificRepair({ runtime: evaluatorRuntime, model: reviewerModel,
+                  sessionId: `score-repair-${runId}-${item.publicCase.id}-${arm}`, outputTokens: 4096 });
+                const anchored = createScorer({ seal: originSeal, expectedDigest: originSeal.digest,
+                  judge: request => repair({ ...request, previousMessage, clauseIds }) });
+                meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: 'scorer-r2-v3-specific-repair', policy_version: seal.spec.policyVersion };
+                try {
+                  const judged = await anchored.score({ packet: item.packet, answer: answer.answer, trace: answer.trace });
+                  arms[arm] = judged.score;
+                  const receipt = { arm, format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest };
+                  repairs.push(receipt);
+                  results.append({ type: 'judgment', case_id: item.publicCase.id, arm, judgment: judged.judgment, score: judged.score, repair: receipt });
+                } catch (error) {
+                  if (error?.code !== 'scorer_output_invalid') throw error;
+                  failedArms.push(arm);
+                  results.append({ type: 'scorer_failed', case_id: item.publicCase.id, arm,
+                    reason: 'specific_repair_still_invalid', repairSealDigest: seal.digest });
+                }
+              };
               for (const arm of ['candidate', 'baseline', 'empty', 'raw-only']) {
                 if (partial && arm === 'candidate') { arms.candidate = partial.candidateJudgment.score; continue; }
+                if (partial?.baselineJudgment && arm === 'baseline') {
+                  arms.baseline = partial.baselineJudgment.score;
+                  repairs.push({ arm: 'baseline', format: 'scorer-r2-v3-specific-repair', repairSealDigest: resume.priorSeal.digest });
+                  continue;
+                }
+                if (partial?.emptyAnswer && arm === 'empty') {
+                  await specific('empty', partial.emptyAnswer.answer, resume.priorSeal, partial.previousMessage, partial.clauseIds);
+                  continue;
+                }
                 if (partial && arm === 'baseline') {
-                  const oldAnswer = partial.baselineAnswer.answer;
-                  const repair = createPiScorerSpecificRepair({ runtime: evaluatorRuntime, model: reviewerModel,
-                    sessionId: `score-repair-${runId}-${item.publicCase.id}`, outputTokens: 4096 });
-                  const priorScorer = createScorer({ seal: resume.priorSeal, expectedDigest: resume.priorSeal.digest,
-                    judge: request => repair({ ...request, previousMessage: partial.previousMessage, clauseId: partial.clauseId }) });
-                  meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: 'scorer-r2-v3-specific-repair', policy_version: seal.spec.policyVersion };
-                  try {
-                    const judged = await priorScorer.score({ packet: item.packet, answer: oldAnswer.answer, trace: oldAnswer.trace });
-                    arms.baseline = judged.score;
-                    results.append({ type: 'judgment', case_id: item.publicCase.id, arm, judgment: judged.judgment, score: judged.score,
-                      repair: { format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest } });
-                  } catch (error) {
-                    if (error?.code !== 'scorer_output_invalid') throw error;
-                    failedArms.push(arm);
-                    results.append({ type: 'scorer_failed', case_id: item.publicCase.id, arm,
-                      reason: 'specific_repair_still_invalid', repairSealDigest: seal.digest });
-                  }
+                  await specific('baseline', partial.baselineAnswer.answer, resume.priorSeal, partial.previousMessage, [partial.clauseId]);
                   continue;
                 }
                 meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: 'answerer-r2-v3', policy_version: seal.spec.policyVersion };
                 const answer = await answerer.run({ arm, case: item.publicCase });
                 results.append({ type: 'answer', case_id: item.publicCase.id, arm, answer });
                 meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: 'scorer-r2-v2', policy_version: seal.spec.policyVersion };
-                const judged = await scorer.score({ packet: item.packet, answer: answer.answer, trace: answer.trace });
-                arms[arm] = judged.score;
-                results.append({ type: 'judgment', case_id: item.publicCase.id, arm, judgment: judged.judgment, score: judged.score });
+                try {
+                  const judged = await scorer.score({ packet: item.packet, answer: answer.answer, trace: answer.trace });
+                  arms[arm] = judged.score;
+                  results.append({ type: 'judgment', case_id: item.publicCase.id, arm, judgment: judged.judgment, score: judged.score });
+                } catch (error) {
+                  if (error?.code !== 'scorer_output_invalid' || !partial || !['empty', 'raw-only'].includes(arm)) throw error;
+                  const calls = error.last_message?.content?.filter(row => row.type === 'toolCall' && row.name === 'submit_score') ?? [];
+                  const clauseIds = calls.length === 1 ? calls[0].arguments?.clauses?.filter(row => row.judgments?.support === 'pass'
+                    && Array.isArray(row.sourceIds) && row.sourceIds.length === 0).map(row => row.id) ?? [] : [];
+                  if (clauseIds.length) await specific(arm, answer, seal, error.last_message, clauseIds);
+                  else { failedArms.push(arm); results.append({ type: 'scorer_failed', case_id: item.publicCase.id, arm, reason: 'invalid_output_without_specific_rule' }); }
+                }
               }
               if (failedArms.length) {
                 partialCaseResult = { case_id: item.publicCase.id, status: 'partial', failed_arms: failedArms, arms,
@@ -481,7 +534,8 @@ async function main() {
                 return { case_id: item.publicCase.id, status: 'partial', failed_arms: failedArms, reference: 'pending_reference_freeze', snapshot: caseSnapshots[item.publicCase.id] };
               }
               reportRows.push({ caseId: item.publicCase.id, sessions: [sourceKey], sealDigest: seal.digest, packetDigest: arms.candidate.packetDigest, arms,
-                ...(partial ? { repair: { arm: 'baseline', format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest } } : {}) });
+                ...(partial && !partial.baselineJudgment ? { repair: { arm: 'baseline', format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest } } : {}),
+                ...(repairs.length ? { repairs } : {}) });
               return { case_id: item.publicCase.id, status: 'scored', reference: 'pending_reference_freeze', snapshot: caseSnapshots[item.publicCase.id] };
             } finally { held.release(); }
           } });

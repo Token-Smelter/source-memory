@@ -92,6 +92,18 @@ test('specific scorer repair makes one call bound to the offending clause', asyn
     ['uncertain', 1, true]);
 });
 
+test('one specific repair names all unsupported pass clauses without choosing their verdicts', async () => {
+  const make = id => ({ id, text: 'fiction', requirementIds: [], sourceIds: [], action: false,
+    judgments: { support: 'pass', authority: 'pass', scope: 'pass', time: 'pass', uncertainty: 'pass' }, alternative: null, relation: null });
+  const previousMessage = message([{ type: 'toolCall', id: 'old', name: 'submit_score', arguments: { clauses: [make('a'), make('b')] } }], 'toolUse');
+  const fake = fakeMetered([message([{ type: 'toolCall', id: 'new', name: 'submit_score', arguments: { clauses: [] } }], 'toolUse')]);
+  const judge = createPiScorerSpecificRepair({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });
+  const result = await judge({ packet: {}, answer: { text: 'fiction' }, trace: {}, scorer: { route: 'fiction', model: 'one', instructions: 'Grade.' },
+    rubric: {}, packetSchema: {}, previousMessage, clauseIds: ['a', 'b'], validate() {} });
+  const instruction = fake.calls[0].context.messages.at(-1).content;
+  assert.deepEqual([result.clauses.length, fake.calls.length, instruction.includes('["a","b"]'), instruction.includes('fail or uncertain')], [0, 1, true, true]);
+});
+
 test('specific scorer repair does not silently correct a still-invalid judgment', async () => {
   const clause = { id: 'fiction-clause', text: 'fiction', requirementIds: [], sourceIds: [], action: true,
     judgments: { support: 'pass', authority: 'pass', scope: 'pass', time: 'pass', uncertainty: 'pass' }, alternative: null, relation: null };

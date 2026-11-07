@@ -50,7 +50,15 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies, provena
       const score = row.arms[arm], armOrigin = origins.get(score.sealDigest);
       if (!armOrigin || score.packetDigest !== row.packetDigest || armOrigin.packets[row.caseId] !== row.packetDigest) return false;
       if (score.sealDigest === row.sealDigest) return true;
-      if (!partial || partial.caseId !== row.caseId || partial.sourceSealDigest !== score.sealDigest || partial.sourceCodeSha !== armOrigin.codeSha) return false;
+      if (!partial || partial.caseId !== row.caseId) return false;
+      if (partial.armOrigins) {
+        if (partial.armOrigins[arm] !== score.sealDigest) return false;
+        if (arm === 'candidate') return armOrigin.codeSha === partial.originalCaseCodeSha && hash(score) === partial.candidateScoreSha256;
+        if (arm === 'baseline') return armOrigin.codeSha === partial.originalCaseCodeSha && hash(score) === partial.baselineScoreSha256;
+        return arm === 'empty' && armOrigin.codeSha === partial.sourceCodeSha && row.repairs?.some(item => item.arm === 'empty' && item.format === partial.repairFormat
+          && item.repairSealDigest === seal.digest);
+      }
+      if (partial.sourceSealDigest !== score.sealDigest || partial.sourceCodeSha !== armOrigin.codeSha) return false;
       if (arm === 'candidate') return hash(score) === partial.candidateScoreSha256;
       return arm === 'baseline' && row.repair?.arm === 'baseline' && row.repair?.format === partial.repairFormat
         && row.repair?.repairSealDigest === seal.digest;
@@ -110,7 +118,8 @@ export function pairedReport({ seal, expectedDigest, rows, dependencies, provena
   return { sealDigest: usedSeals.length === 1 ? usedSeals[0] : null,
     ...(usedSeals.length > 1 ? { provenance: { currentSealDigest: seal.digest, sourceSealDigests: usedSeals, mixedCandidateCode: true,
       mixedAnswererFormat: usedSeals.some(id => hash(origins.get(id).answerer) !== hash(s.answerer)),
-      specificScorerRepair: rows.some(row => row.repair?.format === 'scorer-r2-v3-specific-repair'), interpretation: s.interpretation ?? null,
+      specificScorerRepair: rows.some(row => row.repair?.format === 'scorer-r2-v3-specific-repair'
+        || row.repairs?.some(item => item.format === 'scorer-r2-v3-specific-repair')), interpretation: s.interpretation ?? null,
       limitation: 'Cases were scored under compatible evaluator seals after recorded candidate-method, answerer-format, repair or interpretation transitions.' } } : {}), cases: rows.length, clusters: clusters.length,
     clusterCases: clusters.map(group => group.map(row => row.caseId)), pairedDelta: paired.candidate, deltas: paired, sensitivity, confidence, safety };
 }
