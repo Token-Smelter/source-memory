@@ -21,7 +21,7 @@ const message = (content, stopReason) => ({ role: 'assistant', provider: 'fictio
 
 test('fixed Pi answerer uses metered SDK calls and only declared retrieval tools', async () => {
   const fake = fakeMetered([message([{ type: 'toolCall', id: 'tc', name: 'memory_search', arguments: { query: 'fiction' } }], 'toolUse'),
-    message([{ type: 'text', text: 'Fictional answer' }], 'stop')]);
+    message([{ type: 'toolCall', id: 'submit', name: 'submit_answer', arguments: { answer: 'Fictional answer' } }], 'toolUse')]);
   const respond = createPiAnswererResponder({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', expectedToolsSha256: ANSWERER_TOOLS_SHA256 });
   const result = await respond({ request: 'Fictional question', instructions: 'Use only the tools.', route: 'fiction', model: 'one', reasoning: 'low', inputTokens: 100, costNano: '10000', outputTokens: 20, modelCalls: 2,
     tools: { async search() { return [{ id: 'r', text: 'derived item' }]; }, async resolve() {} } });
@@ -29,12 +29,41 @@ test('fixed Pi answerer uses metered SDK calls and only declared retrieval tools
     fake.calls[1].context.messages.at(-1).toolName, fake.calls[0].options.maxRetries], ['Fictional answer', 2, 'Fictional question', 'memory_search', 0]);
 });
 
-test('scorer makes a tool-free metered Pi SDK call and parses its JSON judgment', async () => {
-  const fake = fakeMetered([message([{ type: 'text', text: '{"clauses":[]}' }], 'stop')]);
+test('scorer uses a structured metered Pi SDK judgment submission', async () => {
+  const fake = fakeMetered([message([{ type: 'toolCall', id: 'score', name: 'submit_score', arguments: { clauses: [] } }], 'toolUse')]);
   const judge = createPiScorerJudge({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });
   const result = await judge({ packet: { caseId: 'fiction' }, answer: { text: 'answer' }, trace: {},
     scorer: { route: 'fiction', model: 'one', reasoning: 'low', instructions: 'Grade the packet.' }, rubric: {}, packetSchema: {} });
-  assert.deepEqual([result, fake.calls[0].context.tools], [{ clauses: [] }, []]);
+  assert.deepEqual([result, fake.calls[0].context.tools.map(tool => tool.name)], [{ clauses: [] }, ['submit_score']]);
+});
+
+test('answerer preserves raw outputs and makes exactly one repair after an invalid submission', async () => {
+  const fake = fakeMetered([message([{ type: 'text', text: 'Fictional answer' }], 'stop'),
+    message([{ type: 'toolCall', id: 'submit', name: 'submit_answer', arguments: { answer: 'Fictional answer' } }], 'toolUse')]);
+  const captured = [];
+  const respond = createPiAnswererResponder({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction',
+    expectedToolsSha256: ANSWERER_TOOLS_SHA256, async onRaw(value) { captured.push(value); } });
+  const result = await respond({ request: 'Fiction?', instructions: 'Use the tools.', route: 'fiction', model: 'one', reasoning: 'low',
+    inputTokens: 100, costNano: '10000', outputTokens: 20, modelCalls: 1, tools: { async search() {}, async resolve() {} } });
+  assert.deepEqual([result.text, captured.length, fake.calls.length], ['Fictional answer', 2, 2]);
+});
+
+test('scorer repairs one truncated judgment and records both outputs', async () => {
+  const fake = fakeMetered([message([{ type: 'text', text: 'invalid' }], 'length'),
+    message([{ type: 'toolCall', id: 'score', name: 'submit_score', arguments: { clauses: [] } }], 'toolUse')]);
+  const captured = [];
+  const judge = createPiScorerJudge({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20,
+    async onRaw(value) { captured.push(value); } });
+  const result = await judge({ packet: { caseId: 'fiction' }, answer: { text: 'answer' }, trace: {},
+    scorer: { route: 'fiction', model: 'one', reasoning: 'low', instructions: 'Grade.' }, rubric: {}, packetSchema: {} });
+  assert.deepEqual([result, captured.length, fake.calls.length], [{ clauses: [] }, 2, 2]);
+});
+
+test('scorer refuses a second invalid judgment rather than fabricating a score', async () => {
+  const fake = fakeMetered([message([{ type: 'text', text: 'invalid' }], 'stop'), message([{ type: 'text', text: 'still invalid' }], 'stop')]);
+  const judge = createPiScorerJudge({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });
+  await assert.rejects(judge({ packet: { caseId: 'fiction' }, answer: { text: 'answer' }, trace: {},
+    scorer: { route: 'fiction', model: 'one', reasoning: 'low', instructions: 'Grade.' }, rubric: {}, packetSchema: {} }), /scorer_output_invalid/);
 });
 
 test('shared Pi gate prevents parallel calls and remains closed on unknown usage', async () => {

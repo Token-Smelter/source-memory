@@ -32,6 +32,32 @@ test('soft ledger enforces one in-flight call and records SDK usage without cach
   assert.deepEqual([budget.state().spent_nano, result.api_equivalent_nano, result.usage.inclusion], ['11', '11', 'Pi Anthropic input excludes cache classes']);
 }));
 
+test('raw model output is captured before a successful result is exposed', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pi-raw-success-')), captured = [];
+  const budget = createSoftBudget({ path: join(directory, 'ledger.jsonl'), capNano: '1000000', sessionKey: 'fiction', sealSha256: 'a'.repeat(64),
+    routes: { 'fiction/model': { maxOutputTokens: 10, ratesNanoPerToken: { input: 1, cacheRead: 1, cacheWrite: 1, output: 1 }, rateEvidence: 'fiction' } },
+    onRaw(row) { captured.push(row); } });
+  try {
+    const runtime = budget.wrap({ streamSimple() { return stream(Promise.resolve({ provider: 'fiction', model: 'model', stopReason: 'stop',
+      usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 }, content: [{ type: 'text', text: 'fiction' }] })); } }, metadata);
+    const response = await runtime.streamSimple(model, { messages: [] }).result();
+    assert.deepEqual([captured.length, captured[0].message.content, response.content], [1, [{ type: 'text', text: 'fiction' }], [{ type: 'text', text: 'fiction' }]]);
+  } finally { budget.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('a raw-output capture failure blocks the completed model result', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pi-raw-failure-'));
+  const budget = createSoftBudget({ path: join(directory, 'ledger.jsonl'), capNano: '1000000', sessionKey: 'fiction', sealSha256: 'a'.repeat(64),
+    routes: { 'fiction/model': { maxOutputTokens: 10, ratesNanoPerToken: { input: 1, cacheRead: 1, cacheWrite: 1, output: 1 }, rateEvidence: 'fiction' } },
+    onRaw() { throw new Error('disk_failure'); } });
+  try {
+    const runtime = budget.wrap({ streamSimple() { return stream(Promise.resolve({ provider: 'fiction', model: 'model', stopReason: 'stop',
+      usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 }, content: [] })); } }, metadata);
+    await assert.rejects(runtime.streamSimple(model, { messages: [] }).result(), /raw_output_capture_failed/);
+    assert.equal(budget.state().stopped, 'raw_output_capture_failed');
+  } finally { budget.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('a locally prevented input-limit dispatch is typed as not sent', () => withBudget(async (budget, path) => {
   let upstream = 0;
   const input = createInputBudget(1);
@@ -44,7 +70,7 @@ test('a locally prevented input-limit dispatch is typed as not sent', () => with
 
 test('unknown received usage stops further admission', () => withBudget(async budget => {
   const runtime = budget.wrap({ streamSimple() { return stream(Promise.resolve({ provider: 'fiction', model: 'model', stopReason: 'stop', usage: null })); } }, metadata);
-  await runtime.streamSimple(model, { messages: [] }).result();
+  await assert.rejects(runtime.streamSimple(model, { messages: [] }).result(), /usage_or_outcome_unknown/);
   await new Promise(resolve => setImmediate(resolve));
   assert.throws(() => runtime.streamSimple(model, { messages: [] }), /usage_or_outcome_unknown/);
 }));
@@ -52,7 +78,7 @@ test('unknown received usage stops further admission', () => withBudget(async bu
 test('a call exceeding twice its pre-call estimate stops further admission', () => withBudget(async budget => {
   const runtime = budget.wrap({ streamSimple() { return stream(Promise.resolve({ provider: 'fiction', model: 'model', stopReason: 'stop',
     usage: { input: 1000, cacheRead: 0, cacheWrite: 0, output: 1 } })); } }, metadata);
-  await runtime.streamSimple(model, { messages: [] }).result();
+  await assert.rejects(runtime.streamSimple(model, { messages: [] }).result(), /over_twice_estimate/);
   await new Promise(resolve => setImmediate(resolve));
   assert.throws(() => runtime.streamSimple(model, { messages: [] }), /over_twice_estimate/);
 }));

@@ -77,7 +77,8 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
       try {
         answer = await respond({ request: input.request, instructions: s.answerer.instructions, route: s.answerer.route,
           model: s.answerer.model, reasoning: s.answerer.reasoning, outputTokens: limits.outputTokens,
-          inputTokens: limits.inputTokens, modelCalls: limits.modelCalls, costNano: limits.costNano, tools });
+          inputTokens: limits.inputTokens, modelCalls: limits.modelCalls, formatRepairCalls: limits.formatRepairCalls ?? 1,
+          repairInstruction: s.answerer.repair_instruction ?? null, costNano: limits.costNano, tools });
         if (inFlight) throw fail('outstanding_tool_calls');
       } finally { closed = true; }
       if (!answer || typeof answer.text !== 'string' || Buffer.byteLength(answer.text) > limits.responseBytes) throw fail('answer_invalid');

@@ -13,6 +13,8 @@ import { createPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { fictionalCase, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
+import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
+import { ANSWERER_FORMAT_SUFFIX, SCORER_FORMAT_SUFFIX } from '../pi-extension/evaluation/pi-calls.mjs';
 
 const root = realpathSync(process.cwd()), scope = 'fiction', sha = b => createHash('sha256').update(b).digest('hex');
 const image = name => execFileSync('/usr/bin/docker', ['image', 'inspect', name, '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
@@ -20,10 +22,16 @@ const images = { databaseImage: image('neo4j:5.26.14-community'), driverImage: i
 const entries = ['a', 'b', 'c'].map((id, i) => ({ type: 'message', id, parentId: i ? ['a', 'b'][i - 1] : null,
   message: { role: 'assistant', content: `Fictional checkpoint ${id}. ${i === 0 ? 'fixture '.repeat(58000) : ''}`, stopReason: 'stop' } }));
 const checkpoints = ['a', 'b', 'c'].map((id, i) => ({ id, time: `2030-01-01T00:00:0${i * 2}Z` }));
-const publicCase = { ...fictionalCase(), queryTime: '2030-01-01T00:00:03Z' };
-const cases = [{ through: 'b', publicCase, packet: scoringPacket() }];
-const seal = createPilotPlan({ cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
-  codeSha: 'd'.repeat(40), routes: { candidate: { mode: 'fiction' }, reviewer: { mode: 'fiction' } } });
+const publicCase = { ...fictionalCase(), queryTime: '2030-01-01T00:00:01Z' };
+const cases = [{ through: 'a', publicCase, packet: scoringPacket() }];
+const prior = structuredClone(createPilotPlan({ cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
+  codeSha: 'd'.repeat(40), routes: { candidate: { mode: 'fiction' }, reviewer: { mode: 'fiction' } } }).spec);
+prior.answerer.version = 'answerer-r2-v1'; prior.answerer.instructions = prior.answerer.instructions.slice(0, -ANSWERER_FORMAT_SUFFIX.length);
+delete prior.answerer.repair_instruction; delete prior.answerer.limits.formatRepairCalls; prior.answerer.tools_sha256 = 'a'.repeat(64);
+prior.scorer.version = 'scorer-r2-v1'; prior.scorer.instructions = prior.scorer.instructions.slice(0, -SCORER_FORMAT_SUFFIX.length)
+  .replace('Use this JSON object schema:', 'Return JSON only, without a code fence:');
+delete prior.scorer.tools_sha256; delete prior.scorer.repair_instruction; delete prior.scorer.formatRepairCalls;
+const seal = sealComparison(prior);
 
 function environment() {
   const dir = mkdtempSync(join(tmpdir(), 'pi-resume-fixture-')), runId = randomUUID();
@@ -66,25 +74,23 @@ firstResult = await runNamespaceHarness({ ...first, async work({ memory, driver 
     const one = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
     if (one.disposition !== 'committed') throw new Error('fixture_first_checkpoint_failed');
     checkpointSnapshot = await first.docker.snapshot({ driver, scope, filename: `baseline-${first.runId}.json` });
-    const two = await runCoveredInterval({ journal, session, through: 'b', cursor: 'a' });
-    if (two.disposition !== 'failed' || journal.state().reconciliation_required) throw new Error('fixture_gap_failed');
     const status = await memory.status(scope);
     if (status.chunks <= 256 || status.unindexed !== 0) throw new Error('fixture_large_batch_failed');
-    return { first: one.disposition, second: two.disposition, chunks: status.chunks, snapshot_sha256: checkpointSnapshot.sha256 };
+    return { first: one.disposition, case: 'fictional_scorer_failed', chunks: status.chunks, snapshot_sha256: checkpointSnapshot.sha256 };
   } finally { journal.close(); }
 } });
 if (firstResult.status !== 'complete') throw new Error('fixture_first_namespace_failed');
 const journalBytes = readFileSync(journalPath), journalSha = sha(journalBytes), ledger = 'f'.repeat(64);
 const report = { status: 'failed_or_partial', run_id: first.runId, seal_sha256: seal.digest,
-  coverage: { dispositions: [{ through: 'a', disposition: 'committed' }, { through: 'b', disposition: 'failed' }] },
+  coverage: null,
   artifacts: { source_snapshot: { sha256: 'a'.repeat(64) }, 'ledger.jsonl': { sha256: ledger },
-    checkpoint_snapshots: [{ through: 'a', sha256: checkpointSnapshot.sha256 }] } };
-const progress = [{ type: 'checkpoint', through: 'a', disposition: 'committed', snapshot: { sha256: checkpointSnapshot.sha256 } },
-  { type: 'checkpoint', through: 'b', disposition: 'failed' }];
+    checkpoint_snapshots: [{ through: 'a', sha256: checkpointSnapshot.sha256 }],
+    case_snapshots: [{ case_id: publicCase.id, sha256: checkpointSnapshot.sha256 }] } };
+const progress = [{ type: 'checkpoint', through: 'a', disposition: 'committed', snapshot: { sha256: checkpointSnapshot.sha256 } }];
 const currentSeal = createPilotPlan({ cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
   codeSha: 'e'.repeat(40), routes: { candidate: { mode: 'fiction' }, reviewer: { mode: 'fiction' } },
   resume: { priorRunId: first.runId, priorSealDigest: seal.digest, priorCodeSha: 'd'.repeat(40), cursor: 'a',
-    snapshotSha256: checkpointSnapshot.sha256, journalSha256: journalSha, transition: 'deferred-bounded-indexing-only' } });
+    snapshotSha256: checkpointSnapshot.sha256, journalSha256: journalSha, transition: 'structured-evaluator-submission-only' } });
 const second = environment();
 copyFileSync(checkpointSnapshot.path, join(second.dir, 'snapshot.json'));
 copyFileSync(journalPath, join(second.dir, journalPath.split('/').at(-1)));
@@ -102,8 +108,8 @@ const secondResult = await runNamespaceHarness({ ...second, async work({ memory,
         { waitForVectors: true, batchLimit: 16, ...options }),
       distiller: { memory: tracked, async run({ throughEntryId }) { events.push(`distill:${throughEntryId}`); return { status: 'complete', disposition: 'abstained' }; } } };
     const outcome = await runPilotSequence({ session, journal, checkpoints, cases, initialCursor: resume.cursor, retryFirst: resume.retryFirst,
-      budget: { state: () => ({ stopped: null }) }, async evaluateCase() { events.push('case:b'); return { status: 'scored' }; } });
-    if (outcome.status !== 'complete' || JSON.stringify(events) !== JSON.stringify(['distill:b', 'case:b', 'distill:c'])) throw new Error('fixture_resume_failed');
+      budget: { state: () => ({ stopped: null }) }, async evaluateCase() { events.push('case:a'); return { status: 'scored' }; } });
+    if (outcome.status !== 'complete' || JSON.stringify(events) !== JSON.stringify(['case:a', 'distill:b', 'distill:c'])) throw new Error('fixture_resume_failed');
     return { restored, sequence: outcome.status, events, previous_record_count: (await memory.status(scope)).records };
   } finally { journal.close(); }
 } });

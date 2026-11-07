@@ -94,9 +94,10 @@ export function createScorer({ seal, expectedDigest, judge }) {
     if (s.packets[packet.caseId] !== hash(packet)) throw fail('packet_seal_mismatch');
     if (!text(answer?.text) || !trace || typeof trace !== 'object') throw fail('packet_invalid');
     validateCaseTrace({ packet, trace, spec: s, seal });
+    const validate = judgment => scoreCase({ seal, expectedDigest, packet, judgment, trace });
     const judgment = await judge({ packet: structuredClone(packet), answer: structuredClone(answer), trace: structuredClone(trace),
-      scorer: structuredClone(s.scorer), rubric: structuredClone(s.rubric), packetSchema: structuredClone(s.packetSchema) });
-    return { judgment, score: scoreCase({ seal, expectedDigest, packet, judgment, trace }) };
+      scorer: structuredClone(s.scorer), rubric: structuredClone(s.rubric), packetSchema: structuredClone(s.packetSchema), validate });
+    return { judgment, score: validate(judgment) };
   } };
 }
 

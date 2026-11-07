@@ -25,10 +25,18 @@ export async function runPilotSequence({ session, journal, checkpoints, cases, b
   if (initialCursor !== null && (typeof initialCursor !== 'string' || !initialCursor)) throw fail('resume_invalid');
   const startIndex = initialCursor === null ? 0 : checkpoints.findIndex(row => row.id === initialCursor) + 1;
   if (initialCursor !== null && startIndex === 0) throw fail('resume_invalid');
-  if (initialCursor !== null && cases.some(item => checkpoints.findIndex(row => row.id === item.through) < startIndex)) throw fail('resume_prior_cases_unsupported');
+  if (initialCursor !== null && cases.some(item => checkpoints.findIndex(row => row.id === item.through) < startIndex - 1)) throw fail('resume_prior_cases_unsupported');
   if (typeof retryFirst !== 'boolean' || (retryFirst && startIndex >= checkpoints.length)) throw fail('resume_invalid');
   let cursor = initialCursor;
   const results = [], evaluated = [];
+  if (initialCursor !== null) for (const item of cases.filter(row => row.through === initialCursor)) {
+    if (budget.state().stopped) return { status: 'budget_stopped', cursor, results, evaluated };
+    let outcome;
+    try { outcome = await evaluateCase(item, cursor); }
+    catch (error) { return { status: 'case_failed', cursor, results, evaluated, failure: error?.code ?? 'case_failed' }; }
+    evaluated.push(outcome);
+    await onCase(outcome, budget.state());
+  }
   for (const [index, checkpoint] of checkpoints.slice(startIndex).entries()) {
     if (budget.state().stopped) return { status: 'budget_stopped', cursor, results, evaluated };
     await onBeforeCheckpoint(checkpoint);
@@ -40,7 +48,9 @@ export async function runPilotSequence({ session, journal, checkpoints, cases, b
     cursor = result.cursor;
     for (const item of cases.filter(row => row.through === cursor)) {
       if (budget.state().stopped) return { status: 'budget_stopped', cursor, results, evaluated };
-      const outcome = await evaluateCase(item, cursor);
+      let outcome;
+      try { outcome = await evaluateCase(item, cursor); }
+      catch (error) { return { status: 'case_failed', cursor, results, evaluated, failure: error?.code ?? 'case_failed' }; }
       evaluated.push(outcome);
       await onCase(outcome, budget.state());
     }

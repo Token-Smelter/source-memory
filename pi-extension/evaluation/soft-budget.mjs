@@ -9,9 +9,9 @@ const validUnits = usage => ['input', 'cacheRead', 'cacheWrite', 'output'].every
   && usage.input + usage.cacheRead + usage.cacheWrite > 0;
 
 /** API-equivalent soft estimates, not a provider charge or a bound on gateway-internal attempts. */
-export function createSoftBudget({ path, capNano, routes, sessionKey, sealSha256 }) {
+export function createSoftBudget({ path, capNano, routes, sessionKey, sealSha256, onRaw = () => {} }) {
   if (!isAbsolute(path ?? '') || !/^[1-9]\d*$/.test(capNano ?? '') || typeof sessionKey !== 'string' || !sessionKey
-    || !/^[a-f0-9]{64}$/.test(sealSha256 ?? '') || !routes || typeof routes !== 'object') throw fail('soft_budget_invalid');
+    || !/^[a-f0-9]{64}$/.test(sealSha256 ?? '') || !routes || typeof routes !== 'object' || typeof onRaw !== 'function') throw fail('soft_budget_invalid');
   routes = JSON.parse(JSON.stringify(routes));
   const parent = realpathSync(dirname(path));
   const state = statSync(parent);
@@ -77,7 +77,9 @@ export function createSoftBudget({ path, capNano, routes, sessionKey, sealSha256
             try {
               const stream = target.streamSimple(model, context, { ...options, maxTokens: output, maxRetries: 0 });
               if (!stream || typeof stream.result !== 'function' || typeof stream[Symbol.asyncIterator] !== 'function') throw fail('pi_stream_invalid');
-              Promise.resolve(stream.result()).then(message => {
+              const recorded = Promise.resolve(stream.result()).then(message => {
+                let captureFailed = false;
+                try { onRaw({ id, ...meta, message: structuredClone(message) }); } catch { captureFailed = true; }
                 const usage = message?.usage;
                 const actualRoute = typeof message?.provider === 'string' && typeof message?.model === 'string' ? `${message.provider}/${message.model}` : null;
                 const known = validUnits(usage) && ['stop', 'length', 'toolUse'].includes(message?.stopReason) && actualRoute === route;
@@ -93,6 +95,7 @@ export function createSoftBudget({ path, capNano, routes, sessionKey, sealSha256
                   if (actual > estimate * 2n) stopped = 'over_twice_estimate';
                   else if (spent >= BigInt(capNano)) stopped = 'soft_cap_exhausted';
                 } else stopped = 'usage_or_outcome_unknown';
+                if (captureFailed && !stopped) stopped = 'raw_output_capture_failed';
                 record({ type: 'result', id, outcome: known ? 'received' : 'unknown', actual_route: actualRoute,
                   stop_reason: message?.stopReason ?? null, actual_reasoning: message?.providerThinkingLevel ?? null,
                   usage: known ? { input: usage.input, cache_read: usage.cacheRead,
@@ -102,13 +105,21 @@ export function createSoftBudget({ path, capNano, routes, sessionKey, sealSha256
                   sdk_cost_estimate: typeof usage?.cost?.total === 'number' && Number.isFinite(usage.cost.total) ? usage.cost.total : null,
                   api_equivalent_nano: actual?.toString() ?? null, latency_ms: Date.now() - started, stop: stopped, at: new Date().toISOString() });
                 active = null;
-              }, () => {
+                if (stopped) throw fail(stopped);
+                return message;
+              }, error => {
                 stopped = 'usage_or_outcome_unknown';
                 record({ type: 'result', id, outcome: 'unknown', usage: null, provider_charge: null,
                   latency_ms: Date.now() - started, stop: stopped, at: new Date().toISOString() });
                 active = null;
-              }).catch(() => { stopped = 'ledger_write_unknown'; });
-              return stream;
+                throw error;
+              });
+              recorded.catch(() => {});
+              return new Proxy(stream, { get(target, key) {
+                if (key === 'result') return () => recorded;
+                const value = Reflect.get(target, key, target);
+                return typeof value === 'function' ? value.bind(target) : value;
+              } });
             } catch (error) {
               const prevented = error?.dispatch_prevented === true && ['input_budget_exhausted', 'input_budget_unknown'].includes(error.code);
               stopped = prevented ? error.code : 'dispatch_unknown';

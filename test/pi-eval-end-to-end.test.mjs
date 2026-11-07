@@ -32,8 +32,9 @@ test('fictional fixed arms, Pi calls, scorer, shared reservations and paired rep
       slots: Array.from({ length: 4 }, (_, i) => ({ id: `s${i}`, kind: 'initial', parent: null, bounds })) });
     const judgments = { clauses: [clause('c1', ['r1', 'r2'])] };
     const responses = [message([{ type: 'toolCall', id: 'search', name: 'memory_search', arguments: { query: 'Mira' } }], 'toolUse'),
-      message([{ type: 'text', text: 'Mira chose 4 for comet.' }]), message([{ type: 'text', text: 'I do not know.' }]),
-      message([{ type: 'text', text: JSON.stringify(judgments) }])];
+      message([{ type: 'toolCall', id: 'answer1', name: 'submit_answer', arguments: { answer: 'Mira chose 4 for comet.' } }], 'toolUse'),
+      message([{ type: 'toolCall', id: 'answer2', name: 'submit_answer', arguments: { answer: 'I do not know.' } }], 'toolUse'),
+      message([{ type: 'toolCall', id: 'score', name: 'submit_score', arguments: judgments }], 'toolUse')];
     const host = { streamSimple() { const result = Promise.resolve(responses.shift()); return { result: () => result, async *[Symbol.asyncIterator]() {} }; } };
     let slot = 0;
     const metered = wrapPiRuntime({ runtime: host, ledger, planId: 'fiction', nextSlot: () => `s${slot++}`,
