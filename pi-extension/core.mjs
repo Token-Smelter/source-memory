@@ -1,4 +1,5 @@
 import { digest, normalizeEnrichment, normalizeTurn, RELATIONS } from '../src/core.mjs';
+import { imageBlock } from './image-archive.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const finished = row => row?.message?.role === 'assistant' && !['error', 'aborted', 'toolUse'].includes(row.message.stopReason)
@@ -13,10 +14,30 @@ function blockText(block) {
   return typeof block.content === 'string' ? block.content : '';
 }
 
-function entryText(row) {
+function entryData(row) {
   const content = row.message.content;
-  return typeof content === 'string' ? content : Array.isArray(content) ? content.map(blockText).filter(Boolean).join('\n') : '';
+  if (typeof content === 'string') return { text: content, ranges: [], images: [] };
+  if (!Array.isArray(content)) return { text: '', ranges: [], images: [] };
+  let result = '';
+  const ranges = [], images = [];
+  for (const block of content) {
+    if (['audio', 'video'].includes(block?.type)) throw fail('source_content_unsupported');
+    let value;
+    if (block?.type === 'image') {
+      const item = imageBlock(block);
+      value = `[image sha256=${item.sha256} mime=${item.mime} bytes=${item.size}]`;
+      images.push({ block, info: { sha256: item.sha256, mime: item.mime, bytes: item.size } });
+    } else value = blockText(block);
+    if (!value) continue;
+    if (result) result += '\n';
+    const start = result.length;
+    result += value;
+    if (block?.type === 'image') ranges.push({ start, end: result.length, reason: 'image_not_citable' });
+  }
+  return { text: result, ranges, images };
 }
+
+export function entryText(row) { return entryData(row).text; }
 
 function turnAt(entries, through, cursor, conversation, { allowInterrupted = false } = {}) {
   if (!Array.isArray(entries) || typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('invalid_input');
@@ -41,16 +62,19 @@ function turnAt(entries, through, cursor, conversation, { allowInterrupted = fal
   const position = cursor === null ? -1 : ancestry.findIndex(row => row.id === cursor);
   if ((cursor !== null && position < 0) || position === ancestry.length - 1) throw fail('cursor_unresolved');
   const chain = ancestry.slice(position + 1);
+  const images = [];
   const sourceEntries = chain.filter(row => row.type === 'message' && row.message).map(row => {
     const role = row.message.role === 'toolResult' ? 'tool' : row.message.role;
     if (!['user', 'assistant', 'tool', 'system'].includes(role)) throw fail('source_role_unsupported');
-    return { id: row.id, role, text: entryText(row) };
+    const parsed = entryData(row);
+    for (const image of parsed.images) images.push({ entry_id: row.id, ...image });
+    return { id: row.id, role, text: parsed.text, ...(parsed.ranges.length ? { uncitable_ranges: parsed.ranges } : {}) };
   });
   const omitted = chain.filter(row => row.type === 'custom_message').map(row => row.id);
   const turn = { source: 'pi-memory', conversation_id: conversation,
     turn_id: digest(['pi-memory-turn/v1', cursor, through]), ...(cursor === null ? { lineage_root: true } : {}), entries: sourceEntries };
   normalizeTurn(turn);
-  return { turn, omissions: { custom_message: { count: omitted.length, entry_ids: omitted } } };
+  return { turn, images, omissions: { custom_message: { count: omitted.length, entry_ids: omitted } } };
 }
 
 /** The same cursor-bounded source turn is retained before either live or replay distillation. */
@@ -58,7 +82,12 @@ export async function distillThrough(session, throughEntryId, cursor, { allowInt
   if (!session || !Array.isArray(session.scopes) || session.scopes.length !== 1
     || typeof session.scopes[0] !== 'string' || !session.scopes[0]) throw fail('scope_unresolved');
   if (!session.memory || typeof session.memory.ingest !== 'function' || !session.distiller || typeof session.distiller.run !== 'function') throw fail('invalid_input');
-  const { turn, omissions } = turnAt(session.entries, throughEntryId, cursor, session.conversation_id, { allowInterrupted });
+  const { turn, images, omissions } = turnAt(session.entries, throughEntryId, cursor, session.conversation_id, { allowInterrupted });
+  if (images.length && typeof session.imageArchive?.archive !== 'function') throw fail('image_archive_required');
+  if (images.length) {
+    const archived = images.map(image => ({ entry_id: image.entry_id, ...session.imageArchive.archive(image.block) }));
+    omissions.images = { count: archived.length, disposition: 'archived_not_text_citable', items: archived };
+  }
   const receipt = await session.memory.ingest(session.scopes[0], turn);
   if (typeof receipt?.id !== 'string' || !receipt.id) throw fail('ingest_receipt_invalid');
   const result = await session.distiller.run({ turn, receipt, throughEntryId, cursor, scope: session.scopes[0] });
@@ -70,7 +99,7 @@ export async function distillThrough(session, throughEntryId, cursor, { allowInt
 export function createLinkChoices(packet) {
   if (!packet || !Array.isArray(packet.records) || !Array.isArray(packet.sources)) throw fail('offer_invalid');
   const records = new Set(packet.records.map(row => row.ref));
-  const sources = new Set(packet.sources.map(row => row.ref));
+  const sources = new Set(packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? '')).map(row => row.ref));
   const links = [];
   return {
     add(link) {
@@ -88,14 +117,25 @@ export function createLinkChoices(packet) {
 export function createTurnTools({ scope, turn, receipt, memory, requireSearch = false }) {
   if (typeof scope !== 'string' || !scope || !turn?.turn_id || !Array.isArray(turn.entries) || !receipt?.id || !memory) throw fail('invalid_input');
   const labels = new Map();
+  const imageNotes = [];
   for (const entry of turn.entries) {
-    let start = 0;
-    do {
-      let end = Math.min(start + 8000, entry.text.length);
-      if (end < entry.text.length && /[\uD800-\uDBFF]/u.test(entry.text[end - 1]) && /[\uDC00-\uDFFF]/u.test(entry.text[end])) end--;
-      labels.set(`ref-${String(labels.size + 1).padStart(6, '0')}`, { entry, start, end });
-      start = end;
-    } while (start < entry.text.length);
+    const ranges = entry.uncitable_ranges ?? [];
+    const add = (first, last) => {
+      for (let start = first; start < last;) {
+        let end = Math.min(start + 8000, last);
+        if (end < last && /[\uD800-\uDBFF]/u.test(entry.text[end - 1]) && /[\uDC00-\uDFFF]/u.test(entry.text[end])) end--;
+        labels.set(`ref-${String(labels.size + 1).padStart(6, '0')}`, { entry, start, end });
+        start = end;
+      }
+    };
+    let previous = 0;
+    for (const range of ranges) {
+      if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) || range.start < previous || range.end > entry.text.length || range.end <= range.start) throw fail('image_range_invalid');
+      add(previous, range.start);
+      imageNotes.push({ entry_id: entry.id, reason: 'image_not_citable', placeholder: entry.text.slice(range.start, range.end) });
+      previous = range.end;
+    }
+    add(previous, entry.text.length);
   }
   const recordIds = [];
   let searches = 0;
@@ -104,6 +144,7 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
   let choices = null;
   return {
     labels() { return [...labels].map(([ref, span]) => ({ ref, role: span.entry.role, text: span.entry.text.slice(span.start, span.end) })); },
+    imageNotes() { return structuredClone(imageNotes); },
     async record(kind, text, refs) {
       if (requireSearch && (!searches || searchFailed)) throw fail('search_required');
       if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length || refs.some(ref => !labels.has(ref))) throw fail('label_not_offered');
@@ -129,7 +170,8 @@ export function createTurnTools({ scope, turn, receipt, memory, requireSearch = 
           const offered = await this.offer();
           const records = offered.packet.records.filter(row => !kinds.length || kinds.includes(row.kind)).slice(0, 32)
             .map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text.slice(0, 500) }));
-          const sources = offered.packet.sources.slice(0, 128).map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text.slice(0, 500) }));
+          const sources = offered.packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? ''))
+            .slice(0, 128).map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text.slice(0, 500) }));
           return { status: 'offer', records, sources, filtered: kinds.length > 0, completeness_guaranteed: false };
         } catch (problem) { searchFailed = true; throw problem; }
       }

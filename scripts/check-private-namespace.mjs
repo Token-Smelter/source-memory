@@ -44,7 +44,7 @@ try {
         return child;
       } }),
     async onIsolation(gate) { writeFileSync(join(scratch, 'isolation.json'), JSON.stringify(gate), { mode: 0o600 }); },
-    async work({ memory }) {
+    async work({ memory, driver }) {
       const stored = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-turn',
         lineage_root: true, entries: [{ id: 'fictional-entry', role: 'user', text: 'The amber fictional key requires rotation.' }] });
       const recalled = await memory.recall('fiction', { query: 'amber fictional key', limit: 8 });
@@ -57,12 +57,35 @@ try {
       }
       if (!derived?.length) throw new Error('derived_search_failed');
       const resolved = await memory.resolveDerived('fiction', { item_id: derived[0].id, evidence_id: derived[0].evidence[0].id });
+      const updateText = 'Only during rehearsal, rotate the amber fictional key weekly.';
+      const later = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-next',
+        entries: [{ id: 'fictional-update', role: 'user', text: updateText }] });
+      await memory.enrich('fiction', { records: [{ id: 'fictional-update-record', kind: 'observation', text: updateText,
+        status: 'proposed', attribution: 'fiction', evidence: [{ turn: later.id, entry_id: 'fictional-update', start: 0, end: updateText.length }] }], relations: [] }, { trigger: later.id });
+      let offer;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        try { offer = await memory.beginLinks('fiction', later.id, ['fictional-update-record']); break; }
+        catch (error) { if (error.code !== 'link_retrieval_incomplete') throw error; await new Promise(resolve => setTimeout(resolve, 500)); }
+      }
+      if (!offer) throw new Error('link_offer_unavailable');
+      const from = offer.packet.records.find(row => row.newly_retained)?.ref;
+      const to = offer.packet.records.find(row => !row.newly_retained && row.text === 'The amber key requires rotation.')?.ref;
+      const source = offer.packet.sources.find(row => row.trigger && row.text === updateText)?.ref;
+      if (!from || !to || !source) throw new Error('link_fixture_unavailable');
+      const proposal = await memory.finishLinks(offer.token, JSON.stringify({ links: [{ from, to, type: 'qualifies', evidence: [source], support: 'explicit' }] }),
+        { provider: 'fiction', model: 'fixture' });
+      const review = { reviewer: 'fictional-reviewer', decision_ref: 'fictional-review', contract: proposal.contract, scope: 'fiction',
+        review_contract: proposal.review_contract, operation_id: proposal.operation_id, context_sha256: proposal.context_sha256,
+        semantic_proposal_sha256: proposal.semantic_proposal_sha256, proposal_sha256: proposal.proposal_sha256, approved: [0] };
+      const linked = await memory.applyLinks(offer.token, review);
+      const snapshot = await docker.snapshot({ driver, scope: 'fiction', filename: `baseline-${runId}.json` });
       return { retained: stored.retained, indexing: stored.indexing?.status, recall_status: recalled.status,
         returned: recalled.bundles?.length ?? 0, derived_returned: derived.length,
-        evidence_resolved: resolved.text === 'The amber fictional key requires rotation.', relay_calls: relayCalls };
+        evidence_resolved: resolved.text === 'The amber fictional key requires rotation.', link_status: linked.status, snapshot, relay_calls: relayCalls };
     } });
   if (result.status !== 'complete' || result.result?.retained !== true || result.result.indexing !== 'ready'
-    || result.result.returned < 1 || result.result.derived_returned < 1 || result.result.evidence_resolved !== true || result.result.relay_calls < 1) process.exitCode = 1;
+    || result.result.returned < 1 || result.result.derived_returned < 1 || result.result.evidence_resolved !== true
+    || result.result.link_status !== 'written' || result.result.snapshot?.nodes < 1 || result.result.relay_calls < 1) process.exitCode = 1;
   process.stdout.write(`${JSON.stringify({ ...result, run_id: runId, private_receipt_dir: scratch })}\n`);
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ status: 'failed', code: error?.code ?? 'smoke_failed' })}\n`);

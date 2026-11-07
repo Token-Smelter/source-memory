@@ -16,13 +16,14 @@ function fakeMetered(responses) {
     boundInput: () => ({ tokens: 10, providerBound: true, proofRef: 'fictional-bound', contextFingerprint: 'a'.repeat(64) }) });
   return { wrapped, calls, attempts };
 }
-const message = (content, stopReason) => ({ role: 'assistant', provider: 'fiction', model: 'one', api: 'example', content, stopReason, timestamp: 1 });
+const message = (content, stopReason) => ({ role: 'assistant', provider: 'fiction', model: 'one', api: 'example', content, stopReason, timestamp: 1,
+  usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 1, cost: { total: 0 } } });
 
 test('fixed Pi answerer uses metered SDK calls and only declared retrieval tools', async () => {
   const fake = fakeMetered([message([{ type: 'toolCall', id: 'tc', name: 'memory_search', arguments: { query: 'fiction' } }], 'toolUse'),
     message([{ type: 'text', text: 'Fictional answer' }], 'stop')]);
   const respond = createPiAnswererResponder({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', expectedToolsSha256: ANSWERER_TOOLS_SHA256 });
-  const result = await respond({ request: 'Fictional question', instructions: 'Use only the tools.', route: 'fiction', model: 'one', reasoning: 'low', outputTokens: 20, modelCalls: 2,
+  const result = await respond({ request: 'Fictional question', instructions: 'Use only the tools.', route: 'fiction', model: 'one', reasoning: 'low', inputTokens: 100, costNano: '10000', outputTokens: 20, modelCalls: 2,
     tools: { async search() { return [{ id: 'r', text: 'derived item' }]; }, async resolve() {} } });
   assert.deepEqual([result.text, fake.attempts.length, fake.calls[0].context.messages[0].content,
     fake.calls[1].context.messages.at(-1).toolName, fake.calls[0].options.maxRetries], ['Fictional answer', 2, 'Fictional question', 'memory_search', 0]);
@@ -44,7 +45,7 @@ test('shared Pi gate prevents parallel calls and remains closed on unknown usage
   const second = gate.wrap(fake.wrapped);
   const stream = first.streamSimple(fictionalModel(), {}, { maxTokens: 20 });
   assert.throws(() => second.streamSimple(fictionalModel(), {}, { maxTokens: 20 }), /model_call_in_flight/);
-  finish(message([{ type: 'text', text: 'fiction' }], 'stop'));
+  finish({ ...message([{ type: 'text', text: 'fiction' }], 'stop'), usage: null });
   await stream.result();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(gate.busy(), true);

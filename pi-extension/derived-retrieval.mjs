@@ -56,6 +56,28 @@ export async function searchDerived(memory, scope, input) {
   return output;
 }
 
+/** Diagnostic raw-only lexical retrieval; derived records and vector channels never seed it. */
+export async function searchRaw(memory, scope, input) {
+  authorize(memory.config, scope);
+  const query = text(input?.query, 4000);
+  const limit = integer(input?.limit, 8, 1, 32);
+  const turnState = await memory.store.lexicalStatus(scope, 'turn');
+  const chunkState = await memory.store.chunkLexicalStatus(scope);
+  if (turnState?.status !== 'ready' || chunkState?.status !== 'ready') throw fail('search_unavailable');
+  const turns = await memory.store.lexical(scope, 'turn', query, 64, []);
+  const chunks = await memory.store.chunkLexical(scope, query, 64, []);
+  if (!Array.isArray(turns) || !Array.isArray(chunks) || [...turns, ...chunks].some(seed => seed.kind !== 'turn')) throw fail('search_invalid');
+  const seeds = fuse({ turn_lexical: turns, chunk_lexical: chunks }).slice(0, limit);
+  const output = [];
+  for (const seed of seeds) {
+    const bundle = await memory.bundle(scope, seed, query, 48, 4);
+    if (!bundle.source || !Array.isArray(bundle.source.excerpts)) throw fail('source_unavailable');
+    const body = bundle.source.excerpts.map(row => row.text).filter(value => typeof value === 'string').join('\n');
+    if (body) output.push({ id: seed.id, scope, text: body });
+  }
+  return output;
+}
+
 /** Re-resolve only evidence belonging to the named derived item or its displayed links. */
 export async function resolveDerived(memory, scope, input) {
   authorize(memory.config, scope);

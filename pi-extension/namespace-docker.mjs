@@ -183,6 +183,14 @@ export function createNamespaceDocker({ execute = command, probe = probeDriver, 
         namespace: dbNamespace, interfaces: result.interfaces, no_default_route: true, host_addresses: hosts,
         unprobeable_link_local: unprobeableLinkLocal, foreign_container_count: list.length - 2, targets: result.targets };
     },
+    async snapshot({ driver, scope, filename }) {
+      requireOwned(driver);
+      if (typeof scope !== 'string' || !scope || scope.length > 256 || !/^baseline-[a-f0-9-]+\.json$/.test(filename ?? '')) throw fail('snapshot_invalid');
+      const result = await json(['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/export-scope.mjs', scope, `/scratch/${filename}`]);
+      if (!/^[a-f0-9]{64}$/.test(result?.sha256 ?? '') || !Number.isSafeInteger(result.bytes) || result.bytes < 1
+        || result.restore_verified !== false) throw fail('snapshot_invalid');
+      return { ...result, path: `${mounts.scratch}/${filename}` };
+    },
     async startShim({ driver, port }) {
       requireOwned(driver);
       if (!Number.isInteger(port) || port < 1024 || port > 65535 || [7474, 7687].includes(port)) throw fail('port_invalid');

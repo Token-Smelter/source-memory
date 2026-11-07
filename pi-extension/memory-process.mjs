@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { normalizeEnrichment } from '../src/core.mjs';
 import * as defaultLinks from '../src/link-proposals.mjs';
-import { searchDerived, resolveDerived } from './derived-retrieval.mjs';
+import { searchDerived, resolveDerived, searchRaw } from './derived-retrieval.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const deferred = () => {
@@ -35,6 +35,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
     async recall({ scope, input }) { allowed(scope); return memory.recall(scope, input); },
     async searchDerived({ scope, input }) { allowed(scope); return searchDerived(memory, scope, input); },
     async resolveDerived({ scope, input }) { allowed(scope); return resolveDerived(memory, scope, input); },
+    async searchRaw({ scope, input }) { allowed(scope); return searchRaw(memory, scope, input); },
     async enrich({ scope, input, trigger }) {
       allowed(scope);
       const normalized = normalizeEnrichment(input);

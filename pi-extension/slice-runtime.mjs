@@ -39,7 +39,8 @@ export async function resolvePiModels({ pi, modelId = 'anthropic/claude-haiku-5-
 
 /** Builds the same incremental private session used by the live adapter and replay core. */
 export async function createSliceSession({ pi, source, entries, conversationId, workDir, scope, memory,
-  modelId = 'anthropic/claude-haiku-5-5', reviewerId, reviewMode = 'separate', budget = createInputBudget(), coverageJournal, meterRuntime }) {
+  modelId = 'anthropic/claude-haiku-5-5', reviewerId, reviewMode = 'separate', budget = createInputBudget(), coverageJournal, meterRuntime,
+  candidateThinking = 'low', reviewerThinking = 'low', imageArchive }) {
   if (typeof meterRuntime !== 'function') throw fail('metered_runtime_required');
   const { runtime, model, reviewerModel } = await resolvePiModels({ pi, modelId, reviewerId });
   const tokenBounded = boundPiRuntime(runtime, budget);
@@ -48,7 +49,8 @@ export async function createSliceSession({ pi, source, entries, conversationId, 
   if (candidateRuntime?.[METERED_RUNTIME] !== true || reviewerRuntime?.[METERED_RUNTIME] !== true) throw fail('metered_runtime_required');
   const incremental = await createIncrementalSession({ source, workDir });
   const trackedMemory = coverageJournal ? coverageJournal.track(memory) : memory;
-  const reviewer = createPiReviewer({ pi, workDir, model: reviewerModel, modelRuntime: reviewerRuntime, budget });
-  const distiller = await createPiDistiller({ pi, incremental, workDir, model, modelRuntime: candidateRuntime, memory: trackedMemory, scope, reviewer, budget, reviewMode });
-  return { entries, conversation_id: conversationId, scopes: [scope], memory: trackedMemory, distiller, budget, coverageJournal };
+  const reviewer = createPiReviewer({ pi, workDir, model: reviewerModel, modelRuntime: reviewerRuntime, budget, thinkingLevel: reviewerThinking });
+  const distiller = await createPiDistiller({ pi, incremental, workDir, model, modelRuntime: candidateRuntime, memory: trackedMemory, scope, reviewer, budget,
+    reviewMode, createOptions: { thinkingLevel: candidateThinking } });
+  return { entries, conversation_id: conversationId, scopes: [scope], memory: trackedMemory, distiller, budget, coverageJournal, imageArchive };
 }

@@ -31,15 +31,24 @@ async function call(runtime, model, context, options) {
 export function createPiAnswererResponder({ runtime, model, sessionId, expectedToolsSha256 }) {
   check({ runtime, model, sessionId });
   if (expectedToolsSha256 !== ANSWERER_TOOLS_SHA256) throw fail('answerer_tools_mismatch');
-  return async ({ request, instructions, route, model: id, reasoning, outputTokens, modelCalls, tools }) => {
+  return async ({ request, instructions, route, model: id, reasoning, inputTokens, outputTokens, modelCalls, costNano, tools }) => {
     if (hash(ANSWERER_TOOLS) !== expectedToolsSha256) throw fail('answerer_tools_mismatch');
     if (route !== model.provider || id !== model.id || typeof request !== 'string' || typeof instructions !== 'string'
+      || !Number.isSafeInteger(inputTokens) || inputTokens < 1 || !/^[1-9]\d*$/.test(costNano ?? '')
       || !Number.isSafeInteger(outputTokens) || outputTokens < 1 || !Number.isSafeInteger(modelCalls) || modelCalls < 1
       || typeof tools?.search !== 'function' || typeof tools?.resolve !== 'function') throw fail('answerer_invalid');
     const context = { systemPrompt: instructions, tools: ANSWERER_TOOLS,
       messages: [{ role: 'user', content: request, timestamp: Date.now() }] };
+    let usedInput = 0, usedCost = 0n;
     for (let count = 0; count < modelCalls; count++) {
+      if (usedInput >= inputTokens || usedCost >= BigInt(costNano)) throw fail('answer_budget_exceeded');
       const message = await call(runtime, model, context, { maxTokens: outputTokens, reasoning, maxRetries: 0, sessionId });
+      const usage = message.usage;
+      if (!['input', 'cacheRead', 'cacheWrite'].every(key => Number.isSafeInteger(usage?.[key]) && usage[key] >= 0)
+        || typeof usage?.cost?.total !== 'number' || !Number.isFinite(usage.cost.total) || usage.cost.total < 0) throw fail('usage_unknown');
+      usedInput += usage.input + usage.cacheRead + usage.cacheWrite;
+      usedCost += BigInt(Math.ceil(usage.cost.total * 1_000_000_000));
+      if (usedInput > inputTokens || usedCost > BigInt(costNano)) throw fail('answer_budget_exceeded');
       context.messages.push(message);
       const calls = message.content.filter(part => part.type === 'toolCall');
       if (!calls.length) {

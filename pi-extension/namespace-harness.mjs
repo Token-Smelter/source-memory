@@ -22,7 +22,7 @@ export async function runNamespaceHarness({ docker, relay, socketPath, shimPort,
       memory = await memoryFactory({ database, driver });
       if (!memory || typeof memory.init !== 'function' || typeof memory.close !== 'function') throw fail('memory_invalid');
       await memory.init();
-      outcome = { status: 'complete', isolation: gate, result: await work({ memory, isolation: gate }) };
+      outcome = { status: 'complete', isolation: gate, result: await work({ memory, isolation: gate, driver }) };
     }
   } catch (error) {
     const code = typeof error?.code === 'string' ? error.code : 'harness_failed';

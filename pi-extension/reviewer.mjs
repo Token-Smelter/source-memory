@@ -3,7 +3,7 @@ import { digest } from '../src/core.mjs';
 const fail = code => Object.assign(new Error(code), { code });
 
 /** A second Pi prompt judges the exact offered proposals; it cannot create new links or evidence. */
-export function createPiReviewer({ pi, workDir, model, modelRuntime, budget }) {
+export function createPiReviewer({ pi, workDir, model, modelRuntime, budget, thinkingLevel }) {
   if (!pi?.SessionManager || typeof pi.createAgentSession !== 'function' || !workDir || !model?.provider || !model?.id) throw fail('reviewer_invalid');
   return {
     async review({ proposal, mode }) {
@@ -17,7 +17,7 @@ export function createPiReviewer({ pi, workDir, model, modelRuntime, budget }) {
           noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
         await resourceLoader.reload();
       }
-      const { session } = await pi.createAgentSession({ cwd: workDir, agentDir: workDir, modelRuntime, model, tools: [], sessionManager: manager,
+      const { session } = await pi.createAgentSession({ cwd: workDir, agentDir: workDir, modelRuntime, model, thinkingLevel, tools: [], sessionManager: manager,
         ...(resourceLoader ? { resourceLoader, settingsManager } : {}) });
       try {
         if (budget) {

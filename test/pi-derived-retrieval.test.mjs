@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDerivedAdapter, resolveDerived, searchDerived } from '../pi-extension/derived-retrieval.mjs';
+import { createDerivedAdapter, resolveDerived, searchDerived, searchRaw } from '../pi-extension/derived-retrieval.mjs';
 
 const span = { turn: 'turn', entry_id: 'entry', start: 0, end: 15, text: 'fictional proof' };
 const bundle = { records: [{ id: 'record', kind: 'decision', text: 'Fictional decision', status: 'proposed', attribution: 'fiction', supporting_evidence: [span] }],
@@ -22,6 +22,19 @@ test('primary retrieval fuses record lexical and vector seeds without raw channe
     assert.deepEqual([kinds, rows[0].text.includes('fictional proof'), evidence.text, JSON.parse(rows[0].text).links[0].type],
       [['status:record', 'search:record', 'vector-status:record', 'vector-search:record'], false, 'fictional proof', 'qualifies']);
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test('raw-only diagnostic seeds from turn and chunk lexical channels, not derived records', async () => {
+  const kinds = [];
+  const memory = { config: { scopes: { read: ['fiction'] } }, store: {
+    async lexicalStatus(_scope, kind) { kinds.push(`status:${kind}`); return { status: 'ready' }; },
+    async chunkLexicalStatus() { kinds.push('status:chunk'); return { status: 'ready' }; },
+    async lexical(_scope, kind) { kinds.push(`search:${kind}`); return [{ kind: 'turn', id: 'turn' }]; },
+    async chunkLexical() { kinds.push('search:chunk'); return []; } },
+  async bundle() { return { source: { excerpts: [{ text: 'fictional raw source' }] } }; } };
+  const rows = await searchRaw(memory, 'fiction', { query: 'fiction', limit: 1 });
+  assert.deepEqual([kinds, rows], [['status:turn', 'status:chunk', 'search:turn', 'search:chunk'],
+    [{ id: 'turn', scope: 'fiction', text: 'fictional raw source' }]]);
 });
 
 test('derived evidence resolution rejects an unoffered source handle', async () => {
