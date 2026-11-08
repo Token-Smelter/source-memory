@@ -42,6 +42,19 @@ test('the fixed item limit is returned as a tool result without another retrieva
   assert.deepEqual([result.text, retrievals, JSON.parse(toolReply.content[0].text).status], ['Uncertain.', 1, 'item_budget_exhausted']);
 });
 
+test('search and retrieval byte limits return bounded tool results', async () => {
+  const fake = fakeMetered([message([{ type: 'toolCall', id: 'one', name: 'memory_search', arguments: { query: 'one' } },
+    { type: 'toolCall', id: 'two', name: 'memory_search', arguments: { query: 'two' } }], 'toolUse'),
+    message([{ type: 'toolCall', id: 'submit', name: 'submit_answer', arguments: { answer: 'Uncertain.' } }], 'toolUse')]);
+  let calls = 0;
+  const respond = createPiAnswererResponder({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', expectedToolsSha256: ANSWERER_TOOLS_SHA256 });
+  await respond({ request: 'Fiction?', instructions: 'Use the tools.', route: 'fiction', model: 'one', reasoning: 'low',
+    inputTokens: 100, costNano: '10000', outputTokens: 20, modelCalls: 2,
+    tools: { async search() { const code = ++calls === 1 ? 'retrieval_bytes_limit' : 'search_limit'; throw Object.assign(new Error(code), { code }); }, async resolve() {} } });
+  const replies = fake.calls[1].context.messages.filter(row => row.role === 'toolResult').map(row => JSON.parse(row.content[0].text).status);
+  assert.deepEqual(replies, ['retrieval_bytes_budget_exhausted', 'search_budget_exhausted']);
+});
+
 test('scorer uses a structured metered Pi SDK judgment submission', async () => {
   const fake = fakeMetered([message([{ type: 'toolCall', id: 'score', name: 'submit_score', arguments: { clauses: [] } }], 'toolUse')]);
   const judge = createPiScorerJudge({ runtime: fake.wrapped, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });

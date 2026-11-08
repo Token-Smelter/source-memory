@@ -78,6 +78,9 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
     const row = rows.find(item => item.through === checkpoint.id && clean.has(item.disposition));
     const reported = report.coverage?.dispositions?.[i] ?? rows.filter(item => clean.has(item.disposition))[i];
     if (!clean.has(state) || row?.disposition !== state || reported?.through !== checkpoint.id || reported.disposition !== state) throw fail('resume_coverage_mismatch');
+    if (state !== 'ineligible_by_policy' && (row.search_incomplete !== false
+      || typeof journal.coveredSearchCompleteness !== 'function'
+      || journal.coveredSearchCompleteness({ through: checkpoint.id, cursor: priorCursor }) !== false)) throw fail('resume_search_completeness_unproven');
     priorCursor = checkpoint.id;
   }
   const gap = journal.state();
