@@ -1,0 +1,158 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createCoverageJournal, runCoveredInterval } from '../pi-extension/coverage.mjs';
+import { fictionalCoverage } from '../pi-extension/policy.mjs';
+
+async function privateJournal(action) {
+  const directory = mkdtempSync(join(tmpdir(), 'pi-coverage-'));
+  try { await action(directory); } finally { rmSync(directory, { recursive: true, force: true }); }
+}
+const entries = [{ type: 'message', id: 'u', parentId: null, message: { role: 'user', content: 'fiction' } },
+  { type: 'message', id: 'a', parentId: 'u', message: { role: 'assistant', content: 'done', stopReason: 'stop' } }];
+
+test('uncertain-write fixture blocks dependent progress and retry across journal reopen', () => privateJournal(async directory => {
+  const fixture = fictionalCoverage().value.cases.find(row => row.id === 'uncertain-write');
+  let journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async enrich() { throw Object.assign(new Error('timeout'), { code: 'request_timeout' }); } });
+  const id = journal.begin({ cursor: null, through: 'a' });
+  await assert.rejects(memory.enrich('fiction', {}), /write_uncertain/);
+  await assert.rejects(memory.enrich('fiction', { different: true }), /write_reconciliation_required/);
+  assert.equal(journal.finish('failed'), fixture.disposition);
+  journal.close();
+  journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  assert.throws(() => journal.begin({ cursor: 'a', through: 'b' }), /reconciliation_required/);
+  assert.throws(() => journal.begin({ cursor: null, through: 'a', retry: true }), /reconciliation_required/);
+  assert.deepEqual([journal.state().id, journal.state().cursor], [id, null]);
+  journal.close();
+}));
+
+test('bounded link-offer omissions are recorded in the active journal', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async beginLinks() { return { token: 'fiction', packet: { retrieval: {
+    omitted_prior_records: 1, omitted_prior_spans: 2, trigger_omissions: [{ entry_id: 'u', start: 10, end: 20, reason: 'packet_budget' }] } } }; } });
+  journal.begin({ cursor: null, through: 'a' });
+  await memory.beginLinks('fiction', 'turn', ['record']);
+  journal.finish('failed');
+  const rows = readFileSync(journal.path, 'utf8').trimEnd().split('\n').map(JSON.parse);
+  assert.deepEqual(rows.find(row => row.type === 'offer_limit')?.trigger_omissions,
+    [{ entry_id: 'u', start: 10, end: 20, reason: 'packet_budget' }]);
+  journal.close();
+}));
+
+test('a confirmed pre-write refusal permits a corrected write in the same interval', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  let calls = 0;
+  const memory = journal.track({ async enrich() { calls++; if (calls === 1) throw Object.assign(new Error('refused'), { effect: 'refused' }); return { records: ['fiction'] }; } });
+  journal.begin({ cursor: null, through: 'a' });
+  await assert.rejects(memory.enrich('fiction', { first: true }), /refused/);
+  await memory.enrich('fiction', { second: true });
+  assert.deepEqual([journal.finish('committed'), calls], ['committed', 2]);
+  journal.close();
+}));
+
+test('reconciliation requires explicit proof and failed outcome before a retry', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const id = journal.begin({ cursor: null, through: 'a' });
+  const memory = journal.track({ async enrich() { throw new Error('uncertain'); } });
+  await assert.rejects(memory.enrich('fiction', {}));
+  journal.finish('failed');
+  assert.throws(() => journal.reconcile({ id, disposition: 'failed', evidenceRef: '' }), /reconciliation_invalid/);
+  journal.reconcile({ id, disposition: 'failed', evidenceRef: 'fictional-proof-of-no-effect' });
+  assert.throws(() => journal.begin({ cursor: null, through: 'a' }), /coverage_gap/);
+  assert.equal(journal.begin({ cursor: null, through: 'a', retry: true }), id);
+  journal.finish('failed');
+  journal.close();
+}));
+
+test('an unfinished interval remains uncertain after restart', () => privateJournal(async directory => {
+  let journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const id = journal.begin({ cursor: null, through: 'a' });
+  journal.close();
+  journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  assert.deepEqual([journal.state().status, journal.state().id], ['uncertain', id]);
+  assert.throws(() => journal.begin({ cursor: null, through: 'a', retry: true }), /reconciliation_required/);
+  journal.close();
+}));
+
+test('a failure after confirmed writes remains failed and requires reconciliation before retry', () => privateJournal(async directory => {
+  let journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async ingest() { return { id: 'turn' }; }, async enrich() { return { ok: true }; } });
+  const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory,
+    distiller: { memory, async run() { await memory.enrich('private', { records: [] }); throw new Error('model failed'); } } };
+  const result = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
+  assert.deepEqual([result.disposition, result.cursor, journal.state().reconciliation_required], ['failed', null, true]);
+  journal.close();
+  journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  assert.throws(() => journal.begin({ cursor: null, through: 'a', retry: true }), /reconciliation_required/);
+  journal.reconcile({ id: result.id, disposition: 'failed', evidenceRef: 'fictional-confirmed-write-and-failure' });
+  assert.equal(journal.begin({ cursor: null, through: 'a', retry: true }), result.id);
+  journal.finish('failed');
+  journal.close();
+}));
+
+test('confirmed indexing alone does not imply a derived record', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async index() { return { status: 'ready' }; } });
+  journal.begin({ cursor: null, through: 'a' });
+  await memory.index('private', {});
+  assert.equal(journal.finish('abstained'), 'abstained');
+  journal.close();
+}));
+
+test('a timed-out idempotent index does not make confirmed source ingestion uncertain', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async ingest() { return { id: 'turn', indexing: { status: 'deferred' } }; },
+    async index() { throw Object.assign(new Error('timeout'), { code: 'request_timeout' }); } });
+  const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory,
+    async ensureIndexed(client) { await client.index('private', { limit: 16 }); },
+    distiller: { memory, async run() { throw new Error('must_not_run'); } } };
+  const result = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
+  assert.deepEqual([result.disposition, result.code, journal.state().status], ['failed', 'request_timeout', 'failed']);
+  journal.close();
+}));
+
+test('a failure after confirmed archive only stays a failed scheduled gap', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async ingest() { return { id: 'turn' }; } });
+  const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory,
+    distiller: { memory, async run() { throw new Error('model failed'); } } };
+  const result = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
+  assert.deepEqual([result.disposition, journal.state().status], ['failed', 'failed']);
+  journal.close();
+}));
+
+test('a bounded successful search is recorded alongside an abstention', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async ingest() { return { id: 'turn' }; } });
+  const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory, distiller: { memory,
+    async run() { return { status: 'complete', disposition: 'abstained', search_limitations: { incomplete: true,
+      statuses: [{ status: 'budget_limited', budget_omitted: 2 }] } }; } } };
+  const result = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
+  const finish = readFileSync(journal.path, 'utf8').trimEnd().split('\n').map(JSON.parse).find(row => row.type === 'finish');
+  assert.deepEqual([result.disposition, finish.search_incomplete, finish.search_statuses[0].status], ['abstained', true, 'budget_limited']);
+  journal.close();
+}));
+
+test('successful silence advances the cursor without inventing a derived record', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async ingest() { return { id: 'turn' }; } });
+  const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory,
+    distiller: { memory, async run() { return { status: 'complete', disposition: 'abstained' }; } } };
+  const result = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
+  assert.deepEqual([result.disposition, result.cursor, journal.state().status], ['abstained', 'a', 'ready']);
+  assert.throws(() => journal.begin({ cursor: null, through: 'a' }), /interval_already_covered/);
+  journal.close();
+}));
+
+test('untracked candidate and archive paths cannot enter the coverage runner', () => privateJournal(async directory => {
+  const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
+  const memory = journal.track({ async ingest() { return { id: 'turn' }; } });
+  const session = { entries, conversation_id: 'fiction', scopes: ['private'], memory,
+    distiller: { memory: {}, async run() { return { status: 'complete', disposition: 'abstained' }; } } };
+  await assert.rejects(runCoveredInterval({ journal, session, through: 'a', cursor: null }), /tracking_required/);
+  assert.equal(journal.state().status, 'ready');
+  journal.close();
+}));

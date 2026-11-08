@@ -1,0 +1,77 @@
+{
+  "id": "memory-coverage/r2-v1",
+  "policy_id": "memory-retention/r2-v1",
+  "fictional_only": true,
+  "cases": [
+    {
+      "id": "tool-output-then-steer",
+      "entries": [
+        {"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"Find the fictional release blocker."}},
+        {"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"toolCall","name":"lookup","arguments":{}}],"stopReason":"toolUse"}},
+        {"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","content":"The certificate must be renewed before release signing."}},
+        {"type":"message","id":"s","parentId":"t","message":{"role":"user","content":"Also note the signing dependency."}},
+        {"type":"message","id":"z","parentId":"s","message":{"role":"assistant","content":"Understood.","stopReason":"stop"}}
+      ],
+      "checkpoints": [{"through":"z","cursor":null,"entries":["u","a","t","s","z"]}]
+    },
+    {
+      "id": "queued-messages",
+      "entries": [
+        {"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"First queued note."}},
+        {"type":"message","id":"u2","parentId":"u1","message":{"role":"user","content":"Second queued note."}},
+        {"type":"message","id":"z","parentId":"u2","message":{"role":"assistant","content":"Acknowledged.","stopReason":"stop"}}
+      ],
+      "checkpoints": [{"through":"z","cursor":null,"entries":["u1","u2","z"]}]
+    },
+    {
+      "id": "cancellation-without-final-assistant",
+      "entries": [
+        {"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"Check fictional signing."}},
+        {"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"toolCall","name":"lookup","arguments":{}}],"stopReason":"toolUse"}},
+        {"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","content":"Renew the signing certificate before release."}}
+      ],
+      "checkpoints": [{"through":"t","cursor":null,"interrupted":true,"entries":["u","a","t"]}]
+    },
+    {
+      "id": "late-tool-result",
+      "entries": [
+        {"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"Check fictional release readiness."}},
+        {"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":"Waiting.","stopReason":"stop"}},
+        {"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","content":"Late result: release signing is blocked."}},
+        {"type":"message","id":"z","parentId":"t","message":{"role":"assistant","content":"Noted.","stopReason":"stop"}}
+      ],
+      "checkpoints": [{"through":"a","cursor":null,"entries":["u","a"]},{"through":"z","cursor":"a","entries":["t","z"]}]
+    },
+    {
+      "id": "unproved-compaction",
+      "entries": [
+        {"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"Fictional source."}},
+        {"type":"compaction","id":"c","parentId":"u","summary":"Unproved dependency closure."},
+        {"type":"message","id":"z","parentId":"c","message":{"role":"assistant","content":"Done.","stopReason":"stop"}}
+      ],
+      "checkpoints": [{"through":"z","cursor":null,"error":"source_boundary_unresolved"},{"through":"z","cursor":"c","error":"source_boundary_unresolved"}]
+    },
+    {
+      "id": "fork-switch",
+      "entries": [
+        {"type":"message","id":"u","parentId":null,"message":{"role":"user","content":"Shared fictional root."}},
+        {"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":"Shared reply.","stopReason":"stop"}},
+        {"type":"message","id":"x","parentId":"a","message":{"role":"assistant","content":"Branch X.","stopReason":"stop"}},
+        {"type":"message","id":"y","parentId":"a","message":{"role":"assistant","content":"Branch Y.","stopReason":"stop"}}
+      ],
+      "checkpoints": [{"through":"y","cursor":"x","error":"cursor_unresolved"},{"through":"y","cursor":"a","entries":["y"]}]
+    },
+    {
+      "id": "batch-overflow",
+      "generator": "1025_nonempty_message_entries",
+      "checkpoints": [{"through":"e1024","cursor":null,"error":"invalid_input"}]
+    },
+    {
+      "id": "uncertain-write",
+      "disposition": "uncertain",
+      "must_block_retry": true,
+      "must_not_advance_cursor": true,
+      "reconciliation_required": true
+    }
+  ]
+}

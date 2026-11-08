@@ -7,7 +7,7 @@ function files(dir) {
     ? files(join(dir, entry.name)) : [join(dir, entry.name)]);
 }
 let checked = 0;
-for (const file of ['src', 'bin', 'scripts', 'test'].flatMap(files).filter(path => path.endsWith('.mjs'))) {
+for (const file of ['src', 'bin', 'scripts', 'test', 'pi-extension'].flatMap(files).filter(path => path.endsWith('.mjs'))) {
   execFileSync(process.execPath, ['--check', file], { stdio: 'pipe' });
   if (readFileSync(file, 'utf8').split('\n').some(line => /[\t ]+$/.test(line))) {
     throw new Error(`Trailing whitespace: ${file}`);

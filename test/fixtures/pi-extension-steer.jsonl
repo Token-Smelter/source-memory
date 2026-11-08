@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"fictional-session"}
+{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"Original fictional request"}}
+{"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[{"type":"toolCall","name":"search","arguments":{"q":"fiction"}}],"stopReason":"toolUse"}}
+{"type":"message","id":"t1","parentId":"a1","message":{"role":"toolResult","content":[{"type":"text","text":"Fictional result"}]}}
+{"type":"message","id":"u2","parentId":"t1","message":{"role":"user","content":"Steer the request"}}
+{"type":"message","id":"a2","parentId":"u2","message":{"role":"assistant","content":[{"type":"text","text":"Done"}],"stopReason":"stop"}}
+{"type":"message","id":"u3","parentId":"a2","message":{"role":"user","content":"Next fictional request"}}
+{"type":"message","id":"a3","parentId":"u3","message":{"role":"assistant","content":[{"type":"text","text":"Next reply"}],"stopReason":"stop"}}

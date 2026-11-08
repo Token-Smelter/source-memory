@@ -8,7 +8,7 @@
   "repository": { "type": "git", "url": "git+https://github.com/Token-Smelter/source-memory.git" },
   "bin": { "source-memory": "bin/memory.mjs" },
   "exports": "./src/memory.mjs",
-  "files": ["bin", "src", "skills", "examples", "config", "README.md", "LICENSE"],
+  "files": ["bin", "src", "pi-extension", "skills", "examples", "config", "README.md", "LICENSE"],
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "node --test test/*.test.mjs",

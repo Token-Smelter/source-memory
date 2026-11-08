@@ -231,11 +231,50 @@ test('missing_retained_source_refuses_before_model_egress', async () => {
   assert.equal(memory.writes.length, 0);
 });
 
-test('known_incomplete_retrieval_stops_comparison', async () => {
+test('whole_bundle_budget_omissions_are_disclosed_in_a_bounded_offer', async () => {
   const { request, memory } = await setup();
-  memory.recall = async () => ({ scope: SCOPE, status: 'budget_limited', budget_omitted: 1,
-    relationship_context_complete: false, bundles: [] });
+  const recall = memory.recall.bind(memory);
+  memory.recall = async (...args) => ({ ...await recall(...args), status: 'budget_limited', budget_omitted: 2,
+    relationship_context_complete: false });
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  assert.deepEqual([result.packet.retrieval.status, result.packet.retrieval.budget_omitted,
+    result.packet.retrieval.relationship_context_complete, result.packet.retrieval.completeness_guaranteed, memory.writes.length],
+  ['budget_limited', 2, false, false, 0]);
+});
+
+test('a_returned_bundle_with_incomplete_relationship_context_stops_comparison', async () => {
+  const { request, memory } = await setup();
+  const recall = memory.recall.bind(memory);
+  memory.recall = async (...args) => {
+    const result = await recall(...args);
+    result.status = 'budget_limited'; result.budget_omitted = 1; result.relationship_context_complete = false;
+    result.bundles[0].relationship_context_complete = false;
+    return result;
+  };
   await assert.rejects(proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) }), { code: 'link_retrieval_incomplete' });
+});
+
+test('long trigger evidence uses whole retained chunk offsets without trimming', async () => {
+  const { request, memory, value } = await setup();
+  const turn = memory.turns.get(value.latest), entry = turn.entries[0];
+  entry.text += 'x'.repeat(20000);
+  memory.sourceChunks = async () => [{ entry_id: entry.id, start: 0, end: 12000, ordinal: 0 },
+    { entry_id: entry.id, start: 11000, end: entry.text.length, ordinal: 1 }];
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  const trigger = result.packet.sources.filter(row => row.trigger);
+  assert.equal(trigger.some(row => row.text === entry.text.slice(11000)), true);
+});
+
+test('bounded offers preserve mandatory new evidence and disclose complete omitted trigger chunks', async () => {
+  const { request, memory, value } = await setup();
+  const turn = memory.turns.get(value.latest), entry = turn.entries[0];
+  entry.text += 'x'.repeat(170000);
+  memory.sourceChunks = async () => Array.from({ length: 18 }, (_, index) => ({ entry_id: entry.id,
+    start: index * 10000, end: Math.min((index + 1) * 10000, entry.text.length), ordinal: index })).filter(row => row.end > row.start);
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  const own = result.packet.records.find(row => row.newly_retained), cited = own.evidence.map(ref => result.packet.sources.find(row => row.ref === ref));
+  assert.equal(cited.every(row => row?.trigger) && result.packet.retrieval.trigger_omissions.some(row => row.reason === 'packet_budget')
+    && Buffer.byteLength(result.prompt) <= LINK_PROPOSAL_LIMITS.prompt_bytes, true);
 });
 
 test('known_partial_channel_stops_even_when_overall_status_is_ready', async () => {
@@ -332,15 +371,16 @@ test('candidate_count_bound_refuses_before_comparison', async () => {
   await assert.rejects(proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) }), { code: 'link_candidate_bound' });
 });
 
-test('model_prompt_bound_refuses_without_silent_source_truncation', async () => {
+test('model_prompt_bound_omits_whole_prior_records_and_discloses_the_gap', async () => {
   const { request, memory } = await setup();
   const original = memory.records.get('old');
   for (let index = 0; index < 8; index++) memory.records.set(`large-${index}`, {
     ...clone(original), id: `large-${index}`, text: 'fictional '.repeat(1500) });
-  await assert.rejects(proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) }), { code: 'link_prompt_bound' });
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  assert.equal(result.packet.retrieval.omitted_prior_records > 0 && Buffer.byteLength(result.prompt) <= LINK_PROPOSAL_LIMITS.prompt_bytes, true);
 });
 
-test('evidence_span_count_bound_refuses_before_comparison', async () => {
+test('evidence_span_count_bound_omits_whole_prior_records_with_disclosure', async () => {
   const { request, memory, value } = await setup();
   const source = memory.turns.get(value.facts[0]);
   source.entries = Array.from({ length: 129 }, (_, index) => ({ id: `span-${index}`, role: 'user',
@@ -352,7 +392,8 @@ test('evidence_span_count_bound_refuses_before_comparison', async () => {
       kind: 'observation', status: 'proposed', attribution: 'fictional extraction', text: 'Separate retained source spans.',
       evidence: entries.map(entry => ({ turn: source.id, entry_id: entry.id, start: 0, end: entry.text.length })) });
   }
-  await assert.rejects(proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) }), { code: 'link_evidence_bound' });
+  const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet)) });
+  assert.equal(result.packet.retrieval.omitted_prior_spans > 0 && result.packet.sources.length <= LINK_PROPOSAL_LIMITS.evidence_spans, true);
 });
 
 test('source_turn_count_bound_refuses_before_comparison', async () => {

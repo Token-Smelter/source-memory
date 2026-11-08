@@ -1,0 +1,23 @@
+# Pi Memory extension — experimental core
+
+**This remains experimental scaffolding, not a production-ready Pi extension or authorization for a paid run.** It provides a versioned retention policy, fictional drift and coverage fixtures, cursor-bounded processing, a durable coverage journal, a Pi SDK adapter, and a private network-namespace harness. The legacy input-token budget is a soft between-call cap, not a hard spend reservation. Live provider bounds, shared metering, chronological dataset admission, fixed answerer/scorer integration and a real end-to-end evaluation remain unqualified.
+
+## Interfaces
+
+| Module | Role |
+|---|---|
+| `policy/`, `policy.mjs` | Frozen invariant policy, fictional calibration and coverage fixtures, and explicit treatment-drift assessment. |
+| `image-archive.mjs` | Original image bytes stored privately by SHA-256; source text contains a deterministic placeholder and image content is explicitly not text-citable. |
+| `chronology.mjs`, `scripts/check-dev-checkpoints.mjs` | No-call validation of pinned source bytes, availability, active ancestry and the selected Pi context; scope authorization and semantic review remain separate. |
+| `derived-retrieval.mjs` | Record lexical and record-vector seeds only, with returned-item evidence handles; actor, scope and pre-answer snapshot verification remain caller obligations. |
+| `evaluation/` | Sealed answerer and scorer contracts, paired connected-history reporting, conditional durable reservation ledger and metered Pi `streamSimple` adapters. |
+| `core.mjs`, `coverage.mjs` | Cursor-bounded source processing and a private append-only coverage journal. Explicit interruption is supported; unproved compaction, overflow, scope errors and uncertain effects remain gaps. The session and distiller must share the journal-tracked Memory facade. |
+| `incremental.mjs` | Copies complete source JSONL entry lines into a private Pi-session file, preserving entry IDs. Prefix rewrites rebuild the private copy if old entry identities remain equal; changed identities and collisions refuse. State is in memory and does not recover after process restart. |
+| `pi-runtime.mjs` | Reopens that private session, branches to the target leaf and runs an injected Pi SDK session. Memory tools run sequentially to avoid competing for the bounded local embedding relay. Anthropic history breakpoint logic is included. |
+| `ndjson.mjs`, `memory-client.mjs`, `memory-process.mjs`, `serve.mjs` | Correlated, cancellable requests to one Memory process; link proposal objects remain in that process for validated reviewed apply. |
+| `index.mjs`, `replay.mjs` | Injectable nonblocking settled-event registration and replay over the same core. |
+| `namespace-docker.mjs`, `namespace-probe.mjs`, `namespace-harness.mjs` | Disposable Neo4j with `network none`, a driver sharing its namespace, and loopback/no-route and foreign-endpoint checks. Labelled resources are recorded before use and cleaned by exact identity. |
+| `unix-relay.mjs`, `embedding-shim.mjs`, `docker-memory.mjs` | Private Unix-socket embedding relay, loopback shim and long-lived Memory subprocess. `scripts/check-private-namespace.mjs` exercises actual isolated Neo4j using fictional content and a fake embedding response. |
+| `bridge-harness.mjs`, `docker-adapter.mjs` | Earlier bridge prototype; not the qualified private namespace path. |
+
+The host must provide trusted configuration, a frozen source snapshot and availability proof, model routing, a reviewer and a shared pre-call spend policy. Image blobs are archived separately; the current text evidence interface cannot support claims about their visual content. A hard reservation requires verified provider bounds; a separately approved soft pilot uses `evaluation/soft-budget.mjs` and reports its overshoot and ledger limitations. `createSliceSession` refuses a runtime without an explicitly supplied metered wrapper; that marker alone does not prove a provider or gateway bound. Errors and unconfirmed writes do not advance the journaled cursor. A successful `budget_limited` recall records its omissions; under the owner-approved interpretation the interval can abstain, but the evaluation runner treats incomplete or unproven search as an invalid run before scoring. Degraded or failed searches remain failures. Separate review and self-review are labelled distinctly; a model proposal is not operator acceptance. Network probes are sanity checks, not exhaustive evidence. The namespace harness verifies the structural isolation before opening Memory, but a fictional infrastructure smoke does not qualify an experiment, a provider route or a live spend cap. The live hook is not restart-safe; see `docs/INTEGRATION.md` when available.
