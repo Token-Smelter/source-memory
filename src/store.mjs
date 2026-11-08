@@ -157,6 +157,13 @@ export class Neo4jStore {
     });
   }
 
+  async getRecords(scope, ids) {
+    return this.transaction('read', async tx => {
+      const result = await tx.run('MATCH (r:SMRecord {scope:$scope}) WHERE r.record_id IN $ids RETURN r', { scope, ids });
+      return result.records.map(row => decodeRecord(unwrap(row.get('r'))));
+    });
+  }
+
   async enrich(scope, payload) {
     return this.transaction('write', async tx => {
       const allSpans = [...payload.records, ...payload.relations].flatMap(row => row.evidence);

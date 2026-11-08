@@ -81,6 +81,9 @@ export function createAtomicOutcomes({ memory, beforeAppend }) {
       } finally { pending.delete(token); }
     },
     cancel(token) { return { cancelled: pending.delete(token) }; },
+    release(scope, trigger) {
+      for (const [handle, offer] of offers) if (offer.scope === scope && offer.trigger === trigger) offers.delete(handle);
+    },
     close() { offers.clear(); pending.clear(); },
   };
 }

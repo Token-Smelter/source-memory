@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTurnTools, entryText } from '../pi-extension/core.mjs';
 import { createPiDistiller, parseFinalResult } from '../pi-extension/pi-runtime.mjs';
+import { compactResult } from './helpers/compact-fixture.mjs';
 
 test('fallback accepts one fenced JSON object but refuses surrounding commentary', () => {
   const body = '{"result":"done_with_writes","reason":"fiction"}';
@@ -16,7 +17,7 @@ test('opaque and summarized thinking blocks are never included in citable source
 
 test('a failed or degraded search cannot be converted into a record or successful search', async () => {
   let writes = 0;
-  const memory = { async recall() { return { status: 'degraded', bundles: [] }; }, async enrich() { writes++; } };
+  const memory = { async searchCompact() { return compactResult({ status: 'degraded' }); }, async enrich() { writes++; } };
   const tools = createTurnTools({ scope: 'fiction', requireSearch: true, memory,
     turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'Fiction' }] }, receipt: { id: 'turn' } });
   await assert.rejects(tools.search('Fiction', []), /search_incomplete/);
@@ -25,38 +26,40 @@ test('a failed or degraded search cannot be converted into a record or successfu
 });
 
 test('an unavailable search channel cannot become a successful bounded search', async () => {
-  const memory = { async recall() { return { status: 'budget_limited', budget_omitted: 1, bundles: [],
-    channels: { record_vector: { status: 'unavailable' } } }; } };
+  const memory = { async searchCompact() { return compactResult({ budget_omitted: 1,
+    channels: { record_lexical: { status: 'ready' }, record_vector: { status: 'unavailable' } } }); } };
   const tools = createTurnTools({ scope: 'fiction', requireSearch: true, memory,
     turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
   await assert.rejects(tools.search('fiction', []), /search_incomplete/);
   assert.equal(tools.stats().search_failed, true);
 });
 
-test('a ready recall with a relationship expansion gap is incomplete', async () => {
-  const memory = { async recall() { return { status: 'ready', relationship_context_complete: false,
-    bundles: [{ records: [], relationship_context_complete: false, gaps: ['node_limit'] }] }; } };
+test('a selected record with an incomplete relationship expansion is incomplete', async () => {
+  const memory = { async searchCompact() { return compactResult({ records: [{ id: 'a', kind: 'decision', text: 'fiction' }] }); },
+    async fetchCompact() { return { relationship_context_complete: false, relationship_omitted_at_least: 1 }; } };
   const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
-  await tools.search('fiction', []);
-  assert.deepEqual([tools.stats().incomplete_search, tools.stats().search_statuses[0].relationship_gaps], [true, ['node_limit']]);
+  const result = await tools.search('fiction', []);
+  await tools.fetch(result.records[0].handle);
+  assert.deepEqual([tools.stats().incomplete_search, tools.stats().search_statuses[1].relationship_omitted_at_least], [true, 1]);
 });
 
-test('a recall without relationship completeness evidence is incomplete', async () => {
-  const memory = { async recall() { return { status: 'ready', bundles: [] }; } };
+test('a selected record without relationship completeness evidence is incomplete', async () => {
+  const memory = { async searchCompact() { return compactResult({ records: [{ id: 'a', kind: 'decision', text: 'fiction' }] }); },
+    async fetchCompact() { return {}; } };
   const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
-  await tools.search('fiction', []);
+  const result = await tools.search('fiction', []);
+  await tools.fetch(result.records[0].handle);
   assert.equal(tools.stats().incomplete_search, true);
 });
 
 test('bounded search exposes omissions and channel status without increasing its budget', async () => {
   const inputs = [];
-  const memory = { async recall(_scope, input) { inputs.push(input); return { status: 'budget_limited', budget_omitted: 2,
-    retrieval_complete: false, channels: { record_lexical: { status: 'ready' }, chunk_vector: { status: 'partial' } },
-    bundles: [{ records: [{ id: 'prior', kind: 'observation', text: 'fiction' }] }] }; } };
+  const memory = { async searchCompact(_scope, input) { inputs.push(input); return compactResult({ budget_omitted: 2,
+    records: [{ id: 'prior', kind: 'observation', text: 'fiction' }] }); } };
   const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'fiction' }] }, receipt: { id: 'turn' } });
   const result = await tools.search('fiction', []);
-  assert.deepEqual([inputs[0].max_chars, result.status, result.budget_omitted, result.channels.chunk_vector.status,
-    result.records[0].id, tools.stats().incomplete_search], [24000, 'budget_limited', 2, 'partial', 'prior', true]);
+  assert.deepEqual([inputs[0].max_bytes, result.status, result.budget_omitted, result.channels.record_vector.status,
+    result.records[0].id, tools.stats().incomplete_search], [24000, 'budget_limited', 2, 'ready', 'prior', true]);
 });
 
 test('a bounded successful search permits candidate-assessed abstention and records incompleteness', async () => {
@@ -69,7 +72,7 @@ test('a bounded successful search permits candidate-assessed abstention and reco
   } };
   const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
     async createAgentSession() { return { session }; } };
-  const memory = { async recall() { return { status: 'budget_limited', budget_omitted: 1, channels: { record_lexical: { status: 'ready' } }, bundles: [{ records: [] }] }; } };
+  const memory = { async searchCompact() { return compactResult({ budget_omitted: 1 }); } };
   const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
     workDir: '/fiction', model: {}, memory, scope: 'fiction' });
   const result = await runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
@@ -77,9 +80,8 @@ test('a bounded successful search permits candidate-assessed abstention and reco
     ['abstained', true, 'budget_limited']);
 });
 
-test('a successful budget-limited search may return zero whole bundles', async () => {
-  const memory = { async recall() { return { status: 'budget_limited', budget_omitted: 3,
-    channels: { record_vector: { status: 'ready' } }, bundles: [] }; } };
+test('a successful budget-limited search may return zero complete cards', async () => {
+  const memory = { async searchCompact() { return compactResult({ budget_omitted: 3 }); } };
   const tools = createTurnTools({ scope: 'fiction', memory, requireSearch: true,
     turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
   const result = await tools.search('fiction', []);
@@ -98,7 +100,7 @@ test('no memory tool may run after the final submission', async () => {
   } };
   const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
     async createAgentSession() { return { session }; } };
-  const memory = { async recall() { return { status: 'no_matches', bundles: [] }; } };
+  const memory = { async searchCompact() { return compactResult(); } };
   const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
     workDir: '/fiction', model: {}, memory, scope: 'fiction' });
   await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } }), /disposition_invalid/);
@@ -114,7 +116,7 @@ test('the model cannot declare operational uncertainty as its result', async () 
   } };
   const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
     async createAgentSession() { return { session }; } };
-  const memory = { async recall() { return { status: 'no_matches', bundles: [] }; } };
+  const memory = { async searchCompact() { return compactResult(); } };
   const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
     workDir: '/fiction', model: {}, memory, scope: 'fiction' });
   await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } }), /disposition_invalid/);
@@ -132,7 +134,7 @@ test('an unknown write aborts the Pi tool loop immediately', async () => {
   } };
   const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
     async createAgentSession() { return { session }; } };
-  const memory = { async recall() { return { status: 'no_matches', bundles: [] }; },
+  const memory = { async searchCompact() { return compactResult(); },
     async enrich() { throw Object.assign(new Error('write_uncertain'), { code: 'write_uncertain', write_outcome_unknown: true }); } };
   const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
     workDir: '/fiction', model: {}, memory, scope: 'fiction' });
@@ -142,7 +144,7 @@ test('an unknown write aborts the Pi tool loop immediately', async () => {
 
 test('inaccessible scope cannot be selected through a memory-search argument', async () => {
   const seen = [];
-  const memory = { async recall(scope) { seen.push(scope); return { status: 'no_matches', bundles: [] }; } };
+  const memory = { async searchCompact(scope) { seen.push(scope); return compactResult(); } };
   const tools = createTurnTools({ scope: 'permitted', memory,
     turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'Fiction' }] }, receipt: { id: 'turn' } });
   await tools.search('Fiction', []);

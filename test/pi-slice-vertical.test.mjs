@@ -8,6 +8,7 @@ import { runHarness } from '../pi-extension/bridge-harness.mjs';
 import { createSliceSession } from '../pi-extension/slice-runtime.mjs';
 import { createInputBudget } from '../pi-extension/budget.mjs';
 import { METERED_RUNTIME } from '../pi-extension/evaluation/pi-wrapper.mjs';
+import { compactResult } from './helpers/compact-fixture.mjs';
 
 const source = fileURLToPath(new URL('./fixtures/pi-extension-steer.jsonl', import.meta.url));
 const entries = readFileSync(source, 'utf8').trim().split('\n').slice(1).map(JSON.parse);
@@ -38,7 +39,7 @@ test('one fictional slice passes the gate, shared replay, fake Pi routing and me
     const gate = { ok: true, targets: [{ host: '127.0.0.1', port: 27690, outcome: 'error' },
       { host: '172.30.0.1', port: 27690, outcome: 'timeout' }, { host: '172.17.0.2', port: 27690, outcome: 'error' }] };
     const memory = { async init() { calls.push('init'); }, async ingest(_scope, turn) { calls.push(turn.source); return { id: 'turn' }; },
-      async recall() { return { status: 'ready', bundles: [] }; } };
+      async searchCompact() { return compactResult(); }, async recall() { return { status: 'ready', bundles: [] }; } };
     const budget = createInputBudget(20000000);
     const result = await runHarness({ docker, relay: { async open() { return { async close() {} }; } }, isolation: async () => gate, memory,
       sessionFactory: async () => [{ session: await createSliceSession({ pi, source, entries, conversationId: 'fiction', workDir: dir,

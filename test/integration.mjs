@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { Memory } from '../src/memory.mjs';
 import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
+import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
 
 const exec = promisify(execFile);
 const contracts = {
@@ -1058,6 +1059,21 @@ export async function runIntegration(database, scratch) {
       const result = await memory.index('demo');
       const after = await memory.status('demo');
       assert.deepEqual([result.status, after.unindexed, after.turns], ['ready', 0, before]);
+    });
+    await check('compact search reads Neo4j records and hydrates only an offered record with relations', async () => {
+      const trigger = await memory.ingest('demo', { ...turn('compact-trigger', 'Check the blue choice.'), source: 'pi-memory' });
+      const handlers = createMemoryHandlers({ memory, scopes: ['demo'] });
+      try {
+        const result = await handlers.searchCompact({ scope: 'demo', trigger: trigger.id,
+          input: { query: 'blue', kinds: [], limit: 64, max_bytes: 24000 } });
+        const old = result.records.find(row => row.id === 'old-decision');
+        assert.ok(old);
+        assert.equal(result.status, 'ready');
+        const shown = await handlers.fetchCompact({ scope: 'demo', trigger: trigger.id, handle: old.handle });
+        assert.equal(shown.record.id, 'old-decision');
+        assert.ok(shown.relations.some(row => row.type === 'supersedes' && row.to === 'old-decision'));
+        assert.equal(shown.relationship_context_complete, true);
+      } finally { handlers.close(); }
     });
     const attemptInput = turn('attempt', 'I ran the demonstration check. It passed. Should we run another?');
     const attemptSource = await memory.ingest('demo', attemptInput);

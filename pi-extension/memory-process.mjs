@@ -1,8 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { normalizeEnrichment } from '../src/core.mjs';
 import * as defaultLinks from '../src/link-proposals.mjs';
 import { searchDerived, resolveDerived, searchRaw } from './derived-retrieval.mjs';
 import { createAtomicOutcomes } from './atomic-outcome.mjs';
+import { searchCompactRecords } from './compact-retrieval.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const deferred = () => {
@@ -16,7 +17,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
   if (!Array.isArray(scopes) || scopes.length !== 1 || typeof scopes[0] !== 'string' || !scopes[0]) throw fail('scope_unresolved');
   if (!Number.isSafeInteger(offerTimeoutMs) || offerTimeoutMs <= 0) throw fail('timeout_invalid');
   const allowed = scope => { if (scope !== scopes[0]) throw fail('scope_denied'); };
-  const slots = new Map();
+  const slots = new Map(), compactOffers = new Map();
   let indexing = null;
   const outcomes = createAtomicOutcomes({ memory, beforeAppend });
   const cancel = slot => {
@@ -49,6 +50,50 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       const result = await memory.recall(scope, input);
       return outcomes.offer(scope, trigger, result);
     },
+    async searchCompact({ scope, input, trigger }) {
+      allowed(scope);
+      if (typeof trigger !== 'string' || !trigger) throw fail('source_invalid');
+      const shown = await memory.show(scope, { kind: 'turn', id: trigger });
+      if (shown?.turn?.source !== 'pi-memory') throw fail('source_invalid');
+      const maxBytes = input?.max_bytes ?? 24000;
+      if (!Number.isSafeInteger(maxBytes) || maxBytes < 256 || maxBytes > 24000) throw fail('invalid_input');
+      const ranked = await searchCompactRecords(memory, scope, input);
+      const wrapped = outcomes.offer(scope, trigger, { bundles: [{ records: ranked.records }] });
+      const selected = [], offers = [];
+      const result = { status: 'budget_limited', records: selected, channels: ranked.channels, ranked_count: ranked.ranked_count,
+        top_k_omitted: ranked.top_k_omitted, filter_may_be_incomplete: ranked.filter_may_be_incomplete,
+        budget_omitted: ranked.records.length, relationship_context: 'not_loaded', completeness_guaranteed: false };
+      for (const row of wrapped.bundles[0].records) {
+        const handle = `record-${randomBytes(16).toString('base64url')}`, item = { ...row, handle };
+        selected.push(item);
+        result.budget_omitted = ranked.records.length - selected.length;
+        if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) { selected.pop(); result.budget_omitted++; continue; }
+        offers.push({ handle, scope, trigger, id: row.id });
+      }
+      if (compactOffers.size + offers.length > 4096) throw fail('compact_offer_limit');
+      for (const offer of offers) compactOffers.set(offer.handle, offer);
+      result.status = result.budget_omitted ? 'budget_limited' : selected.length ? 'ready' : 'no_matches';
+      if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) throw fail('search_budget_invalid');
+      return result;
+    },
+    async fetchCompact({ scope, trigger, handle }) {
+      allowed(scope);
+      const offered = compactOffers.get(handle);
+      if (!offered || offered.scope !== scope || offered.trigger !== trigger) throw fail('handle_not_offered');
+      if (typeof memory.store?.neighbors !== 'function') throw fail('search_unavailable');
+      const shown = await memory.show(scope, { kind: 'record', id: offered.id });
+      const relations = await memory.store.neighbors(scope, [offered.id], 65);
+      if (!Array.isArray(relations) || relations.length > 65
+        || relations.some(row => row.from !== offered.id && row.to !== offered.id)) throw fail('search_incomplete');
+      return { ...shown, relations: relations.slice(0, 64), relationship_context_complete: relations.length <= 64,
+        relationship_omitted_at_least: relations.length > 64 ? 1 : 0 };
+    },
+    async releaseCompact({ scope, trigger }) {
+      allowed(scope);
+      for (const [handle, offered] of compactOffers) if (offered.scope === scope && offered.trigger === trigger) compactOffers.delete(handle);
+      outcomes.release(scope, trigger);
+      return { released: true };
+    },
     async beginOutcome({ scope, trigger, outcome, new_action, action_handle }) {
       allowed(scope);
       return outcomes.begin({ scope, trigger, outcome, new_action, action_handle });
@@ -67,9 +112,19 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       if (shown?.turn?.source !== 'pi-memory') throw fail('source_invalid');
       return memory.enrich(scope, normalized);
     },
-    async beginLinks({ scope, turn, record_ids, review_contract }, { signal } = {}) {
+    async beginLinks({ scope, turn, record_ids, candidate_handles, review_contract }, { signal } = {}) {
       allowed(scope);
       if (signal?.aborted) throw fail('request_cancelled');
+      let candidateRecordIds = null;
+      if (candidate_handles !== undefined) {
+        if (!Array.isArray(candidate_handles) || candidate_handles.length > 32 || new Set(candidate_handles).size !== candidate_handles.length) throw fail('invalid_input');
+        candidateRecordIds = candidate_handles.map(handle => {
+          const offered = compactOffers.get(handle);
+          if (!offered || offered.scope !== scope || offered.trigger !== turn) throw fail('handle_not_offered');
+          return offered.id;
+        });
+        if (new Set(candidateRecordIds).size !== candidateRecordIds.length) throw fail('invalid_input');
+      }
       const token = randomUUID();
       const controller = new AbortController();
       const offered = deferred();
@@ -80,7 +135,8 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       const abort = () => { offered.reject(fail('request_cancelled')); cancel(slot); };
       signal?.addEventListener('abort', abort, { once: true });
       slot.timer = setTimeout(abort, offerTimeoutMs);
-      slot.work = Promise.resolve().then(() => linkModule.proposeMemoryLinks({ memory, scope, turn, record_ids, review_contract,
+      slot.work = Promise.resolve().then(() => linkModule.proposeMemoryLinks({ memory, scope, turn, record_ids,
+        candidate_record_ids: candidateRecordIds, review_contract,
         signal: controller.signal, compare: async input => {
           offered.resolve({ token, packet: input.packet });
           return compare.promise;
@@ -111,6 +167,6 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       } finally { cancel(slot); }
     },
     async cancelLinks({ token }) { return { cancelled: cancel(slots.get(token)) }; },
-    close() { for (const slot of [...slots.values()]) cancel(slot); outcomes.close(); },
+    close() { for (const slot of [...slots.values()]) cancel(slot); compactOffers.clear(); outcomes.close(); },
   };
 }

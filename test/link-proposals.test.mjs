@@ -112,6 +112,17 @@ const reviewFor = (result, approved = [0]) => ({ contract: LINK_PROPOSAL_CONTRAC
 const apply = (request, result, review = reviewFor(result), before_append = request.before_append) => applyReviewedMemoryLinks({
   memory: request.memory, scope: request.scope, result, review, before_append, signal: request.signal });
 
+test('selected link candidates hydrate only chosen records and disclose bounded context', async () => {
+  const { memory, request } = await setup();
+  memory.records.set('unselected', { ...memory.records.get('old'), id: 'unselected' });
+  const result = await proposeMemoryLinks({ ...request, candidate_record_ids: ['old'],
+    compare: async () => ({ text: '{"links":[]}', route }) });
+  assert.deepEqual([result.packet.retrieval.status, result.packet.retrieval.relationship_context_complete,
+    memory.calls.some(call => call.method === 'recall'),
+    memory.calls.filter(call => call.method === 'show' && call.input.kind === 'record').map(call => call.input.id)],
+  ['selected', false, false, ['new', 'old']]);
+});
+
 for (const kind of KINDS) {
   test(`link_pipeline_${kind}_retains_existing_kind_and_requires_separate_review`, async () => {
     const { memory, request } = await setup({ kind });
