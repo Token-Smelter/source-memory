@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTurnTools } from '../pi-extension/core.mjs';
 import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
+import { compactResult } from './helpers/compact-fixture.mjs';
 
 function fixture({ approve = true } = {}) {
   const calls = [], writes = [];
@@ -13,7 +14,10 @@ function fixture({ approve = true } = {}) {
     async enrich(_scope, payload) { calls.push('write'); writes.push(payload); return { records: payload.records.map(row => row.id), relations: payload.relations.map(row => row.id), indexing: { status: 'ready' } }; } };
   const handlers = createMemoryHandlers({ memory, scopes: ['fiction'], beforeAppend: async plan => { calls.push('intent');
     return { accepted: true, operation_id: plan.operation_id, append_sha256: plan.append_sha256 }; } });
-  const client = { recall: (scope, input, options) => handlers.recall({ scope, input, trigger: options.trigger }),
+  const client = { async searchCompact(scope, input, trigger) {
+    const found = await handlers.recall({ scope, input, trigger });
+    return compactResult({ records: found.bundles.flatMap(row => row.records) });
+  },
     beginOutcome: (scope, trigger, outcome, new_action, action_handle) => handlers.beginOutcome({ scope, trigger, outcome, new_action, action_handle }),
     applyOutcome: (scope, token, review) => handlers.applyOutcome({ scope, token, review }),
     cancelOutcome: token => handlers.cancelOutcome({ token }) };

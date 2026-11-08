@@ -1,6 +1,6 @@
 import { createClient } from './ndjson.mjs';
 
-const noPersistentWrite = new Set(['status', 'recordVectorStatus', 'turnVectorStatus', 'sourceChunks', 'recall', 'beginLinks', 'finishLinks', 'cancelLinks', 'beginOutcome', 'cancelOutcome',
+const noPersistentWrite = new Set(['status', 'recordVectorStatus', 'turnVectorStatus', 'sourceChunks', 'recall', 'searchCompact', 'fetchCompact', 'releaseCompact', 'beginLinks', 'finishLinks', 'cancelLinks', 'beginOutcome', 'cancelOutcome',
   'searchDerived', 'resolveDerived', 'searchRaw']);
 
 /** Facade for one long-lived Memory subprocess; never exposes raw relation writes. */
@@ -29,6 +29,9 @@ export function createMemoryClient({ input, output, timeoutMs, indexTimeoutMs = 
     index: (scope, input, options = {}) => call('index', { scope, input }, { ...options, timeoutMs: indexTimeoutMs }),
     ingest: (scope, turn, options) => call('ingest', { scope, turn }, options),
     recall: (scope, input, { signal, trigger } = {}) => call('recall', { scope, input, ...(trigger ? { trigger } : {}) }, { signal }),
+    searchCompact: (scope, input, trigger, options) => call('searchCompact', { scope, input, trigger }, options),
+    fetchCompact: (scope, trigger, handle, options) => call('fetchCompact', { scope, trigger, handle }, options),
+    releaseCompact: (scope, trigger, options) => call('releaseCompact', { scope, trigger }, options),
     beginOutcome: (scope, trigger, outcome, newAction, actionHandle, options) => call('beginOutcome',
       { scope, trigger, outcome, new_action: newAction, action_handle: actionHandle }, options),
     applyOutcome: (scope, token, review, options) => call('applyOutcome', { scope, token, review }, options),
@@ -37,7 +40,8 @@ export function createMemoryClient({ input, output, timeoutMs, indexTimeoutMs = 
     resolveDerived: (scope, input, options) => call('resolveDerived', { scope, input }, options),
     searchRaw: (scope, input, options) => call('searchRaw', { scope, input }, options),
     enrich: (scope, input, { trigger, signal } = {}) => call('enrich', { scope, input, trigger }, { signal }),
-    beginLinks: (scope, turn, recordIds, options) => call('beginLinks', { scope, turn, record_ids: recordIds, review_contract: reviewContract }, options),
+    beginLinks: (scope, turn, recordIds, { candidateHandles, signal } = {}) => call('beginLinks',
+      { scope, turn, record_ids: recordIds, ...(candidateHandles ? { candidate_handles: candidateHandles } : {}), review_contract: reviewContract }, { signal }),
     finishLinks: (token, output, route, options) => call('finishLinks', { token, output, route }, options),
     applyLinks: (token, review, options) => call('applyLinks', { token, review }, options),
     cancelLinks: (token, options) => call('cancelLinks', { token }, options),

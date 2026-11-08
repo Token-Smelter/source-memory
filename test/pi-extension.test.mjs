@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
+import { compactResult } from './helpers/compact-fixture.mjs';
 
 const rows = readFileSync(new URL('./fixtures/pi-extension-steer.jsonl', import.meta.url), 'utf8').trim().split('\n').map(JSON.parse);
 const loadCore = () => import('../pi-extension/core.mjs');
@@ -111,7 +112,7 @@ test('search after a record still executes each query and returns prior action h
   const { createTurnTools } = await loadCore();
   const queries = [];
   const memory = {
-    async recall(_scope, { query }) { queries.push(query); return { status: 'ready', bundles: [{ records: [{ id: 'action', kind: 'action', text: 'fiction', action_handle: 'prior-action' }] }] }; },
+    async searchCompact(_scope, { query }) { queries.push(query); return compactResult({ records: [{ id: 'action', kind: 'action', text: 'fiction', action_handle: 'prior-action' }] }); },
     async enrich(_scope, payload) { return { records: payload.records.map(row => row.id) }; },
     async beginLinks() { return { token: 'offer', packet: { records: [{ ref: 'r0', kind: 'action', text: 'fiction' }], sources: [{ ref: 's0', text: 'fiction' }] } }; },
   };
@@ -121,7 +122,8 @@ test('search after a record still executes each query and returns prior action h
   await tools.record('decision', 'fiction', ['ref-000001']);
   const first = await tools.search('first after', []);
   const second = await tools.search('second after', []);
-  assert.deepEqual([queries, first.records[0].action_handle, second.link_offer.records[0].handle],
+  const offered = await tools.offer([second.records[0].id]);
+  assert.deepEqual([queries, first.records[0].action_handle, offered.packet.records[0].ref],
     [['before', 'first after', 'second after'], 'prior-action', 'r0']);
 });
 
@@ -181,7 +183,7 @@ test('incremental fake Pi distiller reopens the same private session and branche
       this.messages = [{ role: 'assistant', content: [{ type: 'text', text: '{"result":"done_nothing_qualifies","reason":"No useful change."}' }], stopReason: 'stop' }]; } });
   const pi = { SessionManager: { open: () => { calls.push(['open']); return manager; } }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
     async createAgentSession() { return { session: makeSession() }; } };
-  const runtime = await createPiDistiller({ pi, incremental, workDir: '/fiction/work', model: {}, memory: { async recall() { return { status: 'no_matches', bundles: [] }; } }, scope: 'private', createOptions: {} });
+  const runtime = await createPiDistiller({ pi, incremental, workDir: '/fiction/work', model: {}, memory: { async searchCompact() { return compactResult(); } }, scope: 'private', createOptions: {} });
   for (const id of ['a2', 'a3']) await runtime.run({ throughEntryId: id, turn: { turn_id: id, entries: [] }, receipt: { id: 'turn' } });
   assert.deepEqual(calls, [['sync', 'a2'], ['open'], ['branch', 'a2'], ['prompt', 'a2'], ['sync', 'a3'], ['open'], ['branch', 'a3'], ['prompt', 'a3']]);
 });
@@ -196,7 +198,7 @@ for (const mode of ['separate', 'self_review']) {
     const manager = { getSessionId: () => 'distiller-id', branch() {}, buildSessionContext: () => ({ messages: [] }) };
     const result = { contract: 'source-memory-links/v4', review_contract: 'fictional', operation_id: 'operation', context_sha256: 'a',
       semantic_proposal_sha256: 'b', proposal_sha256: 'c', proposals: [{}] };
-    const memory = { async recall() { return { status: 'no_matches', bundles: [] }; }, async enrich() {}, async beginLinks() { return { token: 'offer', packet: { records: [{ ref: 'r0', kind: 'decision', text: 'A' },
+    const memory = { async searchCompact() { return compactResult(); }, async enrich() {}, async beginLinks() { return { token: 'offer', packet: { records: [{ ref: 'r0', kind: 'decision', text: 'A' },
       { ref: 'r1', kind: 'decision', text: 'B' }], sources: [{ ref: 's0', role: 'user', trigger: true, text: 'Fiction' }] } }; },
     async finishLinks(_token, output) { calls.push(['compare', JSON.parse(output).links.length]); return result; },
     async applyLinks(_token, review) { calls.push(['apply', review.reviewer]); return { status: 'written' }; } };
@@ -204,6 +206,7 @@ for (const mode of ['separate', 'self_review']) {
       await registered.get('memory_search').execute('0', { query: 'Choice', kinds: ['decision'] });
       await registered.get('memory_record').execute('1', { kind: 'decision', text: 'Choice', evidence_labels: ['ref-000001'] });
       await registered.get('memory_search').execute('2', { query: 'Choice', kinds: ['decision'] });
+      await registered.get('memory_link_offer').execute('offer', { handles: [] });
       await registered.get('memory_link').execute('3', { from: 'r0', to: 'r1', type: 'qualifies', evidence: ['s0'], support: 'explicit' });
       this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"result":"done_with_writes","reason":"Supported change."}' }] }];
     } };

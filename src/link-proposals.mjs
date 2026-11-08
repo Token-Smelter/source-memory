@@ -91,7 +91,7 @@ export function validateLinkProposals(output, packet) {
 }
 
 /** Run the real read/compare protocol; compare is the host's existing authenticated model controller, not a new route. */
-export async function proposeMemoryLinks({ memory, scope, turn, record_ids, review_contract, compare, signal }) {
+export async function proposeMemoryLinks({ memory, scope, turn, record_ids, candidate_record_ids = null, review_contract, compare, signal }) {
   access(memory, scope);
   active(signal);
   text(turn, 100);
@@ -129,16 +129,27 @@ export async function proposeMemoryLinks({ memory, scope, turn, record_ids, revi
   const querySource = record_ids.map(id => recordPins.get(id).text).join('\n');
   const query = querySource.slice(0, 4000);
   active(signal);
-  const retrieved = await memory.recall(scope, { query, limit: 16, candidates: 64, max_chars: 120000,
-    max_nodes: 32, max_hops: 2 });
+  let retrieved;
+  if (candidate_record_ids !== null) {
+    requireThat(Array.isArray(candidate_record_ids) && candidate_record_ids.length <= 32
+      && new Set(candidate_record_ids).size === candidate_record_ids.length
+      && candidate_record_ids.every(id => typeof id === 'string' && id.length > 0 && id.length <= 256), 'link_request_invalid');
+    retrieved = { scope, status: 'selected', budget_omitted: 0, relationship_context_complete: false,
+      retrieval_complete: false, channels: {}, bundles: [{ relationship_context_complete: true,
+        records: candidate_record_ids.map(id => ({ id })) }] };
+  } else {
+    retrieved = await memory.recall(scope, { query, limit: 16, candidates: 64, max_chars: 120000,
+      max_nodes: 32, max_hops: 2 });
+    active(signal);
+    const bounded = retrieved?.status === 'budget_limited';
+    requireThat(retrieved?.scope === scope && ['ready', 'no_matches', 'budget_limited'].includes(retrieved.status)
+      && Array.isArray(retrieved.bundles) && retrieved.bundles.length <= 16 && retrieved.channels
+      && Number.isSafeInteger(retrieved.budget_omitted)
+      && (bounded ? retrieved.budget_omitted > 0 : retrieved.budget_omitted === 0 && retrieved.relationship_context_complete === true)
+      && !Object.values(retrieved.channels).some(row => ['partial', 'pending', 'unavailable'].includes(row.status)),
+    'link_retrieval_incomplete');
+  }
   active(signal);
-  const bounded = retrieved?.status === 'budget_limited';
-  requireThat(retrieved?.scope === scope && ['ready', 'no_matches', 'budget_limited'].includes(retrieved.status)
-    && Array.isArray(retrieved.bundles) && retrieved.bundles.length <= 16 && retrieved.channels
-    && Number.isSafeInteger(retrieved.budget_omitted)
-    && (bounded ? retrieved.budget_omitted > 0 : retrieved.budget_omitted === 0 && retrieved.relationship_context_complete === true)
-    && !Object.values(retrieved.channels).some(row => ['partial', 'pending', 'unavailable'].includes(row.status)),
-  'link_retrieval_incomplete');
   const ids = new Set(record_ids);
   for (const bundle of retrieved.bundles) {
     requireThat(bundle.relationship_context_complete === true && Array.isArray(bundle.records), 'link_retrieval_incomplete');

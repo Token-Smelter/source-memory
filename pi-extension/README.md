@@ -10,6 +10,7 @@
 | `image-archive.mjs` | Original image bytes stored privately by SHA-256; source text contains a deterministic placeholder and image content is explicitly not text-citable. |
 | `chronology.mjs`, `scripts/check-dev-checkpoints.mjs` | No-call validation of pinned source bytes, availability, active ancestry and the selected Pi context; scope authorization and semantic review remain separate. |
 | `derived-retrieval.mjs` | Record lexical and record-vector seeds only, with returned-item evidence handles; actor, scope and pre-answer snapshot verification remain caller obligations. |
+| `compact-retrieval.mjs` | Distiller-only ranked record cards with explicit omission and channel-cap metadata; selected records alone are hydrated by the scoped Memory process. |
 | `evaluation/` | Sealed answerer and scorer contracts, paired connected-history reporting, conditional durable reservation ledger and metered Pi `streamSimple` adapters. |
 | `core.mjs`, `coverage.mjs` | Cursor-bounded source processing and a private append-only coverage journal. Explicit interruption is supported; unproved compaction, overflow, scope errors and uncertain effects remain gaps. The session and distiller must share the journal-tracked Memory facade. |
 | `incremental.mjs` | Copies complete source JSONL entry lines into a private Pi-session file, preserving entry IDs. Prefix rewrites rebuild the private copy if old entry identities remain equal; changed identities and collisions refuse. State is in memory and does not recover after process restart. |

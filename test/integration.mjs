@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { Memory } from '../src/memory.mjs';
 import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
+import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
 
 const exec = promisify(execFile);
 const contracts = {
@@ -1058,6 +1059,38 @@ export async function runIntegration(database, scratch) {
       const result = await memory.index('demo');
       const after = await memory.status('demo');
       assert.deepEqual([result.status, after.unindexed, after.turns], ['ready', 0, before]);
+    });
+    await check('rank-only recall preserves normal channel and reranker order', async () => {
+      const input = { query: 'blue', candidates: 64, limit: 8, max_chars: 200000 };
+      const ranked = await memory.recall('demo', input, { seedsOnly: true });
+      const full = await memory.recall('demo', input);
+      assert.equal(full.budget_omitted, 0);
+      assert.equal(ranked.channels.reranker.status, 'ready');
+      assert.deepEqual(full.bundles.map(row => [row.match.kind, row.match.id]),
+        ranked.ranked.slice(0, full.bundles.length).map(row => [row.kind, row.id]));
+    });
+    await check('compact search reads Neo4j records and hydrates only an offered record with relations', async () => {
+      const trigger = await memory.ingest('demo', { ...turn('compact-trigger', 'Check the blue choice.'), source: 'pi-memory' });
+      const selectedMemory = Object.create(memory);
+      selectedMemory.recall = async (...args) => {
+        const ranked = await memory.recall(...args);
+        ranked.ranked = ranked.ranked.filter(row => row.kind === 'record' && row.id === 'old-decision');
+        return ranked;
+      };
+      const handlers = createMemoryHandlers({ memory: selectedMemory, scopes: ['demo'] });
+      try {
+        const { surface: result, bindings } = await handlers.searchCompact({ scope: 'demo', trigger: trigger.id,
+          input: { query: 'blue', kinds: [], limit: 48, max_bytes: 24000 } });
+        const old = bindings.findIndex(row => row.id === 'old-decision');
+        const successor = bindings.findIndex(row => row.id === 'new-decision');
+        assert.ok(old >= 0 && successor >= 0 && result.records[successor].score === null);
+        assert.ok(result.relations.some(row => row.endpoints.includes(successor) && row.endpoints.includes(old)));
+        assert.equal(result.status, 'ready');
+        const shown = await handlers.fetchCompact({ scope: 'demo', trigger: trigger.id, handle: bindings[old].handle });
+        assert.equal(shown.record.id, 'old-decision');
+        assert.ok(shown.relations.some(row => row.type === 'supersedes' && row.to_id === 'old-decision'));
+        assert.equal(shown.immediate_relations_complete, true);
+      } finally { handlers.close(); }
     });
     const attemptInput = turn('attempt', 'I ran the demonstration check. It passed. Should we run another?');
     const attemptSource = await memory.ingest('demo', attemptInput);

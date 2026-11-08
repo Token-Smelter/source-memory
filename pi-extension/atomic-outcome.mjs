@@ -5,7 +5,7 @@ const fail = code => Object.assign(new Error(code), { code });
 
 /** Reference handles and proposals remain process-local; a serialized proposal is not a write capability. */
 export function createAtomicOutcomes({ memory, beforeAppend }) {
-  const offers = new Map(), pending = new Map();
+  const offers = new Map(), offerByIdentity = new Map(), pending = new Map();
   const show = async (scope, kind, id) => {
     const result = await memory.show(scope, { kind, id });
     return kind === 'turn' ? result?.turn : result?.record;
@@ -16,9 +16,14 @@ export function createAtomicOutcomes({ memory, beforeAppend }) {
       const copy = structuredClone(recalled);
       for (const bundle of copy.bundles ?? []) for (const record of bundle.records ?? []) {
         if (record.kind !== 'action' || typeof record.id !== 'string') continue;
-        if (offers.size >= 1024) throw fail('outcome_offer_limit');
-        const handle = `action-${randomUUID()}`;
-        offers.set(handle, { scope, trigger, id: record.id });
+        const key = JSON.stringify([scope, trigger, record.id]);
+        let handle = offerByIdentity.get(key);
+        if (!handle) {
+          if (offers.size >= 1024) throw fail('outcome_offer_limit');
+          handle = `action-${randomUUID()}`;
+          offers.set(handle, { scope, trigger, id: record.id, key });
+          offerByIdentity.set(key, handle);
+        }
         record.action_handle = handle;
       }
       return copy;
@@ -81,6 +86,11 @@ export function createAtomicOutcomes({ memory, beforeAppend }) {
       } finally { pending.delete(token); }
     },
     cancel(token) { return { cancelled: pending.delete(token) }; },
-    close() { offers.clear(); pending.clear(); },
+    release(scope, trigger) {
+      for (const [handle, offer] of offers) if (offer.scope === scope && offer.trigger === trigger) {
+        offers.delete(handle); offerByIdentity.delete(offer.key);
+      }
+    },
+    close() { offers.clear(); offerByIdentity.clear(); pending.clear(); },
   };
 }

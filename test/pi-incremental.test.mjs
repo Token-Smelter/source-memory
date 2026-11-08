@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { compactResult } from './helpers/compact-fixture.mjs';
 
 const fixture = readFileSync(new URL('./fixtures/pi-extension-steer.jsonl', import.meta.url), 'utf8').trimEnd().split('\n');
 const load = () => import('../pi-extension/incremental.mjs');
@@ -101,7 +102,7 @@ test('incremental private session reopens each source leaf with no prior task or
     } } };
   } };
   const runtime = await createPiDistiller({ pi, incremental, workDir: dir, model: {},
-    memory: { async recall() { return { status: 'no_matches', bundles: [] }; } }, scope: 'private' });
+    memory: { async searchCompact() { return compactResult(); } }, scope: 'private' });
   for (const leaf of ['a2', 'a3']) await runtime.run({ throughEntryId: leaf, turn: { turn_id: leaf, entries: [] }, receipt: { id: 'turn' } });
   assert.deepEqual(contexts, [['u1', 'a1', 't1', 'u2', 'a2'], ['u1', 'a1', 't1', 'u2', 'a2', 'u3', 'a3']]);
 }));

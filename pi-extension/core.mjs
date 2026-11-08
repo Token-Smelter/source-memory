@@ -142,16 +142,24 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
   let searchFailed = false;
   let incompleteSearch = false;
   const searchStatuses = [];
-  const returnedPriorIds = new Set();
+  const returnedPriorIds = new Set(), fetchedIds = new Set(), linkCandidateIds = new Set();
+  const compactHandles = new Map();
+  let fetches = 0;
   let offer = null;
+  let offerHandles = null;
   let choices = null;
+  let choiceCount = 0;
   return {
     labels() { return [...labels].map(([ref, span]) => ({ ref, role: span.entry.role, text: span.entry.text.slice(span.start, span.end) })); },
     imageNotes() { return structuredClone(imageNotes); },
     async record(kind, text, refs, options = {}) {
       if (requireSearch && (!searches || searchFailed)) throw fail('search_required');
       const record = buildRecord(kind, text, refs);
-      if (offer && typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token);
+      if (offer) {
+        try { if (typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token); }
+        catch (problem) { searchFailed = true; throw problem; }
+        finally { offer = null; offerHandles = null; choices = null; choiceCount = 0; }
+      }
       let write;
       if (kind === 'outcome') {
         const handle = options.action_handle;
@@ -180,77 +188,150 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       }
       if (typeof ensureIndexed === 'function') await ensureIndexed(memory, scope, write?.indexing, { recordIds: write?.records ?? [] });
       offer = null;
+      offerHandles = null;
       choices = null;
+      choiceCount = 0;
       return { id: record.id, status: 'proposed' };
     },
     async search(query, kinds) {
       if (typeof query !== 'string' || !query || !Array.isArray(kinds) || kinds.some(kind => typeof kind !== 'string')) throw fail('invalid_input');
       try {
-        if (typeof memory.recall !== 'function') throw fail('search_unavailable');
-        const result = await memory.recall(scope, { query, limit: 8, max_chars: 24000 }, { trigger: receipt.id });
-        if (!['ready', 'no_matches', 'budget_limited'].includes(result?.status) || !Array.isArray(result.bundles)
-          || Object.values(result.channels ?? {}).some(row => row.status === 'unavailable')) throw fail('search_incomplete');
-        if (result.status === 'budget_limited') {
-          if (!Number.isSafeInteger(result.budget_omitted) || result.budget_omitted < 1 || !result.channels) throw fail('search_incomplete');
-          incompleteSearch = true;
-        }
-        if (Object.values(result.channels ?? {}).some(row => ['partial', 'pending'].includes(row.status))) incompleteSearch = true;
-        const relationshipsComplete = result.relationship_context_complete === true
-          && result.bundles.every(bundle => bundle.relationship_context_complete === true);
-        if (!relationshipsComplete) incompleteSearch = true;
-        const relationshipGaps = [...new Set(result.bundles.flatMap(bundle => Array.isArray(bundle.gaps) ? bundle.gaps : []))];
+        if (typeof memory.searchCompact !== 'function') throw fail('search_unavailable');
+        const envelope = await memory.searchCompact(scope, { query, kinds, limit: 48, max_bytes: 24000 }, receipt.id);
+        const result = envelope?.surface, bindings = envelope?.bindings;
+        if (!Array.isArray(bindings) || !Array.isArray(result?.records) || bindings.length !== result.records.length
+          || new Set(bindings.map(row => row?.handle)).size !== bindings.length || new Set(bindings.map(row => row?.id)).size !== bindings.length
+          || bindings.some((row, index) => typeof row?.id !== 'string' || !row.id || typeof row.handle !== 'string'
+            || row.handle !== result.records[index]?.id || (compactHandles.has(row.handle) && compactHandles.get(row.handle) !== row.id))) throw fail('search_incomplete');
+        const requiredChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'];
+        if (!['ready', 'no_matches', 'budget_limited'].includes(result?.status) || !Array.isArray(result.records)
+          || result.records.length > 256 || !Array.isArray(result.relations) || result.relations.length > 512 || !result.channels
+          || requiredChannels.some(name => result.channels[name]?.status !== 'ready')
+          || Object.values(result.channels).some(row => ['partial', 'pending', 'unavailable'].includes(row.status))
+          || result.completeness_guaranteed !== false || !Array.isArray(result.graph_gaps)
+          || new Set(result.graph_gaps).size !== result.graph_gaps.length
+          || result.graph_gaps.some(gap => !['node_limit', 'edge_limit', 'hop_limit', 'summary_node_limit', 'summary_edge_limit'].includes(gap))
+          || result.declared_seed_limit !== 48 || result.candidate_pool_limit !== 64
+          || !Number.isSafeInteger(result.seed_count) || result.seed_count < 0 || result.seed_count > 48
+          || !Number.isSafeInteger(result.graph_edge_count) || result.graph_edge_count !== result.relations.length + result.edge_budget_omitted
+          || !Number.isSafeInteger(result.collapsed_edge_count) || result.collapsed_edge_count < 0
+          || typeof result.relationship_context_complete !== 'boolean' || !Number.isSafeInteger(result.ranked_count)
+          || !Number.isSafeInteger(result.budget_omitted) || result.budget_omitted < 0
+          || !Number.isSafeInteger(result.edge_budget_omitted) || result.edge_budget_omitted < 0
+          || result.ranked_count !== result.records.length + result.budget_omitted
+          || result.relationship_context_complete !== (!result.graph_gaps.length && !result.budget_omitted && !result.edge_budget_omitted)
+          || (result.status === 'budget_limited') !== (result.budget_omitted > 0 || result.edge_budget_omitted > 0)
+          || (result.status === 'ready' && !result.records.length)
+          || (result.status === 'no_matches' && result.ranked_count !== 0)) throw fail('search_incomplete');
+        if (new Set(result.records.map(row => row.id)).size !== result.records.length
+          || result.records.some(row => typeof row.id !== 'string' || !row.id
+            || typeof row.kind !== 'string' || typeof row.text !== 'string' || typeof row.text_truncated !== 'boolean'
+            || (row.score !== null && (typeof row.score !== 'number' || !Number.isFinite(row.score))))) throw fail('search_incomplete');
+        if (result.relations.some(row => !Array.isArray(row?.endpoints) || row.endpoints.length !== 2
+          || row.endpoints.some(index => !Number.isSafeInteger(index) || index < 0 || index >= result.records.length)
+          || row.endpoints[0] === row.endpoints[1])) throw fail('search_incomplete');
+        if (!result.relationship_context_complete) incompleteSearch = true;
         searches++;
-        const matching = result.bundles.flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind));
-        const localOmitted = Math.max(0, matching.length - 32);
-        if (localOmitted) incompleteSearch = true;
-        searchStatuses.push({ status: result.status, budget_omitted: result.budget_omitted ?? 0, local_records_omitted: localOmitted,
-          relationship_context_complete: relationshipsComplete, relationship_gaps: relationshipGaps,
-          partial_channels: Object.entries(result.channels ?? {}).filter(([, row]) => ['partial', 'pending'].includes(row.status)).map(([name]) => name) });
-        const records = matching.slice(0, 32).map(row => ({ id: row.id, kind: row.kind, snippet: row.text,
-            ...(row.kind === 'action' && row.action_handle ? { action_handle: row.action_handle } : {}) }));
-        for (const row of records) {
-          if (typeof row.id === 'string' && row.id) returnedPriorIds.add(row.id);
+        searchStatuses.push({ surface: 'compact-records', status: result.status, budget_omitted: result.budget_omitted,
+          edge_budget_omitted: result.edge_budget_omitted, graph_gaps: [...result.graph_gaps],
+          relationship_context_complete: result.relationship_context_complete, declared_seed_limit: result.declared_seed_limit,
+          candidate_pool_limit: result.candidate_pool_limit,
+          filtered_record_count: result.filtered_record_count, related_kind_count: result.related_kind_count,
+          collapsed_edge_count: result.collapsed_edge_count, previewed_ids: bindings.map(row => row.id), channels: structuredClone(result.channels) });
+        for (const [index, row] of result.records.entries()) {
+          compactHandles.set(row.id, bindings[index].id);
+          returnedPriorIds.add(bindings[index].id);
           if (typeof row.action_handle === 'string' && row.action_handle) actionHandles.add(row.action_handle);
         }
-        const channels = result.channels ? Object.fromEntries(Object.entries(result.channels).map(([name, value]) => [name,
-          { status: value.status, ...(value.reason ? { reason: value.reason } : {}) }])) : null;
-        let linkOffer = null;
-        if (recordIds.length && typeof memory.beginLinks === 'function') {
-          const offered = await this.offer();
-          const retrieval = offered.packet.retrieval ?? null;
-          if (retrieval?.status === 'budget_limited' || (retrieval?.omitted_prior_records ?? 0) > 0
-            || retrieval?.trigger_omissions?.some(row => row.reason === 'packet_budget')) incompleteSearch = true;
-          searchStatuses.push({ status: retrieval?.status ?? 'offer', budget_omitted: retrieval?.budget_omitted ?? 0,
-            omitted_prior_records: retrieval?.omitted_prior_records ?? 0, trigger_omitted: retrieval?.trigger_omissions?.length ?? 0 });
-          linkOffer = {
-            records: offered.packet.records.filter(row => !kinds.length || kinds.includes(row.kind)).slice(0, 32)
-              .map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text })),
-            sources: offered.packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? ''))
-              .slice(0, 128).map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text })),
-            retrieval,
-          };
-        }
-        return { status: result.status, records, filtered: kinds.length > 0, completeness_guaranteed: false,
-          budget_omitted: result.budget_omitted ?? null, local_records_omitted: localOmitted,
-          retrieval_complete: result.retrieval_complete ?? false, channels, ...(linkOffer ? { link_offer: linkOffer } : {}) };
+        return result;
       } catch (problem) { searchFailed = true; throw problem; }
     },
-    async offer() {
+    async fetch(handle) {
+      if (!compactHandles.has(handle) || typeof memory.fetchCompact !== 'function') throw fail('handle_not_offered');
+      if (++fetches > 32) {
+        incompleteSearch = true;
+        searchStatuses.push({ surface: 'selected-record', status: 'fetch_limit' });
+        throw fail('fetch_limit');
+      }
+      try {
+        const result = await memory.fetchCompact(scope, receipt.id, handle);
+        if (result?.record?.id !== compactHandles.get(handle) || !Array.isArray(result.relations)
+          || !Array.isArray(result.evidence) || !result.evidence.length
+          || result.evidence.some(row => typeof row?.role !== 'string' || typeof row.text !== 'string' || !row.text)
+          || typeof result.immediate_relations_complete !== 'boolean') throw fail('search_incomplete');
+        if (!result.immediate_relations_complete) incompleteSearch = true;
+        for (const edge of result.relations) {
+          if (!RELATIONS.includes(edge.type) || typeof edge.from_id !== 'string' || typeof edge.to_id !== 'string'
+            || typeof edge.from_handle !== 'string' || typeof edge.to_handle !== 'string' || edge.from_id === edge.to_id
+            || (edge.from_id !== result.record.id && edge.to_id !== result.record.id)
+            || (edge.from_id === result.record.id && edge.from_handle !== handle)
+            || (edge.to_id === result.record.id && edge.to_handle !== handle)
+            || (compactHandles.has(edge.from_handle) && compactHandles.get(edge.from_handle) !== edge.from_id)
+            || (compactHandles.has(edge.to_handle) && compactHandles.get(edge.to_handle) !== edge.to_id)) throw fail('search_incomplete');
+          compactHandles.set(edge.from_handle, edge.from_id); compactHandles.set(edge.to_handle, edge.to_id);
+        }
+        fetchedIds.add(result.record.id);
+        searchStatuses.push({ surface: 'selected-record', id: result.record.id,
+          immediate_relations_complete: result.immediate_relations_complete, relationship_omitted_at_least: result.relationship_omitted_at_least ?? null });
+        const pairs = new Map();
+        for (const edge of result.relations) {
+          const endpoints = [edge.from_handle, edge.to_handle].sort();
+          pairs.set(JSON.stringify(endpoints), { endpoints });
+        }
+        return { kind: 'record', record: { id: handle, kind: result.record.kind, text: result.record.text },
+          evidence: result.evidence.map(row => ({ role: row.role, text: row.text })), relations: [...pairs.values()],
+          collapsed_relation_count: result.relations.length - pairs.size, immediate_relations_complete: result.immediate_relations_complete,
+          relationship_omitted_at_least: result.relationship_omitted_at_least };
+      } catch (problem) {
+        if (problem?.code === 'fetch_budget_exceeded') {
+          incompleteSearch = true;
+          searchStatuses.push({ surface: 'selected-record', status: 'fetch_budget_exceeded' });
+        } else searchFailed = true;
+        throw problem;
+      }
+    },
+    async offer(handles = []) {
       if (!recordIds.length || typeof memory.beginLinks !== 'function') throw fail('offer_unavailable');
-      if (offer) return { token: offer.token, packet: offer.packet };
-      const result = await memory.beginLinks(scope, receipt.id, [...recordIds]);
-      if (!result?.token || !result.packet) throw fail('offer_invalid');
+      if (!Array.isArray(handles) || handles.length > 32 || new Set(handles).size !== handles.length
+        || handles.some(handle => !compactHandles.has(handle))) throw fail('handle_not_offered');
+      if (offer && JSON.stringify(offerHandles) === JSON.stringify(handles)) return { token: offer.token, packet: offer.packet };
+      if (offer && choiceCount) throw fail('offer_in_use');
+      if (offer) {
+        try { if (typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token); }
+        catch (problem) { incompleteSearch = true; throw problem; }
+        finally { offer = null; offerHandles = null; choices = null; choiceCount = 0; }
+      }
+      let result;
+      try { result = await memory.beginLinks(scope, receipt.id, [...recordIds], { candidateHandles: handles }); }
+      catch (problem) { incompleteSearch = true; throw problem; }
+      if (!result?.token || !result.packet) { incompleteSearch = true; throw fail('offer_invalid'); }
+      const retrieval = result.packet.retrieval ?? null;
+      if (retrieval?.status !== 'selected' || retrieval?.relationship_context_complete !== false || retrieval?.completeness_guaranteed !== false
+        || !Number.isSafeInteger(retrieval?.omitted_prior_records) || !Number.isSafeInteger(retrieval?.omitted_prior_spans)
+        || !Array.isArray(retrieval?.trigger_omissions) || retrieval.omitted_prior_records > 0 || retrieval.omitted_prior_spans > 0
+        || retrieval.trigger_omissions.some(row => row.reason === 'packet_budget')) incompleteSearch = true;
+      searchStatuses.push({ surface: 'selected-link-offer', status: retrieval?.status ?? 'offer',
+        budget_omitted: retrieval?.budget_omitted ?? 0, omitted_prior_records: retrieval?.omitted_prior_records ?? 0,
+        trigger_omitted: retrieval?.trigger_omissions?.length ?? 0, candidate_ids: handles.map(handle => compactHandles.get(handle)) });
+      for (const handle of handles) linkCandidateIds.add(compactHandles.get(handle));
       offer = result;
+      offerHandles = [...handles];
       choices = createLinkChoices(result.packet);
-      return { token: result.token, packet: result.packet };
+      return { token: offer.token, packet: offer.packet };
     },
     link(choice) {
       if (!choices) throw fail('offer_unavailable');
       choices.add(choice);
+      choiceCount++;
       return { status: 'pending_review' };
     },
-    pendingLinks() { return offer && choices ? { token: offer.token, output: choices.output() } : null; },
+    pendingLinks() { return offer && choices && choiceCount ? { token: offer.token, output: choices.output() } : null; },
+    async release() {
+      try { if (offer && typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token); }
+      finally { if (typeof memory.releaseCompact === 'function') await memory.releaseCompact(scope, receipt.id); }
+    },
     stats() { return { records: recordIds.length, searches, search_failed: searchFailed,
-      incomplete_search: incompleteSearch, search_statuses: structuredClone(searchStatuses), returned_prior_ids: [...returnedPriorIds] }; },
+      incomplete_search: incompleteSearch, search_statuses: structuredClone(searchStatuses), returned_prior_ids: [...returnedPriorIds],
+      fetched_ids: [...fetchedIds], link_candidate_ids: [...linkCandidateIds] }; },
   };
 }

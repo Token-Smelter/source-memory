@@ -8,6 +8,7 @@ import { createIncrementalSession } from '../pi-extension/incremental.mjs';
 import { createPiDistiller } from '../pi-extension/pi-runtime.mjs';
 import { createInputBudget, boundPiRuntime } from '../pi-extension/budget.mjs';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
+import { compactResult } from './helpers/compact-fixture.mjs';
 
 const sdkPath = process.env.PI_SDK_MODULE;
 test('installed Pi SDK runs the fictional distiller with a fake provider and soft metering', { skip: !sdkPath }, async () => {
@@ -37,7 +38,7 @@ test('installed Pi SDK runs the fictional distiller with a fake provider and sof
     const tokenBudget = createInputBudget(1000000);
     const metered = soft.wrap(boundPiRuntime(runtime, tokenBudget), () => ({ purpose: 'candidate', arm: 'candidate', checkpoint: 'a2', task_version: 'fiction', policy_version: 'fiction' }));
     const distiller = await createPiDistiller({ pi, incremental, workDir: directory, model, modelRuntime: metered,
-      memory: { async recall() { return { status: 'no_matches', bundles: [] }; } }, scope: 'fiction', budget: tokenBudget });
+      memory: { async searchCompact() { return compactResult(); } }, scope: 'fiction', budget: tokenBudget });
     const result = await distiller.run({ throughEntryId: 'a2', turn: { turn_id: 'fiction', entries: [] }, receipt: { id: 'fiction' } });
     await new Promise(resolve => setImmediate(resolve));
     soft.close();

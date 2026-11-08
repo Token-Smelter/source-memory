@@ -271,7 +271,7 @@ export class Memory {
   }
 
   // `phases` is an opt-in marker sink (src/phase-diagnostic.mjs). Absent, recall makes exactly the calls it always made.
-  async recall(scope, input, { phases = null } = {}) {
+  async recall(scope, input, { phases = null, seedsOnly = false } = {}) {
     authorize(this.config, scope);
     const trace = tracer(phases);
     // Only the grouped admission query has finer steps worth bracketing; it takes the trace as an extra trailing argument.
@@ -390,6 +390,12 @@ export class Memory {
         availability.reranker = { status: 'ready', ranking_text_truncated: cut };
       } catch (error) { availability.reranker = { status: 'unavailable', reason: safeCode(error) }; }
     } else availability.reranker = { status: this.config.reranker ? 'not_needed' : 'unconfigured' };
+
+    if (seedsOnly) {
+      requireThat(!grouped, 'invalid_input');
+      return { scope, ranked, candidate_limit: candidates, channels: Object.fromEntries(Object.entries(availability).map(([name, state]) =>
+        [name, { ...state, ...(channels[name] ? { candidate_limit_reached: channels[name].length >= candidates } : {}) }])) };
+    }
 
     const bundles = [];
     let chars = 0;
