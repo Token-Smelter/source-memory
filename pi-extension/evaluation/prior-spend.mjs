@@ -4,6 +4,12 @@ const fail = code => Object.assign(new Error(code), { code });
 const sha = value => createHash('sha256').update(value).digest('hex');
 const localStops = new Set(['input_budget_exhausted', 'input_budget_unknown']);
 
+export function validatePriorSpendContinuity(previousNano, priorReportedNano) {
+  if (!/^(0|[1-9]\d*)$/.test(previousNano ?? '') || !/^(0|[1-9]\d*)$/.test(priorReportedNano ?? '')
+    || BigInt(previousNano) < BigInt(priorReportedNano)) throw fail('prior_spend_chain_incomplete');
+  return previousNano;
+}
+
 /** A closed ledger may exclude a pre-dispatch call only with a typed or pinned reconciliation receipt. */
 export function priorSoftSpend(text, { reconciliations = [] } = {}) {
   let rows;
@@ -25,9 +31,13 @@ export function priorSoftSpend(text, { reconciliations = [] } = {}) {
     if (row.type === 'started') {
       if (!Number.isSafeInteger(row.id) || starts.has(row.id)) throw fail('prior_ledger_invalid');
       starts.add(row.id);
+    } else if (row.type === 'stop_requested') {
+      if (localStop || !['SIGINT', 'SIGTERM'].includes(row.reason) || typeof row.in_flight !== 'boolean') throw fail('prior_ledger_unresolved');
+      localStop = 'operator_interrupted';
     } else if (row.type === 'result') {
       if (!starts.has(row.id) || completed.has(row.id)) throw fail('prior_ledger_unresolved');
-      if (row.outcome === 'received' && row.stop === null && /^(0|[1-9]\d*)$/.test(row.api_equivalent_nano ?? '')) spent += BigInt(row.api_equivalent_nano);
+      if (row.outcome === 'received' && (row.stop === null || (row.stop === 'operator_interrupted' && localStop === row.stop))
+        && /^(0|[1-9]\d*)$/.test(row.api_equivalent_nano ?? '')) spent += BigInt(row.api_equivalent_nano);
       else if (row.outcome === 'not_sent' && localStops.has(row.reason) && row.stop === row.reason
         && row.provenance === 'bound-runtime-pre-dispatch') localStop = row.stop;
       else if (row.outcome === 'unknown' && row.stop === 'dispatch_unknown' && approvals.has(row.id)) {

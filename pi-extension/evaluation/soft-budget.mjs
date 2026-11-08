@@ -132,6 +132,14 @@ export function createSoftBudget({ path, capNano, routes, sessionKey, sealSha256
         },
       });
     },
+    requestStop(reason) {
+      if (!['SIGINT', 'SIGTERM'].includes(reason)) throw fail('stop_reason_invalid');
+      if (closed) throw fail('soft_budget_closed');
+      if (stopped) return false;
+      stopped = 'operator_interrupted';
+      record({ type: 'stop_requested', reason, in_flight: Boolean(active), at: new Date().toISOString() });
+      return true;
+    },
     state: () => ({ spent_nano: spent.toString(), cap_nano: capNano, in_flight: Boolean(active), stopped, calls_started: count,
       by_model: Object.fromEntries([...totals].map(([route, total]) => [route, { ...total, api_equivalent_nano: total.api_equivalent_nano.toString() }])) }),
     close() {

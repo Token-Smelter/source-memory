@@ -18,7 +18,7 @@ async function fixture(fn) {
     const memory = journal.track({ async ingest(_scope, turn) { return { id: `turn-${turn.turn_id}` }; }, async enrich() { return { records: ['fiction'] }; } });
     journal.begin({ through: 'a', cursor: null });
     await memory.enrich('fiction', { records: [] });
-    journal.finish('committed');
+    journal.finish('committed', null, { incomplete: false, statuses: [] });
     const failed = journal.begin({ through: 'b', cursor: 'a' });
     await memory.enrich('fiction', { records: ['different'] });
     journal.finish('failed', 'fictional_failure');
@@ -33,7 +33,7 @@ async function fixture(fn) {
       coverage: { dispositions: [{ through: 'a', disposition: 'committed' }, { through: 'b', disposition: 'failed' }] },
       artifacts: { source_snapshot: { sha256: 'a'.repeat(64) }, 'ledger.jsonl': { sha256: ledger },
         checkpoint_snapshots: [{ through: 'a', sha256: snapshot }] } };
-    const progress = [{ type: 'checkpoint', through: 'a', disposition: 'committed', snapshot: { sha256: snapshot } },
+    const progress = [{ type: 'checkpoint', through: 'a', disposition: 'committed', search_incomplete: false, snapshot: { sha256: snapshot } },
       { type: 'checkpoint', through: 'b', disposition: 'failed', snapshot: null }];
     const currentSeal = createPilotPlan({ cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
       codeSha: 'e'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } },
@@ -48,6 +48,11 @@ async function fixture(fn) {
 test('resume validates the prior seal, covered journal prefix, clean snapshot and reconciled retry', () => fixture(async ({ args }) => {
   const result = validatePilotResume(args);
   assert.deepEqual([result.cursor, result.prefixCount, result.retryFirst, result.priorSealDigest], ['a', 1, true, args.seal.digest]);
+}));
+
+test('resume refuses a prefix with unproven search completeness', () => fixture(async ({ args }) => {
+  const progress = structuredClone(args.progress); delete progress[0].search_incomplete;
+  assert.throws(() => validatePilotResume({ ...args, progress }), /resume_search_completeness_unproven/);
 }));
 
 test('a sealed evaluator format transition preserves the old rubric and score rules', () => fixture(async ({ args }) => {
@@ -75,11 +80,12 @@ test('a sealed item-budget result transition preserves answerer limits and score
   old.answerer.version = 'answerer-r2-v2'; old.answerer.instructions = old.answerer.instructions.slice(0, -ANSWERER_BUDGET_SUFFIX.length);
   old.answerer.tools_sha256 = ANSWERER_TOOLS_V2_SHA256;
   const previousSeal = sealComparison(old);
-  const currentSeal = createPilotPlan({ cases: args.cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
+  const currentSpec = structuredClone(createPilotPlan({ cases: args.cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
     codeSha: 'e'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } },
     resume: { priorRunId: args.report.run_id, priorSealDigest: previousSeal.digest, priorCodeSha: old.codeSha, cursor: 'a',
-      snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256, transition: 'answerer-item-budget-result-only' } });
-  const report = { ...args.report, seal_sha256: previousSeal.digest };
+      snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256, transition: 'answerer-item-budget-result-only' } }).spec);
+  currentSpec.answerer.version = 'answerer-r2-v3';
+  const currentSeal = sealComparison(currentSpec), report = { ...args.report, seal_sha256: previousSeal.digest };
   assert.equal(validatePilotResume({ ...args, report, seal: previousSeal, currentSeal }).transition, 'answerer-item-budget-result-only');
   const changed = structuredClone(currentSeal.spec); changed.answerer.limits.returnedItems++;
   assert.throws(() => validatePilotResume({ ...args, report, seal: previousSeal, currentSeal: sealComparison(changed) }), /resume_treatment_mismatch/);
@@ -131,7 +137,7 @@ test('a resumed sequence answers a pending cursor case before the next source in
   const entries = ['a', 'b', 'c'].map((id, i) => ({ type: 'message', id, parentId: i ? ['a', 'b'][i - 1] : null,
     message: { role: 'assistant', content: 'fiction', stopReason: 'stop' } }));
   const session = { entries, conversation_id: 'fiction', scopes: ['fiction'], memory,
-    distiller: { memory, async run({ throughEntryId }) { events.push(`distill:${throughEntryId}`); return { status: 'complete', disposition: 'abstained' }; } } };
+    distiller: { memory, async run({ throughEntryId }) { events.push(`distill:${throughEntryId}`); return { status: 'complete', disposition: 'abstained', search_limitations: { incomplete: false, statuses: [] } }; } } };
   const cases = [{ through: 'a', publicCase: { ...args.cases[0].publicCase, queryTime: '2030-01-01T00:00:01Z' } }];
   const result = await runPilotSequence({ session, journal, checkpoints, cases, initialCursor: 'a', retryFirst: true,
     budget: { state: () => ({ stopped: null }) }, async evaluateCase() { events.push('case:a'); return { status: 'scored' }; } });
@@ -154,7 +160,7 @@ test('a carried scored case is not re-evaluated during resume', () => fixture(as
   const entries = ['a', 'b', 'c'].map((id, i) => ({ type: 'message', id, parentId: i ? ['a', 'b'][i - 1] : null,
     message: { role: 'assistant', content: 'fiction', stopReason: 'stop' } }));
   const session = { entries, conversation_id: 'fiction', scopes: ['fiction'], memory,
-    distiller: { memory, async run({ throughEntryId }) { events.push(throughEntryId); return { status: 'complete', disposition: 'abstained' }; } } };
+    distiller: { memory, async run({ throughEntryId }) { events.push(throughEntryId); return { status: 'complete', disposition: 'abstained', search_limitations: { incomplete: false, statuses: [] } }; } } };
   const cases = [{ through: 'a', publicCase: { ...args.cases[0].publicCase, queryTime: '2030-01-01T00:00:01Z' } }];
   const result = await runPilotSequence({ session, journal, checkpoints, cases, initialCursor: 'a', retryFirst: true,
     completedCaseIds: [cases[0].publicCase.id], budget: { state: () => ({ stopped: null }) },
@@ -167,7 +173,7 @@ test('a resumed sequence retries only the first failed interval and never reproc
   const entries = ['a', 'b', 'c'].map((id, i) => ({ type: 'message', id, parentId: i ? ['a', 'b'][i - 1] : null,
     message: { role: 'assistant', content: 'fiction', stopReason: 'stop' } }));
   const session = { entries, conversation_id: 'fiction', scopes: ['fiction'], memory,
-    distiller: { memory, async run({ throughEntryId }) { events.push(throughEntryId); return { status: 'complete', disposition: 'abstained' }; } } };
+    distiller: { memory, async run({ throughEntryId }) { events.push(throughEntryId); return { status: 'complete', disposition: 'abstained', search_limitations: { incomplete: false, statuses: [] } }; } } };
   const result = await runPilotSequence({ session, journal, checkpoints, cases: [], initialCursor: 'a', retryFirst: true,
     budget: { state: () => ({ stopped: null }) }, async evaluateCase() {} });
   assert.deepEqual([result.status, result.cursor, events], ['complete', 'c', ['b', 'c']]);

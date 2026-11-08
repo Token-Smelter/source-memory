@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
+import { priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 
 const line = value => JSON.stringify(value);
 const known = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ type: 'started', id: 1 }),
@@ -10,6 +10,11 @@ const known = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ typ
 
 test('a completed prior ledger is included in the next soft reservation', () => {
   assert.equal(priorSoftSpend(known), '23');
+});
+
+test('resume refuses prior spend lower than the previous report total', () => {
+  assert.throws(() => validatePriorSpendContinuity('99', '100'), /prior_spend_chain_incomplete/);
+  assert.equal(validatePriorSpendContinuity('100', '100'), '100');
 });
 
 test('an unknown prior effect cannot be hidden by starting a fresh ledger', () => {
@@ -26,6 +31,14 @@ test('a pinned local pre-dispatch reconciliation preserves known prior spend', (
     transcript_row_sha256: 'a'.repeat(64), budget_code_sha256: 'b'.repeat(64), gateway_correlation_sha256: 'c'.repeat(64) };
   assert.equal(priorSoftSpend(ledger, { reconciliations: [receipt] }), '23');
   assert.throws(() => priorSoftSpend(ledger, { reconciliations: [{ ...receipt, ledger_sha256: 'd'.repeat(64) }] }), /prior_ledger_unresolved/);
+});
+
+test('a graceful interruption retains all completed usage without inventing a dispatch', () => {
+  const ledger = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ type: 'started', id: 1 }),
+    line({ type: 'stop_requested', reason: 'SIGTERM', in_flight: true }),
+    line({ type: 'result', id: 1, outcome: 'received', stop: 'operator_interrupted', api_equivalent_nano: '23' }),
+    line({ type: 'close', in_flight: false, stopped: 'operator_interrupted', calls_started: 1, spent_nano: '23' })].join('\n');
+  assert.equal(priorSoftSpend(ledger), '23');
 });
 
 test('a typed pre-dispatch stop requires no fabricated usage', () => {

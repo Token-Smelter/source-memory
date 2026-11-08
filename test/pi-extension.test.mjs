@@ -107,6 +107,24 @@ test('concurrent indexing retries share the same in-flight idempotent operation'
   assert.deepEqual([await first, await second, calls], [{ status: 'ready' }, { status: 'ready' }, 1]);
 });
 
+test('search after a record still executes each query and returns prior action handles', async () => {
+  const { createTurnTools } = await loadCore();
+  const queries = [];
+  const memory = {
+    async recall(_scope, { query }) { queries.push(query); return { status: 'ready', bundles: [{ records: [{ id: 'action', kind: 'action', text: 'fiction', action_handle: 'prior-action' }] }] }; },
+    async enrich(_scope, payload) { return { records: payload.records.map(row => row.id) }; },
+    async beginLinks() { return { token: 'offer', packet: { records: [{ ref: 'r0', kind: 'action', text: 'fiction' }], sources: [{ ref: 's0', text: 'fiction' }] } }; },
+  };
+  const tools = createTurnTools({ scope: 'private', turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'fiction' }] },
+    receipt: { id: 'turn' }, memory, requireSearch: true });
+  await tools.search('before', []);
+  await tools.record('decision', 'fiction', ['ref-000001']);
+  const first = await tools.search('first after', []);
+  const second = await tools.search('second after', []);
+  assert.deepEqual([queries, first.records[0].action_handle, second.link_offer.records[0].handle],
+    [['before', 'first after', 'second after'], 'prior-action', 'r0']);
+});
+
 test('pending Memory proposal exposes exact offer, accepts compare, and retains the in-process apply object', async () => {
   const { createMemoryHandlers } = await import('../pi-extension/memory-process.mjs');
   const candidate = { token: 'same-object', proposals: [{ from: 'r1', to: 'r0' }] };
