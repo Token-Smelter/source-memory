@@ -13,7 +13,7 @@ function fixture() {
   const scope = 'fiction', sourceSha256 = 'a'.repeat(64), candidateSnapshotSha256 = 'b'.repeat(64);
   const report = { status: 'partial_reference_unavailable', coverage: { status: 'complete', scheduled: 1, processed: 1,
     dispositions: [{ through: 'a', disposition: 'abstained', search_incomplete: false }] },
-  artifacts: { source_snapshot: { sha256: sourceSha256 }, case_snapshots: [{ case_id: 'fiction-case', sha256: candidateSnapshotSha256 }] } };
+  artifacts: { source_snapshot: { sha256: sourceSha256 }, case_snapshots: [{ case_id: 'fiction-case', through_entry_id: 'a', sha256: candidateSnapshotSha256 }] } };
   const candidateSnapshot = { schema: 'source-memory-logical-snapshot/v1', scope, nodes: [{ uid: 'turn', labels: ['SMTurn', `${namespace(scope)}Turn`],
     properties: { uid: 'turn', scope, body: JSON.stringify({ entries: [{ id: 'entry', role: 'user', text: 'fictional evidence' }] }) } }], relationships: [] };
   const reference = { schema: 'source-memory-r2-reference-cut/v1', source_key: 'fiction-source', source_sha256: sourceSha256,
@@ -25,6 +25,18 @@ function fixture() {
 test('reference preparation derives a private plan from an explicitly complete candidate cut', () => {
   const result = prepareReferenceInputs(fixture());
   assert.deepEqual([result.qualification, result.audit.input_records, result.audit.imported_records], ['prepared_not_evaluated', 1, 1]);
+});
+
+test('reference preparation refuses a failed candidate report even when coverage appears complete', () => {
+  const input = fixture(); input.report.status = 'failed_or_partial'; input.report.failure = 'artifact_failed';
+  assert.throws(() => prepareReferenceInputs(input), /candidate_run_unqualified/);
+});
+
+test('reference preparation refuses ambiguous case snapshots and wrong checkpoint binding', () => {
+  const input = fixture(); input.report.artifacts.case_snapshots.push({ ...input.report.artifacts.case_snapshots[0] });
+  assert.throws(() => prepareReferenceInputs(input), /reference_binding_mismatch/);
+  input.report.artifacts.case_snapshots.pop(); input.report.artifacts.case_snapshots[0].through_entry_id = 'other';
+  assert.throws(() => prepareReferenceInputs(input), /reference_binding_mismatch/);
 });
 
 test('reference preparation refuses an incomplete or unproven candidate search', () => {

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { prepareReferenceInputs } from '../pi-extension/evaluation/reference-prepare.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -37,10 +39,19 @@ try {
   const result = prepareReferenceInputs({ report: JSON.parse(reportBytes), candidateSnapshot: JSON.parse(snapshotBytes),
     candidateSnapshotSha256: config.snapshot.sha256, reference: JSON.parse(referenceBytes), sourceKey: config.source_key,
     sourceSha256: config.source_sha256, caseId: config.case_id, through: config.through_entry_id });
-  const snapshot = writePrivate(join(dir, 'reference-store.json'), result.snapshot);
+  const repo = realpathSync(join(dirname(fileURLToPath(import.meta.url)), '..'));
+  const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', timeout: 30000, maxBuffer: 2_000_000 }).trim();
+  const codeSha = git(['rev-parse', 'HEAD']);
+  if (!/^[a-f0-9]{40}$/.test(codeSha)) throw fail('compiler_identity_invalid');
+  const compilerDirty = Boolean(git(['status', '--porcelain', '--untracked-files=no']));
+  const compilerFiles = Object.fromEntries(['scripts/prepare-reference-store.mjs', 'pi-extension/evaluation/reference-prepare.mjs',
+    'pi-extension/evaluation/reference-import.mjs', 'src/core.mjs'].map(path => [path, sha(readFileSync(join(repo, path)))]));
+  const outputSnapshotBytes = Buffer.from(JSON.stringify(result.snapshot));
   const audit = writePrivate(join(dir, 'reference-audit.json'), { schema: 'source-memory-reference-audit/v1', ...result.audit,
-    qualification: result.qualification, limitation: result.limitation, inputs: { config: configSha256, report: config.report.sha256,
-      candidate_snapshot: config.snapshot.sha256, reference_cut: config.reference.sha256 } });
+    qualification: result.qualification, limitation: result.limitation, compiler_sha: codeSha, compiler_dirty: compilerDirty,
+    compiler_file_sha256s: compilerFiles, output_snapshot_sha256: sha(outputSnapshotBytes),
+    inputs: { config: configSha256, report: config.report.sha256, candidate_snapshot: config.snapshot.sha256, reference_cut: config.reference.sha256 } });
+  const snapshot = writePrivate(join(dir, 'reference-store.json'), result.snapshot);
   const parent = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY);
   try { fsyncSync(parent); } finally { closeSync(parent); }
   process.stdout.write(`${JSON.stringify({ status: result.qualification, snapshot, audit, model_calls: 0 })}\n`);
