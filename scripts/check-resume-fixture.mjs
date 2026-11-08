@@ -69,7 +69,7 @@ firstResult = await runNamespaceHarness({ ...first, async work({ memory, driver 
           attribution: 'fiction', evidence: [{ turn: receipt.id, entry_id: entry.id, start: 0, end: Math.min(entry.text.length, 100) }] }], relations: [] }, { trigger: receipt.id });
         if (stored.indexing.status !== 'deferred') throw new Error('fixture_index_not_deferred');
         await ensureIndexed(tracked, scope, stored.indexing, { waitForVectors: true, batchLimit: 16, recordIds: stored.records });
-        return { status: 'complete', disposition: 'committed' };
+        return { status: 'complete', disposition: 'committed', search_limitations: { incomplete: false, statuses: [] } };
       } } };
     const one = await runCoveredInterval({ journal, session, through: 'a', cursor: null });
     if (one.disposition !== 'committed') throw new Error('fixture_first_checkpoint_failed');
@@ -86,7 +86,7 @@ const report = { status: 'failed_or_partial', run_id: first.runId, seal_sha256: 
   artifacts: { source_snapshot: { sha256: 'a'.repeat(64) }, 'ledger.jsonl': { sha256: ledger },
     checkpoint_snapshots: [{ through: 'a', sha256: checkpointSnapshot.sha256 }],
     case_snapshots: [{ case_id: publicCase.id, sha256: checkpointSnapshot.sha256 }] } };
-const progress = [{ type: 'checkpoint', through: 'a', disposition: 'committed', snapshot: { sha256: checkpointSnapshot.sha256 } }];
+const progress = [{ type: 'checkpoint', through: 'a', disposition: 'committed', search_incomplete: false, snapshot: { sha256: checkpointSnapshot.sha256 } }];
 const currentSpec = structuredClone(createPilotPlan({ cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
   codeSha: 'e'.repeat(40), routes: { candidate: { mode: 'fiction' }, reviewer: { mode: 'fiction' } },
   resume: { priorRunId: first.runId, priorSealDigest: seal.digest, priorCodeSha: 'd'.repeat(40), cursor: 'a',
@@ -109,7 +109,7 @@ const secondResult = await runNamespaceHarness({ ...second, async work({ memory,
     const session = { entries, conversation_id: 'fiction-session', scopes: [scope], memory: tracked,
       ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state,
         { waitForVectors: true, batchLimit: 16, ...options }),
-      distiller: { memory: tracked, async run({ throughEntryId }) { events.push(`distill:${throughEntryId}`); return { status: 'complete', disposition: 'abstained' }; } } };
+      distiller: { memory: tracked, async run({ throughEntryId }) { events.push(`distill:${throughEntryId}`); return { status: 'complete', disposition: 'abstained', search_limitations: { incomplete: false, statuses: [] } }; } } };
     const outcome = await runPilotSequence({ session, journal, checkpoints, cases, initialCursor: resume.cursor, retryFirst: resume.retryFirst,
       budget: { state: () => ({ stopped: null }) }, async evaluateCase() { events.push('case:a'); return { status: 'scored' }; } });
     if (outcome.status !== 'complete' || JSON.stringify(events) !== JSON.stringify(['case:a', 'distill:b', 'distill:c'])) throw new Error('fixture_resume_failed');

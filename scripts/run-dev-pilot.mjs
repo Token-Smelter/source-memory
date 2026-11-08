@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, closeSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import { loadavg } from 'node:os';
+import { homedir, loadavg } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { digest } from '../src/core.mjs';
 import { verifyChronologicalCheckpoint } from '../pi-extension/chronology.mjs';
@@ -10,6 +10,7 @@ import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createInputBudget } from '../pi-extension/budget.mjs';
 import { createImageArchive } from '../pi-extension/image-archive.mjs';
 import { sameLogicalSnapshot } from '../pi-extension/restore-scope.mjs';
+import { prepareRuntimeTree } from '../pi-extension/runtime-tree.mjs';
 import { ensureIndexed } from '../pi-extension/index-readiness.mjs';
 import { createDerivedAdapter } from '../pi-extension/derived-retrieval.mjs';
 import { createNamespaceDocker } from '../pi-extension/namespace-docker.mjs';
@@ -21,7 +22,7 @@ import { createAnswerer } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_TOOLS_SHA256, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
 import { createPilotPlan, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
-import { priorSoftSpend } from '../pi-extension/evaluation/prior-spend.mjs';
+import { priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
 import { validateCaseContinuation } from '../pi-extension/evaluation/pilot-continuation.mjs';
@@ -29,6 +30,7 @@ import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
 import { createScorer, scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
+import { createSnapshotVerifier } from '../pi-extension/evaluation/snapshot-verifier.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -116,7 +118,7 @@ async function main() {
   const cases = input('development/cases.jsonl').trimEnd().split('\n').map(JSON.parse).filter(row => row.split === 'development' && row.pre_answer_store_snapshot?.source_key === sourceKey);
   if (!proofs.length || !cases.length || proofs.some(row => row.snapshot_path !== source.snapshot_path || row.source_sha256 !== source.source_sha256)) throw fail('dataset_invalid');
   const sourceBytes = pinned(source.snapshot_path, source.source_sha256);
-  pinned('/var/tmp/source-memory-retention-eval-design/INTERPRETATION-02.md', INTERPRETATION_02_SHA256, 100000);
+  pinned(process.env.SOURCE_MEMORY_INTERPRETATION_PATH, INTERPRETATION_02_SHA256, 100000);
   pinned(sdkIndex, sdkIndexSha, 5_000_000); pinned(sdkSession, sdkSessionSha, 5_000_000);
   const pi = await import(pathToFileURL(sdkIndex).href), builder = await import(pathToFileURL(sdkSession).href);
   const verified = proofs.map(proof => verifyChronologicalCheckpoint({ bytes: sourceBytes, proof, availability, pi: builder }));
@@ -175,6 +177,7 @@ async function main() {
     try { request = JSON.parse(process.env.PILOT_RESUME); } catch { throw fail('resume_invalid'); }
     if (!request || typeof request !== 'object' || Array.isArray(request)) throw fail('resume_invalid');
     const report = JSON.parse(pinned(request.reportPath, request.reportSha256, 10_000_000).toString('utf8'));
+    validatePriorSpendContinuity(previous.toString(), report.budget?.total_spent_nano);
     const priorDir = dirname(request.reportPath);
     const checkpointsAtCursor = report.artifacts?.checkpoint_snapshots?.filter(row => row.through === request.cursor) ?? [];
     const checkpointMatch = checkpointsAtCursor.length === 1;
@@ -308,8 +311,11 @@ async function main() {
   if (resume?.handbackRows.length) pairedReport({ seal, expectedDigest: seal.digest, rows: resume.handbackRows, dependencies: [],
     provenance: resume.originSeals.filter(row => row.digest !== seal.digest) });
   const runId = randomUUID(), dir = mkdtempSync(join(parent, 'pilot-'));
-  const driverDir = join(dir, 'driver'), piDir = join(dir, 'pi'), imageDir = join(dir, 'image-blobs');
-  mkdirSync(driverDir, { mode: 0o700 }); mkdirSync(piDir, { mode: 0o700 }); mkdirSync(imageDir, { mode: 0o700 });
+  const driverDir = join(dir, 'driver'), piDir = join(dir, 'pi'), imageDir = join(dir, 'image-blobs'), runtimeDir = join(dir, 'runtime');
+  mkdirSync(driverDir, { mode: 0o700 }); mkdirSync(piDir, { mode: 0o700 }); mkdirSync(imageDir, { mode: 0o700 }); mkdirSync(runtimeDir, { mode: 0o700 });
+  const runtimeTree = prepareRuntimeTree({ repo: realpathSync('.'), codeSha, directory: runtimeDir,
+    npmCache: process.env.SOURCE_MEMORY_NPM_CACHE ?? join(homedir(), '.npm') });
+  writePrivate(join(dir, 'runtime-tree.json'), runtimeTree);
   mkdirSync(join(driverDir, 'intents'), { mode: 0o700 });
   const sourceCopy = join(dir, 'source.jsonl'); writePrivate(sourceCopy, sourceBytes);
   writePrivate(join(dir, 'seal.json'), seal);
@@ -344,12 +350,16 @@ async function main() {
     chunking: { words: 256, overlap: 32 }, embedding: { url: 'http://127.0.0.1:18080/v1/embeddings', model: 'embeddinggemma', dimensions: 768, timeout_ms: 120000 }, index_on_write: false });
   const resources = privateWriter(join(dir, 'resources.jsonl')), progress = privateWriter(join(dir, 'progress.jsonl'));
   const memoryLog = privateWriter(join(dir, 'memory-receipts.jsonl')), results = privateWriter(join(dir, 'case-results.jsonl'));
-  const relayLog = privateWriter(join(dir, 'embedding-relay.jsonl')), rawOutputs = privateWriter(join(dir, 'model-outputs.jsonl'));
+  const relayLog = privateWriter(join(dir, 'embedding-relay.jsonl')), rawOutputs = privateWriter(join(dir, 'model-outputs.jsonl')),
+    snapshotChecks = privateWriter(join(dir, 'snapshot-verifications.jsonl'));
   const image = name => execFileSync('/usr/bin/docker', ['image', 'inspect', name, '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
   const docker = createNamespaceDocker({ databaseImage: image('neo4j:5.26.14-community'), driverImage: image('node:22-bookworm-slim'),
-    mounts: { memory: resolve('.'), scratch: driverDir }, runId, onResource: row => resources.append(row) });
+    mounts: { memory: runtimeDir, scratch: driverDir }, runId, onResource: row => resources.append(row) });
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
     routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => rawOutputs.append(row) });
+  const onInterrupt = signal => { try { budget.requestStop(signal); } catch {} };
+  const onSigint = () => onInterrupt('SIGINT'), onSigterm = () => onInterrupt('SIGTERM');
+  process.on('SIGINT', onSigint); process.on('SIGTERM', onSigterm);
   let meta = { purpose: 'candidate', arm: 'candidate', checkpoint: 'preflight', task_version: 'distiller-r2-v4', policy_version: seal.spec.policyVersion };
   let journal, sequenceResult, snapshot, resumeRestore, partialCaseResult = null, failure = null;
   const reportRows = resume ? [...resume.handbackRows] : [],
@@ -363,6 +373,7 @@ async function main() {
       if (!isolation.ok) return;
       const ready = { status: 'awaiting_go', run_id: runId, run_dir: dir, source_key: sourceKey, source_sha256: source.source_sha256,
         dataset_sha256: manifestSha, code_sha: codeSha, seal_sha256: seal.digest, interpretation_sha256: INTERPRETATION_02_SHA256,
+        runtime_archive_sha256: runtimeTree.archive_sha256,
         sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
         models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
         routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
@@ -380,6 +391,7 @@ async function main() {
       if (process.env.SOURCE_MEMORY_PREFLIGHT_ONLY === '1') throw fail('preflight_only');
       const deadline = Date.now() + 600000, go = join(dir, 'GO');
       while (Date.now() < deadline) {
+        if (budget.state().stopped) throw fail(budget.state().stopped);
         try { if (readFileSync(go, 'utf8').trim() === seal.digest) return; } catch (error) { if (error.code !== 'ENOENT') throw error; }
         await sleep(250);
       }
@@ -461,14 +473,30 @@ async function main() {
             try {
               caseSnapshots[item.publicCase.id] = await docker.snapshot({ driver, scope,
                 filename: `baseline-${runId}-${sha(item.publicCase.id).slice(0, 16)}.json` });
+              const original = caseSnapshots[item.publicCase.id];
+              const expectedSnapshot = JSON.parse(pinned(original.path, original.sha256, 128_000_000));
+              let verificationSequence = 0;
+              const verifySnapshot = createSnapshotVerifier({ held, expectedSnapshot,
+                async capture() {
+                  const sequence = (++verificationSequence).toString(16).padStart(8, '0');
+                  const check = await docker.snapshot({ driver, scope,
+                    filename: `baseline-${runId}-${sha(item.publicCase.id).slice(0, 16)}-${sequence}.json` });
+                  return { snapshot: JSON.parse(pinned(check.path, check.sha256, 128_000_000)),
+                    receipt: { case_id: item.publicCase.id, sequence, expected_sha256: original.sha256,
+                      observed_sha256: check.sha256, path: check.path } };
+                },
+                onCheck: row => snapshotChecks.append(row),
+              });
               const allow = async access => access.actor === item.publicCase.actor && access.queryTime === item.publicCase.queryTime;
               const empty = { async searchDerived() { return []; }, async resolveDerived() { throw fail('evidence_not_offered'); } };
-              const candidate = { scope, snapshotId: held.id, authorize: allow, verifySnapshot: held.verify, client: session.memory };
-              const baseline = { scope, snapshotId: held.id, authorize: allow, verifySnapshot: held.verify, client: empty };
+              const candidate = { scope, snapshotId: held.id, authorize: allow, verifySnapshot, client: session.memory };
+              const baseline = { scope, snapshotId: held.id, authorize: allow, verifySnapshot, client: empty };
               const adapter = createDerivedAdapter({ stores: { candidate, 'baseline-empty': baseline } });
               const archive = { async search(args) {
-                if (!await allow(args) || await held.verify(args.queryTime) !== held.id) throw fail('snapshot_unverified');
-                return session.memory.searchRaw(scope, { query: args.query, limit: args.limit });
+                if (!await allow(args) || await verifySnapshot(args.queryTime) !== held.id) throw fail('snapshot_unverified');
+                const value = await session.memory.searchRaw(scope, { query: args.query, limit: args.limit });
+                if (await verifySnapshot(args.queryTime) !== held.id) throw fail('snapshot_unverified');
+                return value;
               } };
               const respond = createPiAnswererResponder({ runtime: evaluatorRuntime, model: reviewerModel, sessionId: `answer-${runId}-${item.publicCase.id}`,
                 expectedToolsSha256: ANSWERER_TOOLS_SHA256 });
@@ -511,7 +539,7 @@ async function main() {
                   await specific('baseline', partial.baselineAnswer.answer, resume.priorSeal, partial.previousMessage, [partial.clauseId]);
                   continue;
                 }
-                meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: 'answerer-r2-v3', policy_version: seal.spec.policyVersion };
+                meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: 'answerer-r2-v4', policy_version: seal.spec.policyVersion };
                 const answer = await answerer.run({ arm, case: item.publicCase });
                 results.append({ type: 'answer', case_id: item.publicCase.id, arm, answer });
                 meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: 'scorer-r2-v2', policy_version: seal.spec.policyVersion };
@@ -561,11 +589,17 @@ async function main() {
       return { sequence: sequenceResult, failure, snapshot, reference: 'pending_reference_freeze' };
     } });
   let scorecard = null;
-  if (reportRows.length) scorecard = pairedReport({ seal, expectedDigest: seal.digest, rows: reportRows, dependencies: [],
-    provenance: (resume?.originSeals ?? []).filter(row => row.digest !== seal.digest) });
+  try {
+    if (reportRows.length && sequenceResult?.status !== 'invalid_search_truncation') scorecard = pairedReport({ seal, expectedDigest: seal.digest, rows: reportRows, dependencies: [],
+      provenance: (resume?.originSeals ?? []).filter(row => row.digest !== seal.digest) });
+  } catch (error) { failure ??= typeof error?.code === 'string' ? error.code : 'scorecard_failed'; }
+  process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm);
+  if (budget.state().stopped === 'operator_interrupted') failure ??= 'operator_interrupted';
   try { budget.close(); } catch { failure ??= 'ledger_close_failed'; }
-  for (const writer of [resources, progress, memoryLog, results, relayLog, rawOutputs]) writer.close();
-  const artifactNames = ['seal.json', 'ledger.jsonl', 'progress.jsonl', 'memory-receipts.jsonl', 'case-results.jsonl', 'model-outputs.jsonl', 'resources.jsonl',
+  for (const writer of [resources, progress, memoryLog, results, relayLog, rawOutputs, snapshotChecks]) {
+    try { writer.close(); } catch { failure ??= 'artifact_close_failed'; }
+  }
+  const artifactNames = ['seal.json', 'runtime-tree.json', 'ledger.jsonl', 'progress.jsonl', 'memory-receipts.jsonl', 'case-results.jsonl', 'model-outputs.jsonl', 'snapshot-verifications.jsonl', 'resources.jsonl',
     'isolation.json', 'embedding-relay.jsonl', 'environment.json', 'resume-restore.json', 'superseded-case-attempt.json', 'case-handback.json',
     'partial-case-handback.json', 'prior-source-tree-drift.json'];
   const artifacts = {};
@@ -573,6 +607,7 @@ async function main() {
     try { const bytes = readFileSync(join(dir, name)); artifacts[name] = { path: join(dir, name), sha256: sha(bytes), bytes: bytes.length }; }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
+  try {
   if (snapshot?.path) { const bytes = readFileSync(snapshot.path); if (sha(bytes) !== snapshot.sha256) throw fail('snapshot_changed');
     artifacts.baseline_snapshot = { path: snapshot.path, sha256: snapshot.sha256, bytes: bytes.length, restore_verified: false }; }
   artifacts.checkpoint_snapshots = Object.entries(checkpointSnapshots).map(([through, item]) => {
@@ -599,8 +634,13 @@ async function main() {
     if (`${digest}.blob` !== name) throw fail('image_archive_conflict');
     return { path, sha256: digest, bytes: bytes.length };
   });
-  const final = { status: harness.status === 'complete' && !failure && sequenceResult?.status === 'complete' ? 'partial_reference_unavailable'
-    : harness.status === 'complete' && !failure && sequenceResult?.status === 'complete_with_partial_cases' ? 'partial_scorer_failed' : 'failed_or_partial',
+  } catch (error) {
+    failure ??= typeof error?.code === 'string' ? error.code : 'artifact_verification_failed';
+    scorecard = null;
+  }
+  const final = { status: sequenceResult?.status === 'invalid_search_truncation' ? 'invalid: search truncation fault'
+    : harness.status === 'complete' && !failure && sequenceResult?.status === 'complete' ? 'partial_reference_unavailable'
+      : harness.status === 'complete' && !failure && sequenceResult?.status === 'complete_with_partial_cases' ? 'partial_scorer_failed' : 'failed_or_partial',
     harness_status: harness.status, failure: failure ?? harness.code ?? null, resume: resumeValidation, resume_restore: resumeRestore ?? null,
     source_tree_drift: resume?.driftBytes ? { sha256: sha(resume.driftBytes), artifact: join(dir, 'prior-source-tree-drift.json'),
       limitation: 'The preceding run experienced disclosed additive source-tree drift; see the retained incident.' } : null,

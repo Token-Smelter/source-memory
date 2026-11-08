@@ -104,13 +104,20 @@ export function createPiAnswererResponder({ runtime, model, sessionId, expectedT
         if (tool.name === 'memory_search' && exact(args, ['query']) && typeof args.query === 'string' && !invalid) {
           try { context.messages.push(toolResult(tool, await tools.search(args.query))); }
           catch (error) {
-            if (error?.code !== 'item_limit') throw error;
-            context.messages.push(toolResult(tool, { status: 'item_budget_exhausted',
+            const budgets = { item_limit: 'item_budget_exhausted', search_limit: 'search_budget_exhausted',
+              retrieval_bytes_limit: 'retrieval_bytes_budget_exhausted', evidence_limit: 'evidence_budget_exhausted' };
+            if (!budgets[error?.code]) throw error;
+            context.messages.push(toolResult(tool, { status: budgets[error.code],
               instruction: 'Answer from retrieved items or state uncertainty.' }));
           }
         } else if (tool.name === 'memory_resolve' && exact(args, ['item_id', 'evidence_id'])
           && typeof args.item_id === 'string' && typeof args.evidence_id === 'string' && !invalid) {
-          context.messages.push(toolResult(tool, await tools.resolve(args.item_id, args.evidence_id)));
+          try { context.messages.push(toolResult(tool, await tools.resolve(args.item_id, args.evidence_id))); }
+          catch (error) {
+            if (!['resolve_limit', 'evidence_limit'].includes(error?.code)) throw error;
+            context.messages.push(toolResult(tool, { status: error.code === 'resolve_limit' ? 'resolve_budget_exhausted' : 'evidence_budget_exhausted',
+              instruction: 'Answer from retrieved evidence or state uncertainty.' }));
+          }
         } else { invalid = true; context.messages.push(toolResult(tool, { error: 'invalid_submission' }, true)); }
       }
       if (invalid) {
