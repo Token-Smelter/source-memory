@@ -195,11 +195,16 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
           incompleteSearch = true;
         }
         if (Object.values(result.channels ?? {}).some(row => ['partial', 'pending'].includes(row.status))) incompleteSearch = true;
+        const relationshipsComplete = result.relationship_context_complete === true
+          && result.bundles.every(bundle => bundle.relationship_context_complete === true);
+        if (!relationshipsComplete) incompleteSearch = true;
+        const relationshipGaps = [...new Set(result.bundles.flatMap(bundle => Array.isArray(bundle.gaps) ? bundle.gaps : []))];
         searches++;
         const matching = result.bundles.flatMap(bundle => bundle.records ?? []).filter(row => !kinds.length || kinds.includes(row.kind));
         const localOmitted = Math.max(0, matching.length - 32);
         if (localOmitted) incompleteSearch = true;
         searchStatuses.push({ status: result.status, budget_omitted: result.budget_omitted ?? 0, local_records_omitted: localOmitted,
+          relationship_context_complete: relationshipsComplete, relationship_gaps: relationshipGaps,
           partial_channels: Object.entries(result.channels ?? {}).filter(([, row]) => ['partial', 'pending'].includes(row.status)).map(([name]) => name) });
         const records = matching.slice(0, 32).map(row => ({ id: row.id, kind: row.kind, snippet: row.text,
             ...(row.kind === 'action' && row.action_handle ? { action_handle: row.action_handle } : {}) }));
