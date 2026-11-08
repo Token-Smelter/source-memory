@@ -58,6 +58,18 @@ test('a raw-output capture failure blocks the completed model result', async () 
   } finally { budget.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('a signal stops admission while an in-flight call settles with known usage', () => withBudget(async (budget, path) => {
+  let finish;
+  const runtime = budget.wrap({ streamSimple() { return stream(new Promise(resolve => { finish = resolve; })); } }, metadata);
+  const pending = runtime.streamSimple(model, { messages: [] });
+  budget.requestStop('SIGTERM');
+  assert.throws(() => runtime.streamSimple(model, { messages: [] }), /operator_interrupted/);
+  finish({ provider: 'fiction', model: 'model', stopReason: 'stop', usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 }, content: [] });
+  await assert.rejects(pending.result(), /operator_interrupted/);
+  const rows = readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual([rows.find(row => row.type === 'stop_requested').reason, rows.at(-1).outcome, budget.state().in_flight], ['SIGTERM', 'received', false]);
+}));
+
 test('a locally prevented input-limit dispatch is typed as not sent', () => withBudget(async (budget, path) => {
   let upstream = 0;
   const input = createInputBudget(1);

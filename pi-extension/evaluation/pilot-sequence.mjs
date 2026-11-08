@@ -49,6 +49,9 @@ export async function runPilotSequence({ session, journal, checkpoints, cases, b
     results.push(result);
     await onCheckpoint(result, budget.state());
     if (!['committed', 'abstained', 'ineligible_by_policy'].includes(result.disposition)) return { status: result.disposition, cursor, results, evaluated };
+    if (result.disposition !== 'ineligible_by_policy' && result.search_incomplete !== false) return {
+      status: 'invalid_search_truncation', cursor, results, evaluated,
+      failure: result.search_incomplete === true ? 'search_truncation_fault' : 'search_completeness_unproven', stopped_at: checkpoint.id };
     cursor = result.cursor;
     for (const item of cases.filter(row => row.through === cursor && !completed.has(row.publicCase.id))) {
       if (budget.state().stopped) return { status: 'budget_stopped', cursor, results, evaluated };

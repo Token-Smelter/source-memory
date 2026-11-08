@@ -43,14 +43,26 @@ test('answerer confines evidence to returned items and keeps primary arms off ra
 });
 
 test('concurrent retrieval cannot exceed the shared returned-item limit', async () => {
-  const answerer = createAnswerer({ seal: sealComparison(fictionalSettings()),
-    memory: { async search() { await new Promise(resolve => setImmediate(resolve)); return [1, 2, 3].map(i => ({ id: `i${i}`, scope: 'fiction', text: 'fact', evidence: [] })); }, async resolve() {} },
+  const settings = fictionalSettings(); settings.answerer.limits.returnedItems = 3; settings.answerer.limits.searchCalls = 2;
+  const answerer = createAnswerer({ seal: sealComparison(settings),
+    memory: { async search() { await new Promise(resolve => setImmediate(resolve)); return [1, 2].map(i => ({ id: `i${i}`, scope: 'fiction', text: 'fact', evidence: [] })); }, async resolve() {} },
     archive: { async search() { return []; } },
     async respond({ tools }) { const values = await Promise.allSettled([tools.search('a'), tools.search('b')]);
       assert.equal(values.filter(v => v.status === 'fulfilled').length, 1);
       assert.match(values.find(v => v.status === 'rejected').reason.message, /item_limit/);
       return { text: 'fiction' }; } });
   await answerer.run({ arm: 'candidate', case: fictionalCase() });
+});
+
+test('sequential searches share a fixed per-query item allowance', async () => {
+  const settings = fictionalSettings(), requested = [];
+  settings.answerer.limits.returnedItems = 12; settings.answerer.limits.searchCalls = 4;
+  const answerer = createAnswerer({ seal: sealComparison(settings),
+    memory: { async search({ query, limit }) { requested.push(limit); return Array.from({ length: limit }, (_, i) => ({ id: `${query}-${i}`, scope: 'fiction', text: 'fact', evidence: [] })); }, async resolve() {} },
+    archive: { async search() { return []; } },
+    async respond({ tools }) { for (let i = 0; i < 4; i++) await tools.search(`query-${i}`); return { text: 'fiction' }; } });
+  const result = await answerer.run({ arm: 'candidate', case: fictionalCase() });
+  assert.deepEqual([requested, result.trace.returnedItems], [[3, 3, 3, 3], 12]);
 });
 
 test('empty and raw-only conditions are separate and use fixed limits', async () => {
@@ -62,5 +74,5 @@ test('empty and raw-only conditions are separate and use fixed limits', async ()
   await answerer.run({ arm: 'empty', case: fictionalCase() });
   await answerer.run({ arm: 'raw-only', case: fictionalCase() });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].limit, 3);
+  assert.equal(calls[0].limit, 2);
 });

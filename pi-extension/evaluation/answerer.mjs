@@ -27,12 +27,13 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
           const remaining = limits.returnedItems - returned;
           if (remaining <= 0) throw fail('item_limit');
           if (closed) throw fail('answer_closed');
-          const args = { ...access, query, limit: remaining };
+          const perSearch = Math.ceil(limits.returnedItems / limits.searchCalls);
+          const args = { ...access, query, limit: Math.min(remaining, perSearch) };
           inFlight++;
           try {
             const rows = arm === 'empty' ? [] : arm === 'raw-only' ? await archive.search(args) : await memory.search({ ...args, storeId });
             if (closed) throw fail('answer_closed');
-            if (!Array.isArray(rows) || rows.length > remaining) throw fail('retrieval_invalid');
+            if (!Array.isArray(rows) || rows.length > args.limit) throw fail('retrieval_invalid');
             if (returned + rows.length > limits.returnedItems) throw fail('item_limit');
             const next = new Map(), result = rows.map(row => {
               if (!nonempty(row?.id) || !nonempty(row?.text) || !access.readScopes.includes(row.scope)) throw fail('retrieval_scope_invalid');

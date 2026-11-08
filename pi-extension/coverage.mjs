@@ -55,7 +55,7 @@ export function createCoverageJournal({ directory, sessionKey }) {
         || !Number.isSafeInteger(row.omitted_prior_spans) || row.omitted_prior_spans < 0 || !Array.isArray(row.trigger_omissions)) throw fail('journal_invalid');
     } else if (row.type === 'finish') {
       if (!active || active.id !== row.id || ![...covered, 'failed', 'uncertain', 'unresolved_scope'].includes(row.disposition)) throw fail('journal_invalid');
-      if (covered.has(row.disposition)) finished.set(row.id, row.disposition);
+      if (covered.has(row.disposition)) finished.set(row.id, { disposition: row.disposition, search_incomplete: row.search_incomplete ?? null });
       else gap = { id: row.id, disposition: row.disposition, through: active.through, cursor: active.cursor,
         ...(row.reconciliation_required ? { reconciliation_required: true } : {}) };
       active = null;
@@ -67,7 +67,7 @@ export function createCoverageJournal({ directory, sessionKey }) {
       if (!gap || gap.id !== row.id || !['uncertain', 'failed'].includes(gap.disposition)
         || (gap.disposition === 'failed' && (!gap.reconciliation_required || row.disposition !== 'failed'))
         || !['committed', 'failed'].includes(row.disposition)) throw fail('journal_invalid');
-      if (row.disposition === 'committed') { finished.set(row.id, 'committed'); gap = null; }
+      if (row.disposition === 'committed') { finished.set(row.id, { disposition: 'committed', search_incomplete: null }); gap = null; }
       else { gap.disposition = 'failed'; delete gap.reconciliation_required; }
     } else throw fail('journal_invalid');
   }
@@ -170,7 +170,11 @@ export function createCoverageJournal({ directory, sessionKey }) {
     },
     coveredDisposition({ through, cursor }) {
       if (typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('checkpoint_invalid');
-      return finished.get(digest(['coverage-interval/v1', sessionKey, cursor, through])) ?? null;
+      return finished.get(digest(['coverage-interval/v1', sessionKey, cursor, through]))?.disposition ?? null;
+    },
+    coveredSearchCompleteness({ through, cursor }) {
+      if (typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('checkpoint_invalid');
+      return finished.get(digest(['coverage-interval/v1', sessionKey, cursor, through]))?.search_incomplete ?? null;
     },
     state() {
       if (active) return { status: 'uncertain', id: active.id, cursor: active.cursor, through: active.through, reason: 'unfinished_interval' };
