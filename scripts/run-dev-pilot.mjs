@@ -625,7 +625,9 @@ async function main() {
   artifacts.case_snapshots = Object.entries(caseSnapshots).map(([caseId, item]) => {
     const bytes = readFileSync(item.path);
     if (sha(bytes) !== item.sha256) throw fail('snapshot_changed');
-    return { case_id: caseId, path: item.path, sha256: item.sha256, bytes: bytes.length, restore_verified: false };
+    const planned = prepared.find(row => row.publicCase.id === caseId);
+    if (!planned) throw fail('case_schedule_invalid');
+    return { case_id: caseId, through_entry_id: planned.through, path: item.path, sha256: item.sha256, bytes: bytes.length, restore_verified: false };
   });
   artifacts.source_snapshot = { path: sourceCopy, sha256: source.source_sha256, bytes: sourceBytes.length };
   artifacts.image_blobs = readdirSync(imageDir).map(name => {
