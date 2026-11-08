@@ -41,7 +41,7 @@ test('compact search fits many records without fetching unselected evidence and 
     const result = await handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input });
     assert.deepEqual([result.status, result.records.length, result.budget_omitted, reads.length], ['ready', 40, 0, 0]);
     assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 24000);
-    assert.ok(result.records.every(row => Buffer.byteLength(row.text) <= 80 && row.text_truncated));
+    assert.ok(result.records.every(row => Buffer.byteLength(row.text) <= 80 && row.text_truncated && !Object.hasOwn(row, 'status')));
     assert.ok(result.records.find(row => row.id === 'prior-0').action_handle);
     assert.ok(!JSON.stringify(result).includes('private evidence'));
     const chosen = result.records[1];
