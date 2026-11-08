@@ -33,6 +33,21 @@ test('an unavailable search channel cannot become a successful bounded search', 
   assert.equal(tools.stats().search_failed, true);
 });
 
+test('a ready recall with a relationship expansion gap is incomplete', async () => {
+  const memory = { async recall() { return { status: 'ready', relationship_context_complete: false,
+    bundles: [{ records: [], relationship_context_complete: false, gaps: ['node_limit'] }] }; } };
+  const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
+  await tools.search('fiction', []);
+  assert.deepEqual([tools.stats().incomplete_search, tools.stats().search_statuses[0].relationship_gaps], [true, ['node_limit']]);
+});
+
+test('a recall without relationship completeness evidence is incomplete', async () => {
+  const memory = { async recall() { return { status: 'ready', bundles: [] }; } };
+  const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
+  await tools.search('fiction', []);
+  assert.equal(tools.stats().incomplete_search, true);
+});
+
 test('bounded search exposes omissions and channel status without increasing its budget', async () => {
   const inputs = [];
   const memory = { async recall(_scope, input) { inputs.push(input); return { status: 'budget_limited', budget_omitted: 2,
