@@ -122,7 +122,7 @@ test('search after a record still executes each query and returns prior action h
   await tools.record('decision', 'fiction', ['ref-000001']);
   const first = await tools.search('first after', []);
   const second = await tools.search('second after', []);
-  const offered = await tools.offer([second.records[0].handle]);
+  const offered = await tools.offer([second.records[0].id]);
   assert.deepEqual([queries, first.records[0].action_handle, offered.packet.records[0].ref],
     [['before', 'first after', 'second after'], 'prior-action', 'r0']);
 });

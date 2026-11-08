@@ -66,37 +66,39 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       const maxBytes = input?.max_bytes ?? 24000;
       if (!Number.isSafeInteger(maxBytes) || maxBytes < 256 || maxBytes > 24000) throw fail('invalid_input');
       const ranked = await searchCompactRecords(memory, scope, input);
-      const selected = [], edges = [], offers = [], handles = new Map();
+      const selected = [], edges = [], offers = [], indexes = new Map();
       const result = { status: 'budget_limited', records: selected, relations: edges, channels: ranked.channels,
         ranked_count: ranked.ranked_count, seed_count: ranked.seed_count, declared_seed_limit: ranked.declared_seed_limit,
+        candidate_pool_limit: ranked.candidate_pool_limit,
         filtered_record_count: ranked.filtered_record_count, filtered_edge_count: ranked.filtered_edge_count,
-        related_kind_count: ranked.related_kind_count, graph_edge_count: ranked.edges.length,
+        collapsed_edge_count: ranked.collapsed_edge_count, related_kind_count: ranked.related_kind_count, graph_edge_count: ranked.edges.length,
         graph_gaps: ranked.graph_gaps, relationship_context_complete: false,
         budget_omitted: ranked.records.length, edge_budget_omitted: ranked.edges.length, completeness_guaranteed: false };
       for (const row of ranked.records) {
         const handle = compactHandle(scope, trigger, row.id);
-        const item = { ...row, handle, ...(row.kind === 'action' ? { action_handle: `action-${'0'.repeat(36)}` } : {}) };
+        const item = { id: handle, kind: row.kind, score: row.score, text: row.text, text_truncated: row.text_truncated,
+          ...(row.kind === 'action' ? { action_handle: `action-${'0'.repeat(36)}` } : {}) };
         selected.push(item);
         result.budget_omitted = ranked.records.length - selected.length;
         if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) { selected.pop(); result.budget_omitted++; continue; }
         offers.push({ handle, scope, trigger, id: row.id });
-        handles.set(row.id, handle);
+        indexes.set(row.id, selected.length - 1);
       }
       for (const edge of ranked.edges) {
-        if (!handles.has(edge.from) || !handles.has(edge.to)) continue;
-        edges.push({ type: edge.type, from_handle: handles.get(edge.from), to_handle: handles.get(edge.to) });
+        if (!indexes.has(edge.from) || !indexes.has(edge.to)) continue;
+        edges.push({ endpoints: [indexes.get(edge.from), indexes.get(edge.to)].sort((a, b) => a - b) });
         result.edge_budget_omitted = ranked.edges.length - edges.length;
         if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) { edges.pop(); result.edge_budget_omitted++; }
       }
       const fresh = offers.filter(offer => !compactOffers.has(offer.handle));
       if (compactOffers.size + fresh.length > 4096) throw fail('compact_offer_limit');
-      const actionRows = outcomes.offer(scope, trigger, { bundles: [{ records: selected }] }).bundles[0].records;
+      const actionRows = outcomes.offer(scope, trigger, { bundles: [{ records: selected.map((row, index) => ({ ...row, id: offers[index].id })) }] }).bundles[0].records;
       for (let i = 0; i < selected.length; i++) if (actionRows[i].action_handle) selected[i].action_handle = actionRows[i].action_handle;
       result.relationship_context_complete = !ranked.graph_gaps.length && !result.budget_omitted && !result.edge_budget_omitted;
       result.status = result.budget_omitted || result.edge_budget_omitted ? 'budget_limited' : selected.length ? 'ready' : 'no_matches';
       if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) throw fail('search_budget_invalid');
       registerCompact(offers);
-      return result;
+      return { surface: result, bindings: offers.map(({ handle, id }) => ({ handle, id })) };
     },
     async fetchCompact({ scope, trigger, handle }) {
       allowed(scope);
@@ -104,7 +106,8 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       if (!offered || offered.scope !== scope || offered.trigger !== trigger) throw fail('handle_not_offered');
       if (typeof memory.store?.neighbors !== 'function') throw fail('search_unavailable');
       const shown = await memory.show(scope, { kind: 'record', id: offered.id });
-      if (shown?.kind !== 'record' || shown.record?.scope !== scope || shown.record.id !== offered.id || !Array.isArray(shown.evidence)) throw fail('search_incomplete');
+      if (shown?.kind !== 'record' || shown.record?.scope !== scope || shown.record.id !== offered.id || !Array.isArray(shown.evidence)
+        || !shown.evidence.length || shown.evidence.some(row => typeof row?.role !== 'string' || typeof row.text !== 'string' || !row.text)) throw fail('search_incomplete');
       const relations = await memory.store.neighbors(scope, [offered.id], 65);
       if (!Array.isArray(relations) || relations.length > 65
         || relations.some(row => row.from !== offered.id && row.to !== offered.id)) throw fail('search_incomplete');
@@ -114,7 +117,8 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
         || endpoints.some(row => row.scope !== scope || !ids.includes(row.id))) throw fail('search_incomplete');
       const offers = ids.map(id => ({ handle: compactHandle(scope, trigger, id), scope, trigger, id }));
       const handles = new Map(offers.map(row => [row.id, row.handle]));
-      const result = { kind: 'record', record: { id: shown.record.id, kind: shown.record.kind, text: shown.record.text }, evidence: shown.evidence,
+      const result = { kind: 'record', record: { id: shown.record.id, kind: shown.record.kind, text: shown.record.text },
+        evidence: shown.evidence.map(row => ({ role: row.role, text: row.text })),
         relations: relations.slice(0, 64).map(row => ({ type: row.type, from_id: row.from, to_id: row.to,
           from_handle: handles.get(row.from), to_handle: handles.get(row.to) })),
         immediate_relations_complete: relations.length <= 64, relationship_omitted_at_least: relations.length > 64 ? 1 : 0 };

@@ -6,12 +6,11 @@ const requiredChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'ch
 const maxNodes = 48, maxHops = 4, maxEdges = maxNodes * 4;
 const maxCards = 256, maxSummaryEdges = 512;
 const preview = value => {
-  let result = '', bytes = 0;
+  let result = '';
   for (const char of value) {
-    const size = Buffer.byteLength(char);
-    if (bytes + size > 80) break;
-    result += char;
-    bytes += size;
+    const next = result + char;
+    if (Buffer.byteLength(JSON.stringify(next)) - 2 > 80) break;
+    result = next;
   }
   return { text: result, text_truncated: result.length < value.length };
 };
@@ -21,12 +20,15 @@ const edgeOrder = (a, b) => Number(b.type === 'supersedes') - Number(a.type === 
 /** Use the normal recall ranking, expanding graph metadata but never source evidence. */
 export async function searchCompactRecords(memory, scope, input) {
   authorize(memory.config, scope);
-  const query = text(input?.query, 4000), limit = integer(input?.limit, 64, 1, 64);
+  const query = text(input?.query, 4000), limit = integer(input?.limit, 48, 1, 48);
   if (!Array.isArray(input?.kinds) || input.kinds.some(kind => !kinds.has(kind)) || new Set(input.kinds).size !== input.kinds.length) throw fail('invalid_input');
   if (typeof memory.recall !== 'function' || typeof memory.store?.getRecords !== 'function'
-    || typeof memory.store?.neighbors !== 'function' || typeof memory.store?.recordsForTurn !== 'function') throw fail('search_unavailable');
-  const result = await memory.recall(scope, { query, candidates: limit, limit: Math.min(limit, 32), max_chars: 24000 }, { seedsOnly: true });
-  if (result?.scope !== scope || !Array.isArray(result.ranked) || result.ranked.length > limit || !result.channels
+    || typeof memory.store?.neighbors !== 'function' || typeof memory.store?.recordsForTurn !== 'function'
+    || typeof memory.store?.lexicalStatus !== 'function') throw fail('search_unavailable');
+  const lexicalStates = await Promise.all(['turn', 'record'].map(kind => memory.store.lexicalStatus(scope, kind)));
+  if (lexicalStates.some(state => state?.status !== 'ready')) throw fail('search_incomplete');
+  const result = await memory.recall(scope, { query, candidates: 64, limit: Math.min(limit, 32), max_chars: 24000 }, { seedsOnly: true });
+  if (result?.scope !== scope || !Array.isArray(result.ranked) || result.ranked.length > 64 || !result.channels
     || requiredChannels.some(name => result.channels[name]?.status !== 'ready')
     || Object.values(result.channels).some(row => ['partial', 'pending', 'unavailable'].includes(row.status))) throw fail('search_incomplete');
   const channels = Object.fromEntries(Object.entries(result.channels).map(([name, value]) => [name, { status: value.status,
@@ -48,7 +50,8 @@ export async function searchCompactRecords(memory, scope, input) {
     adjacency.set(id, rows);
     return rows;
   };
-  for (const seed of result.ranked) {
+  const seeds = result.ranked.slice(0, limit);
+  for (const seed of seeds) {
     if (!['turn', 'record'].includes(seed.kind) || typeof seed.id !== 'string' || !seed.id || !Number.isFinite(seed.score)
       || (seed.rerank_score !== undefined && !Number.isFinite(seed.rerank_score))) throw fail('search_incomplete');
     let initial = seed.kind === 'record' ? [await getRecord(seed.id)] : await memory.store.recordsForTurn(scope, seed.id, maxNodes + 1);
@@ -106,9 +109,15 @@ export async function searchCompactRecords(memory, scope, input) {
     }
   }
   const matching = [...cards.values()].filter(row => visible.has(row.id));
-  const edges = [...relations.values()].filter(row => visible.has(row.from) && visible.has(row.to));
-  return { records: matching, edges, ranked_count: matching.length, seed_count: result.ranked.length, declared_seed_limit: limit,
-    filtered_record_count: cards.size - matching.length, filtered_edge_count: relations.size - edges.length,
+  const visibleEdges = [...relations.values()].filter(row => visible.has(row.from) && visible.has(row.to));
+  const pairs = new Map();
+  for (const edge of visibleEdges) {
+    const key = JSON.stringify([edge.from, edge.to].sort());
+    if (!pairs.has(key)) pairs.set(key, edge);
+  }
+  return { records: matching, edges: [...pairs.values()], ranked_count: matching.length, seed_count: seeds.length, declared_seed_limit: limit, candidate_pool_limit: 64,
+    filtered_record_count: cards.size - matching.length, filtered_edge_count: relations.size - visibleEdges.length,
+    collapsed_edge_count: visibleEdges.length - pairs.size,
     related_kind_count: input.kinds.length ? matching.filter(row => !input.kinds.includes(row.kind)).length : 0,
     graph_gaps: [...gaps].sort(), channels };
 }

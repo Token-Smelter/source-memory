@@ -197,7 +197,12 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       if (typeof query !== 'string' || !query || !Array.isArray(kinds) || kinds.some(kind => typeof kind !== 'string')) throw fail('invalid_input');
       try {
         if (typeof memory.searchCompact !== 'function') throw fail('search_unavailable');
-        const result = await memory.searchCompact(scope, { query, kinds, limit: 64, max_bytes: 24000 }, receipt.id);
+        const envelope = await memory.searchCompact(scope, { query, kinds, limit: 48, max_bytes: 24000 }, receipt.id);
+        const result = envelope?.surface, bindings = envelope?.bindings;
+        if (!Array.isArray(bindings) || !Array.isArray(result?.records) || bindings.length !== result.records.length
+          || new Set(bindings.map(row => row?.handle)).size !== bindings.length || new Set(bindings.map(row => row?.id)).size !== bindings.length
+          || bindings.some((row, index) => typeof row?.id !== 'string' || !row.id || typeof row.handle !== 'string'
+            || row.handle !== result.records[index]?.id || (compactHandles.has(row.handle) && compactHandles.get(row.handle) !== row.id))) throw fail('search_incomplete');
         const requiredChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'];
         if (!['ready', 'no_matches', 'budget_limited'].includes(result?.status) || !Array.isArray(result.records)
           || result.records.length > 256 || !Array.isArray(result.relations) || result.relations.length > 512 || !result.channels
@@ -206,8 +211,10 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
           || result.completeness_guaranteed !== false || !Array.isArray(result.graph_gaps)
           || new Set(result.graph_gaps).size !== result.graph_gaps.length
           || result.graph_gaps.some(gap => !['node_limit', 'edge_limit', 'hop_limit', 'summary_node_limit', 'summary_edge_limit'].includes(gap))
-          || result.declared_seed_limit !== 64 || !Number.isSafeInteger(result.seed_count) || result.seed_count < 0 || result.seed_count > 64
+          || result.declared_seed_limit !== 48 || result.candidate_pool_limit !== 64
+          || !Number.isSafeInteger(result.seed_count) || result.seed_count < 0 || result.seed_count > 48
           || !Number.isSafeInteger(result.graph_edge_count) || result.graph_edge_count !== result.relations.length + result.edge_budget_omitted
+          || !Number.isSafeInteger(result.collapsed_edge_count) || result.collapsed_edge_count < 0
           || typeof result.relationship_context_complete !== 'boolean' || !Number.isSafeInteger(result.ranked_count)
           || !Number.isSafeInteger(result.budget_omitted) || result.budget_omitted < 0
           || !Number.isSafeInteger(result.edge_budget_omitted) || result.edge_budget_omitted < 0
@@ -216,25 +223,24 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
           || (result.status === 'budget_limited') !== (result.budget_omitted > 0 || result.edge_budget_omitted > 0)
           || (result.status === 'ready' && !result.records.length)
           || (result.status === 'no_matches' && result.ranked_count !== 0)) throw fail('search_incomplete');
-        if (new Set(result.records.map(row => row.handle)).size !== result.records.length
-          || new Set(result.records.map(row => row.id)).size !== result.records.length
-          || result.records.some(row => typeof row.id !== 'string' || !row.id || typeof row.handle !== 'string' || !row.handle
-            || (compactHandles.has(row.handle) && compactHandles.get(row.handle) !== row.id)
+        if (new Set(result.records.map(row => row.id)).size !== result.records.length
+          || result.records.some(row => typeof row.id !== 'string' || !row.id
             || typeof row.kind !== 'string' || typeof row.text !== 'string' || typeof row.text_truncated !== 'boolean'
             || (row.score !== null && (typeof row.score !== 'number' || !Number.isFinite(row.score))))) throw fail('search_incomplete');
-        const handles = new Set(result.records.map(row => row.handle));
-        if (result.relations.some(row => !RELATIONS.includes(row.type) || !handles.has(row.from_handle) || !handles.has(row.to_handle)
-          || row.from_handle === row.to_handle)) throw fail('search_incomplete');
+        if (result.relations.some(row => !Array.isArray(row?.endpoints) || row.endpoints.length !== 2
+          || row.endpoints.some(index => !Number.isSafeInteger(index) || index < 0 || index >= result.records.length)
+          || row.endpoints[0] === row.endpoints[1])) throw fail('search_incomplete');
         if (!result.relationship_context_complete) incompleteSearch = true;
         searches++;
         searchStatuses.push({ surface: 'compact-records', status: result.status, budget_omitted: result.budget_omitted,
           edge_budget_omitted: result.edge_budget_omitted, graph_gaps: [...result.graph_gaps],
           relationship_context_complete: result.relationship_context_complete, declared_seed_limit: result.declared_seed_limit,
+          candidate_pool_limit: result.candidate_pool_limit,
           filtered_record_count: result.filtered_record_count, related_kind_count: result.related_kind_count,
-          previewed_ids: result.records.map(row => row.id), channels: structuredClone(result.channels) });
-        for (const row of result.records) {
-          compactHandles.set(row.handle, row.id);
-          returnedPriorIds.add(row.id);
+          collapsed_edge_count: result.collapsed_edge_count, previewed_ids: bindings.map(row => row.id), channels: structuredClone(result.channels) });
+        for (const [index, row] of result.records.entries()) {
+          compactHandles.set(row.id, bindings[index].id);
+          returnedPriorIds.add(bindings[index].id);
           if (typeof row.action_handle === 'string' && row.action_handle) actionHandles.add(row.action_handle);
         }
         return result;
@@ -242,10 +248,16 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
     },
     async fetch(handle) {
       if (!compactHandles.has(handle) || typeof memory.fetchCompact !== 'function') throw fail('handle_not_offered');
-      if (++fetches > 32) { searchFailed = true; throw fail('fetch_limit'); }
+      if (++fetches > 32) {
+        incompleteSearch = true;
+        searchStatuses.push({ surface: 'selected-record', status: 'fetch_limit' });
+        throw fail('fetch_limit');
+      }
       try {
         const result = await memory.fetchCompact(scope, receipt.id, handle);
         if (result?.record?.id !== compactHandles.get(handle) || !Array.isArray(result.relations)
+          || !Array.isArray(result.evidence) || !result.evidence.length
+          || result.evidence.some(row => typeof row?.role !== 'string' || typeof row.text !== 'string' || !row.text)
           || typeof result.immediate_relations_complete !== 'boolean') throw fail('search_incomplete');
         if (!result.immediate_relations_complete) incompleteSearch = true;
         for (const edge of result.relations) {
@@ -261,8 +273,22 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
         fetchedIds.add(result.record.id);
         searchStatuses.push({ surface: 'selected-record', id: result.record.id,
           immediate_relations_complete: result.immediate_relations_complete, relationship_omitted_at_least: result.relationship_omitted_at_least ?? null });
-        return result;
-      } catch (problem) { searchFailed = true; throw problem; }
+        const pairs = new Map();
+        for (const edge of result.relations) {
+          const endpoints = [edge.from_handle, edge.to_handle].sort();
+          pairs.set(JSON.stringify(endpoints), { endpoints });
+        }
+        return { kind: 'record', record: { id: handle, kind: result.record.kind, text: result.record.text },
+          evidence: result.evidence.map(row => ({ role: row.role, text: row.text })), relations: [...pairs.values()],
+          collapsed_relation_count: result.relations.length - pairs.size, immediate_relations_complete: result.immediate_relations_complete,
+          relationship_omitted_at_least: result.relationship_omitted_at_least };
+      } catch (problem) {
+        if (problem?.code === 'fetch_budget_exceeded') {
+          incompleteSearch = true;
+          searchStatuses.push({ surface: 'selected-record', status: 'fetch_budget_exceeded' });
+        } else searchFailed = true;
+        throw problem;
+      }
     },
     async offer(handles = []) {
       if (!recordIds.length || typeof memory.beginLinks !== 'function') throw fail('offer_unavailable');

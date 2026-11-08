@@ -67,9 +67,9 @@ try {
       const updateRecord = await memory.enrich('fiction', { records: [{ id: 'fictional-update-record', kind: 'observation', text: updateText,
         status: 'proposed', attribution: 'fiction', evidence: [{ turn: later.id, entry_id: 'fictional-update', start: 0, end: updateText.length }] }], relations: [] }, { trigger: later.id });
       await ensureIndexed(memory, 'fiction', updateRecord.indexing, { waitForVectors: true, recordIds: updateRecord.records });
-      const compact = await memory.searchCompact('fiction', { query: 'amber key rotation', kinds: [], limit: 64, max_bytes: 24000 }, later.id);
-      const chosen = compact.records.find(row => row.id === 'fictional-record');
-      if (!chosen?.handle || compact.status !== 'ready' || compact.relationship_context_complete !== true) throw new Error('compact_search_invalid');
+      const compact = await memory.searchCompact('fiction', { query: 'amber key rotation', kinds: [], limit: 48, max_bytes: 24000 }, later.id);
+      const chosen = compact.bindings.find(row => row.id === 'fictional-record');
+      if (!chosen?.handle || compact.surface.status !== 'ready' || compact.surface.relationship_context_complete !== true) throw new Error('compact_search_invalid');
       const selected = await memory.fetchCompact('fiction', later.id, chosen.handle);
       if (selected.record?.id !== chosen.id || selected.immediate_relations_complete !== true) throw new Error('compact_fetch_invalid');
       const offer = await memory.beginLinks('fiction', later.id, ['fictional-update-record'], { candidateHandles: [chosen.handle] });
@@ -96,8 +96,9 @@ try {
       const followText = 'The fictional beacon inspection later confirmed another pass.';
       const follow = await memory.ingest('fiction', { source: 'pi-memory', conversation_id: 'fictional-session', turn_id: 'fictional-prior-outcome',
         entries: [{ id: 'fictional-prior-source', role: 'user', text: followText }] });
-      const priorSearch = await memory.searchCompact('fiction', { query: 'fictional beacon inspected', kinds: [], limit: 64, max_bytes: 24000 }, follow.id);
-      const priorHandle = priorSearch.records.find(row => row.id === 'fictional-action')?.action_handle;
+      const priorSearch = await memory.searchCompact('fiction', { query: 'fictional beacon inspected', kinds: [], limit: 48, max_bytes: 24000 }, follow.id);
+      const priorId = priorSearch.bindings.find(row => row.id === 'fictional-action')?.handle;
+      const priorHandle = priorSearch.surface.records.find(row => row.id === priorId)?.action_handle;
       if (!priorHandle) throw new Error('prior_action_unavailable');
       const priorOutcome = { id: 'fictional-prior-outcome-record', kind: 'outcome', text: 'Another fictional test passed.', status: 'proposed', attribution: 'fiction',
         evidence: [{ turn: follow.id, entry_id: 'fictional-prior-source', start: 0, end: followText.length }] };
@@ -121,7 +122,7 @@ try {
       const snapshot = await docker.snapshot({ driver, scope: 'fiction', filename: `baseline-${runId}.json` });
       return { retained: stored.retained, indexing: stored.indexing?.status, recall_status: recalled.status,
         returned: recalled.bundles?.length ?? 0, derived_returned: derived.length,
-        evidence_resolved: resolved.text === 'The amber fictional key requires rotation.', compact_status: compact.status,
+        evidence_resolved: resolved.text === 'The amber fictional key requires rotation.', compact_status: compact.surface.status,
         compact_selected: selected.record.id === chosen.id, link_status: linked.status,
         atomic_new_status: atomicResult.status, atomic_prior_status: priorResult.status, long_chunk_labels: labels.spans.length, snapshot, relay_calls: relayCalls };
     } });

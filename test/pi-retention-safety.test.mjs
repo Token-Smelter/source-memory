@@ -36,10 +36,11 @@ test('an unavailable search channel cannot become a successful bounded search', 
 
 test('a selected record with an incomplete relationship expansion is incomplete', async () => {
   const memory = { async searchCompact() { return compactResult({ records: [{ id: 'a', kind: 'decision', text: 'fiction' }] }); },
-    async fetchCompact() { return { record: { id: 'a' }, relations: [], immediate_relations_complete: false, relationship_omitted_at_least: 1 }; } };
+    async fetchCompact() { return { record: { id: 'a' }, evidence: [{ role: 'user', text: 'fiction' }],
+      relations: [], immediate_relations_complete: false, relationship_omitted_at_least: 1 }; } };
   const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
   const result = await tools.search('fiction', []);
-  await tools.fetch(result.records[0].handle);
+  await tools.fetch(result.records[0].id);
   assert.deepEqual([tools.stats().incomplete_search, tools.stats().search_statuses[1].relationship_omitted_at_least], [true, 1]);
 });
 
@@ -48,7 +49,7 @@ test('a selected record without relationship completeness evidence is incomplete
     async fetchCompact() { return {}; } };
   const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
   const result = await tools.search('fiction', []);
-  await assert.rejects(tools.fetch(result.records[0].handle), /search_incomplete/);
+  await assert.rejects(tools.fetch(result.records[0].id), /search_incomplete/);
   assert.equal(tools.stats().search_failed, true);
 });
 
@@ -59,7 +60,7 @@ test('bounded search exposes omissions and channel status without increasing its
   const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'fiction' }] }, receipt: { id: 'turn' } });
   const result = await tools.search('fiction', []);
   assert.deepEqual([inputs[0].max_bytes, result.status, result.budget_omitted, result.channels.record_vector.status,
-    result.records[0].id, tools.stats().incomplete_search], [24000, 'budget_limited', 2, 'ready', 'prior', true]);
+    tools.stats().returned_prior_ids, tools.stats().incomplete_search], [24000, 'budget_limited', 2, 'ready', ['prior'], true]);
 });
 
 test('a bounded successful search permits candidate-assessed abstention and records incompleteness', async () => {

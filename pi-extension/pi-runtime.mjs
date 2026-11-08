@@ -68,11 +68,11 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           throw error;
         }
       } });
-    register('memory_search', 'Search private memory for compact ranked record handles and bounded related-record summaries. Results do not establish global completeness. Use memory_fetch for full details of selected handles.',
+    register('memory_search', 'Search private memory for compact records and bounded related-record summaries. Each record id is a turn-scoped handle; relation endpoints are zero-based indexes into this result’s records array. Results do not establish global completeness. Use memory_fetch for selected ids.',
       { query: { type: 'string', minLength: 1, maxLength: 4000 }, kinds }, (tools, args) => tools.search(args.query, args.kinds));
-    register('memory_fetch', 'Fetch full text and original-source evidence for one offered handle, plus immediate relation endpoint handles. At most 32 fetches per turn.',
+    register('memory_fetch', 'Fetch full text and original-source evidence for one offered record id, plus immediate relation endpoint ids. At most 32 fetches per turn.',
       { handle: string }, (tools, args) => tools.fetch(args.handle));
-    register('memory_link_offer', 'After recording, select relevant search handles to obtain link and source handles for a reviewed link proposal.',
+    register('memory_link_offer', 'After recording, select relevant record ids to obtain link and source handles for a reviewed link proposal.',
       { handles: { type: 'array', items: string, maxItems: 32, uniqueItems: true } }, async (tools, args) => {
         const offered = await tools.offer(args.handles), packet = offered.packet;
         const sources = packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? ''));
