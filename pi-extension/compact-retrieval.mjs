@@ -50,7 +50,7 @@ export async function searchCompactRecords(memory, scope, input) {
   const selected = matching.slice(0, limit).map(row => {
     const record = byId.get(row.id);
     if (!kinds.has(record.kind) || typeof record.text !== 'string' || typeof record.status !== 'string') throw fail('search_invalid');
-    return { id: row.id, kind: record.kind, status: record.status, score: Number(row.score.toFixed(6)), ...preview(record.text) };
+    return { id: row.id, kind: record.kind, score: Number(row.score.toFixed(6)), ...preview(record.text) };
   });
   const lexicalCapped = lexical.length === 64, vectorCapped = nodes.length === 64;
   return { records: selected, ranked_count: matching.length, top_k_omitted: Math.max(0, matching.length - selected.length),
