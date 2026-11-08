@@ -22,7 +22,7 @@ export function summarizeStage({ coverage, reference, candidate, alignments, ali
   }
   for (const row of candidate.records) {
     if (!nonempty(row?.id) || allCandidates.has(row.id) || typeof row.text !== 'string'
-      || !Number.isSafeInteger(row.checkpoint_index) || row.checkpoint_index < 1) throw fail('stage_invalid');
+      || !Number.isSafeInteger(row.checkpoint_index) || row.checkpoint_index < 1 || row.checkpoint_index > cutoff) throw fail('stage_invalid');
     allCandidates.set(row.id, row);
   }
   const map = new Map();

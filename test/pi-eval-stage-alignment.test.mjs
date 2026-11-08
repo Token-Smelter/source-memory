@@ -46,7 +46,12 @@ test('invalid verdicts and unverified checkpoint metadata are refused', () => {
   assert.throws(() => summarizeStage(g), /stage_invalid/);
 });
 
+test('a pre-answer snapshot containing a record first seen after the cut is refused', () => {
+  const f = fixture(); f.cutoff = 1; f.candidate.relations = [];
+  assert.throws(() => summarizeStage(f), /stage_invalid/);
+});
+
 test('a returned item outside the pre-answer snapshot is refused', () => {
-  const f = fixture(); f.cutoff = 1; f.candidate.relations = []; f.returnedIds = ['c2'];
+  const f = fixture(); f.cutoff = 1; f.candidate.records = f.candidate.records.slice(0, 1); f.candidate.relations = []; f.returnedIds = ['c2'];
   assert.throws(() => summarizeStage(f), /stage_invalid/);
 });
