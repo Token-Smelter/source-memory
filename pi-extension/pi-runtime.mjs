@@ -68,9 +68,9 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           throw error;
         }
       } });
-    register('memory_search', 'Search private memory for compact ranked record handles. Results are bounded and do not establish completeness. Use memory_fetch for full details of selected handles.',
+    register('memory_search', 'Search private memory for compact ranked record handles and bounded related-record summaries. Results do not establish global completeness. Use memory_fetch for full details of selected handles.',
       { query: { type: 'string', minLength: 1, maxLength: 4000 }, kinds }, (tools, args) => tools.search(args.query, args.kinds));
-    register('memory_fetch', 'Fetch full record and original-source evidence for one handle returned by memory_search in this turn.',
+    register('memory_fetch', 'Fetch full text and original-source evidence for one offered handle, plus immediate relation endpoint handles. At most 32 fetches per turn.',
       { handle: string }, (tools, args) => tools.fetch(args.handle));
     register('memory_link_offer', 'After recording, select relevant search handles to obtain link and source handles for a reviewed link proposal.',
       { handles: { type: 'array', items: string, maxItems: 32, uniqueItems: true } }, async (tools, args) => {
@@ -110,7 +110,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
     async run(input) {
       if (busy) throw fail('distiller_busy');
       busy = true;
-      let session;
+      let session, runError;
       try {
         const synced = await incremental.syncThrough(input.throughEntryId);
         const manager = pi.SessionManager.open(synced.file, workDir);
@@ -179,13 +179,19 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
         }
         return { status: 'complete', disposition, model_result: modelResult.result, evaluation_reason: modelResult.reason, policy_sha256: policy.sha256,
           search_limitations: { incomplete: stats.incomplete_search, statuses: stats.search_statuses,
-            returned_prior_ids: stats.returned_prior_ids,
+            returned_prior_ids: stats.returned_prior_ids, fetched_ids: stats.fetched_ids, link_candidate_ids: stats.link_candidate_ids,
             abstention_support: disposition === 'abstained' ? 'candidate_assessed_not_independently_verified' : null },
           usage: reply.usage ?? null, call_usage: budget?.receipts().slice(startReceipt) ?? [],
           records: currentTools.stats().records, reviewer_calls: reviewerCalls, breakpoint, link };
-      } finally {
-        try { await currentTools?.release?.(); } catch { /* Transient handles are also cleared when the memory process closes. */ }
-        currentTools = null; activeSession = null; busy = false; await session?.dispose?.();
+      } catch (error) { runError = error; throw error; }
+      finally {
+        let releaseError;
+        try { await currentTools?.release?.(); } catch (error) { releaseError = error; }
+        currentTools = null; activeSession = null; busy = false;
+        let disposeError;
+        try { await session?.dispose?.(); } catch (error) { disposeError = error; }
+        if (!runError && releaseError) throw fail('handle_release_unconfirmed');
+        if (!runError && disposeError) throw disposeError;
       }
     },
     async close() {},

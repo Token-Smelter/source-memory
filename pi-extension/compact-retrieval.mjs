@@ -1,8 +1,10 @@
-import { authorize, cosine, fuse, integer, text } from '../src/core.mjs';
-import { embed, embeddingIdentity } from '../src/models.mjs';
+import { authorize, integer, RELATIONS, text } from '../src/core.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const kinds = new Set(['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action']);
+const requiredChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'];
+const maxNodes = 48, maxHops = 4, maxEdges = maxNodes * 4;
+const maxCards = 256, maxSummaryEdges = 512;
 const preview = value => {
   let result = '', bytes = 0;
   for (const char of value) {
@@ -13,48 +15,100 @@ const preview = value => {
   }
   return { text: result, text_truncated: result.length < value.length };
 };
+const edgeOrder = (a, b) => Number(b.type === 'supersedes') - Number(a.type === 'supersedes')
+  || String(a.uid ?? a.id).localeCompare(String(b.uid ?? b.id));
 
-/** Rank record seeds without fetching bundles or original-source evidence. */
+/** Use the normal recall ranking, expanding graph metadata but never source evidence. */
 export async function searchCompactRecords(memory, scope, input) {
   authorize(memory.config, scope);
   const query = text(input?.query, 4000), limit = integer(input?.limit, 64, 1, 64);
   if (!Array.isArray(input?.kinds) || input.kinds.some(kind => !kinds.has(kind)) || new Set(input.kinds).size !== input.kinds.length) throw fail('invalid_input');
-  if (!memory.store || typeof memory.store.lexicalStatus !== 'function' || typeof memory.store.getRecords !== 'function'
-    || !memory.config.embedding) throw fail('search_unavailable');
-  const lexicalState = await memory.store.lexicalStatus(scope, 'record');
-  if (lexicalState?.status !== 'ready') throw fail('search_unavailable');
-  const lexical = await memory.store.lexical(scope, 'record', query, 64, []);
-  if (!Array.isArray(lexical) || lexical.length > 64 || lexical.some(row => row.kind !== 'record' || typeof row.id !== 'string')) throw fail('search_invalid');
-  const key = embeddingIdentity(memory.config.embedding), [vector] = await embed(memory.config.embedding, [query]);
-  const index = await memory.store.vectorIndexStatus(scope, 'record', vector.length);
-  let nodes;
-  if (index === 'online') {
-    const result = await memory.store.indexedVectors(scope, 'record', key, vector, 64, null, [], { remaining: 14 });
-    if (result.partial !== false || result.unindexed !== 0 || !Array.isArray(result.nodes)) throw fail('search_incomplete');
-    nodes = result.nodes;
-  } else if (index === 'missing') {
-    const scanLimit = integer(memory.config.vector_scan_limit, 10000, 1, 100000);
-    const scanned = await memory.store.vectors(scope, key, scanLimit + 1, [], 'record');
-    const counts = await memory.store.vectorCounts(scope, 'record', key, []);
-    if (!Array.isArray(scanned) || scanned.length > scanLimit || counts?.unindexed !== 0) throw fail('search_incomplete');
-    nodes = scanned.map(row => ({ ...row, similarity: cosine(vector, row.embedding) })).filter(row => Number.isFinite(row.similarity))
-      .sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid)).slice(0, 64);
-  } else throw fail('search_incomplete');
-  if (!Array.isArray(nodes) || nodes.length > 64 || nodes.some(row => typeof row.record_id !== 'string')) throw fail('search_invalid');
-  const ranked = fuse({ record_lexical: lexical, record_vector: nodes.map(row => ({ kind: 'record', id: row.record_id, text: row.text })) });
-  const records = await memory.store.getRecords(scope, ranked.map(row => row.id));
-  if (!Array.isArray(records) || records.length !== ranked.length) throw fail('search_incomplete');
-  const byId = new Map(records.map(row => [row.id, row]));
-  if (byId.size !== records.length || ranked.some(row => !byId.has(row.id))) throw fail('search_invalid');
-  const matching = ranked.filter(row => !input.kinds.length || input.kinds.includes(byId.get(row.id).kind));
-  const selected = matching.slice(0, limit).map(row => {
-    const record = byId.get(row.id);
-    if (!kinds.has(record.kind) || typeof record.text !== 'string' || typeof record.status !== 'string') throw fail('search_invalid');
-    return { id: row.id, kind: record.kind, score: Number(row.score.toFixed(6)), ...preview(record.text) };
-  });
-  const lexicalCapped = lexical.length === 64, vectorCapped = nodes.length === 64;
-  return { records: selected, ranked_count: matching.length, top_k_omitted: Math.max(0, matching.length - selected.length),
-    filter_may_be_incomplete: input.kinds.length > 0 && (lexicalCapped || vectorCapped),
-    channels: { record_lexical: { status: 'ready', candidate_limit_reached: lexicalCapped },
-      record_vector: { status: 'ready', index, candidate_limit_reached: vectorCapped } } };
+  if (typeof memory.recall !== 'function' || typeof memory.store?.getRecords !== 'function'
+    || typeof memory.store?.neighbors !== 'function' || typeof memory.store?.recordsForTurn !== 'function') throw fail('search_unavailable');
+  const result = await memory.recall(scope, { query, candidates: limit, limit: Math.min(limit, 32), max_chars: 24000 }, { seedsOnly: true });
+  if (result?.scope !== scope || !Array.isArray(result.ranked) || result.ranked.length > limit || !result.channels
+    || requiredChannels.some(name => result.channels[name]?.status !== 'ready')
+    || Object.values(result.channels).some(row => ['partial', 'pending', 'unavailable'].includes(row.status))) throw fail('search_incomplete');
+  const channels = Object.fromEntries(Object.entries(result.channels).map(([name, value]) => [name, { status: value.status,
+    ...(typeof value.candidate_limit_reached === 'boolean' ? { candidate_limit_reached: value.candidate_limit_reached } : {}),
+    ...(value.reason ? { reason: value.reason } : {}) }]));
+  const cards = new Map(), relations = new Map(), loaded = new Map(), adjacency = new Map(), gaps = new Set();
+  const getRecord = async id => {
+    if (loaded.has(id)) return loaded.get(id);
+    const rows = await memory.store.getRecords(scope, [id]);
+    if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.id !== id || rows[0].scope !== scope) throw fail('search_incomplete');
+    loaded.set(id, rows[0]);
+    return rows[0];
+  };
+  const neighbors = async id => {
+    if (adjacency.has(id)) return adjacency.get(id);
+    const rows = await memory.store.neighbors(scope, [id], maxEdges + 1);
+    if (!Array.isArray(rows) || rows.length > maxEdges + 1 || rows.some(row => !row?.id || !RELATIONS.includes(row.type)
+      || (row.from !== id && row.to !== id))) throw fail('search_incomplete');
+    adjacency.set(id, rows);
+    return rows;
+  };
+  for (const seed of result.ranked) {
+    if (!['turn', 'record'].includes(seed.kind) || typeof seed.id !== 'string' || !seed.id || !Number.isFinite(seed.score)
+      || (seed.rerank_score !== undefined && !Number.isFinite(seed.rerank_score))) throw fail('search_incomplete');
+    let initial = seed.kind === 'record' ? [await getRecord(seed.id)] : await memory.store.recordsForTurn(scope, seed.id, maxNodes + 1);
+    if (!Array.isArray(initial)) throw fail('search_incomplete');
+    if (initial.length > maxNodes) { gaps.add('node_limit'); initial = initial.slice(0, maxNodes); }
+    const local = new Map(), localRelations = new Set(), visited = new Set();
+    const add = (record, directlyRanked) => {
+      if (!record || record.scope !== scope || typeof record.id !== 'string' || !record.id
+        || !kinds.has(record.kind) || typeof record.text !== 'string' || typeof record.status !== 'string') throw fail('search_incomplete');
+      if (local.has(record.id)) return true;
+      if (local.size >= maxNodes) { gaps.add('node_limit'); return false; }
+      if (!cards.has(record.id) && cards.size >= maxCards) { gaps.add('summary_node_limit'); return false; }
+      local.set(record.id, record);
+      loaded.set(record.id, record);
+      const score = Number((seed.rerank_score ?? seed.score).toFixed(6));
+      if (!cards.has(record.id)) cards.set(record.id, { id: record.id, kind: record.kind, score: directlyRanked ? score : null, ...preview(record.text) });
+      else if (directlyRanked && cards.get(record.id).score === null) cards.get(record.id).score = score;
+      return true;
+    };
+    for (const record of initial) add(record, true);
+    let frontier = [...local.keys()];
+    for (let hop = 0; hop <= maxHops && frontier.length; hop++) {
+      const edges = new Map();
+      for (const id of frontier) {
+        const rows = await neighbors(id);
+        if (rows.length > maxEdges) gaps.add('edge_limit');
+        for (const edge of rows.slice(0, maxEdges)) edges.set(edge.id, edge);
+        visited.add(id);
+      }
+      const ordered = [...edges.values()].sort(edgeOrder);
+      if (ordered.length > maxEdges) gaps.add('edge_limit');
+      const next = new Set();
+      for (const edge of ordered.slice(0, maxEdges)) {
+        const missing = [edge.from, edge.to].filter(id => !local.has(id));
+        if (missing.length && hop === maxHops) { gaps.add('hop_limit'); continue; }
+        if (local.size + missing.length > maxNodes) { gaps.add('node_limit'); continue; }
+        if (missing.some(id => !cards.has(id)) && cards.size >= maxCards) { gaps.add('summary_node_limit'); continue; }
+        for (const id of missing) add(await getRecord(id), false);
+        if (!local.has(edge.from) || !local.has(edge.to)) continue;
+        if (!localRelations.has(edge.id) && localRelations.size >= maxEdges) { gaps.add('edge_limit'); continue; }
+        if (!relations.has(edge.id) && relations.size >= maxSummaryEdges) { gaps.add('summary_edge_limit'); continue; }
+        localRelations.add(edge.id);
+        relations.set(edge.id, { id: edge.id, type: edge.type, from: edge.from, to: edge.to });
+        for (const id of [edge.from, edge.to]) if (!visited.has(id)) next.add(id);
+      }
+      frontier = [...next];
+    }
+  }
+  const visible = new Set([...cards.values()].filter(row => !input.kinds.length || input.kinds.includes(row.kind)).map(row => row.id));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const edge of relations.values()) if (visible.has(edge.from) !== visible.has(edge.to)) {
+      visible.add(visible.has(edge.from) ? edge.to : edge.from); changed = true;
+    }
+  }
+  const matching = [...cards.values()].filter(row => visible.has(row.id));
+  const edges = [...relations.values()].filter(row => visible.has(row.from) && visible.has(row.to));
+  return { records: matching, edges, ranked_count: matching.length, seed_count: result.ranked.length, declared_seed_limit: limit,
+    filtered_record_count: cards.size - matching.length, filtered_edge_count: relations.size - edges.length,
+    related_kind_count: input.kinds.length ? matching.filter(row => !input.kinds.includes(row.kind)).length : 0,
+    graph_gaps: [...gaps].sort(), channels };
 }

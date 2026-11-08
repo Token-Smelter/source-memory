@@ -69,9 +69,9 @@ try {
       await ensureIndexed(memory, 'fiction', updateRecord.indexing, { waitForVectors: true, recordIds: updateRecord.records });
       const compact = await memory.searchCompact('fiction', { query: 'amber key rotation', kinds: [], limit: 64, max_bytes: 24000 }, later.id);
       const chosen = compact.records.find(row => row.id === 'fictional-record');
-      if (!chosen?.handle || compact.status !== 'ready' || compact.relationship_context !== 'not_loaded') throw new Error('compact_search_invalid');
+      if (!chosen?.handle || compact.status !== 'ready' || compact.relationship_context_complete !== true) throw new Error('compact_search_invalid');
       const selected = await memory.fetchCompact('fiction', later.id, chosen.handle);
-      if (selected.record?.id !== chosen.id || selected.relationship_context_complete !== true) throw new Error('compact_fetch_invalid');
+      if (selected.record?.id !== chosen.id || selected.immediate_relations_complete !== true) throw new Error('compact_fetch_invalid');
       const offer = await memory.beginLinks('fiction', later.id, ['fictional-update-record'], { candidateHandles: [chosen.handle] });
       const from = offer.packet.records.find(row => row.newly_retained)?.ref;
       const to = offer.packet.records.find(row => !row.newly_retained && row.text === 'The amber key requires rotation.')?.ref;

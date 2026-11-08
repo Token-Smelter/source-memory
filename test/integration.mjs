@@ -1062,17 +1062,25 @@ export async function runIntegration(database, scratch) {
     });
     await check('compact search reads Neo4j records and hydrates only an offered record with relations', async () => {
       const trigger = await memory.ingest('demo', { ...turn('compact-trigger', 'Check the blue choice.'), source: 'pi-memory' });
-      const handlers = createMemoryHandlers({ memory, scopes: ['demo'] });
+      const selectedMemory = Object.create(memory);
+      selectedMemory.recall = async (...args) => {
+        const ranked = await memory.recall(...args);
+        ranked.ranked = ranked.ranked.filter(row => row.kind === 'record' && row.id === 'old-decision');
+        return ranked;
+      };
+      const handlers = createMemoryHandlers({ memory: selectedMemory, scopes: ['demo'] });
       try {
         const result = await handlers.searchCompact({ scope: 'demo', trigger: trigger.id,
           input: { query: 'blue', kinds: [], limit: 64, max_bytes: 24000 } });
         const old = result.records.find(row => row.id === 'old-decision');
-        assert.ok(old);
+        const successor = result.records.find(row => row.id === 'new-decision');
+        assert.ok(old && successor && successor.score === null);
+        assert.ok(result.relations.some(row => row.type === 'supersedes' && row.from_handle === successor.handle && row.to_handle === old.handle));
         assert.equal(result.status, 'ready');
         const shown = await handlers.fetchCompact({ scope: 'demo', trigger: trigger.id, handle: old.handle });
         assert.equal(shown.record.id, 'old-decision');
-        assert.ok(shown.relations.some(row => row.type === 'supersedes' && row.to === 'old-decision'));
-        assert.equal(shown.relationship_context_complete, true);
+        assert.ok(shown.relations.some(row => row.type === 'supersedes' && row.to_id === 'old-decision'));
+        assert.equal(shown.immediate_relations_complete, true);
       } finally { handlers.close(); }
     });
     const attemptInput = turn('attempt', 'I ran the demonstration check. It passed. Should we run another?');

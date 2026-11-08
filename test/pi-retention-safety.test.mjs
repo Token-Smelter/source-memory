@@ -36,7 +36,7 @@ test('an unavailable search channel cannot become a successful bounded search', 
 
 test('a selected record with an incomplete relationship expansion is incomplete', async () => {
   const memory = { async searchCompact() { return compactResult({ records: [{ id: 'a', kind: 'decision', text: 'fiction' }] }); },
-    async fetchCompact() { return { relationship_context_complete: false, relationship_omitted_at_least: 1 }; } };
+    async fetchCompact() { return { record: { id: 'a' }, relations: [], immediate_relations_complete: false, relationship_omitted_at_least: 1 }; } };
   const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
   const result = await tools.search('fiction', []);
   await tools.fetch(result.records[0].handle);
@@ -48,8 +48,8 @@ test('a selected record without relationship completeness evidence is incomplete
     async fetchCompact() { return {}; } };
   const tools = createTurnTools({ scope: 'fiction', memory, turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } });
   const result = await tools.search('fiction', []);
-  await tools.fetch(result.records[0].handle);
-  assert.equal(tools.stats().incomplete_search, true);
+  await assert.rejects(tools.fetch(result.records[0].handle), /search_incomplete/);
+  assert.equal(tools.stats().search_failed, true);
 });
 
 test('bounded search exposes omissions and channel status without increasing its budget', async () => {
@@ -140,6 +140,24 @@ test('an unknown write aborts the Pi tool loop immediately', async () => {
     workDir: '/fiction', model: {}, memory, scope: 'fiction' });
   await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'fiction' }] }, receipt: { id: 'turn' } }), /distillation_incomplete/);
   assert.equal(aborted, 1);
+});
+
+for (const primary of [false, true]) test(`failed handle release ${primary ? 'preserves the earlier error' : 'prevents a successful interval'}`, async () => {
+  const tools = new Map();
+  class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0]({ on() {}, registerTool(tool) { tools.set(tool.name, tool); } }); } }
+  const manager = { getSessionId: () => 'fiction', branch() {}, buildSessionContext: () => ({ messages: [] }) };
+  const session = { sessionId: 'fiction', agent: { sessionId: 'fiction', state: {} }, messages: [], async prompt() {
+    await tools.get('memory_search').execute('search', { query: 'fiction', kinds: [] });
+    if (primary) throw Object.assign(new Error('write_uncertain'), { code: 'write_uncertain', write_outcome_unknown: true });
+    this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"result":"done_nothing_qualifies","reason":"fiction"}' }] }];
+  } };
+  const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
+    async createAgentSession() { return { session }; } };
+  const memory = { async searchCompact() { return compactResult(); }, async releaseCompact() { throw new Error('release_failed'); } };
+  const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'fiction', async syncThrough() { return { file: '/fiction' }; } },
+    workDir: '/fiction', model: {}, memory, scope: 'fiction' });
+  await assert.rejects(runtime.run({ throughEntryId: 'a', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' } }),
+    primary ? /write_uncertain/ : /handle_release_unconfirmed/);
 });
 
 test('inaccessible scope cannot be selected through a memory-search argument', async () => {
