@@ -13,7 +13,18 @@
       ],
       "forbidden": [
         "mechanical_summary"
-      ]
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Thanks."
+        },
+        {
+          "role": "assistant",
+          "text": "You are welcome."
+        }
+      ],
+      "store_prior": []
     },
     {
       "id": "rare-consequential-fact",
@@ -28,7 +39,18 @@
       "forbidden": [
         "frequency_as_exclusion",
         "claim_key_contents"
-      ]
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "For the Project Lumen annual migration next month: the only restore key is held by the cold-storage custodian, and it has to be requested before the migration starts."
+        },
+        {
+          "role": "assistant",
+          "text": "Understood."
+        }
+      ],
+      "store_prior": []
     },
     {
       "id": "scoped-override",
@@ -46,6 +68,19 @@
       ],
       "forbidden": [
         "global_45_second_replacement"
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Use 45 seconds for Project Orion import readiness only. Keep the general import readiness limit at 30 seconds and interactive reads capped at 4 seconds."
+        },
+        {
+          "role": "assistant",
+          "text": "Okay: 45 seconds for Orion import readiness only."
+        }
+      ],
+      "store_prior": [
+        "The general import readiness limit is 30 seconds; interactive reads are capped at 4 seconds."
       ]
     },
     {
@@ -61,7 +96,18 @@
         "cross_scope_search",
         "claim_global_absence",
         "link_inaccessible_prior"
-      ]
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "The active project now has a 12-hour reporting deadline."
+        },
+        {
+          "role": "assistant",
+          "text": "Noted."
+        }
+      ],
+      "store_prior": []
     },
     {
       "id": "interrupted-consequential-work",
@@ -75,7 +121,28 @@
       "forbidden": [
         "invent_final_assistant",
         "drop_prior_tool_output"
-      ]
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Sign the release build."
+        },
+        {
+          "role": "assistant",
+          "text": "",
+          "tool": {
+            "name": "sign_release",
+            "arguments": {
+              "build": "release"
+            }
+          }
+        },
+        {
+          "role": "toolResult",
+          "text": "Release signing blocked: the required signing certificate has expired and must be renewed before signing."
+        }
+      ],
+      "store_prior": []
     },
     {
       "id": "uncertain-write",
@@ -105,7 +172,18 @@
       "forbidden": [
         "penalize_recovery_as_duplicate",
         "assert_global_absence"
-      ]
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Reminder: mail delivery must stay disabled during the rehearsal."
+        },
+        {
+          "role": "assistant",
+          "text": "Got it."
+        }
+      ],
+      "store_prior": []
     },
     {
       "id": "accessible-duplicate",
@@ -120,6 +198,19 @@
       ],
       "forbidden": [
         "duplicate_write"
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Reminder: mail delivery must stay disabled during the rehearsal."
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, that is still in place."
+        }
+      ],
+      "store_prior": [
+        "Mail delivery must stay disabled during the rehearsal."
       ]
     },
     {
@@ -133,7 +224,18 @@
       ],
       "forbidden": [
         "assert_verified_deployment"
-      ]
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Dana told me the deployment passed. I have not checked it myself."
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks, I will treat that as reported."
+        }
+      ],
+      "store_prior": []
     },
     {
       "id": "routine-action-result",
@@ -146,7 +248,30 @@
       "forbidden": [
         "routine_action_record",
         "routine_outcome_record"
-      ]
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Please run the linter."
+        },
+        {
+          "role": "assistant",
+          "text": "Running the linter now.",
+          "tool": {
+            "name": "run_lint",
+            "arguments": {}
+          }
+        },
+        {
+          "role": "toolResult",
+          "text": "lint passed with no warnings"
+        },
+        {
+          "role": "assistant",
+          "text": "Lint is clean."
+        }
+      ],
+      "store_prior": []
     }
   ]
 }

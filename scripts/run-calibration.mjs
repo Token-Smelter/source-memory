@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createIncrementalSession } from '../pi-extension/incremental.mjs';
 import { createPiDistiller } from '../pi-extension/pi-runtime.mjs';
+import { sourceInterval } from '../pi-extension/core.mjs';
 import { createInputBudget, boundPiRuntime } from '../pi-extension/budget.mjs';
 import { resolvePiModels } from '../pi-extension/slice-runtime.mjs';
 import { fictionalCalibrationV2, retentionPolicy } from '../pi-extension/policy.mjs';
@@ -48,6 +49,21 @@ export function calibrationMemory(prior) {
   } };
 }
 
+/** A case's transcript as Pi session rows: only source content, never the case's narrated expectation. */
+export function transcriptRows(item) {
+  if (!Array.isArray(item.transcript) || !item.transcript.length) throw fail('calibration_transcript_missing');
+  const rows = [{ type: 'session', version: 3, id: `calibration-${item.id}` }];
+  item.transcript.forEach((entry, i) => {
+    const id = `e${i + 1}`, parentId = i ? `e${i}` : null;
+    if (entry.role === 'toolResult') rows.push({ type: 'message', id, parentId, message: { role: 'toolResult', toolCallId: `call-${i}`, toolName: 'tool', content: [{ type: 'text', text: entry.text }] } });
+    else if (entry.role === 'assistant') rows.push({ type: 'message', id, parentId, message: { role: 'assistant', stopReason: entry.tool ? 'toolUse' : 'stop', content: [
+      ...(entry.text ? [{ type: 'text', text: entry.text }] : []), ...(entry.tool ? [{ type: 'toolCall', id: `call-${i + 1}`, name: entry.tool.name, arguments: entry.tool.arguments }] : [])] } });
+    else if (entry.role === 'user') rows.push({ type: 'message', id, parentId, message: { role: 'user', content: entry.text } });
+    else throw fail('calibration_transcript_invalid');
+  });
+  return rows;
+}
+
 export function scoreCalibration(cases, outcomes) {
   const rows = cases.map(row => {
     const outcome = outcomes.find(item => item.id === row.id);
@@ -77,29 +93,27 @@ async function main() {
   if (`${model.provider}/${model.id}` !== ROUTE) throw fail('route_changed');
   const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   if (execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8' }).trim()) throw fail('working_tree_dirty');
+  const rates = { maxOutputTokens: 4096, ratesNanoPerToken: { input: 500, cacheRead: 50, cacheWrite: 625, output: 2500 }, rateEvidence: 'Haiku SDK max tier as sealed in pilot plans' };
   const spec = { schema: 'calibration-run-seal/v1', codeSha, label, guidance, calibrationSha256: calibration.sha256, policySha256: retentionPolicy().sha256,
-    route: ROUTE, priorSpendNano: prior.totalNano, capNano: remaining.toString() };
+    route: ROUTE, rates, priorSpendNano: prior.totalNano, capNano: remaining.toString() };
   const digest = hash(spec), dir = mkdtempSync(join(outDir, `calibration-${label}-`)), runId = randomUUID();
   writeNew(join(dir, 'seal.json'), JSON.stringify({ spec, digest }));
-  const rates = { maxOutputTokens: 4096, ratesNanoPerToken: { input: 500, cacheRead: 50, cacheWrite: 625, output: 2500 }, rateEvidence: 'Haiku SDK max tier as sealed in pilot plans' };
   const soft = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `calibration-${runId}`, sealSha256: digest, routes: { [ROUTE]: rates } });
   const outcomes = [];
   try {
     for (const item of calibration.value.cases.filter(row => row.expected_action !== 'uncertain')) {
-      const caseDir = mkdtempSync(join(dir, `${item.id}-`)), source = join(caseDir, 'source.jsonl'), text = `[Fictional calibration] ${item.context}`;
-      writeFileSync(source, [{ type: 'session', version: 3, id: `calibration-${item.id}` },
-        { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: text } },
-        { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'Noted.' }], stopReason: 'stop' } }]
-        .map(row => `${JSON.stringify(row)}\n`).join(''), { mode: 0o600 });
+      const caseDir = mkdtempSync(join(dir, `${item.id}-`)), source = join(caseDir, 'source.jsonl'), rows = transcriptRows(item), through = rows.at(-1).id;
+      writeFileSync(source, rows.map(row => `${JSON.stringify(row)}\n`).join(''), { mode: 0o600 });
+      // The interrupted-work case ends at a tool result with no final reply, exactly as that source would.
+      const { turn } = sourceInterval(rows.slice(1), through, null, `calibration-${item.id}`, { allowInterrupted: item.transcript.at(-1).role !== 'assistant' });
       const incremental = await createIncrementalSession({ source, workDir: caseDir, sessionId: `calibration-${item.id}` });
-      const budget = createInputBudget(2_000_000), fake = calibrationMemory(item.accessible_prior);
+      const budget = createInputBudget(2_000_000), fake = calibrationMemory(item.store_prior ?? []);
       const metered = soft.wrap(boundPiRuntime(runtime, budget), () => ({ purpose: 'candidate', arm: label, checkpoint: item.id,
         task_version: 'calibration-r2-v2', policy_version: retentionPolicy().value.id }));
       try {
         const distiller = await createPiDistiller({ pi, incremental, workDir: caseDir, model, modelRuntime: metered, memory: fake.memory, scope: 'calibration',
           budget, guidance, createOptions: { thinkingLevel: 'low' } });
-        const result = await distiller.run({ throughEntryId: 'a1', receipt: { id: `turn-${item.id}` },
-          turn: { turn_id: item.id, entries: [{ id: 'u1', role: 'user', text }, { id: 'a1', role: 'assistant', text: 'Noted.' }] } });
+        const result = await distiller.run({ throughEntryId: through, receipt: { id: `turn-${item.id}` }, turn });
         outcomes.push({ id: item.id, disposition: result.disposition, writes: fake.writes });
       } catch (error) {
         outcomes.push({ id: item.id, error: error?.code ?? 'distillation_failed', writes: fake.writes });
