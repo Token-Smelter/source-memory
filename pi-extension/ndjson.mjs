@@ -2,9 +2,10 @@ import { createInterface } from 'node:readline';
 
 const error = code => Object.assign(new Error(code), { code });
 const MAX_LINE = 4_000_000;
-// Write provenance on a failure frame (QUALIFICATION.md): only these values are carried; a frame without one makes no claim.
+// Write provenance on a failure frame (QUALIFICATION.md). Only staged methods carry it, as bin/memory.mjs failureReply does:
+// a stage that does not prove no write is unknown. A frame without a stage makes no claim.
 const STAGES = ['before_write', 'rolled_back', 'unknown'];
-const staged = value => (STAGES.includes(value?.stage) ? { stage: value.stage } : {});
+const noWriteStage = problem => (['before_write', 'rolled_back'].includes(problem?.stage) ? problem.stage : 'unknown');
 
 function write(output, value) {
   const line = JSON.stringify(value);
@@ -32,7 +33,8 @@ export function createClient({ input, output, timeoutMs = 30000 }) {
     let message;
     try { message = JSON.parse(line); } catch { close(); return; }
     if (typeof message?.id !== 'string' || typeof message.ok !== 'boolean') { close(); return; }
-    const problem = message.ok ? null : Object.assign(error(message.error ?? 'request_failed'), { remote_rejection: true }, staged(message));
+    const problem = message.ok ? null : Object.assign(error(message.error ?? 'request_failed'), { remote_rejection: true },
+      STAGES.includes(message.stage) ? { stage: message.stage } : {});
     finish(message.id, problem, message.value);
   });
   function close() {
@@ -66,7 +68,7 @@ export function createClient({ input, output, timeoutMs = 30000 }) {
 }
 
 /** Each request runs independently so a pending model comparison cannot block a cancel or another request. */
-export async function serve({ input, output, handlers, signal }) {
+export async function serve({ input, output, handlers, signal, staged = [] }) {
   const lines = createInterface({ input, crlfDelay: Infinity });
   const active = new Map();
   const stop = () => { for (const controller of active.values()) controller.abort(); lines.close(); };
@@ -87,7 +89,7 @@ export async function serve({ input, output, handlers, signal }) {
       }).then(value => write(output, { id: request.id, ok: true, value }), problem => {
         const code = typeof problem?.code === 'string' && /^[a-z_]+$/.test(problem.code) ? problem.code
           : controller.signal.aborted ? 'request_cancelled' : 'request_failed';
-        write(output, { id: request.id, ok: false, error: code, ...staged(problem) });
+        write(output, { id: request.id, ok: false, error: code, ...(staged.includes(request.method) ? { stage: noWriteStage(problem) } : {}) });
       }).catch(() => {}).finally(() => active.delete(request.id));
     }
   } finally {

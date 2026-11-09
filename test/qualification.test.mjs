@@ -240,7 +240,7 @@ test('every post-commit code is reported inside an ok:true CLI reply after the w
   assert.deepEqual([...exercised].sort(), await listed('post-commit'));
 });
 
-// Neither ingest nor enrich raises these; they belong to read commands, init and warm. Pinned so a code cannot move between
+// Neither ingest nor enrich raises these through the CLI; they belong to read commands, init and warm. Pinned so a code cannot move between
 // this class and another without this test changing with it.
 test('QUALIFICATION.md lists exactly the pinned not-on-write-path and stage-dependent codes', async () => {
   assert.deepEqual(await listed('not-on-write-path'), ['conversation_unavailable', 'embedding_unconfigured', 'index_not_ready',

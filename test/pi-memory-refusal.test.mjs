@@ -9,7 +9,7 @@ import { Memory } from '../src/memory.mjs';
 import { Neo4jStore } from '../src/store.mjs';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createMemoryClient } from '../pi-extension/memory-client.mjs';
-import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
+import { createMemoryHandlers, STAGED_METHODS } from '../pi-extension/memory-process.mjs';
 import { createClient, serve } from '../pi-extension/ndjson.mjs';
 
 test('an explicit pre-write server rejection is distinguished from a transport timeout', async () => {
@@ -29,26 +29,36 @@ test('an explicit pre-write server rejection is distinguished from a transport t
   } finally { client.close(); stopped.abort(); inbound.end(); outbound.end(); await server; }
 });
 
-test('a failure frame carries a valid write stage and is otherwise byte-identical', async () => {
+test('only a staged method carries a write stage on its failure frame; other frames are byte-identical', async () => {
   const inbound = new PassThrough(), outbound = new PassThrough(), stopped = new AbortController();
   const frames = [];
   outbound.on('data', part => frames.push(...String(part).trimEnd().split('\n')));
   const raise = stage => async () => { throw Object.assign(new Error('x'), { code: 'fiction_refused' }, stage === undefined ? {} : { stage }); };
-  const server = serve({ input: inbound, output: outbound, signal: stopped.signal, handlers: {
-    plain: raise(), before: raise('before_write'), rolled: raise('rolled_back'), unknown: raise('unknown'), bogus: raise('committed') } });
+  const server = serve({ input: inbound, output: outbound, signal: stopped.signal, staged: ['before', 'rolled', 'bogus', 'bare'],
+    handlers: { plain: raise('rolled_back'), before: raise('before_write'), rolled: raise('rolled_back'), bogus: raise('committed'), bare: raise() } });
   const client = createClient({ input: outbound, output: inbound, timeoutMs: 1000 });
   try {
     const stages = [];
-    for (const method of ['plain', 'before', 'rolled', 'unknown', 'bogus']) {
+    for (const method of ['plain', 'before', 'rolled', 'bogus', 'bare']) {
       await assert.rejects(client.request(method, {}), error => { stages.push(error.stage); return error.code === 'fiction_refused'; });
     }
-    assert.deepEqual(stages, [undefined, 'before_write', 'rolled_back', 'unknown', undefined]);
+    assert.deepEqual(stages, [undefined, 'before_write', 'rolled_back', 'unknown', 'unknown']);
     assert.deepEqual(frames, ['{"id":"1","ok":false,"error":"fiction_refused"}',
       '{"id":"2","ok":false,"error":"fiction_refused","stage":"before_write"}',
       '{"id":"3","ok":false,"error":"fiction_refused","stage":"rolled_back"}',
       '{"id":"4","ok":false,"error":"fiction_refused","stage":"unknown"}',
-      '{"id":"5","ok":false,"error":"fiction_refused"}']);
+      '{"id":"5","ok":false,"error":"fiction_refused","stage":"unknown"}']);
   } finally { client.close(); stopped.abort(); inbound.end(); outbound.end(); await server; }
+});
+
+test('the client keeps only a known stage from a failure frame', async () => {
+  const inbound = new PassThrough(), outbound = new PassThrough();
+  const client = createClient({ input: inbound, output: outbound, timeoutMs: 1000 });
+  try {
+    const pending = client.request('enrich', {});
+    inbound.write('{"id":"1","ok":false,"error":"outcome_referent_required","stage":"committed"}\n');
+    await assert.rejects(pending, error => error.code === 'outcome_referent_required' && !('stage' in error));
+  } finally { client.close(); inbound.end(); outbound.end(); }
 });
 
 test('memory-process stages its write handlers as the CLI does', async () => {
@@ -70,8 +80,9 @@ test('memory-process stages its write handlers as the CLI does', async () => {
   } finally { handlers.close(); }
 });
 
-// Coverage journal -> memory client -> NDJSON -> memory-process -> Memory -> Neo4jStore.atomicWrite, with only the driver
-// transaction replaced. The referent check runs inside the write transaction, so a first-attempt refusal is rolled_back.
+// Coverage journal -> memory client -> NDJSON -> memory-process -> Memory -> Neo4jStore.atomicWrite. The driver transaction,
+// the trigger read and the body of the store's enrich are replaced; the real referent query runs through the CLI in Q-SM-3.
+// The referent check runs inside the write transaction, so a first-attempt refusal is rolled_back.
 test('a referent-missing enrich through memory-process is refused with no reconcile; after a driver retry it is uncertain', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'pi-memory-refusal-'));
   const store = new Neo4jStore({ uri: 'bolt://127.0.0.1:1', auth: 'none' });
@@ -79,16 +90,22 @@ test('a referent-missing enrich through memory-process is refused with no reconc
     const outcome = { records: [{ id: 'harbour-outcome', kind: 'outcome', text: 'The fictional harbour reopened.', attribution: 'fiction',
       evidence: [{ turn: 'turn-fiction', entry_id: 'u1', start: 0, end: 4 }] }], relations: [] };
     const results = [];
-    for (const [label, transaction] of [
-      ['first attempt', async (_mode, action) => action({})],
-      ['driver retry', async (_mode, action) => { try { await action({}); } catch { /* retryable */ } return action({}); }]]) {
+    // The driver retries only a transient Neo4jError, here a stand-in, then the retry raises the refusal.
+    const retried = async (_mode, action) => { try { await action({}); } catch { /* transient */ } return action({}); };
+    for (const [label, transaction, transient] of [
+      ['first attempt', async (_mode, action) => action({}), false], ['driver retry', retried, true]]) {
+      let attempt = 0;
       store.transaction = transaction;
-      store.enrich = () => store.atomicWrite(() => { throw new MemoryError('outcome_referent_required'); });
+      store.enrich = () => store.atomicWrite(() => {
+        attempt += 1;
+        throw transient && attempt === 1 ? Object.assign(new Error('transient'), { code: 'ServiceUnavailable' })
+          : new MemoryError('outcome_referent_required');
+      });
       const memory = Object.assign(new Memory({ scopes: { read: ['fiction'], write: ['fiction'] } }, store),
         { show: async () => ({ turn: { id: 'turn-fiction', source: 'pi-memory' } }) });
       const inbound = new PassThrough(), outbound = new PassThrough(), stopped = new AbortController();
       const handlers = createMemoryHandlers({ memory, scopes: ['fiction'] });
-      const server = serve({ input: inbound, output: outbound, signal: stopped.signal, handlers });
+      const server = serve({ input: inbound, output: outbound, signal: stopped.signal, handlers, staged: STAGED_METHODS });
       const journal = createCoverageJournal({ directory, sessionKey: label });
       const client = journal.track(createMemoryClient({ input: outbound, output: inbound, timeoutMs: 1000 }));
       try {

@@ -14,7 +14,7 @@ export function createMemoryClient({ input, output, timeoutMs, indexTimeoutMs = 
     } catch (error) {
       if (noPersistentWrite.has(method)) error.effect = 'none';
       if (method === 'index') error.effect = 'retryable_idempotent';
-      // A server that reports stage unknown cannot rule out a committed write; a frame without a stage predates it.
+      // Stage unknown cannot rule out a committed write. A frame without a stage makes no claim; the code alone decides.
       if (error.remote_rejection === true && error.stage !== 'unknown' && ((method === 'enrich' && error.code === 'outcome_referent_required')
         || (method === 'applyOutcome' && ['outcome_review_refused', 'outcome_context_changed'].includes(error.code)))) error.effect = 'refused';
       onReceipt({ method, ok: false, code: error.code ?? 'request_failed', effect: error.effect ?? 'unknown' });

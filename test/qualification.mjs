@@ -37,7 +37,8 @@ async function severableRelay(uri) {
 }
 
 /**
- * Q-SM-1…6 through the real CLI transport: each call is a fresh `node bin/memory.mjs` process against the disposable store.
+ * Q-SM-1…6 through the real CLI transport: each call is a fresh `node bin/memory.mjs` process against the disposable store,
+ * except the driver-retry check, which runs `main` in process to instrument the store.
  * Fictional content only. Returns one result per qualification with the evidence it observed.
  */
 export async function runQualification(database, scratch) {
@@ -321,13 +322,13 @@ export async function runQualification(database, scratch) {
           return action(tx);
         }
         let severed = false;
-        const run = async (...args) => {
+        const runThenSever = async (...args) => {
           const result = await tx.run(...args);
           if (!severed) { severed = true; relay.sever(); }
           return result;
         };
-        try { return await action({ run }); }
-        catch (error) { attempts[0].error = { memory_error: error instanceof MemoryError, code: error.code, retriable: error.retriable }; throw error; }
+        try { return await action({ run: runThenSever }); }
+        catch (error) { attempts[0].error = { memory_error: error instanceof MemoryError, code: error.code, retryable: error.retryable }; throw error; }
       });
       const input = await file({ records: [record('q7-companion', turn),
         record('q7-retried', turn, { text: 'Amber shutters for the fictional lighthouse.' })], relations: [] });
@@ -338,7 +339,7 @@ export async function runQualification(database, scratch) {
       } catch (error) { reply = failureReply('enrich', error); } finally { await relay.close(); }
       const companion = (await show('q7', 'record', 'q7-companion')).reply;
       const stored = (await show('q7', 'record', 'q7-retried')).reply.record;
-      assert.deepEqual([attempts.length, attempts[0].error?.memory_error, attempts[0].error?.retriable, reply],
+      assert.deepEqual([attempts.length, attempts[0].error?.memory_error, attempts[0].error?.retryable, reply],
         [2, false, true, { ok: false, error: 'record_identity_conflict', stage: 'unknown' }]);
       assert.deepEqual([companion.error, stored.text, (await counts('q7')).records],
         ['not_found', 'Teal shutters for the fictional lighthouse.', 1]);

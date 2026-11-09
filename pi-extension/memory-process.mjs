@@ -6,6 +6,8 @@ import { createAtomicOutcomes } from './atomic-outcome.mjs';
 import { catalogCompactRecords, searchCompactRecords } from './compact-retrieval.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
+// The handlers whose failure frames carry `stage`; pass to ndjson serve.
+export const STAGED_METHODS = ['ingest', 'enrich'];
 // Stages a write as bin/memory.mjs does: a failed check wrote nothing; a write failure keeps its own stage, else unknown.
 async function stagedWrite(check, perform) {
   try { await check(); } catch (error) { throw markStage(error, 'before_write'); }

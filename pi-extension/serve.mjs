@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { digest } from '../src/core.mjs';
 import { Memory } from '../src/memory.mjs';
-import { createMemoryHandlers } from './memory-process.mjs';
+import { createMemoryHandlers, STAGED_METHODS } from './memory-process.mjs';
 import { serve } from './ndjson.mjs';
 
 /** Persist an append intent exactly once; an existing intent is an unknown outcome, never permission to retry. */
@@ -38,7 +38,7 @@ export async function main(argv = process.argv.slice(2), { input = process.stdin
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
   const memory = new Memory(config, store);
   const handlers = createMemoryHandlers({ memory, scopes: [scope], beforeAppend: createIntentWriter(intentDir), offerTimeoutMs });
-  try { await serve({ input, output, handlers }); }
+  try { await serve({ input, output, handlers, staged: STAGED_METHODS }); }
   finally { handlers.close(); await memory.close(); }
 }
 
