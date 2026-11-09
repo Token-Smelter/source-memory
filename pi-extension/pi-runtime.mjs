@@ -215,7 +215,9 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
         const startCalls = budget?.started() ?? 0;
         if (budget) {
           if (typeof session.subscribe !== 'function') throw fail('usage_unavailable');
-          session.subscribe(event => { if (event.type === 'turn_end' && event.message?.role === 'assistant') budget.record(event.message.usage); });
+          // Charge each assistant message when it completes, before its tool calls run, so a reviewer call made inside a
+          // tool (a prior-action outcome review) starts with the distiller's usage already recorded.
+          session.subscribe(event => { if (event.type === 'message_end' && event.message?.role === 'assistant') budget.record(event.message.usage); });
         }
         let reviewerCalls = 0;
         const boundedReviewer = reviewer ? { async review(request) {
