@@ -2,14 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Memory } from '../src/memory.mjs';
 import { digest, identity, MemoryError, normalizeEnrichment, RECORD_CONTRACT } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
 import { Neo4jStore } from '../src/store.mjs';
-import { failureReply } from '../bin/memory.mjs';
+import { failureReply, main } from '../bin/memory.mjs';
 import { qualificationCodes, sourceCodes, TRANSPORT_CODES } from './helpers/qualification-codes.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -175,4 +176,88 @@ test('QUALIFICATION.md classifies exactly the codes the CLI transport can raise'
   const documented = qualificationCodes(await readFile(join(root, 'QUALIFICATION.md'), 'utf8'));
   const raised = await sourceCodes(join(root, 'bin/memory.mjs'));
   assert.deepEqual([...documented.keys()].sort(), [...new Set([...raised, ...TRANSPORT_CODES])].sort());
+});
+
+// Runs bin/memory.mjs main in process with a supplied store; returns the reply line the CLI would print.
+async function cliReply(t, command, settings, input, store) {
+  const scratch = await mkdtemp(join(tmpdir(), 'source-memory-qualification-'));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  await writeFile(join(scratch, 'config.json'), JSON.stringify(settings));
+  await writeFile(join(scratch, 'input.json'), JSON.stringify(input));
+  let stdout = '';
+  try {
+    await main([command, '--config', join(scratch, 'config.json'), '--scope', 'fiction', '--input', join(scratch, 'input.json')],
+      { store, stdout: { write: line => { stdout += line; } }, stderr: { write() {} } });
+  } catch (error) { return failureReply(command, error); }
+  return JSON.parse(stdout);
+}
+
+const listed = async kind => [...qualificationCodes(await readFile(join(root, 'QUALIFICATION.md'), 'utf8'))]
+  .filter(([, value]) => value === kind).map(([code]) => code).sort();
+
+// Each post-commit code comes from a real indexing failure after the write and reaches the caller only as indexing.reason
+// in an ok:true reply. Moving a code into or out of post-commit in QUALIFICATION.md fails this test.
+test('every post-commit code is reported inside an ok:true CLI reply after the write', async t => {
+  const hung = [];
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const part of req) body += part;
+    const { model, input } = JSON.parse(body);
+    const vectors = embedding => res.end(JSON.stringify({ model, data: input.map((_, index) => ({ index, embedding })) }));
+    if (req.url === '/down') res.writeHead(503).end();
+    else if (req.url === '/hang') hung.push(res);
+    else if (req.url === '/large') res.end('x'.repeat(8_000_001));
+    else if (req.url === '/other-model') res.end(JSON.stringify({ model: 'other', data: [] }));
+    else if (req.url === '/short') res.end(JSON.stringify({ model, data: [] }));
+    else if (req.url === '/bad-vector') vectors([1]);
+    else vectors([1, 0]);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(done => { for (const res of hung) res.destroy(); server.closeAllConnections(); server.close(done); }));
+  const embedding = (path, extra) => ({ url: `http://127.0.0.1:${server.address().port}${path}`, model: 'fixture', dimensions: 2, ...extra });
+  const cases = [
+    ['model_request_failed', embedding('/down')],
+    ['model_timeout', embedding('/hang', { timeout_ms: 50 })],
+    ['model_response_too_large', embedding('/large')],
+    ['invalid_model_endpoint', embedding('/ok', { url: 'ftp://127.0.0.1/embed' })],
+    ['model_endpoint_must_be_loopback', embedding('/ok', { url: 'http://embedding.example.invalid/embed' })],
+    ['embedding_model_mismatch', embedding('/other-model')],
+    ['invalid_embedding_response', embedding('/short')],
+    ['invalid_embedding', embedding('/bad-vector')],
+    ['database_unavailable', embedding('/ok'), { async saveEmbeddings() { throw new TypeError('driver detail'); } }],
+  ];
+  const exercised = new Set();
+  for (const command of ['ingest', 'enrich']) {
+    for (const [code, settings, override] of cases) {
+      const store = Object.assign(fakeStore({ pending: 1 }), override);
+      const reply = await cliReply(t, command, config({ embedding: settings }), command === 'ingest' ? turn : enrichment, store);
+      assert.deepEqual([reply.ok, reply.indexing, store.writes], [true, { status: 'unavailable', reason: code, source_retained: true }, 1],
+        `${command} ${code}`);
+      exercised.add(code);
+    }
+  }
+  assert.deepEqual([...exercised].sort(), await listed('post-commit'));
+});
+
+// Neither ingest nor enrich raises these; they belong to read commands, init and warm. Pinned so a code cannot move between
+// this class and another without this test changing with it.
+test('QUALIFICATION.md lists exactly the pinned not-on-write-path and stage-dependent codes', async () => {
+  assert.deepEqual(await listed('not-on-write-path'), ['conversation_unavailable', 'embedding_unconfigured', 'index_not_ready',
+    'index_scope_mismatch', 'invalid_rerank_response', 'malformed_reply', 'not_found', 'output_envelope_exceeded',
+    'reranker_model_mismatch', 'source_unavailable', 'vector_index_dimension_mismatch', 'vector_index_quantization_mismatch',
+    'vector_index_schema_mismatch']);
+  assert.deepEqual(await listed('stage-dependent'), ['operation_failed']);
+});
+
+// The outcome is decided before close: a committed write must not become a failure reply because close() rejected.
+test('a close failure after a successful write still gives an ok:true CLI reply', async t => {
+  const indexing = { status: 'unconfigured', indexed: 0 };
+  for (const [command, input, expected] of [
+    ['ingest', turn, { ok: true, id: 'turn_fixture', replayed: false, retained: true, indexing }],
+    ['enrich', enrichment, { ok: true, records: ['lighthouse-teal'], relations: [], indexing }]]) {
+    let closed = 0;
+    const store = Object.assign(fakeStore(), { async close() { closed += 1; throw new Error('driver close failed'); } });
+    assert.deepEqual([await cliReply(t, command, config(), input, store), closed], [expected, 1], command);
+  }
 });

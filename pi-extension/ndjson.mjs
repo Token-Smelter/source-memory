@@ -2,6 +2,9 @@ import { createInterface } from 'node:readline';
 
 const error = code => Object.assign(new Error(code), { code });
 const MAX_LINE = 4_000_000;
+// Write provenance on a failure frame (QUALIFICATION.md): only these values are carried; a frame without one makes no claim.
+const STAGES = ['before_write', 'rolled_back', 'unknown'];
+const staged = value => (STAGES.includes(value?.stage) ? { stage: value.stage } : {});
 
 function write(output, value) {
   const line = JSON.stringify(value);
@@ -29,7 +32,7 @@ export function createClient({ input, output, timeoutMs = 30000 }) {
     let message;
     try { message = JSON.parse(line); } catch { close(); return; }
     if (typeof message?.id !== 'string' || typeof message.ok !== 'boolean') { close(); return; }
-    const problem = message.ok ? null : Object.assign(error(message.error ?? 'request_failed'), { remote_rejection: true });
+    const problem = message.ok ? null : Object.assign(error(message.error ?? 'request_failed'), { remote_rejection: true }, staged(message));
     finish(message.id, problem, message.value);
   });
   function close() {
@@ -84,7 +87,7 @@ export async function serve({ input, output, handlers, signal }) {
       }).then(value => write(output, { id: request.id, ok: true, value }), problem => {
         const code = typeof problem?.code === 'string' && /^[a-z_]+$/.test(problem.code) ? problem.code
           : controller.signal.aborted ? 'request_cancelled' : 'request_failed';
-        write(output, { id: request.id, ok: false, error: code });
+        write(output, { id: request.id, ok: false, error: code, ...staged(problem) });
       }).catch(() => {}).finally(() => active.delete(request.id));
     }
   } finally {

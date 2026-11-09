@@ -157,5 +157,6 @@ The §9.4 table for `memory.remember@2` was written against the defect. With thi
 | `scope_denied` → `unknown` | `scope_denied` is raised only before the write (`stage: before_write`); no post-commit site remains (Q-SM-6) |
 | `evidence_unavailable` … `outcome_referent_required` → `unknown` until Q-SM-3 | Raised before the first `MERGE` and rolled back (Q-SM-3), `stage: rolled_back` |
 | Classification by code | A codec can classify by `stage` alone: `before_write`/`rolled_back` → `no_write`, anything else → `unknown`. That is a new codec version, as §9.4 requires for a reclassification |
+| `record_identity_conflict`, `relation_identity_conflict` | Not covered by that shorthand. With `stage: rolled_back` they are conflicts (the stored record or relation differs), not no-write retries. With `stage: unknown` they are `unknown`, as is every `stage: unknown` reply |
 
 Not covered here: the Agency codec, registry and consumer adapter (§18.1, Memory owner), concurrent original and redispatch deliveries (§9.3, class I only), and the class-I ruling.

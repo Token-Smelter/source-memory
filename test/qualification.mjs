@@ -1,15 +1,40 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
+import { connect, createServer as createTcpServer } from 'node:net';
 import { once } from 'node:events';
 import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { digest, normalizeEnrichment, RECORD_CONTRACT } from '../src/core.mjs';
+import { digest, MemoryError, normalizeEnrichment, RECORD_CONTRACT } from '../src/core.mjs';
+import { Neo4jStore } from '../src/store.mjs';
+import { failureReply, main } from '../bin/memory.mjs';
 import { qualificationCodes } from './helpers/qualification-codes.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const SCOPES = ['q1', 'q2', 'q3', 'q4', 'q5', 'q5-other', 'q6'];
+const SCOPES = ['q1', 'q2', 'q3', 'q4', 'q5', 'q5-other', 'q6', 'q7'];
+
+// A loopback TCP relay to the disposable store whose open connections can be severed, as a network failure would.
+async function severableRelay(uri) {
+  const { hostname, port } = new URL(uri);
+  const sockets = new Set();
+  const server = createTcpServer(client => {
+    const upstream = connect(Number(port), hostname);
+    for (const socket of [client, upstream]) {
+      sockets.add(socket);
+      socket.on('error', () => {});
+      socket.on('close', () => { sockets.delete(socket); client.destroy(); upstream.destroy(); });
+    }
+    client.pipe(upstream).pipe(client);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return {
+    uri: `bolt://127.0.0.1:${server.address().port}`,
+    sever() { for (const socket of sockets) socket.destroy(); },
+    close() { this.sever(); return new Promise(done => server.close(done)); },
+  };
+}
 
 /**
  * Q-SM-1…6 through the real CLI transport: each call is a fresh `node bin/memory.mjs` process against the disposable store.
@@ -111,7 +136,7 @@ export async function runQualification(database, scratch) {
 
   try {
     for (const scope of SCOPES) await ok('base', 'init', scope);
-    for (const scope of ['q1', 'q2', 'q3', 'q4', 'q6']) sources[scope] = (await ok('base', 'ingest', scope, fixtureTurn())).id;
+    for (const scope of ['q1', 'q2', 'q3', 'q4', 'q6', 'q7']) sources[scope] = (await ok('base', 'ingest', scope, fixtureTurn())).id;
 
     await check('Q-SM-1 the same record id and normalized record twice give one record and success both times', async () => {
       const turn = sources.q1;
@@ -279,6 +304,45 @@ export async function runQualification(database, scratch) {
       assert.ok(staged.every(stage => ['before_write', 'rolled_back', 'unknown'].includes(stage)) && staged.length > 0);
       return { pre_commit: deniedEnrich.reply, rolled_back: rolledBack.reply,
         post_commit: { ok: true, indexing: committed.reply.indexing }, staged_failures: staged.length };
+    });
+
+    await check('Q-SM-6 a refusal raised after a real driver retry carries stage unknown', async () => {
+      const turn = sources.q7;
+      const relay = await severableRelay(database.uri);
+      const store = new Neo4jStore({ ...database, uri: relay.uri });
+      // The real executeWrite runs every attempt. Attempt 1 runs its first statement, then loses its connection before
+      // commit; between attempts another writer commits the same record id with other bytes, so only the retry conflicts.
+      const realTransaction = store.transaction.bind(store);
+      const attempts = [];
+      store.transaction = (mode, action) => realTransaction(mode, async tx => {
+        attempts.push({ attempt: attempts.length + 1 });
+        if (attempts.length > 1) {
+          await ok('base', 'enrich', 'q7', { records: [record('q7-retried', turn)], relations: [] });
+          return action(tx);
+        }
+        let severed = false;
+        const run = async (...args) => {
+          const result = await tx.run(...args);
+          if (!severed) { severed = true; relay.sever(); }
+          return result;
+        };
+        try { return await action({ run }); }
+        catch (error) { attempts[0].error = { memory_error: error instanceof MemoryError, code: error.code, retriable: error.retriable }; throw error; }
+      });
+      const input = await file({ records: [record('q7-companion', turn),
+        record('q7-retried', turn, { text: 'Amber shutters for the fictional lighthouse.' })], relations: [] });
+      let reply;
+      try {
+        await main(['enrich', '--config', configs.base, '--scope', 'q7', '--input', input],
+          { store, stdout: { write: line => { reply = JSON.parse(line); } }, stderr: { write() {} } });
+      } catch (error) { reply = failureReply('enrich', error); } finally { await relay.close(); }
+      const companion = (await show('q7', 'record', 'q7-companion')).reply;
+      const stored = (await show('q7', 'record', 'q7-retried')).reply.record;
+      assert.deepEqual([attempts.length, attempts[0].error?.memory_error, attempts[0].error?.retriable, reply],
+        [2, false, true, { ok: false, error: 'record_identity_conflict', stage: 'unknown' }]);
+      assert.deepEqual([companion.error, stored.text, (await counts('q7')).records],
+        ['not_found', 'Teal shutters for the fictional lighthouse.', 1]);
+      return { attempts, reply, retry_rolled_back: true };
     });
     return results;
   } finally {

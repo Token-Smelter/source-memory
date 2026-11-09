@@ -1,11 +1,16 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { normalizeEnrichment } from '../src/core.mjs';
+import { markStage, normalizeEnrichment } from '../src/core.mjs';
 import * as defaultLinks from '../src/link-proposals.mjs';
 import { searchDerived, resolveDerived, searchRaw } from './derived-retrieval.mjs';
 import { createAtomicOutcomes } from './atomic-outcome.mjs';
 import { catalogCompactRecords, searchCompactRecords } from './compact-retrieval.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
+// Stages a write as bin/memory.mjs does: a failed check wrote nothing; a write failure keeps its own stage, else unknown.
+async function stagedWrite(check, perform) {
+  try { await check(); } catch (error) { throw markStage(error, 'before_write'); }
+  try { return await perform(); } catch (error) { throw markStage(error, 'unknown'); }
+}
 const deferred = () => {
   let resolve, reject;
   const promise = new Promise((accept, refuse) => { resolve = accept; reject = refuse; });
@@ -50,9 +55,10 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       try { return await flight; } finally { if (indexing === flight) indexing = null; }
     },
     async ingest({ scope, turn }) {
-      allowed(scope);
-      if (turn?.source !== 'pi-memory') throw fail('source_invalid');
-      return memory.ingest(scope, turn);
+      return stagedWrite(() => {
+        allowed(scope);
+        if (turn?.source !== 'pi-memory') throw fail('source_invalid');
+      }, () => memory.ingest(scope, turn));
     },
     async recall({ scope, input, trigger }) {
       allowed(scope);
@@ -146,13 +152,15 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
     async resolveDerived({ scope, input }) { allowed(scope); return resolveDerived(memory, scope, input); },
     async searchRaw({ scope, input }) { allowed(scope); return searchRaw(memory, scope, input); },
     async enrich({ scope, input, trigger }) {
-      allowed(scope);
-      const normalized = normalizeEnrichment(input);
-      if (normalized.relations.length || normalized.records.some(record => record.status !== 'proposed')) throw fail('raw_link_refused');
-      if (typeof trigger !== 'string' || !trigger || normalized.records.some(record => record.evidence.some(span => span.turn !== trigger))) throw fail('record_not_from_trigger');
-      const shown = await memory.show(scope, { kind: 'turn', id: trigger });
-      if (shown?.turn?.source !== 'pi-memory') throw fail('source_invalid');
-      return memory.enrich(scope, normalized);
+      let normalized;
+      return stagedWrite(async () => {
+        allowed(scope);
+        normalized = normalizeEnrichment(input);
+        if (normalized.relations.length || normalized.records.some(record => record.status !== 'proposed')) throw fail('raw_link_refused');
+        if (typeof trigger !== 'string' || !trigger || normalized.records.some(record => record.evidence.some(span => span.turn !== trigger))) throw fail('record_not_from_trigger');
+        const shown = await memory.show(scope, { kind: 'turn', id: trigger });
+        if (shown?.turn?.source !== 'pi-memory') throw fail('source_invalid');
+      }, () => memory.enrich(scope, normalized));
     },
     async beginLinks({ scope, turn, record_ids, candidate_handles, review_contract }, { signal } = {}) {
       allowed(scope);
