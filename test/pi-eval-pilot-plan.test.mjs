@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPilotPlan, createCitedPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { createPilotPlan, createCitedPilotPlan, TREATMENTS } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { ANSWERER_CITED_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
 import { fictionalCase, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
 import { verifySeal } from '../pi-extension/evaluation/seal.mjs';
@@ -27,5 +27,8 @@ test('fresh cited plan seals grounded scorer and leaves candidate and model rout
     legacy.scorer.route, legacy.scorer.model, 'scorer-r2-v3-grounded', 'answerer-cited-evidence-v1', 'semantic-rubric-v2-citation-grounded']);
   assert.throws(() => createCitedPilotPlan({ ...options, resume: {} }), /resume_transition_forbidden/);
   assert.deepEqual([cited.toolCallReviewSha256, cited.designSha256], ['f'.repeat(64), '5b0c1fc1d3a94117c9518b8180b7587551514460ec0c9e47a35275063c5eaa6e']);
+  const d0 = createCitedPilotPlan({ ...options, treatment: TREATMENTS.D0 }).spec;
+  assert.deepEqual([Object.hasOwn(cited, 'treatment'), d0.treatment.retrieval], [false, 'oracle-catalog']);
+  assert.throws(() => createCitedPilotPlan({ ...options, treatment: { ...TREATMENTS.D0, retrieval: 'search' } }), /pilot_plan_invalid/);
   assert.throws(() => createCitedPilotPlan({ ...options, toolCallReviewSha256: undefined }), /pilot_plan_invalid/);
 });

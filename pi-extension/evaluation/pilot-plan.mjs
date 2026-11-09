@@ -15,6 +15,11 @@ const scorerInstructions = 'Judge each asserted answer or action clause against 
 const answerInstructions = 'Answer the user using only the permitted retrieval tools. Preserve source attribution, authority, scope, time and uncertainty. If the returned information is insufficient, say so. Do not perform external actions.';
 const groundedScorerInstructions = 'Judge each asserted answer or action clause against the supplied reference packet and the answerer’s own cited evidence using the frozen rubric. Support passes only when both support a factual clause; a correct guess with irrelevant cited evidence fails. Factual support graded pass or uncertain requires citationIds containing supplied citation_id values. Preserve uncertainty and do not omit unsupported additions. Submit clauses with id, text, requirementIds, sourceIds, citationIds, abstention, action, judgments for support/authority/scope/time/uncertainty, alternative and relation. For the exact canonical unknown with no citations, an abstention clause may have abstention=true, the exact answer text, action=false, no relation and empty citationIds; use reference sourceIds to judge any explicit uncertainty requirement. Do not assign an abstention to any requirement when the packet is answerable. All factual clauses have abstention=false. For an alternative use a reference-source-linked rationale. For a required relationship use required, recoverable and returned itemIds.' + SCORER_FORMAT_SUFFIX;
 
+/** Sealed treatment surfaces; a run without one is the baseline. */
+export const TREATMENTS = Object.freeze({
+  // D0's oracle is the candidate's own earlier store in the run's scope, not the reference catalog.
+  D0: Object.freeze({ id: 'D0', surface: 'distiller retrieval', retrieval: 'oracle-catalog', catalog: 'candidate-store-in-scope', product: false }),
+});
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
 /** Runtime paths whose change can alter candidate behavior; each changed one must be named as reviewed. */
 export const RUNTIME_PATH = /^(?:(?:src|pi-extension|config|scripts)\/|package(?:-lock)?\.json$)/;
@@ -115,6 +120,10 @@ export function createCitedPilotPlan(options) {
   const settings = structuredClone(createPilotPlan(options).spec);
   settings.toolCallReviewSha256 = options.toolCallReviewSha256;
   settings.designSha256 = DESIGN_SHA256;
+  if (options.treatment !== undefined && options.treatment !== null) {
+    if (!TREATMENTS[options.treatment?.id] || JSON.stringify(options.treatment) !== JSON.stringify(TREATMENTS[options.treatment.id])) throw fail('pilot_plan_invalid');
+    settings.treatment = structuredClone(options.treatment);
+  }
   settings.answerer.version = 'answerer-r2-v5';
   settings.answerer.citationProtocol = CITATION_PROTOCOL;
   settings.answerer.instructions += ANSWERER_CITATION_SUFFIX;
