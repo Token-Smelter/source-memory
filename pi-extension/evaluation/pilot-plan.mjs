@@ -17,7 +17,8 @@ const groundedScorerInstructions = 'Judge each asserted answer or action clause 
 
 /** Sealed treatment surfaces; a run without one is the baseline. */
 export const TREATMENTS = Object.freeze({
-  D0: Object.freeze({ id: 'D0', surface: 'distiller retrieval', retrieval: 'oracle-catalog', product: false }),
+  // D0's oracle is the candidate's own earlier store in the run's scope, not the reference catalog.
+  D0: Object.freeze({ id: 'D0', surface: 'distiller retrieval', retrieval: 'oracle-catalog', catalog: 'candidate-store-in-scope', product: false }),
 });
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
 /** Runtime paths whose change can alter candidate behavior; each changed one must be named as reviewed. */

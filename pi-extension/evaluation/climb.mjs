@@ -149,7 +149,7 @@ export function runExport({ treatment, seal, report, reportSha256, graph, answer
   if (seal?.digest !== report?.seal_sha256 || report.coverage?.status !== 'complete' || !report.scorecard?.deltas
     || !/^[a-f0-9]{64}$/.test(reportSha256 ?? '')) throw fail('run_unqualified');
   // The export label must agree with the sealed treatment; an unsealed run is a baseline.
-  if (seal.spec.treatment ? !treatment.startsWith(seal.spec.treatment.id) : /^(D|T)\d/.test(treatment)) throw fail('treatment_label_mismatch');
+  if (seal.spec.treatment ? !(treatment === seal.spec.treatment.id || treatment.startsWith(`${seal.spec.treatment.id}-`)) : /^(D|T)\d/.test(treatment)) throw fail('treatment_label_mismatch');
   const sourceKey = Object.keys(DEV_REFERENCES).find(key => DEV_REFERENCES[key].source_sha256 === seal.spec.sourceSha256);
   assertDevelopmentSource(sourceKey, seal.spec.sourceSha256);
   const dispositions = report.coverage.dispositions;
