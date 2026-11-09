@@ -1,6 +1,6 @@
 import {
   authorize, authorizeTarget, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
-  normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, requireThat, sourceExcerpt, text,
+  digest, normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, RECORD_KINDS, RECORD_STATUSES, requireThat, sourceExcerpt, text,
 } from './core.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, embeddingIdentity, rerank } from './models.mjs';
@@ -164,6 +164,57 @@ export class Memory {
     const record = await this.store.getRecord(scope, id);
     requireThat(record, 'not_found');
     return { kind: 'record', record, evidence: await this.evidence(scope, record.evidence) };
+  }
+
+  /**
+   * Exact enumeration of turns and records over one scope or a subtree, newest first by retention order, keyset-paged.
+   * A full walk returns every item committed before its first page exactly once. Turns are fixed-size headers; a record too
+   * large for `max_bytes` alone is named by a stub and the walk moves past it.
+   */
+  async list(scope, input = {}) {
+    const target = authorizeTarget(this.config, scope);
+    requireThat(input && typeof input === 'object' && !Array.isArray(input)
+      && Object.keys(input).every(key => LIST_KEYS.includes(key)), 'invalid_input');
+    const kind = input.kind === undefined ? null : text(input.kind, 32);
+    requireThat(kind === null || kind === 'turn' || RECORD_KINDS.includes(kind), 'invalid_kind');
+    const status = input.status === undefined ? null : text(input.status, 32);
+    requireThat(status === null || (kind !== 'turn' && RECORD_STATUSES.includes(status)), 'invalid_input');
+    const source = input.source === undefined ? null : text(input.source, 256);
+    const conversation = input.conversation_id === undefined ? null : text(input.conversation_id, 256);
+    const limit = integer(input.limit, 16, 1, 64);
+    const maxBytes = integer(input.max_bytes, 65536, 4096, 1_000_000);
+    const binding = digest(['source-memory.list/1', scope, kind, status, source, conversation]).slice(0, 32);
+    let after = input.cursor === undefined ? null : decodeCursor(input.cursor, binding);
+    // A status filter names a record field, so it selects records only.
+    const wants = { turns: kind === 'turn' || (kind === null && status === null), records: kind !== 'turn' };
+    const matches = row => {
+      if (row.type === 'turn') return (source === null || row.header.source === source) && (conversation === null || row.header.conversation_id === conversation);
+      return (kind === null || row.body.kind === kind) && (status === null || row.body.status === status)
+        && ((source === null && conversation === null) || row.evidence.some(key => (source === null || key.source === source)
+          && (conversation === null || key.conversation_id === conversation)));
+    };
+    const items = [];
+    let last = null;
+    while (items.length < limit) {
+      const batch = await this.store.listBatch(target, { ...wants, after, limit: LIST_BATCH });
+      for (const row of batch) {
+        after = { at: row.at, uid: row.uid };
+        const parsed = listRow(row);
+        if (!matches(parsed)) continue;
+        const item = listItem(parsed);
+        const size = Buffer.byteLength(JSON.stringify([...items, item]));
+        if (size > maxBytes) {
+          if (items.length) return listPage(scope, items, last, binding);
+          const stub = { kind: item.kind, scope: item.scope, id: item.id, stored_at: item.stored_at,
+            bytes: Buffer.byteLength(JSON.stringify(item)), content_omitted: 'max_bytes' };
+          items.push(stub);
+        } else items.push(item);
+        last = after;
+        if (items.length === limit) return listPage(scope, items, last, binding);
+      }
+      if (batch.length < LIST_BATCH) return listPage(scope, items, null, binding);
+    }
+    return listPage(scope, items, last, binding);
   }
 
   // Which of a caller's candidate keys already names a stored turn. More than one is reported, never resolved here.
@@ -619,6 +670,51 @@ const vectorHits = (kind, nodes, withScope = false) => nodes.map(row => kind ===
   kind: 'turn', id: row.turn_uid, text: row.text, ...(withScope ? { scope: row.scope } : {}),
   match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
 } : { kind: 'record', id: row.record_id, text: row.text, ...(withScope ? { scope: row.scope } : {}) });
+
+const LIST_KEYS = ['kind', 'status', 'source', 'conversation_id', 'limit', 'max_bytes', 'cursor'];
+const LIST_BATCH = 128;
+
+const encodeCursor = (binding, key) => Buffer.from(JSON.stringify({ v: 1, q: binding, at: key.at, uid: key.uid })).toString('base64url');
+
+// A cursor resumes only the request that issued it: same selection and filters.
+function decodeCursor(value, binding) {
+  text(value, 2048);
+  let cursor;
+  try { cursor = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); } catch { cursor = null; }
+  requireThat(cursor && cursor.v === 1 && cursor.q === binding && typeof cursor.at === 'string' && cursor.at.length <= 64
+    && typeof cursor.uid === 'string' && cursor.uid.length <= 128, 'invalid_input');
+  return { at: cursor.at, uid: cursor.uid };
+}
+
+const listPage = (scope, items, last, binding) => ({ kind: 'list', scope, order: 'stored_desc', items,
+  next_cursor: last === null ? null : encodeCursor(binding, last) });
+
+// Turn headers come from the stored envelope; a body this store did not write falls back to the node's own properties.
+function listRow(row) {
+  if (row.type === 'record') return { ...row, body: JSON.parse(row.body), evidence: row.evidence.map(key => {
+    if (key.header === null) return key;
+    const header = parseHeader(key.header);
+    return { source: key.source ?? header?.source ?? null, conversation_id: key.conversation_id ?? header?.conversation_id ?? null };
+  }) };
+  return { ...row, header: parseHeader(row.header) ?? {} };
+}
+
+function parseHeader(value) {
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+function listItem(row) {
+  const stored = row.untimed ? null : row.at;
+  if (row.type === 'turn') {
+    const header = row.header;
+    return { kind: 'turn', scope: row.scope, id: row.uid, source: header.source ?? null, conversation_id: header.conversation_id ?? null,
+      turn_id: header.turn_id ?? null, parent_turn_id: header.parent_turn_id ?? null, occurred_at: header.occurred_at ?? null,
+      stored_at: stored, entry_count: row.entry_count };
+  }
+  const record = row.body;
+  return { kind: 'record', scope: row.scope, id: record.id, record_kind: record.kind, status: record.status, text: record.text,
+    attribution: record.attribution, evidence: record.evidence, stored_at: stored };
+}
 
 const CHANNEL_KINDS = { turn_lexical: 'turn', chunk_lexical: 'chunk', record_lexical: 'record', chunk_vector: 'chunk', record_vector: 'record' };
 

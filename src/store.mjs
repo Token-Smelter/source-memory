@@ -26,6 +26,8 @@ const eligible = n => `(size($exclude) = 0
 // Above this many eligible tree vectors a read uses the shared ANN index; at or below it, an exact cosine scan.
 export const TREE_SCAN_LIMIT = 4096;
 const TREE_BACKFILL = { batch: 1000, batches: 50 };
+// `list` orders a node written without `created_at` (by a writer other than this store) as this instant.
+export const LIST_EPOCH = '0001-01-01T00:00:00Z';
 
 /**
  * Where a read looks. A flat scope (depth 1 or a non-path name) keeps its own labels and indexes and the exact `scope`
@@ -712,6 +714,33 @@ export class Neo4jStore {
       const top = row.get('top');
       requireThat(top.every(node => sel.owns(node.scope)), 'index_scope_mismatch');
       return { nodes: top, uids: row.get('uids') };
+    });
+  }
+
+  /**
+   * One batch of turns and records of a selection, newest first by (created_at, uid) and strictly after `after`. A node
+   * written without `created_at` sorts as the oldest instant. Turns return only their envelope header (the body before its
+   * entries) and entry count, never their text; records return their body and the source keys of their evidence turns.
+   */
+  async listBatch(target, { turns, records, after, limit }) {
+    const sel = selection(target);
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`CALL {
+          MATCH (n:SMTurn) WHERE $turns AND ${sel.where('n')} RETURN n, 'turn' AS type
+          UNION ALL
+          MATCH (n:SMRecord) WHERE $records AND ${sel.where('n')} RETURN n, 'record' AS type
+        }
+        WITH n, type, coalesce(n.created_at, datetime($epoch)) AS at
+        WHERE $after IS NULL OR at < datetime($after.at) OR (at = datetime($after.at) AND n.uid < $after.uid)
+        WITH n, type, at ORDER BY at DESC, n.uid DESC LIMIT $limit
+        RETURN n.uid AS uid, type, toString(at) AS at, n.created_at IS NULL AS untimed, n.scope AS scope,
+          CASE WHEN type = 'turn' THEN split(n.body, ',"entries":')[0] + '}' END AS header,
+          CASE WHEN type = 'turn' THEN size(split(n.body, '{"id":"')) - 1 END AS entry_count,
+          CASE WHEN type = 'record' THEN n.body END AS body,
+          CASE WHEN type = 'record' THEN [(n)-[:SM_EVIDENCE]->(t:SMTurn) | {source: t.source, conversation_id: t.conversation_id,
+            header: CASE WHEN t.source IS NULL OR t.conversation_id IS NULL THEN split(t.body, ',"entries":')[0] + '}' END}] END AS evidence`,
+      { ...sel.params, turns, records, after, epoch: LIST_EPOCH, limit: neo4j.int(limit) });
+      return result.records.map(row => row.toObject());
     });
   }
 

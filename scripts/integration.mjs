@@ -9,6 +9,7 @@ import neo4j from 'neo4j-driver';
 import { runIntegration } from '../test/integration.mjs';
 import { runQualification } from '../test/qualification.mjs';
 import { runNestedScopes } from '../test/nested-scopes.mjs';
+import { runList } from '../test/list-integration.mjs';
 import { integrationResources } from './integration-resources.mjs';
 
 const exec = promisify(execFile);
@@ -75,7 +76,7 @@ try {
   if (!ready) throw new Error('private Neo4j did not become ready');
   const database = { uri, auth: 'none', database: 'neo4j' };
   // Nested scopes run first: the flat integration checks then also run beside existing root trees.
-  if (suite !== 'qualification') results = await runNestedScopes(database, scratch);
+  if (suite !== 'qualification') results = [...await runNestedScopes(database, scratch), ...await runList(database, scratch)];
   if (suite === 'all') results = [...results, ...await runIntegration(database, scratch)];
   if (suite !== 'scopes') results = [...results, ...await runQualification(database, scratch)];
 } catch (error) {
