@@ -27,7 +27,7 @@ const eligible = n => `(size($exclude) = 0
 export const TREE_SCAN_LIMIT = 4096;
 const TREE_BACKFILL = { batch: 1000, batches: 50 };
 // `list` orders a node written without `created_at` (by a writer other than this store) as this instant.
-export const LIST_EPOCH = '0001-01-01T00:00:00Z';
+const LIST_EPOCH = '0001-01-01T00:00:00Z';
 
 /**
  * Where a read looks. A flat scope (depth 1 or a non-path name) keeps its own labels and indexes and the exact `scope`
@@ -717,29 +717,41 @@ export class Neo4jStore {
     });
   }
 
+
   /**
-   * One batch of turns and records of a selection, newest first by (created_at, uid) and strictly after `after`. A node
-   * written without `created_at` sorts as the oldest instant. Turns return only their envelope header (the body before its
-   * entries) and entry count, never their text; records return their body and the source keys of their evidence turns.
+   * One page of a selection's turns and records, newest first by (created_at, uid), strictly after `after`, filtered
+   * inside the query so its limit counts matches only. A node without a datetime `created_at` sorts as the oldest
+   * instant. Record kind and status, and a legacy turn's source keys, are matched in the stored JSON body: this store
+   * writes those keys in a fixed order and escapes every quote inside a value, so the anchored patterns can match only
+   * the top-level key. Turns return their envelope header (the body before its entries) and entry count, not their text.
    */
-  async listBatch(target, { turns, records, after, limit }) {
+  async listPage(target, { turns, records, kind = null, status = null, source = null, conversation = null, after = null, limit }) {
     const sel = selection(target);
+    const keys = t => `($source IS NULL OR CASE WHEN ${t}.source IS NULL THEN ${t}.body STARTS WITH $sourceBody ELSE ${t}.source = $source END)
+      AND ($conversation IS NULL OR CASE WHEN ${t}.conversation_id IS NULL THEN ${t}.body CONTAINS $conversationBody ELSE ${t}.conversation_id = $conversation END)`;
     return this.transaction('read', async tx => {
       const result = await tx.run(`CALL {
-          MATCH (n:SMTurn) WHERE $turns AND ${sel.where('n')} RETURN n, 'turn' AS type
+          MATCH (n:SMTurn) WHERE $turns AND ${sel.where('n')} AND ${keys('n')} RETURN n, 'turn' AS type
           UNION ALL
-          MATCH (n:SMRecord) WHERE $records AND ${sel.where('n')} RETURN n, 'record' AS type
+          MATCH (n:SMRecord) WHERE $records AND ${sel.where('n')}
+            AND ($kind IS NULL OR n.body CONTAINS $kind) AND ($status IS NULL OR n.body CONTAINS $status)
+            AND (($source IS NULL AND $conversation IS NULL) OR EXISTS { MATCH (n)-[:SM_EVIDENCE]->(t:SMTurn) WHERE ${keys('t')} })
+          RETURN n, 'record' AS type
         }
-        WITH n, type, coalesce(n.created_at, datetime($epoch)) AS at
+        WITH n, type, n.created_at IS :: ZONED DATETIME NOT NULL AS timed
+        WITH n, type, timed, CASE WHEN timed THEN n.created_at ELSE datetime($epoch) END AS at
         WHERE $after IS NULL OR at < datetime($after.at) OR (at = datetime($after.at) AND n.uid < $after.uid)
-        WITH n, type, at ORDER BY at DESC, n.uid DESC LIMIT $limit
-        RETURN n.uid AS uid, type, toString(at) AS at, n.created_at IS NULL AS untimed, n.scope AS scope,
+        WITH n, type, timed, at ORDER BY at DESC, n.uid DESC LIMIT $limit
+        RETURN n.uid AS uid, type, toString(at) AS at, NOT timed AS untimed, n.scope AS scope,
           CASE WHEN type = 'turn' THEN split(n.body, ',"entries":')[0] + '}' END AS header,
           CASE WHEN type = 'turn' THEN size(split(n.body, '{"id":"')) - 1 END AS entry_count,
-          CASE WHEN type = 'record' THEN n.body END AS body,
-          CASE WHEN type = 'record' THEN [(n)-[:SM_EVIDENCE]->(t:SMTurn) | {source: t.source, conversation_id: t.conversation_id,
-            header: CASE WHEN t.source IS NULL OR t.conversation_id IS NULL THEN split(t.body, ',"entries":')[0] + '}' END}] END AS evidence`,
-      { ...sel.params, turns, records, after, epoch: LIST_EPOCH, limit: neo4j.int(limit) });
+          CASE WHEN type = 'turn' THEN {source: n.source, conversation_id: n.conversation_id, turn_id: n.turn_key, parent_turn_id: n.parent_turn_id} END AS properties,
+          CASE WHEN type = 'record' THEN n.body END AS body`,
+      { ...sel.params, turns, records, after, epoch: LIST_EPOCH, limit: neo4j.int(limit),
+        kind: kind === null ? null : `,"kind":${JSON.stringify(kind)},"text":`,
+        status: status === null ? null : `,"status":${JSON.stringify(status)},"attribution":`,
+        source, sourceBody: source === null ? null : `{"source":${JSON.stringify(source)},"conversation_id":`,
+        conversation, conversationBody: conversation === null ? null : `,"conversation_id":${JSON.stringify(conversation)},"turn_id":` });
       return result.records.map(row => row.toObject());
     });
   }

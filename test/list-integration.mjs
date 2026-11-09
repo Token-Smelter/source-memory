@@ -3,6 +3,7 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Memory } from '../src/memory.mjs';
 import { identity } from '../src/core.mjs';
+import { fileURLToPath } from 'node:url';
 import { main } from '../bin/memory.mjs';
 
 const turn = (conversation, id, parent = null) => ({ source: 'list-fixture', conversation_id: conversation, turn_id: id,
@@ -25,7 +26,7 @@ const ids = pages => pages.flatMap(page => page.items.map(item => `${item.scope}
 export async function runList(database, scratch = null) {
   const results = [];
   const check = async (name, fn) => { await fn(); results.push({ name, pass: true }); console.log(`PASS ${name}`); };
-  const grants = ['lst', 'lst/**', 'lst/a b'];
+  const grants = ['lst', 'lst/**', 'lst/a b', 'tie', 'legacy'];
   const config = { neo4j: database, scopes: { read: grants, write: grants } };
   const memory = new Memory(config);
   const seed = async (scope, conversation, turnIds, records = []) => {
@@ -90,20 +91,63 @@ export async function runList(database, scratch = null) {
       assert.deepEqual([items.at(-1).id, items.at(-1).stored_at, items.at(-1).turn_id], [uid, null, 'old']);
     });
 
-    await check('the CLI lists a subtree from a file or empty input and refuses a foreign cursor', async () => {
+    await check('items sharing a write time, and untimed items, page one at a time in descending uid order', async () => {
+      const raw = (uid, createdAt) => memory.store.transaction('write', tx => tx.run(`CREATE (t:SMTurn {uid:$uid, scope:'tie', hash:'h',
+        body:'{"source":"tie","conversation_id":"c","turn_id":"x","parent_turn_id":null,"occurred_at":null,"entries":[]}', text:'',
+        lineage:true, source:'tie', conversation_id:'c', turn_key:$uid}) SET t.created_at = $at`, { uid, at: createdAt }));
+      for (const uid of ['turn_t1', 'turn_t3', 'turn_t2']) await memory.store.transaction('write', tx => tx.run(`CREATE (t:SMTurn {uid:$uid, scope:'tie',
+        hash:'h', body:'{}', text:'', source:'tie', conversation_id:'c', turn_key:$uid, created_at: datetime('2026-02-03T04:05:06.007Z')})`, { uid }));
+      await raw('turn_u1', null);
+      await raw('turn_u2', 'not a datetime');
+      const pages = await walk(memory, 'tie', { limit: 1 });
+      assert.deepEqual(ids(pages), ['tie:turn_t3', 'tie:turn_t2', 'tie:turn_t1', 'tie:turn_u2', 'tie:turn_u1']);
+      assert.deepEqual(pages.flatMap(page => page.items.map(item => item.stored_at)),
+        ['2026-02-03T04:05:06.007Z', '2026-02-03T04:05:06.007Z', '2026-02-03T04:05:06.007Z', null, null]);
+    });
+
+    await check('source filters match a legacy turn and a record citing it through the stored envelope', async () => {
+      const uid = identity('turn', 'legacy', 'list-fixture', 'c-legacy', 'old');
+      const body = JSON.stringify({ source: 'list-fixture', conversation_id: 'c-legacy', turn_id: 'old', parent_turn_id: null, occurred_at: null,
+        entries: [{ id: 'u', role: 'user', text: 'A "quoted" ,"conversation_id":"c-other","turn_id": decoy.', occurred_at: null }] });
+      await memory.store.transaction('write', tx => tx.run(`CREATE (t:SMTurn {uid:$uid, scope:'legacy', hash:'h', body:$body, text:'legacy',
+        created_at: datetime()})`, { uid, body }));
+      await memory.enrich('legacy', { records: [{ id: 'legacy-d', kind: 'decision', text: 'Fictional legacy decision.', attribution: 'fixture',
+        evidence: [{ turn: uid, entry_id: 'u', start: 0, end: 5 }] }], relations: [] });
+      assert.deepEqual(ids(await walk(memory, 'legacy', { conversation_id: 'c-legacy' })), ['legacy:legacy-d', `legacy:${uid}`]);
+      assert.deepEqual(ids(await walk(memory, 'legacy', { source: 'list-fixture', kind: 'decision' })), ['legacy:legacy-d']);
+      assert.deepEqual(ids(await walk(memory, 'legacy', { conversation_id: 'c-other' })), [], 'quoted text inside an entry never matches');
+      const legacyTurn = (await memory.list('legacy', { kind: 'turn' })).items[0];
+      assert.deepEqual([legacyTurn.source, legacyTurn.conversation_id, legacyTurn.turn_id, legacyTurn.entry_count], ['list-fixture', 'c-legacy', 'old', 1]);
+    });
+
+    await check('the CLI lists with or without --input, never waits on stdin, and refuses a foreign cursor', async () => {
       if (!scratch) return;
       const configPath = join(scratch, 'list-config.json');
       await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });
       const run = async (scope, input) => {
-        const inputPath = join(scratch, 'list-input.json');
-        await writeFile(inputPath, JSON.stringify(input), { mode: 0o600 });
+        const args = ['list', '--config', configPath, '--scope', scope];
+        if (input !== undefined) {
+          const inputPath = join(scratch, 'list-input.json');
+          await writeFile(inputPath, JSON.stringify(input), { mode: 0o600 });
+          args.push('--input', inputPath);
+        }
         let out = '';
-        await main(['list', '--config', configPath, '--scope', scope, '--input', inputPath], { stdout: { write: chunk => { out += chunk; } } });
+        await main(args, { stdout: { write: chunk => { out += chunk; } } });
         return JSON.parse(out);
       };
       const reply = await run('lst/**', { kind: 'episode', limit: 1 });
       assert.deepEqual([reply.ok, reply.kind, reply.items.length, typeof reply.next_cursor], [true, 'list', 1, 'string']);
       await assert.rejects(run('lst', { cursor: reply.next_cursor }), { code: 'invalid_input' });
+      assert.equal((await run('lst/**')).items.length, 12, 'no --input lists with defaults');
+      const { execFile } = await import('node:child_process');
+      const started = Date.now();
+      const child = await new Promise((resolve, reject) => {
+        const proc = execFile(process.execPath, [fileURLToPath(new URL('../bin/memory.mjs', import.meta.url)), 'list', '--config', configPath, '--scope', 'lst'],
+          { timeout: 20000 }, (error, stdout) => error ? reject(error) : resolve(stdout));
+        proc.stdin.write('');
+      });
+      assert.equal(JSON.parse(child).kind, 'list');
+      assert.ok(Date.now() - started < 20000, 'an open stdin pipe does not block list');
     });
   } finally { await memory.close(); }
   return results;

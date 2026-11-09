@@ -85,7 +85,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `show` | `{"kind":"units","units":[{"key":{"scope":"...","source":"...","conversation_id":"..."},"seeds":[{"kind":"turn"\|"record","id":"..."}]}],"follow":{}}` | Recheck up to 4 units of up to 20 exact seeds each, optionally folding following; no ranking or exclusion |
 | `show` | `{"kind":"following","turn":"<turn id>","limit":2}` | Later turns of the same conversation by exact `parent_turn_id` links (see below) |
 | `show` | `{"kind":"turn_by_key","source":"...","conversation_id":"...","turn_ids":["..."]}` | Which of up to 16 caller turn keys already name stored turns (`found`, in request order); for callers that must reuse an existing identity |
-| `list` | Optional `{"kind","status","source","conversation_id","limit","max_bytes","cursor"}` | Exact enumeration of turns and records over a scope or `'S/**'`, newest first, keyset-paged (below) |
+| `list` | Optional `--input` `{"kind","status","source","conversation_id","limit","max_bytes","cursor"}`; never reads stdin | Exact enumeration of turns and records over a scope or `'S/**'`, newest first, keyset-paged (below) |
 | `status` | None | Counts, unindexed items, configured models, and `store` (`system`, `database_id`, `database`, `record_contract`) naming the physical store and the record-contract version |
 | `warm` | None | Sends one fixed embedding request (no memory text) through the configured `embedding` endpoint, never connecting to Neo4j or writing, and returns `{warm:{model,embedding_key,ms}}`, or `{warm:{status:"unconfigured"}}` with no request. It keeps a local embedding model resident: that consumes shared model memory on the endpoint, so callers should schedule it only while recall is in use |
 | `warm --db v1` | None | Opt-in database warm-up (below). Needs read authorization for `--scope`; makes no model call and no write |
@@ -185,15 +185,15 @@ Every root segment has its own tree: labels `SMTree<d>Turn`, `SMTree<d>Chunk`, `
 
 | Rule | Behaviour |
 |---|---|
-| Order | Newest first by `(stored_at, uid)`. Every item carries `stored_at`, its write time, as per-item freshness; it is outside the record body and hash. `stored_at` is the store's write-time `created_at` (Neo4j statement clock, nanosecond precision); equal times are ordered by uid. A node without it sorts last with `stored_at: null` |
-| Exactness | A full walk returns every item committed before its first page exactly once; an item committed during the walk appears at most once. There is no `since`/`until`: the statement clock does not follow commit order, so a time window could miss an item |
+| Order | Newest first by `(stored_at, uid)`. Every item carries `stored_at`, its write time, as per-item freshness; it is outside the record body and hash. `stored_at` is the store's write-time `created_at` (Neo4j statement clock, stamped in milliseconds and compared exactly); equal times are common and are ordered by uid. A node without it sorts last with `stored_at: null` |
+| Exactness | A full walk returns every item committed before its first page exactly once; an item committed during the walk appears at most once. There is no `since`/`until`: the statement clock does not follow commit order, so a time window could miss an item. Exactness assumes every page reads the same up-to-date store, as a single Neo4j instance does; a cluster read from a lagging follower is not covered |
 | Selection | The request's exact scope, or every path scope in `S/**` (an opaque name under the prefix is not a member). It does not depend on tree labels, so a subtree lists completely before `init 'S/**'` |
 | Filters | `kind`: `turn` or a record kind; `status` (records only); `source` and `conversation_id` match a turn, or any evidence turn of a record |
-| Turn items | `{kind:"turn", scope, id, source, conversation_id, turn_id, parent_turn_id, occurred_at, stored_at, entry_count}`; text via `show` |
+| Turn items | `{kind:"turn", scope, id, source, conversation_id, turn_id, parent_turn_id, occurred_at, stored_at, entry_count}`, cut from the stored envelope inside the database so entry text is never returned; text via `show` |
 | Record items | `{kind:"record", scope, id, record_kind, status, text, attribution, evidence, stored_at}`; evidence as span coordinates; excerpts via `show` |
 | Bounds | `limit` 1–64 (default 16); `max_bytes` 4,096–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before an item that would exceed it. An item larger than `max_bytes` by itself is listed as `{kind, scope, id, stored_at, bytes, content_omitted:"max_bytes"}` and the walk moves on |
 | Cursor | Opaque and bound to the request's scope and filters; any other use is `invalid_input` |
-| Cost | Each page sorts the selection. With the scope range indexes (created by any nested or subtree `init`) that is a seek; a store without them scans every turn or record |
+| Cost | One query per page: filters run inside it, before its limit, and it sorts the matching part of the selection. With the scope range indexes (created by any nested or subtree `init`) selection is a seek; a store without them scans every turn or record |
 
 ## Following a conversation
 

@@ -167,9 +167,9 @@ export class Memory {
   }
 
   /**
-   * Exact enumeration of turns and records over one scope or a subtree, newest first by retention order, keyset-paged.
-   * A full walk returns every item committed before its first page exactly once. Turns are fixed-size headers; a record too
-   * large for `max_bytes` alone is named by a stub and the walk moves past it.
+   * Exact enumeration of turns and records over one scope or a subtree, newest first by write time, keyset-paged: one
+   * filtered store query per page. A full walk returns every item committed before its first page exactly once. Turns are
+   * bounded headers; an item too large for `max_bytes` by itself is named by a stub and the walk moves past it.
    */
   async list(scope, input = {}) {
     const target = authorizeTarget(this.config, scope);
@@ -178,43 +178,35 @@ export class Memory {
     const kind = input.kind === undefined ? null : text(input.kind, 32);
     requireThat(kind === null || kind === 'turn' || RECORD_KINDS.includes(kind), 'invalid_kind');
     const status = input.status === undefined ? null : text(input.status, 32);
-    requireThat(status === null || (kind !== 'turn' && RECORD_STATUSES.includes(status)), 'invalid_input');
+    requireThat(status === null || RECORD_STATUSES.includes(status), 'invalid_status');
+    requireThat(status === null || kind !== 'turn', 'invalid_input');
     const source = input.source === undefined ? null : text(input.source, 256);
     const conversation = input.conversation_id === undefined ? null : text(input.conversation_id, 256);
     const limit = integer(input.limit, 16, 1, 64);
     const maxBytes = integer(input.max_bytes, 65536, 4096, 1_000_000);
     const binding = digest(['source-memory.list/1', scope, kind, status, source, conversation]).slice(0, 32);
-    let after = input.cursor === undefined ? null : decodeCursor(input.cursor, binding);
+    const after = input.cursor === undefined ? null : decodeCursor(input.cursor, binding);
     // A status filter names a record field, so it selects records only.
-    const wants = { turns: kind === 'turn' || (kind === null && status === null), records: kind !== 'turn' };
-    const matches = row => {
-      if (row.type === 'turn') return (source === null || row.header.source === source) && (conversation === null || row.header.conversation_id === conversation);
-      return (kind === null || row.body.kind === kind) && (status === null || row.body.status === status)
-        && ((source === null && conversation === null) || row.evidence.some(key => (source === null || key.source === source)
-          && (conversation === null || key.conversation_id === conversation)));
-    };
+    const rows = await this.store.listPage(target, { turns: kind === 'turn' || (kind === null && status === null), records: kind !== 'turn',
+      kind: kind === 'turn' ? null : kind, status, source, conversation, after, limit });
     const items = [];
+    let bytes = 2;
     let last = null;
-    while (items.length < limit) {
-      const batch = await this.store.listBatch(target, { ...wants, after, limit: LIST_BATCH });
-      for (const row of batch) {
-        after = { at: row.at, uid: row.uid };
-        const parsed = listRow(row);
-        if (!matches(parsed)) continue;
-        const item = listItem(parsed);
-        const size = Buffer.byteLength(JSON.stringify([...items, item]));
-        if (size > maxBytes) {
-          if (items.length) return listPage(scope, items, last, binding);
-          const stub = { kind: item.kind, scope: item.scope, id: item.id, stored_at: item.stored_at,
-            bytes: Buffer.byteLength(JSON.stringify(item)), content_omitted: 'max_bytes' };
-          items.push(stub);
-        } else items.push(item);
-        last = after;
-        if (items.length === limit) return listPage(scope, items, last, binding);
+    for (const row of rows) {
+      const item = listItem(row);
+      const size = Buffer.byteLength(JSON.stringify(item));
+      const added = size + (items.length ? 1 : 0);
+      if (bytes + added > maxBytes) {
+        if (items.length) return listPage(scope, items, last, binding);
+        items.push({ kind: item.kind, scope: item.scope, id: item.id, stored_at: item.stored_at, bytes: size, content_omitted: 'max_bytes' });
+        bytes += Buffer.byteLength(JSON.stringify(items[0]));
+      } else {
+        items.push(item);
+        bytes += added;
       }
-      if (batch.length < LIST_BATCH) return listPage(scope, items, null, binding);
+      last = { at: row.at, uid: row.uid };
     }
-    return listPage(scope, items, last, binding);
+    return listPage(scope, items, rows.length < limit ? null : last, binding);
   }
 
   // Which of a caller's candidate keys already names a stored turn. More than one is reported, never resolved here.
@@ -672,7 +664,8 @@ const vectorHits = (kind, nodes, withScope = false) => nodes.map(row => kind ===
 } : { kind: 'record', id: row.record_id, text: row.text, ...(withScope ? { scope: row.scope } : {}) });
 
 const LIST_KEYS = ['kind', 'status', 'source', 'conversation_id', 'limit', 'max_bytes', 'cursor'];
-const LIST_BATCH = 128;
+// The text Neo4j gives `toString` of a zoned datetime; anything else would fail inside the query instead of here.
+const STORED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2}(:\d{2})?)(\[[A-Za-z0-9_+/-]{1,64}\])?$/u;
 
 const encodeCursor = (binding, key) => Buffer.from(JSON.stringify({ v: 1, q: binding, at: key.at, uid: key.uid })).toString('base64url');
 
@@ -681,37 +674,27 @@ function decodeCursor(value, binding) {
   text(value, 2048);
   let cursor;
   try { cursor = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); } catch { cursor = null; }
-  requireThat(cursor && cursor.v === 1 && cursor.q === binding && typeof cursor.at === 'string' && cursor.at.length <= 64
-    && typeof cursor.uid === 'string' && cursor.uid.length <= 128, 'invalid_input');
+  requireThat(cursor && cursor.v === 1 && cursor.q === binding && typeof cursor.at === 'string' && cursor.at.length <= 128
+    && STORED_AT.test(cursor.at) && typeof cursor.uid === 'string' && cursor.uid.length <= 128, 'invalid_input');
   return { at: cursor.at, uid: cursor.uid };
 }
 
 const listPage = (scope, items, last, binding) => ({ kind: 'list', scope, order: 'stored_desc', items,
   next_cursor: last === null ? null : encodeCursor(binding, last) });
 
-// Turn headers come from the stored envelope; a body this store did not write falls back to the node's own properties.
-function listRow(row) {
-  if (row.type === 'record') return { ...row, body: JSON.parse(row.body), evidence: row.evidence.map(key => {
-    if (key.header === null) return key;
-    const header = parseHeader(key.header);
-    return { source: key.source ?? header?.source ?? null, conversation_id: key.conversation_id ?? header?.conversation_id ?? null };
-  }) };
-  return { ...row, header: parseHeader(row.header) ?? {} };
-}
-
-function parseHeader(value) {
-  try { return JSON.parse(value); } catch { return null; }
-}
-
+// A turn header comes from its stored envelope; a body this store did not write falls back to the node's own properties.
 function listItem(row) {
   const stored = row.untimed ? null : row.at;
   if (row.type === 'turn') {
-    const header = row.header;
-    return { kind: 'turn', scope: row.scope, id: row.uid, source: header.source ?? null, conversation_id: header.conversation_id ?? null,
-      turn_id: header.turn_id ?? null, parent_turn_id: header.parent_turn_id ?? null, occurred_at: header.occurred_at ?? null,
+    let header = {};
+    try { header = JSON.parse(row.header) ?? {}; } catch {}
+    const own = row.properties ?? {};
+    return { kind: 'turn', scope: row.scope, id: row.uid, source: own.source ?? header.source ?? null,
+      conversation_id: own.conversation_id ?? header.conversation_id ?? null, turn_id: own.turn_id ?? header.turn_id ?? null,
+      parent_turn_id: own.parent_turn_id ?? header.parent_turn_id ?? null, occurred_at: header.occurred_at ?? null,
       stored_at: stored, entry_count: row.entry_count };
   }
-  const record = row.body;
+  const record = JSON.parse(row.body);
   return { kind: 'record', scope: row.scope, id: record.id, record_kind: record.kind, status: record.status, text: record.text,
     attribution: record.attribution, evidence: record.evidence, stored_at: stored };
 }

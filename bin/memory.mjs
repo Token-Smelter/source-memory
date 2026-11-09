@@ -13,8 +13,9 @@ const HELP = `source-memory <init|ingest|enrich|index|recall|show|list|status|wa
 --config defaults to $SOURCE_MEMORY_CONFIG.
 --scope 'S/**' names the subtree under path scope S for recall, list, status and init; every other command takes one exact scope.
 
-JSON input is read from --input or stdin for ingest/enrich/recall/show; list reads optional input the same way.
-index accepts optional --input {"limit":256}; init/status/warm need no input.
+JSON input is read from --input or stdin for ingest/enrich/recall/show.
+index and list accept optional --input only; they never read stdin.
+index takes {"limit":256}; list takes {"kind","status","source","conversation_id","limit","max_bytes","cursor"}; init/status/warm need no input.
 recall accepts --diagnostic-phases v1: bounded start/end phase markers and one footer line on stderr; stdout is unchanged.
 warm sends one fixed embedding request and never touches the database.
 warm --db v1 instead runs the read-only recall query paths once against Neo4j, makes no model call, and reports ready or unavailable.
@@ -80,10 +81,6 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     config = await fileJson(configPath, 64000);
     if (options['--input']) input = await fileJson(options['--input'], 4_000_000);
     else if (['ingest', 'enrich', 'recall', 'show'].includes(command)) input = JSON.parse(await readBounded(process.stdin));
-    else if (command === 'list') {
-      const raw = process.stdin.isTTY ? '' : await readBounded(process.stdin);
-      input = raw.trim() ? JSON.parse(raw) : {};
-    }
   } catch (error) { throw markStage(error, 'before_write'); }
   if (command === 'warm' && options['--db']) {
     const memory = new Memory(config, store);
