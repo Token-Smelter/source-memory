@@ -216,7 +216,8 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
             open: () => openSession(journal, sessionId, sessionFile, dir) });
           // Mark the session seen now (a null cursor), so turns that fail before their first interval are not baselined away on
           // a later resume; this instance still records its own baseline, if any, at the first settle.
-          if (fresh) cursorStore.save(null);
+          // The rename landed even when only the directory fsync failed; keep this controller and its baseline then.
+          if (fresh) { try { cursorStore.save(null); } catch (error) { if (error.code !== 'cursor_save_unsynced') throw error; } }
           entry = { controller, journal, sessionFile };
         } catch (error) { journal.close(); throw error; }
         controllers.set(sessionId, entry);

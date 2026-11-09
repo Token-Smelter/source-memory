@@ -143,7 +143,6 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
     return evidence;
   }
 
-  /** End of the covered prefix of this branch: every entry on a covered interval's chain counts, not only its endpoints. */
   /** Entries of a covered interval's chain, or null when the chain no longer reaches its cursor in these entries. */
   function chainOf(row, parents) {
     const chain = [];
@@ -152,6 +151,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
     return (id ?? null) === row.cursor ? chain : null;
   }
 
+  /** End of the covered prefix of this branch: every entry on a covered interval's chain counts, not only its endpoints. */
   function resolveCursor(entries, path) {
     const saved = cursorStore.load()?.cursor ?? null;
     const intervals = journal.intervals();
