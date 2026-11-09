@@ -20,9 +20,9 @@ const reference = { schema: 'source-memory-r2-reference-cut/v1', source_key: 'fi
   records: [{ id: 'action', kind: 'action', text: 'Fictional action.', evidence: [ev('a')] },
     { id: 'outcome', kind: 'outcome', text: 'Fictional outcome.', evidence: [ev('a')] },
     { id: 'unlinked', kind: 'outcome', text: 'Fictional unlinked outcome.', evidence: [ev('a')] },
-    { id: 'decision', kind: 'decision', text: 'Fictional decision.', evidence: [ev('a')] }],
+    { id: 'question', kind: 'question', text: 'Fictional question.', evidence: [ev('a')] }],
   edges: [{ from: 'outcome', to: 'action', type: 'outcome_of', evidence: [ev('a')] },
-    { from: 'unlinked', to: 'decision', type: 'outcome_of', evidence: [ev('a')] }] };
+    { from: 'unlinked', to: 'question', type: 'outcome_of', evidence: [ev('a')] }] };
 const prepared = prepareReferenceSnapshot({ snapshot: source, reference, sourceKey: 'fiction-source', through: 'a' });
 const dir = mkdtempSync(join(tmpdir(), 'pi-reference-fixture-')), root = realpathSync(process.cwd()), runId = randomUUID();
 const bytes = Buffer.from(JSON.stringify(prepared.snapshot)), digest = createHash('sha256').update(bytes).digest('hex');

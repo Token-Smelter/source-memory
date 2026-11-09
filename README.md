@@ -155,8 +155,8 @@ Chunks are word windows inside a single entry, recorded with exact UTF-16 offset
 ```
 
 - Kinds: `decision`, `observation`, `outcome`, `question`, `intention`, `episode`, `action`. Status: `proposed` (default), `accepted`, `observed`. Status and attribution are caller assertions.
-- Relation types: `supersedes` (new → old), `qualifies`, `contradicts`, `depends_on`, `outcome_of` (outcome → action). Each relation has its own `id`, `attribution`, and `evidence`.
-- An `outcome` must have an `outcome_of` relation to an `action`, supplied in the same bundle or already stored.
+- Relation types: `supersedes` (new → old), `qualifies`, `contradicts`, `depends_on`, `outcome_of` (outcome → action, decision or intention). Each relation has its own `id`, `attribution`, and `evidence`.
+- An `outcome` must have an `outcome_of` relation to an `action`, `decision` or `intention`, supplied in the same bundle or already stored. Any other target is refused with `invalid_outcome_relation`. Example: "the deploy failed" is `outcome_of` the decision "skip staging".
 - Evidence offsets are half-open UTF-16 offsets into an entry of a retained turn, may not split a surrogate pair, and are resolved from stored source; callers never supply quoted text.
 - Records and relations are append-only by identity. Record a correction as a new record with a `supersedes` or `qualifies` relation. Chronology and similarity never create relations automatically.
 - Limits: 128 records and 256 relations per call; 16 spans per item; 16,000 characters per span, 32,000 per item. Any invalid span, endpoint, or identity conflict rolls back the entire call.

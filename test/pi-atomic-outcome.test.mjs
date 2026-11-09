@@ -4,9 +4,9 @@ import { createTurnTools } from '../pi-extension/core.mjs';
 import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
 import { compactResult } from './helpers/compact-fixture.mjs';
 
-function fixture({ approve = true } = {}) {
-  const calls = [], writes = [];
-  const prior = { id: 'prior-action', kind: 'action', text: 'A fictional action', status: 'proposed', attribution: 'fiction',
+function fixture({ approve = true, priorKind = 'action' } = {}) {
+  const calls = [], writes = [], reviews = [];
+  const prior = { id: `prior-${priorKind}`, kind: priorKind, text: `A fictional ${priorKind}`, status: 'proposed', attribution: 'fiction',
     evidence: [{ turn: 'prior-turn', entry_id: 'p', start: 0, end: 7 }] };
   const memory = { async recall() { return { status: 'ready', budget_omitted: 0, bundles: [{ records: [prior] }] }; },
     async show(_scope, input) { return input.kind === 'turn' ? { turn: { id: 'turn', source: 'pi-memory', entries: [] } } : { record: prior }; },
@@ -21,10 +21,10 @@ function fixture({ approve = true } = {}) {
     beginOutcome: (scope, trigger, outcome, new_action, action_handle) => handlers.beginOutcome({ scope, trigger, outcome, new_action, action_handle }),
     applyOutcome: (scope, token, review) => handlers.applyOutcome({ scope, token, review }),
     cancelOutcome: token => handlers.cancelOutcome({ token }) };
-  const reviewer = { async review() { calls.push('review'); return { reviewer: 'fiction', decision_ref: 'review', approved: approve ? [0] : [] }; } };
+  const reviewer = { async review(input) { calls.push('review'); reviews.push(input); return { reviewer: 'fiction', decision_ref: 'review', approved: approve ? [0] : [] }; } };
   const tools = createTurnTools({ scope: 'fiction', turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'fictional evidence' }] },
     receipt: { id: 'turn' }, memory: client, reviewer, requireSearch: true });
-  return { tools, calls, writes, handlers };
+  return { tools, calls, writes, reviews, handlers };
 }
 
 test('a new action and its outcome commit together in one atomic write', async () => {
@@ -45,6 +45,26 @@ test('an outcome to an offered prior action is reviewed before the atomic commit
     await f.tools.record('outcome', 'fictional result', ['ref-000001'], { action_handle: search.records[0].action_handle });
     assert.deepEqual([f.calls, f.writes[0].records.map(row => row.kind), f.writes[0].relations[0].to],
       [['review', 'intent', 'write'], ['outcome'], 'prior-action']);
+  } finally { f.handlers.close(); }
+});
+
+for (const priorKind of ['decision', 'intention']) {
+  test(`an outcome to an offered prior ${priorKind} is reviewed as that kind before the atomic commit`, async () => {
+    const f = fixture({ priorKind });
+    try {
+      const search = await f.tools.search('fiction', []);
+      await f.tools.record('outcome', 'fictional result', ['ref-000001'], { action_handle: search.records[0].action_handle });
+      assert.deepEqual([f.calls, f.reviews[0].proposal.packet.records.map(row => row.kind), f.writes[0].records.map(row => row.kind),
+        f.writes[0].relations[0].to], [['review', 'intent', 'write'], ['outcome', priorKind], ['outcome'], `prior-${priorKind}`]);
+    } finally { f.handlers.close(); }
+  });
+}
+
+test('a prior question is offered no outcome referent handle', async () => {
+  const f = fixture({ priorKind: 'question' });
+  try {
+    const search = await f.tools.search('fiction', []);
+    assert.equal(search.records[0].action_handle, undefined);
   } finally { f.handlers.close(); }
 });
 

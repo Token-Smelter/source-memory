@@ -10,9 +10,9 @@ import { compactResult } from './helpers/compact-fixture.mjs';
 
 const longId = i => `pi-memory-record-${String(i).padStart(64, '0')}`;
 function fixture({ count = 40, partial = false, lexicalState = 'ready', linkModule, longIds = false, allActions = false, actionEvery7 = false,
-  directCount = count, edges = [], escaped = false, ranking = null } = {}) {
+  directCount = count, edges = [], escaped = false, ranking = null, kindOf = null } = {}) {
   const reads = [], rows = Array.from({ length: count }, (_, i) => ({ id: longIds ? longId(i) : `prior-${i}`,
-    scope: 'fiction', kind: allActions || i === 0 || (actionEvery7 && i % 7 === 0) ? 'action' : 'observation', status: 'proposed',
+    scope: 'fiction', kind: kindOf ? kindOf(i) : allActions || i === 0 || (actionEvery7 && i % 7 === 0) ? 'action' : 'observation', status: 'proposed',
     text: escaped ? `"\\\n\u0001`.repeat(100) : `Prior ${i}: ${'🌿'.repeat(600)}`,
     attribution: 'fiction', evidence: [{ turn: `source-${i}`, entry_id: 'entry', start: 0, end: 7 }] }));
   const channels = Object.fromEntries(['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector']
@@ -45,6 +45,16 @@ const input = { query: 'fiction', kinds: [], limit: 48, max_bytes: 24000 };
 const toolsFor = handlers => createTurnTools({ scope: 'fiction', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' },
   memory: { searchCompact: (scope, request, trigger) => handlers.searchCompact({ scope, input: request, trigger }),
     fetchCompact: (scope, trigger, handle) => handlers.fetchCompact({ scope, trigger, handle }) } });
+
+test('compact search offers an outcome referent handle on action, decision and intention cards only', async () => {
+  const kinds = ['action', 'decision', 'intention', 'question', 'observation', 'outcome'];
+  const { handlers } = fixture({ count: kinds.length, kindOf: i => kinds[i] });
+  try {
+    const { surface } = await handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input });
+    assert.deepEqual(surface.records.map(row => [row.kind, typeof row.action_handle]),
+      kinds.map(kind => [kind, ['action', 'decision', 'intention'].includes(kind) ? 'string' : 'undefined']));
+  } finally { handlers.close(); }
+});
 
 test('compact search exposes scoped ids and graph summaries without hydrating unselected evidence', async () => {
   const { handlers, reads } = fixture();

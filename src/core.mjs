@@ -135,6 +135,9 @@ export const RECORD_CONTRACT = 'source-memory.record/1';
 
 export const RELATIONS = ['supersedes', 'qualifies', 'contradicts', 'depends_on', 'outcome_of'];
 
+// An outcome may result from something done, something decided or something intended; any other target is refused.
+export const OUTCOME_REFERENT_KINDS = ['action', 'decision', 'intention'];
+
 export function normalizeEnrichment(input) {
   requireThat(input && Array.isArray(input.records) && Array.isArray(input.relations));
   requireThat(input.records.length <= 128 && input.relations.length <= 256, 'enrichment_too_large');

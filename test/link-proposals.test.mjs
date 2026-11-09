@@ -47,7 +47,8 @@ function fixtureMemory() {
           sourceExcerpt(turn, span);
         }
         if (edge.type === 'outcome_of') {
-          assert.deepEqual([this.records.get(edge.from).kind, this.records.get(edge.to).kind], ['outcome', 'action']);
+          assert.equal(this.records.get(edge.from).kind, 'outcome');
+          assert.ok(['action', 'decision', 'intention'].includes(this.records.get(edge.to).kind));
         }
         const previous = this.relations.get(edge.id);
         if (previous) assert.equal(canonical(previous), canonical(edge));
@@ -163,6 +164,23 @@ for (const type of RELATIONS) {
       compact: true, unicodeBytesDiffer: true });
   });
 }
+
+for (const oldKind of ['decision', 'intention']) {
+  test(`reviewed_outcome_of_appends_to_${oldKind}_referent`, async () => {
+    const { request, memory } = await setup({ kind: 'outcome', oldKind });
+    const result = await proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet, { type: 'outcome_of' })) });
+    const written = await apply(request, result);
+    const edge = written.enrichment.relations[0];
+    assert.deepEqual([edge.type, edge.from, edge.to, memory.writes.length], ['outcome_of', 'new', 'old', 1]);
+  });
+}
+
+test('proposal_outcome_of_to_a_question_rejects_entire_delta_without_write', async () => {
+  const { request, memory } = await setup({ kind: 'outcome', oldKind: 'question' });
+  await assert.rejects(proposeMemoryLinks({ ...request, compare: comparison(packet => proposedLink(packet, { type: 'outcome_of' })) }),
+    { code: 'invalid_outcome_relation' });
+  assert.equal(memory.writes.length, 0);
+});
 
 for (const support of ['ambiguous', 'unsupported', 'chronology_only']) {
   test(`link_${support}_remains_unresolved_without_append`, async () => {

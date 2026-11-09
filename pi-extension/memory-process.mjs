@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { markStage, normalizeEnrichment } from '../src/core.mjs';
+import { markStage, normalizeEnrichment, OUTCOME_REFERENT_KINDS } from '../src/core.mjs';
 import * as defaultLinks from '../src/link-proposals.mjs';
 import { searchDerived, resolveDerived, searchRaw } from './derived-retrieval.mjs';
 import { createAtomicOutcomes } from './atomic-outcome.mjs';
@@ -87,7 +87,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       for (const row of ranked.records) {
         const handle = compactHandle(scope, trigger, row.id);
         const item = { id: handle, kind: row.kind, score: row.score, text: row.text, text_truncated: row.text_truncated,
-          ...(row.kind === 'action' ? { action_handle: `action-${'0'.repeat(36)}` } : {}) };
+          ...(OUTCOME_REFERENT_KINDS.includes(row.kind) ? { action_handle: `action-${'0'.repeat(36)}` } : {}) };
         selected.push(item);
         result.budget_omitted = ranked.records.length - selected.length;
         if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) { selected.pop(); result.budget_omitted++; continue; }
