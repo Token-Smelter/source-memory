@@ -102,9 +102,10 @@ function trackSnapshot(memory) {
       release() { lock = false; } };
   } };
 }
-function exactRoute(model) {
+// Inference goes through the local gateway, except a candidate route whose sealed treatment declares its provider origin.
+function exactRoute(model, allowedOrigin = 'http://127.0.0.1:3003') {
   const url = new URL(model.baseUrl);
-  if (url.origin !== 'http://127.0.0.1:3003' || url.username || url.password) throw fail('route_changed');
+  if (url.origin !== allowedOrigin || url.username || url.password) throw fail('route_changed');
   return `${model.provider}/${model.id}`;
 }
 
@@ -172,7 +173,8 @@ async function main() {
   if (process.env.PILOT_TREATMENT && !treatment) throw fail('treatment_invalid');
   const candidateRoute = treatment?.candidateRoute ?? BASELINE_CANDIDATE_ROUTE;
   const { runtime, model, reviewerModel } = await resolvePiModels({ pi, modelId: candidateRoute, reviewerId: 'anthropic/claude-sonnet-5-5' });
-  if (exactRoute(model) !== candidateRoute || exactRoute(reviewerModel) !== 'anthropic/claude-sonnet-5-5') throw fail('route_changed');
+  const candidateOrigin = treatment?.candidateOrigin ?? 'http://127.0.0.1:3003';
+  if (exactRoute(model, candidateOrigin) !== candidateRoute || exactRoute(reviewerModel) !== 'anthropic/claude-sonnet-5-5') throw fail('route_changed');
   // Pi replaces image blocks with a fixed placeholder for a text-only route; the sealed treatment must say so.
   if (treatment?.imageInput !== undefined && model.input?.includes('image') !== treatment.imageInput) throw fail('route_changed');
   const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
@@ -397,7 +399,7 @@ async function main() {
   const docker = createNamespaceDocker({ databaseImage: image('neo4j:5.26.14-community'), driverImage: image('node:22-bookworm-slim'),
     mounts: { memory: runtimeDir, scratch: driverDir }, runId, onResource: row => resources.append(row) });
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
-    routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => rawOutputs.append(row) });
+    routes: { [exactRoute(model, candidateOrigin)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => rawOutputs.append(row) });
   const onInterrupt = signal => { try { budget.requestStop(signal); } catch {} };
   const onSigint = () => onInterrupt('SIGINT'), onSigterm = () => onInterrupt('SIGTERM');
   process.on('SIGINT', onSigint); process.on('SIGTERM', onSigterm);
@@ -417,10 +419,12 @@ async function main() {
         toolcall_review: reviewUse, treatment,
         runtime_archive_sha256: runtimeTree.archive_sha256,
         sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
-        models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
-        candidate_model: { route: exactRoute(model), api: model.api, image_input: model.input?.includes('image') === true, context_window: model.contextWindow,
+        models: { candidate: exactRoute(model, candidateOrigin), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
+        candidate_model: { route: exactRoute(model, candidateOrigin), origin: candidateOrigin, api: model.api, image_input: model.input?.includes('image') === true, context_window: model.contextWindow,
           catalog_cost: model.cost ?? null, served_version: treatment?.servedVersion ?? null },
-        routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
+        routes: { origin: 'http://127.0.0.1:3003', ...(treatment?.candidateOrigin ? { candidate_origin: treatment.candidateOrigin,
+          candidate_privacy: 'operator-approved direct provider route: source transcript context is sent to this provider for distillation' } : {}),
+          privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
         budget: { overall_effort_soft_usd: 250, share_soft_usd: Number(WORKER_SHARE_NANO / 1_000_000_000n), prior_spend_nano: previous.toString(), prior_attestation: priorAttestation,
           remaining_soft_nano: remaining.toString(), prior_ledger_sha256s: priorLedgers.map(row => row.sha256),
           prior_reconciliation_sha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), one_call_in_flight: true, stop_unknown_usage: true,
@@ -487,7 +491,7 @@ async function main() {
           }
         }
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
-          memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
+          memory: guarded.client, modelId: exactRoute(model, candidateOrigin), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
           retrieval: treatment?.retrieval ?? 'search', guidance: treatment?.guidance ?? null,
           budget: createInputBudget(Number.MAX_SAFE_INTEGER),
           imageArchive: createImageArchive({ directory: imageDir }),

@@ -32,7 +32,7 @@ export const TREATMENTS = Object.freeze({
   D0: Object.freeze({ id: 'D0', surface: 'distiller retrieval', retrieval: 'oracle-catalog', catalog: 'candidate-store-in-scope', product: false }),
   // A model arm changes only the candidate distiller route; the reviewer, answerer and scorer stay Sonnet. Rates are the
   // provider's published peak tier (off-peak is half), so API-equivalent spend is conservative.
-  'M-DS': Object.freeze({ id: 'M-DS', surface: 'candidate distiller model', candidateRoute: 'deepseek/deepseek-v4-flash',
+  'M-DS': Object.freeze({ id: 'M-DS', surface: 'candidate distiller model', candidateRoute: 'deepseek/deepseek-v4-flash', candidateOrigin: 'https://api.deepseek.com',
     servedVersion: 'DeepSeek-V4.1-Flash-1017 (provider docs: the legacy deepseek-v4-flash name is served by it)', imageInput: false,
     rateCard: Object.freeze({ source: 'https://api-docs.deepseek.com/quick_start/pricing (read 2026-11-09)', tier: 'peak',
       usdPerMillion: Object.freeze({ cacheHit: 0.006, cacheMiss: 0.3, output: 1.2 }), offPeakUsdPerMillion: Object.freeze({ cacheHit: 0.003, cacheMiss: 0.15, output: 0.6 }) }),
