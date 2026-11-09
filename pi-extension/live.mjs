@@ -41,7 +41,9 @@ export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onE
  * pointer into it. A failed cursor save, a crash or a branch switch is resolved from the journal before the next interval,
  * so no source entry is ingested under two different turn IDs.
  */
-export function createLiveController({ journal, cursorStore, conversationId, open, maxRetries = 3, distillOptions = {} }) {
+export function createLiveController({ journal, cursorStore, conversationId, open, maxRetries = 3 }) {
+  // Live sessions compact; summaries follow the frozen dependency-closure rule instead of blocking every later interval.
+  const distillOptions = { summaryPolicy: 'dependency_closure' };
   if (!journal || !cursorStore || typeof open !== 'function' || typeof conversationId !== 'string' || !conversationId
     || !Number.isSafeInteger(maxRetries) || maxRetries < 0) throw fail('controller_invalid');
   let session = null;

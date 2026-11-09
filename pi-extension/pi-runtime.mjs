@@ -37,6 +37,15 @@ export function parseFinalResult(text) {
   catch { throw fail('disposition_invalid'); }
 }
 
+/** Pi's compaction-aware context, minus summaries whose dependency closure is not permitted. */
+export function contextMessages(pi, manager, excludedSummaryIds) {
+  if (excludedSummaryIds === undefined) return manager.buildSessionContext().messages;
+  if (!Array.isArray(excludedSummaryIds) || typeof manager.buildContextEntries !== 'function'
+    || typeof pi.sessionEntryToContextMessages !== 'function') throw fail('summary_exclusion_unavailable');
+  const excluded = new Set(excludedSummaryIds);
+  return manager.buildContextEntries().filter(entry => !excluded.has(entry.id)).flatMap(entry => pi.sessionEntryToContextMessages(entry));
+}
+
 /** Reopen one incremental private Pi file for each side branch while keeping its fixed session ID. */
 export async function createPiDistiller({ pi, incremental, workDir, model, modelRuntime, memory, scope, reviewer, budget, ensureIndexed, reviewMode = 'separate', createOptions = {} }) {
   if (!pi?.SessionManager || typeof pi.createAgentSession !== 'function' || !incremental?.sessionId
@@ -120,7 +129,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           tools: ['memory_search', 'memory_fetch', 'memory_record', 'memory_link_offer', 'memory_link', 'memory_submit'], sessionManager: manager, ...(resourceLoader ? { resourceLoader } : {}) }));
         if (session.sessionId !== sessionId || session.agent?.sessionId !== sessionId) throw fail('session_identity_changed');
         activeSession = session;
-        session.agent.state.messages = manager.buildSessionContext().messages;
+        session.agent.state.messages = contextMessages(pi, manager, input.excludedSummaryIds);
         const priorMessages = session.messages.length;
         const startReceipt = budget?.receipts().length ?? 0;
         const startCalls = budget?.started() ?? 0;

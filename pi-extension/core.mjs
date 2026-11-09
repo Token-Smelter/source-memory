@@ -41,7 +41,41 @@ function entryData(row) {
 
 export function entryText(row) { return entryData(row).text; }
 
-function turnAt(entries, through, cursor, conversation, { allowInterrupted = false } = {}) {
+const SUMMARY_TYPES = new Set(['compaction', 'branch_summary']);
+
+/**
+ * Frozen availability rule: a summary is admissible only when its full dependency closure is permitted on the active branch.
+ * A Pi compaction summarizes the path from the previous kept boundary up to its firstKeptEntryId, with the previous summary as
+ * context; a branch summary describes an abandoned branch, which is never on the active path. Extension-provided summaries
+ * have no provable closure.
+ */
+function summaryVerdicts(ancestry) {
+  const index = new Map(ancestry.map((row, position) => [row.id, position]));
+  const verdicts = new Map();
+  let previous = null;
+  ancestry.forEach((row, position) => {
+    if (row.type === 'branch_summary') verdicts.set(row.id, 'summary_source_off_branch');
+    if (row.type !== 'compaction') return;
+    const kept = typeof row.firstKeptEntryId === 'string' ? index.get(row.firstKeptEntryId) : undefined;
+    let reason = null;
+    if (row.fromHook === true || kept === undefined || kept >= position) reason = 'summary_closure_unproved';
+    else {
+      let start = 0;
+      if (previous) {
+        const at = index.get(previous.id), previousKept = index.get(previous.firstKeptEntryId);
+        start = previousKept !== undefined && previousKept < at ? previousKept : at + 1;
+        if (verdicts.get(previous.id)) reason = 'summary_dependency_inadmissible';
+      }
+      if (ancestry.slice(start, kept).some(dependency => verdicts.get(dependency.id))) reason = 'summary_dependency_inadmissible';
+    }
+    verdicts.set(row.id, reason);
+    previous = row;
+  });
+  return verdicts;
+}
+
+function turnAt(entries, through, cursor, conversation, { allowInterrupted = false, summaryPolicy } = {}) {
+  if (summaryPolicy !== undefined && summaryPolicy !== 'dependency_closure') throw fail('invalid_input');
   if (!Array.isArray(entries) || typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('invalid_input');
   const byId = new Map();
   for (const row of entries) {
@@ -58,9 +92,10 @@ function turnAt(entries, through, cursor, conversation, { allowInterrupted = fal
     const row = byId.get(current);
     if (!row || seen.has(current)) throw fail('cursor_unresolved');
     seen.add(current);
-    if (['compaction', 'branch_summary'].includes(row.type)) throw fail('source_boundary_unresolved');
+    if (!summaryPolicy && SUMMARY_TYPES.has(row.type)) throw fail('source_boundary_unresolved');
     ancestry.unshift(row);
   }
+  const verdicts = summaryPolicy ? summaryVerdicts(ancestry) : null;
   const position = cursor === null ? -1 : ancestry.findIndex(row => row.id === cursor);
   if ((cursor !== null && position < 0) || position === ancestry.length - 1) throw fail('cursor_unresolved');
   const chain = ancestry.slice(position + 1);
@@ -76,7 +111,14 @@ function turnAt(entries, through, cursor, conversation, { allowInterrupted = fal
   const turn = { source: 'pi-memory', conversation_id: conversation,
     turn_id: digest(['pi-memory-turn/v1', cursor, through]), ...(cursor === null ? { lineage_root: true } : {}), entries: sourceEntries };
   normalizeTurn(turn);
-  return { turn, images, omissions: { custom_message: { count: omitted.length, entry_ids: omitted } } };
+  const omissions = { custom_message: { count: omitted.length, entry_ids: omitted } };
+  if (!verdicts) return { turn, images, omissions };
+  // Summaries are derived, never source; an inadmissible one is an explicit gap and is withheld from the distiller's context.
+  const summaries = chain.filter(row => SUMMARY_TYPES.has(row.type)).map(row => ({ entry_id: row.id, type: row.type,
+    disposition: verdicts.get(row.id) ? 'gap' : 'admissible', reason: verdicts.get(row.id) ?? null }));
+  if (summaries.length) omissions.summaries = summaries;
+  const excludedSummaryIds = [...verdicts].filter(([, reason]) => reason).map(([id]) => id);
+  return { turn, images, omissions, excludedSummaryIds };
 }
 
 /** Pure check of one cursor interval; it throws the same codes distillThrough would before any side effect. */
@@ -85,11 +127,11 @@ export function sourceInterval(entries, throughEntryId, cursor, conversation, op
 }
 
 /** The same cursor-bounded source turn is retained before either live or replay distillation. */
-export async function distillThrough(session, throughEntryId, cursor, { allowInterrupted = false } = {}) {
+export async function distillThrough(session, throughEntryId, cursor, { allowInterrupted = false, summaryPolicy } = {}) {
   if (!session || !Array.isArray(session.scopes) || session.scopes.length !== 1
     || typeof session.scopes[0] !== 'string' || !session.scopes[0]) throw fail('scope_unresolved');
   if (!session.memory || typeof session.memory.ingest !== 'function' || !session.distiller || typeof session.distiller.run !== 'function') throw fail('invalid_input');
-  const { turn, images, omissions } = turnAt(session.entries, throughEntryId, cursor, session.conversation_id, { allowInterrupted });
+  const { turn, images, omissions, excludedSummaryIds } = turnAt(session.entries, throughEntryId, cursor, session.conversation_id, { allowInterrupted, summaryPolicy });
   if (images.length && typeof session.imageArchive?.archive !== 'function') throw fail('image_archive_required');
   if (images.length) {
     const archived = images.map(image => ({ entry_id: image.entry_id, ...session.imageArchive.archive(image.block) }));
@@ -98,7 +140,8 @@ export async function distillThrough(session, throughEntryId, cursor, { allowInt
   const receipt = await session.memory.ingest(session.scopes[0], turn);
   if (typeof receipt?.id !== 'string' || !receipt.id) throw fail('ingest_receipt_invalid');
   if (typeof session.ensureIndexed === 'function') await session.ensureIndexed(session.memory, session.scopes[0], receipt.indexing, { turnId: receipt.id });
-  const result = await session.distiller.run({ turn, receipt, throughEntryId, cursor, scope: session.scopes[0] });
+  const result = await session.distiller.run({ turn, receipt, throughEntryId, cursor, scope: session.scopes[0],
+    ...(excludedSummaryIds ? { excludedSummaryIds } : {}) });
   if (result?.status !== 'complete') throw fail('distillation_incomplete');
   return { cursor: throughEntryId, turn_id: turn.turn_id, receipt, omissions, distillation: result };
 }
