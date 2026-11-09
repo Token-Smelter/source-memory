@@ -51,8 +51,9 @@ test('compact search offers an outcome referent handle on action, decision and i
   const { handlers } = fixture({ count: kinds.length, kindOf: i => kinds[i] });
   try {
     const { surface } = await handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input });
-    assert.deepEqual(surface.records.map(row => [row.kind, typeof row.action_handle]),
-      kinds.map(kind => [kind, ['action', 'decision', 'intention'].includes(kind) ? 'string' : 'undefined']));
+    const placeholder = `action-${'0'.repeat(36)}`;
+    assert.deepEqual(surface.records.map(row => [row.kind, typeof row.action_handle === 'string' && row.action_handle !== placeholder]),
+      kinds.map(kind => [kind, ['action', 'decision', 'intention'].includes(kind)]));
   } finally { handlers.close(); }
 });
 

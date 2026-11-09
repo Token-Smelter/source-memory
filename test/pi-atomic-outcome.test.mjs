@@ -60,6 +60,32 @@ for (const priorKind of ['decision', 'intention']) {
   });
 }
 
+for (const priorKind of ['decision', 'intention']) {
+  test(`the memory process refuses an unreviewed outcome to a prior ${priorKind}`, async () => {
+    const f = fixture({ priorKind });
+    try {
+      const search = await f.tools.search('fiction', []);
+      const outcome = { id: 'fiction-outcome', kind: 'outcome', text: 'fictional result', status: 'proposed', attribution: 'fiction',
+        evidence: [{ turn: 'turn', entry_id: 'u', start: 0, end: 9 }] };
+      const offered = await f.handlers.beginOutcome({ scope: 'fiction', trigger: 'turn', outcome, action_handle: search.records[0].action_handle });
+      assert.equal(offered.proposal.requires_review, true);
+      await assert.rejects(f.handlers.applyOutcome({ scope: 'fiction', token: offered.token, review: null }), /outcome_review_refused/);
+      assert.equal(f.writes.length, 0);
+    } finally { f.handlers.close(); }
+  });
+}
+
+test('the memory process refuses a new referent that is not an action', async () => {
+  const f = fixture();
+  try {
+    const span = [{ turn: 'turn', entry_id: 'u', start: 0, end: 9 }];
+    const outcome = { id: 'fiction-outcome', kind: 'outcome', text: 'fictional result', status: 'proposed', attribution: 'fiction', evidence: span };
+    const decision = { id: 'fiction-decision', kind: 'decision', text: 'fictional decision', status: 'proposed', attribution: 'fiction', evidence: span };
+    await assert.rejects(f.handlers.beginOutcome({ scope: 'fiction', trigger: 'turn', outcome, new_action: decision }), /invalid_outcome_relation/);
+    assert.equal(f.writes.length, 0);
+  } finally { f.handlers.close(); }
+});
+
 test('a prior question is offered no outcome referent handle', async () => {
   const f = fixture({ priorKind: 'question' });
   try {
