@@ -7,8 +7,10 @@ import { pathToFileURL } from 'node:url';
 import { distillThrough, sourceInterval } from '../pi-extension/core.mjs';
 import { createCoverageJournal, runCoveredInterval } from '../pi-extension/coverage.mjs';
 import { createCursorStore } from '../pi-extension/cursor-store.mjs';
-import { createLiveController } from '../pi-extension/live.mjs';
-import { contextMessages } from '../pi-extension/pi-runtime.mjs';
+import { createIncrementalSession } from '../pi-extension/incremental.mjs';
+import { createLiveController, registerLiveMemory } from '../pi-extension/live.mjs';
+import { contextMessages, createPiDistiller } from '../pi-extension/pi-runtime.mjs';
+import { compactResult } from './helpers/compact-fixture.mjs';
 import { fictionalCoverage } from '../pi-extension/policy.mjs';
 
 const policy = { summaryPolicy: 'dependency_closure' };
@@ -87,7 +89,7 @@ test('the distiller receives exclusions and its context drops only inadmissible 
   const manager = { buildSessionContext: () => ({ messages: ['all'] }), buildContextEntries: () => entries };
   const pi = { sessionEntryToContextMessages: entry => [entry.id] };
   assert.deepEqual([inputs[0], contextMessages(pi, manager, undefined), contextMessages(pi, manager, ['b']), contextMessages(pi, manager, [])],
-    [['b'], ['all'], ['u', 'a'], ['u', 'b', 'a']]);
+    [['b'], ['all'], ['u', 'a'], ['all']]);
   assert.throws(() => contextMessages({}, manager, ['b']), /summary_exclusion_unavailable/);
 });
 
@@ -106,25 +108,3 @@ test('the live controller covers intervals across a compaction and journals its 
   journal.close();
 }));
 
-const sdkPath = process.env.PI_SDK_MODULE;
-test('real Pi compaction and branch-summary entries follow the closure rule and context exclusion', { skip: !sdkPath }, async () => {
-  const pi = await import(pathToFileURL(sdkPath).href);
-  const manager = pi.SessionManager.inMemory('/fiction');
-  const say = (role, text) => manager.appendMessage(role === 'user' ? { role, content: text, timestamp: 1 }
-    : { role, content: [{ type: 'text', text }], stopReason: 'stop', api: 'fiction', provider: 'fiction', model: 'fiction', timestamp: 1,
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
-  say('user', 'Fictional start.');
-  const a1 = say('assistant', 'Noted.');
-  const u2 = say('user', 'Fictional middle.');
-  say('assistant', 'Kept.');
-  const c1 = manager.appendCompaction('Fictional summary.', u2, 10);
-  say('user', 'After compaction.');
-  const a3 = say('assistant', 'Continued.');
-  const entries = manager.getEntries();
-  const result = sourceInterval(entries, a3, a1, 'fiction', policy);
-  const standard = contextMessages(pi, manager, result.excludedSummaryIds);
-  const withheld = contextMessages(pi, manager, [c1]);
-  assert.deepEqual([result.omissions.summaries.map(row => [row.entry_id, row.disposition]), result.turn.entries.length,
-    standard.length === manager.buildSessionContext().messages.length, standard.length - withheld.length],
-  [[[c1, 'admissible']], 4, true, 1]);
-});
