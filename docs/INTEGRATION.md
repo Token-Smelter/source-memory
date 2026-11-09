@@ -108,6 +108,18 @@ The live controller passes `summaryPolicy: 'dependency_closure'` to the core. Th
 
 Summaries inside the interval are returned in `omissions.summaries` and written to the journal `finish` row as `boundaries`. Every inadmissible summary on the path is passed to the distiller as `excludedSummaryIds` and removed from its Pi context (`contextMessages`). Later intervals continue normally. Without the option, the core keeps the sealed `coverage-r2-v1` behavior, so replay and the harness still raise `source_boundary_unresolved`.
 
+### Budget and permission gate before ingest (implemented)
+
+`createLiveController({ gate })` runs the gate before each interval, including a retry. It runs before the journal `begin`, before the Memory process opens, and before `ingest`. A refusal returns `status: 'refused'` with no journal row, no source write and no model call. A gate that throws without a typed refusal is reported as `gate_unavailable`, never as permission. `pi-extension/live-gate.mjs` provides the standard gate:
+
+| Part | Contract |
+|---|---|
+| `createUsageLedger({ directory })` | A private, append-only, fsynced `usage.jsonl` holding reported model usage and admitted intervals per UTC day, so spend survives restarts. A torn or unreadable line counts as unknown usage on the day it is found. |
+| `createDailyInputBudget({ ledger, limit })` | `createInputBudget` seeded from the day's recorded usage. Reported input, cache-read and cache-write tokens count, as in the harness. The day rolls over only between intervals. Unknown usage on the same day keeps it refused (`input_budget_unknown`). |
+| `createLiveGate({ scope, grants, budget, ledger, maxIntervalsPerDay, minRemaining })` | Refuses `scope_permission_denied` unless the Memory configuration grants both read and write on the scope. Refuses `input_budget_unknown` or `input_budget_exhausted` from the budget, `input_budget_reserve` when less than `minRemaining` tokens remain, and `interval_limit` at the daily cap. Otherwise it records the admitted interval. |
+
+The budget remains a between-call token guard: a single admitted call can overshoot it, and it is not a dollar reservation or a provider bill.
+
 ### Legacy `registerPiMemory` boundary
 
 **`registerPiMemory` is not restart-safe.** Use the live controller instead. The host must implement `saveCursor` and durable cursor loading and bind them to the correct session and branch. A `createSliceSession` result built with `coverageJournal` cannot be used directly with `registerPiMemory`: the hook does not begin an interval and tracked ingest fails with `interval_not_started`. Use the journal through `runCoveredInterval` or `replay`, not by passing it to the live hook. The cursor save is not atomic with the journal.
@@ -154,7 +166,7 @@ Turns created by this adapter use source `pi-memory`. Their `turn_id` is derived
 | Area | Implemented and exercised | Still required or planned |
 |---|---|---|
 | Event adapter | Injectable `agent_settled` hook and per-session in-memory queue; nonblocking registration has a fictional test | Real host bootstrap, queue ordering/error/cursor-save tests, lifecycle and operational authorization |
-| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries** | Budget-before-ingest; operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
+| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries, and a durable budget and permission gate before ingest** | Operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
 | Retrieval | Scoped Memory search and proposal handles; bounded-state disclosure | Compact per-record results and chosen-handle evidence fetch; eliminate the observed truncation fault |
 | Distiller | Private incremental Pi copy, sequential memory tools, metering interfaces and fictional/offline SDK tests | Production route qualification, bounded provider costs and host-level access controls |
 | Evidence and identity | Current-turn evidence labels, private image blobs, explicit `pi-memory` source | Cross-source deduplication and visual-content citation |

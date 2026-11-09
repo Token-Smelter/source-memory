@@ -41,11 +41,11 @@ export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onE
  * pointer into it. A failed cursor save, a crash or a branch switch is resolved from the journal before the next interval,
  * so no source entry is ingested under two different turn IDs.
  */
-export function createLiveController({ journal, cursorStore, conversationId, open, maxRetries = 3 }) {
+export function createLiveController({ journal, cursorStore, conversationId, open, maxRetries = 3, gate = null }) {
   // Live sessions compact; summaries follow the frozen dependency-closure rule instead of blocking every later interval.
   const distillOptions = { summaryPolicy: 'dependency_closure' };
   if (!journal || !cursorStore || typeof open !== 'function' || typeof conversationId !== 'string' || !conversationId
-    || !Number.isSafeInteger(maxRetries) || maxRetries < 0) throw fail('controller_invalid');
+    || !Number.isSafeInteger(maxRetries) || maxRetries < 0 || (gate !== null && typeof gate !== 'function')) throw fail('controller_invalid');
   let session = null;
   let busy = false;
 
@@ -115,6 +115,11 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
   }
 
   async function run(entries, through, cursor, retry) {
+    // Admission precedes the journal begin and the Memory process, so a refusal leaves no row, no ingest and no spend.
+    if (gate) {
+      try { await gate({ through, cursor, retry }); }
+      catch (problem) { return { refused: true, through, cursor, code: problem?.refused ? problem.code : 'gate_unavailable' }; }
+    }
     const current = await getSession();
     const result = await runCoveredInterval({ journal, session: { ...current, entries }, through, cursor, retry, ...distillOptions });
     if (covered.has(result.disposition)) {
@@ -143,7 +148,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
           catch { return { status: 'blocked', code: 'coverage_gap_unreachable', id: state.id, cursor }; }
           const retried = await run(entries, state.through, state.cursor, true);
           results.push(retried);
-          if (!covered.has(retried.disposition)) return { status: 'stopped', cursor, results, reconciled };
+          if (!covered.has(retried.disposition)) return { status: retried.refused ? 'refused' : 'stopped', cursor, results, reconciled };
           cursor = state.through;
         }
         if (leafId === cursor) return { status: 'current', cursor, results, reconciled };
@@ -151,7 +156,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         catch (problem) { return { status: 'skipped', code: problem.code ?? 'source_invalid', cursor, results, reconciled }; }
         const result = await run(entries, leafId, cursor, false);
         results.push(result);
-        return { status: covered.has(result.disposition) ? 'covered' : 'stopped', cursor: covered.has(result.disposition) ? leafId : cursor,
+        return { status: covered.has(result.disposition) ? 'covered' : result.refused ? 'refused' : 'stopped', cursor: covered.has(result.disposition) ? leafId : cursor,
           results, reconciled, ...(repaired ? { cursor_repair: repaired } : {}) };
       } finally { busy = false; }
     },

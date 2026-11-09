@@ -1,10 +1,11 @@
 const fail = code => Object.assign(new Error(code), { code });
 
 /** Reported input and cache usage are charged after each call; a single call may overshoot the ceiling. */
-export function createInputBudget(limit = 20_000_000, { onReceipt = () => {} } = {}) {
-  if (!Number.isSafeInteger(limit) || limit <= 0) throw fail('input_budget_invalid');
-  let used = 0;
-  let unknown = false;
+export function createInputBudget(limit = 20_000_000, { onReceipt = () => {}, initialUsed = 0, initialUnknown = false } = {}) {
+  if (!Number.isSafeInteger(limit) || limit <= 0 || !Number.isSafeInteger(initialUsed) || initialUsed < 0
+    || typeof initialUnknown !== 'boolean') throw fail('input_budget_invalid');
+  let used = initialUsed;
+  let unknown = initialUnknown;
   let started = 0;
   const receipts = [];
   const persist = receipt => {
