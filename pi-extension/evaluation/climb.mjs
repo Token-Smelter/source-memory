@@ -246,7 +246,7 @@ function render(){
     const left=el('div',{},pair);el('div',{class:'cap',text:'Reference as labeled — '+s.reference_caption},left);
     if(s.reference){el('div',{class:'stats',text:stats(s.reference)},left);graph(left,s.reference,maxCp)}else el('div',{class:'none',text:'reference unavailable'},left);
     const right=el('div',{},pair);
-    if(run){const a=run.alignment;el('div',{class:'cap',text:'Candidate · '+run.treatment+' · code '+run.code_sha.slice(0,7)+' · seal '+run.seal_sha256.slice(0,8)+' · Δ '+run.primary.value.toFixed(3)+' · '+usd(run.cost.spent_nano)},right);
+    if(run){const a=run.alignment;el('div',{class:'cap',text:'Candidate · '+run.treatment+(run.coverage_status==='case_failed'?' · case phase incomplete ('+run.primary.cases+' cases)':'')+' · code '+run.code_sha.slice(0,7)+' · seal '+run.seal_sha256.slice(0,8)+' · Δ '+run.primary.value.toFixed(3)+' · '+usd(run.cost.spent_nano)},right);
       el('div',{class:'stats',text:stats(run.graph)+(a?' · match: '+D.buckets.map(b=>b.replace('_provisional','')+' '+(a.item_counts?.[b]??0)).join(', ')+' (returned = returned to the candidate answerer in any case)':' · alignment not run')},right);graph(right,run.graph,maxCp)}
     else el('div',{class:'none',text:'no completed run for this treatment'},right);
   }
