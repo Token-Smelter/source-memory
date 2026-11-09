@@ -5,6 +5,7 @@ import { ANSWERER_TOOLS_SHA256, ANSWERER_CITED_TOOLS_SHA256, SCORER_TOOLS_SHA256
   ANSWERER_BUDGET_SUFFIX, ANSWERER_CITATION_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, ANSWERER_CITED_REPAIR,
   SCORER_REPAIR, SCORER_GROUNDED_REPAIR, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from './pi-calls.mjs';
 import { CITATION_PROTOCOL } from './answerer.mjs';
+import { BLOCK_EVIDENCE_CONTRACT } from './dev-dataset.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
@@ -85,6 +86,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
 /** New comparisons and same-treatment resumptions use the citation-bound answerer. */
 export function createCitedPilotPlan(options) {
   if (options?.resume != null && options.resume.transition !== 'same-treatment-resume') throw fail('resume_transition_forbidden');
+  if (!Array.isArray(options?.cases) || options.cases.some(row => row?.packet?.evidenceContract !== BLOCK_EVIDENCE_CONTRACT)) throw fail('packet_contract_mismatch');
   const settings = structuredClone(createPilotPlan(options).spec);
   settings.answerer.version = 'answerer-r2-v5';
   settings.answerer.citationProtocol = CITATION_PROTOCOL;
@@ -97,6 +99,7 @@ export function createCitedPilotPlan(options) {
   settings.scorer.tools_sha256 = SCORER_GROUNDED_TOOLS_SHA256;
   settings.scorer.repair_instruction = SCORER_GROUNDED_REPAIR;
   settings.rubric = { version: CITED_RUBRIC_VERSION, instructions: CITED_RUBRIC, examples: CITED_WORKED_EXAMPLES };
+  settings.packetSchema.evidenceContract = BLOCK_EVIDENCE_CONTRACT;
   settings.budget.purposes.answerer.taskVersion = settings.answerer.version;
   settings.budget.purposes.scorer.taskVersion = settings.scorer.version;
   return sealComparison(settings);

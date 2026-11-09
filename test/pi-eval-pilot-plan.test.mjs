@@ -4,6 +4,7 @@ import { createPilotPlan, createCitedPilotPlan } from '../pi-extension/evaluatio
 import { ANSWERER_CITED_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
 import { fictionalCase, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
 import { verifySeal } from '../pi-extension/evaluation/seal.mjs';
+import { BLOCK_EVIDENCE_CONTRACT } from '../pi-extension/evaluation/dev-dataset.mjs';
 
 test('pilot plan freezes model roles, named empty baseline and strict safety before observations', () => {
   const cases = [{ publicCase: fictionalCase(), packet: scoringPacket() }];
@@ -15,7 +16,7 @@ test('pilot plan freezes model roles, named empty baseline and strict safety bef
 });
 
 test('fresh cited plan seals grounded scorer and leaves candidate and model routes unchanged', () => {
-  const options = { cases: [{ publicCase: fictionalCase(), packet: scoringPacket() }], sourceSha256: 'a'.repeat(64),
+  const options = { cases: [{ publicCase: fictionalCase(), packet: { ...scoringPacket(), evidenceContract: BLOCK_EVIDENCE_CONTRACT } }], sourceSha256: 'a'.repeat(64),
     datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64), codeSha: 'd'.repeat(40),
     routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } } };
   const legacy = createPilotPlan(options).spec, cited = createCitedPilotPlan(options).spec;

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createPilotPlan, createCitedPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { BLOCK_EVIDENCE_CONTRACT } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { fictionalCase, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
@@ -51,7 +52,8 @@ test('resume validates the prior seal, covered journal prefix, clean snapshot an
 }));
 
 test('same-treatment cited resume requires the same code, budget and prior answerer protocol', () => fixture(async ({ args }) => {
-  const options = { cases: args.cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
+  const options = { cases: args.cases.map(row => ({ ...row, packet: { ...row.packet, evidenceContract: BLOCK_EVIDENCE_CONTRACT } })),
+    sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
     codeSha: 'd'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } } };
   const previous = createCitedPilotPlan(options);
   const current = createCitedPilotPlan({ ...options, resume: { priorRunId: args.report.run_id, priorSealDigest: previous.digest,
