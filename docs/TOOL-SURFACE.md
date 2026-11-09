@@ -46,7 +46,7 @@ A caller concept that needs state transitions (open/closed, assigned, due) stays
 | Prepare a scope or subtree | `init` | built; subtree in PR 1 | exact scope or `S/**` (write grant) |
 | Keep the embedding model resident; warm the database read paths | `warm`; `warm --db v1` | built | exact scope |
 
-Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence` on the extension transport, refuses it `scope_denied` inside `authorize`, before any storage call.
+Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence`, refuses it `scope_denied` inside `authorize`, before any storage call. The extension transport (`pi-extension/memory-process.mjs`) serves one exact scope and refuses a selector at startup with `scope_unresolved`.
 
 ## Scopes (PR 1)
 

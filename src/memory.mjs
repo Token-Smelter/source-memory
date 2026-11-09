@@ -385,7 +385,7 @@ export class Memory {
             // A root's ANN index is filtered after its top-k, so a small selection is scored exactly, inside the database.
             const census = tree && vector_index === 'online' ? await this.store.vectorCounts(target, kind, key, exclude) : null;
             if (census && census.total <= Math.min(this.treeScanLimit, vectorLimit)) {
-              const scan = await this.store.treeVectorScan(target, kind, key, queryVector, candidates, exclude);
+              const scan = await this.store.treeVectorScan(target, kind, key, queryVector, grouped ? 0 : candidates, exclude);
               unindexed = census.unindexed;
               result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, scan.uids, candidates, perConversation, exclude)
                 : { hits: vectorHits(kind, scan.nodes, sel.subtree) };
