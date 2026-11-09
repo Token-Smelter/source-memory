@@ -27,10 +27,16 @@ export function evidenceSpansForEntry(entry, chunks = []) {
     for (const chunk of matching) {
       const { start, end, ordinal } = chunk;
       if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || !Number.isSafeInteger(ordinal) || seen.has(ordinal)
-        || start < 0 || end <= start || end > entry.text.length || end - start > 16000
+        || start < 0 || end <= start || end > entry.text.length
         || (start > 0 && /[\uD800-\uDBFF]/u.test(entry.text[start - 1]) && /[\uDC00-\uDFFF]/u.test(entry.text[start]))
         || (end < entry.text.length && /[\uD800-\uDBFF]/u.test(entry.text[end - 1]) && /[\uDC00-\uDFFF]/u.test(entry.text[end]))) throw fail('evidence_chunk_invalid');
       seen.add(ordinal);
+      // A single unbroken token (minified or encoded output) can make a word-based chunk exceed the citable bound.
+      // Its text stays retained and searchable; it is disclosed as uncitable rather than cut at invented offsets.
+      if (end - start > 16000) {
+        omissions.push({ entry_id: entry.id, reason: 'chunk_over_citable_limit', ordinal });
+        continue;
+      }
       if (ranges.some(range => start < range.end && end > range.start)) {
         omissions.push({ entry_id: entry.id, reason: 'image_overlapping_chunk_not_citable', ordinal });
         continue;
