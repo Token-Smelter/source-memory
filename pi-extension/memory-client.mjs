@@ -1,6 +1,6 @@
 import { createClient } from './ndjson.mjs';
 
-const noPersistentWrite = new Set(['status', 'recordVectorStatus', 'turnVectorStatus', 'sourceChunks', 'recall', 'searchCompact', 'fetchCompact', 'releaseCompact', 'beginLinks', 'finishLinks', 'cancelLinks', 'beginOutcome', 'cancelOutcome',
+const noPersistentWrite = new Set(['status', 'recordPresence', 'recordVectorStatus', 'turnVectorStatus', 'sourceChunks', 'recall', 'searchCompact', 'fetchCompact', 'releaseCompact', 'beginLinks', 'finishLinks', 'cancelLinks', 'beginOutcome', 'cancelOutcome',
   'searchDerived', 'resolveDerived', 'searchRaw']);
 
 /** Facade for one long-lived Memory subprocess; never exposes raw relation writes. */
@@ -26,6 +26,7 @@ export function createMemoryClient({ input, output, timeoutMs, indexTimeoutMs = 
     recordVectorStatus: (scope, ids, options) => call('recordVectorStatus', { scope, ids }, options),
     turnVectorStatus: (scope, turn, options) => call('turnVectorStatus', { scope, turn }, options),
     sourceChunks: (scope, turn, options) => call('sourceChunks', { scope, turn }, options),
+    recordPresence: (scope, ids, options) => call('recordPresence', { scope, ids }, options),
     index: (scope, input, options = {}) => call('index', { scope, input }, { ...options, timeoutMs: indexTimeoutMs }),
     ingest: (scope, turn, options) => call('ingest', { scope, turn }, options),
     recall: (scope, input, { signal, trigger } = {}) => call('recall', { scope, input, ...(trigger ? { trigger } : {}) }, { signal }),

@@ -9,8 +9,25 @@ const tracking = Symbol('coverage-tracking');
 const covered = new Set(['committed', 'abstained', 'ineligible_by_policy']);
 const safeCode = error => typeof error?.code === 'string' && /^[a-z_]{1,80}$/.test(error.code) ? error.code : 'operation_failed';
 
-/** One private, append-only journal per session. An orphan lock requires operator inspection, not automatic recovery. */
-export function createCoverageJournal({ directory, sessionKey }) {
+function staleLock(lockPath) {
+  let owner;
+  try { owner = readFileSync(lockPath, 'utf8'); } catch { return false; }
+  if (!/^[1-9][0-9]{0,9}\n$/.test(owner)) return false;
+  const pid = Number(owner);
+  if (pid === process.pid) return false;
+  try { process.kill(pid, 0); return false; }
+  catch (problem) { return problem.code === 'ESRCH'; }
+}
+
+const idList = value => Array.isArray(value) && value.length <= 64 && value.every(id => typeof id === 'string' && id && id.length <= 512);
+
+/**
+ * One private, append-only journal per session. An orphan lock requires operator inspection, not automatic recovery.
+ * effectIds records the deterministic record IDs a derived write names, so a restart can settle an unknown outcome by reading them.
+ * pidLock writes the owner's process ID into the lock and breaks only a lock whose recorded owner no longer exists on this host;
+ * an empty or unreadable lock still requires an operator.
+ */
+export function createCoverageJournal({ directory, sessionKey, effectIds = false, pidLock = false }) {
   if (typeof sessionKey !== 'string' || !sessionKey) throw fail('session_invalid');
   const dir = realpathSync(directory);
   const dirStat = statSync(dir);
@@ -19,8 +36,15 @@ export function createCoverageJournal({ directory, sessionKey }) {
   const path = join(dir, `${name}.jsonl`);
   const lockPath = join(dir, `${name}.lock`);
   let lock, file;
+  const takeLock = () => openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
   try {
-    lock = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try { lock = takeLock(); }
+    catch (problem) {
+      if (problem.code !== 'EEXIST' || !pidLock || !staleLock(lockPath)) throw problem;
+      unlinkSync(lockPath);
+      lock = takeLock();
+    }
+    if (pidLock) { writeSync(lock, `${process.pid}\n`); fsyncSync(lock); }
     file = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
     const st = fstatSync(file);
     if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o077) !== 0) throw fail('journal_invalid');
@@ -36,15 +60,18 @@ export function createCoverageJournal({ directory, sessionKey }) {
   let previous = null;
   let active = null;
   let gap = null;
+  let gapEffects = new Map();
   const finished = new Map();
+  const attempts = new Map();
   function apply(row) {
     if (row.type === 'begin') {
       if (active || (gap && (gap.reconciliation_required || !['failed', 'unresolved_scope'].includes(gap.disposition) || row.id !== gap.id || !row.retry)) || finished.has(row.id)) throw fail('journal_invalid');
       active = { id: row.id, through: row.through, cursor: row.cursor, effects: new Map(), derived: false };
+      attempts.set(row.id, (attempts.get(row.id) ?? 0) + 1);
       gap = null;
     } else if (row.type === 'effect_begin') {
-      if (!active || active.id !== row.id || active.effects.has(row.effect)) throw fail('journal_invalid');
-      active.effects.set(row.effect, { method: row.method, state: 'pending' });
+      if (!active || active.id !== row.id || active.effects.has(row.effect) || (row.ids !== undefined && !idList(row.ids))) throw fail('journal_invalid');
+      active.effects.set(row.effect, { method: row.method, state: 'pending', ...(row.ids ? { ids: [...row.ids] } : {}) });
     } else if (row.type === 'effect_end') {
       const effect = active?.effects.get(row.effect);
       if (!effect || active.id !== row.id || effect.state !== 'pending' || !['confirmed', 'refused', 'unknown'].includes(row.outcome)) throw fail('journal_invalid');
@@ -55,19 +82,27 @@ export function createCoverageJournal({ directory, sessionKey }) {
         || !Number.isSafeInteger(row.omitted_prior_spans) || row.omitted_prior_spans < 0 || !Array.isArray(row.trigger_omissions)) throw fail('journal_invalid');
     } else if (row.type === 'finish') {
       if (!active || active.id !== row.id || ![...covered, 'failed', 'uncertain', 'unresolved_scope'].includes(row.disposition)) throw fail('journal_invalid');
-      if (covered.has(row.disposition)) finished.set(row.id, { disposition: row.disposition, search_incomplete: row.search_incomplete ?? null });
-      else gap = { id: row.id, disposition: row.disposition, through: active.through, cursor: active.cursor,
-        ...(row.reconciliation_required ? { reconciliation_required: true } : {}) };
+      if (covered.has(row.disposition)) finished.set(row.id, { disposition: row.disposition, search_incomplete: row.search_incomplete ?? null,
+        cursor: active.cursor, through: active.through });
+      else {
+        gap = { id: row.id, disposition: row.disposition, through: active.through, cursor: active.cursor,
+          ...(row.reconciliation_required ? { reconciliation_required: true } : {}) };
+        gapEffects = active.effects;
+      }
       active = null;
     } else if (row.type === 'reconcile') {
       if (active && active.id === row.id) {
         gap = { id: active.id, disposition: 'uncertain', through: active.through, cursor: active.cursor };
+        gapEffects = active.effects;
         active = null;
       }
       if (!gap || gap.id !== row.id || !['uncertain', 'failed'].includes(gap.disposition)
         || (gap.disposition === 'failed' && (!gap.reconciliation_required || row.disposition !== 'failed'))
         || !['committed', 'failed'].includes(row.disposition)) throw fail('journal_invalid');
-      if (row.disposition === 'committed') { finished.set(row.id, { disposition: 'committed', search_incomplete: null }); gap = null; }
+      if (row.disposition === 'committed') {
+        finished.set(row.id, { disposition: 'committed', search_incomplete: null, cursor: gap.cursor, through: gap.through });
+        gap = null;
+      }
       else { gap.disposition = 'failed'; delete gap.reconciliation_required; }
     } else throw fail('journal_invalid');
   }
@@ -101,6 +136,7 @@ export function createCoverageJournal({ directory, sessionKey }) {
     closeSync(file); closeSync(lock); unlinkSync(lockPath);
     throw problem.code === 'journal_invalid' ? problem : fail('journal_invalid');
   }
+  const outcomeIds = new Map();
   const api = {
     path,
     begin({ through, cursor, retry = false }) {
@@ -119,6 +155,11 @@ export function createCoverageJournal({ directory, sessionKey }) {
           if (key === tracking) return api;
           const value = Reflect.get(target, key, target);
           if (typeof value !== 'function') return value;
+          if (effectIds && key === 'beginOutcome') return async (...args) => {
+            const result = await value.apply(target, args);
+            if (typeof result?.token === 'string') outcomeIds.set(result.token, [args[2]?.id, args[3]?.id].filter(id => typeof id === 'string'));
+            return result;
+          };
           if (key === 'beginLinks') return async (...args) => {
             if (!active) throw fail('interval_not_started');
             const result = await value.apply(target, args), info = result?.packet?.retrieval;
@@ -135,7 +176,9 @@ export function createCoverageJournal({ directory, sessionKey }) {
             const id = active.id;
             const effect = digest(['coverage-effect/v1', id, key, args]);
             if (active.effects.has(effect)) throw fail('effect_already_attempted');
-            append({ type: 'effect_begin', id, method: key, effect });
+            const ids = !effectIds ? null : key === 'enrich' ? args[1]?.records?.map(row => row?.id) ?? []
+              : key === 'applyOutcome' ? outcomeIds.get(args[1]) ?? null : null;
+            append({ type: 'effect_begin', id, method: key, effect, ...(ids && idList(ids) ? { ids } : {}) });
             try {
               const result = await value.apply(target, args);
               append({ type: 'effect_end', id, effect, outcome: 'confirmed', receipt_sha256: digest(result ?? null) });
@@ -176,6 +219,16 @@ export function createCoverageJournal({ directory, sessionKey }) {
       if (typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('checkpoint_invalid');
       return finished.get(digest(['coverage-interval/v1', sessionKey, cursor, through]))?.search_incomplete ?? null;
     },
+    /** Covered intervals, used to resolve a durable cursor against the active branch. */
+    intervals() {
+      return [...finished].map(([id, row]) => ({ id, cursor: row.cursor, through: row.through, disposition: row.disposition }));
+    },
+    /** Effects of the unfinished interval or of the current gap, for reconciliation planning. */
+    effects() {
+      const rows = active ? active.effects : gap ? gapEffects : new Map();
+      return [...rows].map(([effect, row]) => ({ effect, ...structuredClone(row) }));
+    },
+    attempts: id => attempts.get(id) ?? 0,
     state() {
       if (active) return { status: 'uncertain', id: active.id, cursor: active.cursor, through: active.through, reason: 'unfinished_interval' };
       return gap ? { status: gap.disposition, ...gap } : { status: 'ready' };
