@@ -26,11 +26,13 @@ function ancestryOf(entries, leafId) {
  * agent_settled hook for live controllers. The handler only snapshots and enqueues, and never throws into Pi;
  * the session file path is captured synchronously because ctx must not be used after the handler returns.
  */
-export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onError = () => {} }) {
-  if (!pi || typeof pi.on !== 'function' || typeof controllerFor !== 'function') throw fail('extension_invalid');
+export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onError = () => {}, active = () => true }) {
+  if (!pi || typeof pi.on !== 'function' || typeof controllerFor !== 'function' || typeof active !== 'function') throw fail('extension_invalid');
   const queue = createSessionQueue(onError);
   pi.on('agent_settled', (_event, ctx) => {
     try {
+      // An inactive host pays nothing: the O(session) snapshot copy is taken only when work could follow.
+      if (!active(ctx)) return;
       const snapshot = settledSnapshot(ctx, { throughSummaries: true });
       if (!snapshot) return;
       snapshot.sessionFile = ctx.sessionManager.getSessionFile?.() ?? null;
@@ -49,13 +51,17 @@ export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onE
  * pointer that must agree with it. Each settle derives its cursor as the end of the covered prefix of the active branch,
  * so a failed cursor save, a crash, a fork inside a covered interval or a branch switch never ingests a covered entry again.
  */
-export function createLiveController({ journal, cursorStore, conversationId, open, gate, maxRetries = 3 }) {
+export function createLiveController({ journal, cursorStore, conversationId, open, gate, maxRetries = 3, baseline = null }) {
   if (!journal || !journal.options?.effectIds || !journal.options?.pidLock || !cursorStore || typeof open !== 'function' || typeof gate !== 'function'
-    || typeof conversationId !== 'string' || !conversationId || !Number.isSafeInteger(maxRetries) || maxRetries < 0) throw fail('controller_invalid');
+    || typeof conversationId !== 'string' || !conversationId || !Number.isSafeInteger(maxRetries) || maxRetries < 0
+    || (baseline !== null && (typeof baseline !== 'string' || !baseline))) throw fail('controller_invalid');
   // Live sessions compact; summaries follow the dependency-closure rule instead of blocking every later interval.
   const summaryPolicy = 'dependency_closure';
   let session = null;
   let busy = false;
+  let closing = false;
+  let opening = null;
+  let running = null;
 
   /** Only an explicit { admitted: true } admits; anything else, including a thrown error, is a refusal. */
   async function admit(request) {
@@ -67,8 +73,15 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
   }
 
   async function getSession() {
+    if (closing) throw fail('controller_closed');
     if (!session) {
-      const opened = await open();
+      opening = open();
+      let opened;
+      try { opened = await opening; } finally { opening = null; }
+      if (closing) {
+        try { await opened?.close?.(); } catch {}
+        throw fail('controller_closed');
+      }
       // The admitted scope and budget must be the ones this session writes and spends through.
       if ((gate.scope !== undefined && opened?.scopes?.[0] !== gate.scope) || (gate.budget !== undefined && opened?.budget !== gate.budget)) {
         try { await opened?.close?.(); } catch {}
@@ -155,7 +168,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
     const refusal = await admit({ phase: 'interval', through, cursor, retry });
     if (refusal) return { refused: true, through, cursor, code: refusal };
     const current = await getSession();
-    const result = await runCoveredInterval({ journal, session: { ...current, entries }, through, cursor, retry, summaryPolicy });
+    const result = await runCoveredInterval({ journal, session: { ...current, entries }, through, cursor, retry, summaryPolicy, interrupted: () => closing });
     if (covered.has(result.disposition)) {
       const saveError = save(through, result.id);
       return saveError ? { ...result, cursor_save: saveError } : result;
@@ -166,15 +179,34 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
 
   return {
     /** Process the source suffix through one settled leaf; returns a status object and never advances past an uncovered interval. */
-    async settle(snapshot) {
-      const result = await settleOnce(snapshot);
-      return gate.ungated ? { ...result, ungated: true } : result;
+    settle(snapshot) {
+      if (closing) return Promise.resolve({ status: 'skipped', code: 'controller_closed', results: [], reconciled: null });
+      if (busy) return Promise.reject(fail('controller_busy'));
+      running = settleOnce(snapshot).then(result => gate.ungated ? { ...result, ungated: true } : result);
+      return running;
     },
-    async close() { await dropSession(); },
+    /**
+     * Refuse new work, abort the running distiller, wait up to graceMs for the settle, then close the Memory session so
+     * remaining calls fail, and wait (bounded) for the settle to end. The journal stays open for the caller to close after.
+     */
+    async close({ graceMs = 5000 } = {}) {
+      closing = true;
+      const wait = (promise, ms) => new Promise(resolve => {
+        const timer = setTimeout(resolve, ms);
+        Promise.resolve(promise).catch(() => {}).finally(() => { clearTimeout(timer); resolve(); });
+      });
+      // Sticky: the session refuses new model dispatches and Memory writes from now on, even for a run not yet started.
+      try { session?.stop?.(); } catch {}
+      try { session?.distiller?.abort?.(); } catch {}
+      await wait(running, graceMs);
+      await dropSession();
+      await wait(opening, graceMs);
+      await wait(running, graceMs);
+      await dropSession();
+    },
   };
 
   async function settleOnce({ leafId, entries }) {
-      if (busy) throw fail('controller_busy');
       busy = true;
       const results = [];
       let reconciled = null;
@@ -188,11 +220,19 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         }
         reconciled = await reconcile();
         if (reconciled?.blocked) return { status: 'blocked', code: reconciled.blocked, id: journal.state().id, results, reconciled };
+        // A session first seen with history (resume, fork, clone) starts after that history unless the host opts into backfill.
+        const messages = new Set(entries.filter(row => row?.type === 'message').map(row => row.id));
+        if (baseline && !journal.intervals().length && journal.state().status === 'ready' && entries.some(row => row?.id === baseline)
+          && ancestryOf(entries, baseline).some(id => messages.has(id))) {
+          journal.begin({ cursor: null, through: baseline });
+          journal.finish('ineligible_by_policy', 'baseline');
+          save(baseline, null);
+        }
         const path = ancestryOf(entries, leafId);
         const state = journal.state();
         if (['failed', 'unresolved_scope'].includes(state.status)) {
           // A gap is retried wherever it still validates, also on another branch; nothing else may begin before it closes.
-          if (journal.attempts(state.id) > maxRetries) return { status: 'blocked', code: 'retry_limit', id: state.id, results, reconciled };
+          if (journal.failures(state.id) > maxRetries) return { status: 'blocked', code: 'retry_limit', id: state.id, results, reconciled };
           try { sourceInterval(entries, state.through, state.cursor, conversationId, { summaryPolicy }); }
           catch { return { status: 'blocked', code: 'coverage_gap_unreachable', id: state.id, results, reconciled }; }
           const retried = await run(entries, state.through, state.cursor, true);

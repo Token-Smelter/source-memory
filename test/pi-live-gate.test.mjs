@@ -280,7 +280,7 @@ test('a gated retry of a failed interval is also refused before ingest', () => p
   const refused = await live.controller.settle({ leafId: 'a', entries });
   allow = true;
   const resumed = await live.controller.settle({ leafId: 'a', entries });
-  assert.deepEqual([refused.status, live.journal.attempts(live.journal.intervals()[0]?.id), resumed.status, live.seen.ingested], ['refused', 2, 'current', 2]);
+  assert.deepEqual([refused.status, live.journal.failures(live.journal.intervals()[0]?.id), resumed.status, live.seen.ingested], ['refused', 1, 'current', 2]);
   live.journal.close();
 }));
 

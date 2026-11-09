@@ -10,6 +10,7 @@ import { Memory } from '../src/memory.mjs';
 import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
 import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
+import { runLiveSmoke } from './live-smoke.mjs';
 import { createDerivedAdapter, searchDerived, resolveDerived } from '../pi-extension/derived-retrieval.mjs';
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { GROUNDING_PROTOCOL, CITED_RUBRIC_VERSION, CITED_RUBRIC, CITED_WORKED_EXAMPLES } from '../pi-extension/evaluation/rubric.mjs';
@@ -1186,6 +1187,10 @@ export async function runIntegration(database, scratch) {
         { scope: 'cli', source: input.source, conversation_id: input.conversation_id }, 0, ['number', 'number', 'number', 'undefined', 'undefined'],
         terminal, 'units', terminal, []]);
     });
+    if (process.env.PI_SDK_MODULE) {
+      await check('a real Pi session with the live extension writes settled turns to a private Memory and resumes after restart without overlap',
+        () => runLiveSmoke({ database, scratch, sdkPath: process.env.PI_SDK_MODULE }));
+    }
     if (process.env.SOURCE_MEMORY_REAL_EMBEDDING_URL) {
       await check('a real local embedding endpoint indexes and recalls by meaning', async () => {
         const real = new Memory({ neo4j: database, scopes: { read: ['real'], write: ['real'] },

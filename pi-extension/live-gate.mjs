@@ -147,14 +147,17 @@ export function createUsageLedger({ directory, now = () => new Date() }) {
 export function createDailyInputBudget({ ledger, limit }) {
   if (!Number.isSafeInteger(limit) || limit <= 0 || typeof ledger?.callStart !== 'function') throw fail('input_budget_invalid');
   const own = [];
-  let unknownDay = null, prevented = 0;
+  let unknownDay = null, prevented = 0, stopped = false;
   const check = () => {
     if (unknownDay === ledger.day() || own.some(call => !call.receipt) || ledger.unknown()) return 'input_budget_unknown';
     return ledger.used() >= limit ? 'input_budget_exhausted' : null;
   };
   return {
     ledger,
+    /** Sticky: every later dispatch is refused before it is sent, so shutdown cannot start a model call. */
+    stop() { stopped = true; },
     beforeCall() {
+      if (stopped) { prevented++; throw fail('dispatch_prevented'); }
       const reason = check();
       // Pi reports a dispatch it never made with empty usage; that report must not read as lost spend.
       if (reason) { prevented++; throw fail(reason); }
