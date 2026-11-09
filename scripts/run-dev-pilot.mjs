@@ -21,7 +21,7 @@ import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runti
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases, toolCallReviewSummary, verifyToolCallReview } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { CITED_RESUME_TRANSITIONS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { CITED_RESUME_TRANSITIONS, DISTILLER_MAX_OUTPUT_TOKENS, EVALUATOR_MAX_OUTPUT_TOKENS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { WORKER_SHARE_NANO, attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
@@ -66,10 +66,6 @@ function writePrivate(path, value) {
   const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
   try { writeFileSync(fd, typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
 }
-// Haiku and Sonnet 5.5 use Pi's adaptive thinking (compat.forceAdaptiveThinking): there is no separate thinking budget,
-// so thinking and the answer share max_tokens. At 4,096 a distiller turn could spend the whole ceiling thinking and stop
-// with "length", failing the checkpoint; 16,384 is the declared distiller ceiling for every arm (baseline v2.1 onward).
-export const DISTILLER_MAX_OUTPUT_TOKENS = 16384, EVALUATOR_MAX_OUTPUT_TOKENS = 4096;
 function rates(model, maxOutputTokens) {
   const tiers = [model.cost, ...(model.cost?.tiers ?? [])];
   const result = {};

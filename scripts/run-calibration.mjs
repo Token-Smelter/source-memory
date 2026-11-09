@@ -14,7 +14,7 @@ import { resolvePiModels } from '../pi-extension/slice-runtime.mjs';
 import { fictionalCalibrationV2, retentionPolicy } from '../pi-extension/policy.mjs';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
 import { WORKER_SHARE_NANO, attestedPriorSpend } from '../pi-extension/evaluation/prior-spend.mjs';
-import { TREATMENTS } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { DISTILLER_MAX_OUTPUT_TOKENS, TREATMENTS } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { hash } from '../pi-extension/evaluation/seal.mjs';
 import { readPinned } from '../pi-extension/evaluation/climb.mjs';
 import { privateDir, writeNew } from './export-climb-run.mjs';
@@ -93,7 +93,7 @@ async function main() {
   if (`${model.provider}/${model.id}` !== ROUTE) throw fail('route_changed');
   const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   if (execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8' }).trim()) throw fail('working_tree_dirty');
-  const rates = { maxOutputTokens: 4096, ratesNanoPerToken: { input: 500, cacheRead: 50, cacheWrite: 625, output: 2500 }, rateEvidence: 'Haiku SDK max tier as sealed in pilot plans' };
+  const rates = { maxOutputTokens: DISTILLER_MAX_OUTPUT_TOKENS, ratesNanoPerToken: { input: 500, cacheRead: 50, cacheWrite: 625, output: 2500 }, rateEvidence: 'Haiku SDK max tier as sealed in pilot plans' };
   const spec = { schema: 'calibration-run-seal/v1', codeSha, label, guidance, calibrationSha256: calibration.sha256, policySha256: retentionPolicy().sha256,
     route: ROUTE, rates, priorSpendNano: prior.totalNano, capNano: remaining.toString() };
   const digest = hash(spec), dir = mkdtempSync(join(outDir, `calibration-${label}-`)), runId = randomUUID();

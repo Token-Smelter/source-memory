@@ -18,6 +18,11 @@ const scorerInstructions = 'Judge each asserted answer or action clause against 
 const answerInstructions = 'Answer the user using only the permitted retrieval tools. Preserve source attribution, authority, scope, time and uncertainty. If the returned information is insufficient, say so. Do not perform external actions.';
 const groundedScorerInstructions = 'Judge each asserted answer or action clause against the supplied reference packet and the answerer’s own cited evidence using the frozen rubric. Support passes only when both support a factual clause; a correct guess with irrelevant cited evidence fails. Factual support graded pass or uncertain requires citationIds containing supplied citation_id values. Preserve uncertainty and do not omit unsupported additions. Submit clauses with id, text, requirementIds, sourceIds, citationIds, abstention, action, judgments for support/authority/scope/time/uncertainty, alternative and relation. For the exact canonical unknown with no citations, an abstention clause may have abstention=true, the exact answer text, action=false, no relation and empty citationIds; use reference sourceIds to judge any explicit uncertainty requirement. Do not assign an abstention to any requirement when the packet is answerable. All factual clauses have abstention=false. For an alternative use a reference-source-linked rationale. For a required relationship use required, recoverable and returned itemIds.' + SCORER_FORMAT_SUFFIX;
 
+// Haiku and Sonnet 5.5 use Pi's adaptive thinking (compat.forceAdaptiveThinking): there is no separate thinking budget,
+// so thinking and the answer share max_tokens. At 4,096 a distiller turn could spend the whole ceiling thinking and stop
+// with "length", failing the checkpoint; 16,384 is the declared distiller ceiling for every arm (baseline v2.1 onward).
+export const DISTILLER_MAX_OUTPUT_TOKENS = 16384, EVALUATOR_MAX_OUTPUT_TOKENS = 4096;
+
 /** Sealed treatment surfaces; a run without one is the baseline. */
 export const TREATMENTS = Object.freeze({
   // D0's oracle is the candidate's own earlier store in the run's scope, not the reference catalog.
