@@ -79,7 +79,8 @@ test('a declared default-path code transition resumes only after the failure it 
     codeSha: 'd'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } }, toolCallReviewSha256: 'f'.repeat(64) };
   const previous = createCitedPilotPlan(options);
   const codeTransition = { from: 'd'.repeat(40), to: 'e'.repeat(40), failureCode: 'fictional_failure', failedCheckpoint: 'b',
-    reason: 'Fictional fix for the failed interval only.', evidence: ['fictional golden test'] };
+    reason: 'Fictional fix for the failed interval only.', evidence: ['fictional golden test'],
+    changedPaths: [{ path: 'docs/notes.md', blob: '1'.repeat(40) }, { path: 'src/fiction.mjs', blob: '2'.repeat(40) }], reviewedPaths: ['src/fiction.mjs'] };
   const resume = { priorRunId: args.report.run_id, priorSealDigest: previous.digest, priorCodeSha: options.codeSha, cursor: 'a',
     snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256, transition: 'default-path-code-transition', codeTransition };
   const current = createCitedPilotPlan({ ...options, codeSha: 'e'.repeat(40), capNano: '200000000000', priorSpendNano: '50000000000', resume });
@@ -90,6 +91,7 @@ test('a declared default-path code transition resumes only after the failure it 
   assert.throws(() => validatePilotResume({ ...args, report: otherFailure, seal: previous, currentSeal: current }), /resume_treatment_mismatch/);
   assert.throws(() => createCitedPilotPlan({ ...options, codeSha: 'e'.repeat(40), resume: { ...resume, codeTransition: { ...codeTransition, to: '0'.repeat(40) } } }), /pilot_plan_invalid/);
   assert.throws(() => createCitedPilotPlan({ ...options, codeSha: 'e'.repeat(40), capNano: '250000000000', priorSpendNano: '1', resume }), /pilot_plan_invalid/);
+  assert.throws(() => createCitedPilotPlan({ ...options, codeSha: 'e'.repeat(40), resume: { ...resume, codeTransition: { ...codeTransition, reviewedPaths: [] } } }), /pilot_plan_invalid/);
 }));
 
 test('resume refuses a prefix with unproven search completeness', () => fixture(async ({ args }) => {

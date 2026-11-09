@@ -155,7 +155,9 @@ export function runExport({ treatment, seal, report, reportSha256, graph, answer
   const byArm = arm => answers.filter(row => row.arm === arm).map(row => row.answer.trace);
   const arms = [...new Set(answers.map(row => row.arm))].sort();
   return { schema: CLIMB_RUN_SCHEMA, treatment, source_key: sourceKey, source_sha256: seal.spec.sourceSha256, run_id: report.run_id, run_dir: report.run_dir,
-    code_sha: seal.spec.codeSha, seal_sha256: report.seal_sha256, report_sha256: reportSha256, dataset_sha256: seal.spec.datasetSha256,
+    code_sha: seal.spec.codeSha, mixed_code: seal.spec.resume?.codeTransition
+      ? { from: seal.spec.resume.codeTransition.from, to: seal.spec.resume.codeTransition.to, cursor: seal.spec.resume.cursor } : null,
+    seal_sha256: report.seal_sha256, report_sha256: reportSha256, dataset_sha256: seal.spec.datasetSha256,
     models: Object.fromEntries(Object.entries(seal.spec.budget?.purposes ?? {}).map(([purpose, row]) => [purpose, row.route])),
     primary: { metric: 'candidate usefulness delta vs no-memory baseline', value: report.scorecard.deltas.candidate,
       sensitivity: report.scorecard.sensitivity, confidence: report.scorecard.confidence, cases: answers.filter(row => row.arm === 'candidate').length,

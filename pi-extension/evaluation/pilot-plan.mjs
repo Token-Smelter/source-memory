@@ -16,12 +16,20 @@ const answerInstructions = 'Answer the user using only the permitted retrieval t
 const groundedScorerInstructions = 'Judge each asserted answer or action clause against the supplied reference packet and the answerer’s own cited evidence using the frozen rubric. Support passes only when both support a factual clause; a correct guess with irrelevant cited evidence fails. Factual support graded pass or uncertain requires citationIds containing supplied citation_id values. Preserve uncertainty and do not omit unsupported additions. Submit clauses with id, text, requirementIds, sourceIds, citationIds, abstention, action, judgments for support/authority/scope/time/uncertainty, alternative and relation. For the exact canonical unknown with no citations, an abstention clause may have abstention=true, the exact answer text, action=false, no relation and empty citationIds; use reference sourceIds to judge any explicit uncertainty requirement. Do not assign an abstention to any requirement when the packet is answerable. All factual clauses have abstention=false. For an alternative use a reference-source-linked rationale. For a required relationship use required, recoverable and returned itemIds.' + SCORER_FORMAT_SUFFIX;
 
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
+/** Runtime paths whose change can alter candidate behavior; each changed one must be named as reviewed. */
+export const RUNTIME_PATH = /^(src|pi-extension|config)\//;
 /**
  * A code change may resume a run only when it is declared to leave every completed interval unchanged: the prior run must
- * have stopped at the first interval after the cursor with the named failure the change addresses.
+ * have stopped at the first interval after the cursor with the named failure the change addresses, and every changed
+ * runtime path (recomputed by the driver from git) must be listed as reviewed for default-path identity.
  */
 export function validCodeTransition(value, from, to) {
-  return Boolean(value) && Object.keys(value).sort().join(',') === 'evidence,failedCheckpoint,failureCode,from,reason,to'
+  const changed = value?.changedPaths;
+  return Boolean(value) && Object.keys(value).sort().join(',') === 'changedPaths,evidence,failedCheckpoint,failureCode,from,reason,reviewedPaths,to'
+    && Array.isArray(changed) && changed.length > 0 && changed.every((row, i) => row && Object.keys(row).sort().join(',') === 'blob,path'
+      && typeof row.path === 'string' && row.path.length > 0 && (row.blob === null || /^[a-f0-9]{40}$/.test(row.blob))
+      && (i === 0 || changed[i - 1].path < row.path))
+    && Array.isArray(value.reviewedPaths) && changed.filter(row => RUNTIME_PATH.test(row.path)).every(row => value.reviewedPaths.includes(row.path))
     && value.from === from && value.to === to && from !== to && /^[a-z][a-z0-9_]{2,63}$/.test(value.failureCode ?? '')
     && typeof value.failedCheckpoint === 'string' && value.failedCheckpoint.length > 0
     && typeof value.reason === 'string' && value.reason.trim().length > 0 && value.reason.length <= 2000

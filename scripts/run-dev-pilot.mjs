@@ -33,6 +33,15 @@ import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
 import { createSnapshotVerifier } from '../pi-extension/evaluation/snapshot-verifier.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
+// Recomputed from git so a transition cannot under-declare what changed between the two sealed commits.
+function changedPaths(from, to) {
+  if (!/^[a-f0-9]{40}$/.test(from ?? '') || !/^[a-f0-9]{40}$/.test(to ?? '')) throw fail('resume_invalid');
+  const names = execFileSync('git', ['diff', '--name-only', '--no-renames', from, to], { encoding: 'utf8' }).split('\n').filter(Boolean).sort();
+  return names.map(path => {
+    try { return { path, blob: execFileSync('git', ['rev-parse', `${to}:${path}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() }; }
+    catch { return { path, blob: null }; }
+  });
+}
 const sha = value => createHash('sha256').update(value).digest('hex');
 const sleep = ms => new Promise(resolveReply => setTimeout(resolveReply, ms));
 function pinned(path, expected, max = 100_000_000) {
@@ -261,7 +270,8 @@ async function main() {
       caseHandbacks: handbacks, checkpointSnapshotSha256: checkpointRef.sha256, ...(driftBytes ? { sourceTreeDriftSha256: driftSha } : {}),
       ...(request.transition === 'default-path-code-transition' ? { codeTransition: { from: priorSeal.spec?.codeSha, to: codeSha,
         failureCode: request.codeTransition?.failureCode, failedCheckpoint: request.codeTransition?.failedCheckpoint,
-        reason: request.codeTransition?.reason, evidence: request.codeTransition?.evidence } } : {}) };
+        reason: request.codeTransition?.reason, evidence: request.codeTransition?.evidence, reviewedPaths: request.codeTransition?.reviewedPaths,
+        changedPaths: changedPaths(priorSeal.spec?.codeSha, codeSha) } } : {}) };
     let superseded = null, partialCase = null;
     const pendingCases = prepared.filter(item => item.through === request.cursor && !completedCases.includes(item));
     if (pendingCases.length) {
@@ -683,6 +693,8 @@ async function main() {
     ledger_completeness: 'partial: gateway-internal failover/retry attempts not correlatable',
     image_limitation: 'Original image blobs are archived by SHA-256; image content is not text-citable.',
     latency_limitation: 'Local embedding latency is environment-sensitive; a later sample showed 100% GPU and elevated host load, not proof of contention during any call.', artifacts,
+    mixed_code: seal.spec.resume?.codeTransition ? { from: seal.spec.resume.codeTransition.from, to: seal.spec.resume.codeTransition.to,
+      cursor: seal.spec.resume.cursor, changed_paths: seal.spec.resume.codeTransition.changedPaths.length } : null,
     run_dir: dir, run_id: runId, seal_sha256: seal.digest };
   writePrivate(join(dir, 'REPORT.json'), final);
   process.stdout.write(`${JSON.stringify({ status: final.status, run_id: runId, run_dir: dir, failure: final.failure })}\n`);
