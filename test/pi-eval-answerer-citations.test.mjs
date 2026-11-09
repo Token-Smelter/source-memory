@@ -1,17 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createAnswerer, CITATION_PROTOCOL, UNKNOWN_ANSWER } from '../pi-extension/evaluation/answerer.mjs';
-import { createPiAnswererResponder, ANSWERER_CITED_TOOLS_SHA256, ANSWERER_CITED_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
+import { createAnswerer, CITATION_PROTOCOL, UNKNOWN_ANSWER, citationId, textSha256 } from '../pi-extension/evaluation/answerer.mjs';
+import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_CITED_TOOLS_SHA256, ANSWERER_CITED_REPAIR,
+  SCORER_GROUNDED_TOOLS_SHA256, SCORER_GROUNDED_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
+import { hash, sealComparison } from '../pi-extension/evaluation/seal.mjs';
 import { fictionalCase, fictionalModel, fictionalSettings, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
-import { createScorer } from '../pi-extension/evaluation/scorer.mjs';
+import { createScorer, scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { wrapPiRuntime } from '../pi-extension/evaluation/pi-wrapper.mjs';
+import { GROUNDING_PROTOCOL, CITED_RUBRIC_VERSION, CITED_RUBRIC, CITED_WORKED_EXAMPLES } from '../pi-extension/evaluation/rubric.mjs';
 
 const citation = { item_id: 'item', evidence_id: 'source' };
 function settings() {
   const value = fictionalSettings();
   value.answerer.citationProtocol = CITATION_PROTOCOL;
   value.answerer.version = 'answerer-r2-v5';
+  value.answerer.tools_sha256 = ANSWERER_CITED_TOOLS_SHA256;
+  value.answerer.repair_instruction = ANSWERER_CITED_REPAIR;
+  value.answerer.limits.formatRepairCalls = 1;
+  value.scorer.version = 'scorer-r2-v3-grounded';
+  value.scorer.groundingProtocol = GROUNDING_PROTOCOL;
+  value.scorer.tools_sha256 = SCORER_GROUNDED_TOOLS_SHA256;
+  value.scorer.repair_instruction = SCORER_GROUNDED_REPAIR;
+  value.scorer.formatRepairCalls = 1;
+  value.rubric = { version: CITED_RUBRIC_VERSION, instructions: CITED_RUBRIC, examples: CITED_WORKED_EXAMPLES };
   return value;
 }
 function fixture({ rows = [], respond, resolve } = {}) {
@@ -40,8 +51,20 @@ test('successfully returned evidence supports a machine-readable citation', asyn
     return { text: 'A fictional answer.', citations: [citation] };
   } });
   const result = await answerer.run({ arm: 'candidate', case: fictionalCase() });
-  assert.deepEqual([result.answer, result.trace.citations, result.trace.returnedEvidence, result.trace.abstention],
-    [{ text: 'A fictional answer.', citations: [citation] }, [citation], [citation], 'not_enforced']);
+  assert.deepEqual([result.answer, result.trace.citations, result.trace.returnedEvidence, result.trace.citedEvidence, result.trace.abstention],
+    [{ text: 'A fictional answer.', citations: [citation] }, [citation],
+      [{ ...citation, scope: 'fiction', text_sha256: textSha256('Fictional source.') }],
+      [{ citation_id: citationId('item', 'source'), ...citation, scope: 'fiction', text_sha256: textSha256('Fictional source.'), text: 'Fictional source.' }], 'not_enforced']);
+});
+
+test('only cited returned evidence text enters the scorer-side trace', async () => {
+  const multi = { ...item, evidence: [{ id: 'source', scope: 'fiction' }, { id: 'uncited', scope: 'fiction' }] };
+  const answerer = fixture({ rows: [multi], resolve(request) { return { id: request.evidenceId, scope: 'fiction', text: `Fiction ${request.evidenceId}` }; },
+    async respond({ tools }) { await tools.search('fiction'); await tools.resolve('item', 'source'); await tools.resolve('item', 'uncited');
+      return { text: 'Fiction.', citations: [citation] }; } });
+  const result = await answerer.run({ arm: 'candidate', case: fictionalCase() });
+  assert.deepEqual([result.trace.returnedEvidence.length, result.trace.citedEvidence.map(row => row.text),
+    result.trace.returnedEvidence.every(row => !Object.hasOwn(row, 'text'))], [2, ['Fiction source'], true]);
 });
 
 for (const [name, run, expected] of [
@@ -65,12 +88,20 @@ test('out-of-scope evidence is never resolved or citable', async () => {
   assert.equal(resolves, 0);
 });
 
+test('a swallowed retrieval failure cannot become an abstention', async () => {
+  const seal = sealComparison(settings());
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest,
+    memory: { async search() { throw new Error('transport_failed'); }, async resolve() {} }, archive: { async search() { return []; } },
+    async respond({ tools }) { await assert.rejects(tools.search('fiction'), /transport_failed/); return { text: 'Unknown.', citations: [] }; } });
+  await assert.rejects(answerer.run({ arm: 'candidate', case: fictionalCase() }), /retrieval_failed/);
+});
+
 test('a failed evidence resolution never becomes citable', async () => {
   const answerer = fixture({ rows: [item], resolve() { throw new Error('source_unavailable'); }, async respond({ tools }) {
     await tools.search('fiction'); await assert.rejects(tools.resolve('item', 'source'), /source_unavailable/);
     return { text: 'Fiction.', citations: [citation] };
   } });
-  await assert.rejects(answerer.run({ arm: 'candidate', case: fictionalCase() }), /citation_not_returned/);
+  await assert.rejects(answerer.run({ arm: 'candidate', case: fictionalCase() }), /retrieval_failed/);
 });
 
 test('an empty resolved source cannot support a citation', async () => {
@@ -78,7 +109,7 @@ test('an empty resolved source cannot support a citation', async () => {
     await tools.search('fiction'); await assert.rejects(tools.resolve('item', 'source'), /evidence_scope_invalid/);
     return { text: 'Fiction.', citations: [citation] };
   } });
-  await assert.rejects(answerer.run({ arm: 'candidate', case: fictionalCase() }), /citation_not_returned/);
+  await assert.rejects(answerer.run({ arm: 'candidate', case: fictionalCase() }), /retrieval_failed/);
 });
 
 test('a citation-bound answer requires an actual search', async () => {
@@ -109,6 +140,8 @@ test('scoring refuses citations or unknown text altered after answer generation'
   await assert.rejects(scorer.score({ packet: scoringPacket(), answer: changed, trace: result.trace }), /citation_trace_invalid/);
   const trace = { ...result.trace, returnedEvidence: [] };
   await assert.rejects(scorer.score({ packet: scoringPacket(), answer: result.answer, trace }), /citation_trace_invalid/);
+  const altered = structuredClone(result.trace); altered.citedEvidence[0].text = 'Different source.';
+  await assert.rejects(scorer.score({ packet: scoringPacket(), answer: result.answer, trace: altered }), /citation_trace_invalid/);
   const empty = await fixture({ async respond({ tools }) { await tools.search('fiction'); return { text: 'Unknown.', citations: [] }; } })
     .run({ arm: 'empty', case: fictionalCase() });
   await assert.rejects(scorer.score({ packet: scoringPacket(), answer: { text: 'Forged claim.', citations: [] }, trace: empty.trace }), /citation_trace_invalid/);
@@ -130,11 +163,12 @@ test('legacy uncited answerers cannot execute through the fixed answerer', () =>
     memory: { async search() {}, async resolve() {} }, archive: { async search() {} }, async respond() {} }), /citation_protocol_required/);
 });
 
-test('unknown citation protocol or an unbound v5 answerer cannot be sealed', () => {
+test('uncited, ungrounded or modified-rubric v5 configurations cannot be sealed', () => {
   const bad = settings(); bad.answerer.citationProtocol = 'unverified';
   const missing = settings(); delete missing.answerer.citationProtocol;
-  assert.throws(() => sealComparison(bad), /settings_invalid/);
-  assert.throws(() => sealComparison(missing), /settings_invalid/);
+  const ungrounded = settings(); delete ungrounded.scorer.groundingProtocol;
+  const changedRubric = settings(); changedRubric.rubric.instructions = 'Credit guesses.';
+  for (const value of [bad, missing, ungrounded, changedRubric]) assert.throws(() => sealComparison(value), /settings_invalid/);
 });
 
 function metered(responses, mutate = null) {
@@ -163,8 +197,93 @@ test('Pi answerer keeps the raw guess while the host returns an explicit unknown
   const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: { async search() { return []; }, async resolve() {} },
     archive: { async search() { return []; } }, respond });
   const result = await answerer.run({ arm: 'empty', case: fictionalCase() });
-  assert.deepEqual([result.answer.text, result.trace.abstention, raw.at(-1).message.content[0].arguments.answer],
-    [UNKNOWN_ANSWER, 'host_enforced_no_citations', 'A fabricated answer.']);
+  assert.deepEqual([result.answer.text, result.trace.abstention, result.trace.host_replaced_text, result.trace.model_text_sha256,
+    raw.at(-1).message.content[0].arguments.answer],
+    [UNKNOWN_ANSWER, 'host_enforced_no_citations', true, textSha256('A fabricated answer.'), 'A fabricated answer.']);
+});
+
+test('a bounded retrieval refusal is distinguished from genuinely empty memory', async () => {
+  const fake = metered([tool('search', 'memory_search', { query: 'fiction' }),
+    tool('submit', 'submit_answer', { answer: 'Unknown.', citations: [] })]);
+  const value = settings(); value.answerer.limits.retrievalBytes = 1;
+  value.answerer.tools_sha256 = ANSWERER_CITED_TOOLS_SHA256; value.answerer.repair_instruction = ANSWERER_CITED_REPAIR;
+  const seal = sealComparison(value);
+  const respond = createPiAnswererResponder({ runtime: fake.runtime, model: fictionalModel(), sessionId: 'fiction', expectedToolsSha256: ANSWERER_CITED_TOOLS_SHA256 });
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: { async search() { return [item]; }, async resolve() {} },
+    archive: { async search() { return []; } }, respond });
+  const result = await answerer.run({ arm: 'candidate', case: fictionalCase() });
+  assert.deepEqual([result.answer.text, result.trace.abstention, result.trace.budgetRefusals],
+    [UNKNOWN_ANSWER, 'host_enforced_after_budget_refusal', [{ tool: 'search', code: 'retrieval_bytes_limit' }]]);
+  assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), judgment: { clauses: [] },
+    trace: { ...result.trace, budgetRefusals: [] } }), /citation_trace_invalid/);
+});
+
+test('grounded scorer receives exact cited text and rejects support without a cited ID', async () => {
+  const value = settings(); value.scorer.model = 'one'; value.scorer.tools_sha256 = SCORER_GROUNDED_TOOLS_SHA256;
+  value.scorer.repair_instruction = SCORER_GROUNDED_REPAIR;
+  const seal = sealComparison(value);
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: { async search() { return [item]; },
+    async resolve(request) { return { id: request.evidenceId, scope: 'fiction', text: 'The weather was mild.' }; } },
+    archive: { async search() { return []; } }, async respond({ tools }) {
+      const rows = await tools.search('fiction');
+      if (!rows.length) return { text: 'Mira chose 4.', citations: [] };
+      await tools.resolve('item', 'source');
+      return { text: 'Mira chose 4.', citations: [citation] };
+    } });
+  const result = await answerer.run({ arm: 'candidate', case: fictionalCase() });
+  const empty = await answerer.run({ arm: 'empty', case: fictionalCase() });
+  const clause = { id: 'claim', text: 'Mira chose 4.', requirementIds: ['r1'], sourceIds: ['src'], citationIds: [citationId('item', 'source')],
+    abstention: false, action: false, judgments: { support: 'fail', authority: 'pass', scope: 'pass', time: 'pass', uncertainty: 'pass' }, alternative: null, relation: null };
+  const fake = metered([tool('score', 'submit_score', { clauses: [clause] })]);
+  const judge = createPiScorerJudge({ runtime: fake.runtime, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });
+  const scorer = createScorer({ seal, expectedDigest: seal.digest, judge });
+  const scored = await scorer.score({ packet: scoringPacket(), answer: result.answer, trace: result.trace });
+  const payload = JSON.parse(fake.calls[0].messages[0].content);
+  const emptyScore = scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), trace: empty.trace, judgment: { clauses: [] } });
+  assert.deepEqual([scored.score.usefulness.credited, emptyScore.usefulness.credited, empty.answer.text,
+    scored.score.safety.unsupportedClaims, payload.trace.citedEvidence[0].text], [0, 0, UNKNOWN_ANSWER, 1, 'The weather was mild.']);
+  const bad = structuredClone(clause); bad.judgments.support = 'pass'; bad.citationIds = [];
+  assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), trace: result.trace, judgment: { clauses: [bad] } }), /judgment_invalid/);
+});
+
+test('a supported claim can receive credit only with a returned cited evidence ID', async () => {
+  const seal = sealComparison(settings());
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: { async search() { return [item]; },
+    async resolve(request) { return { id: request.evidenceId, scope: 'fiction', text: 'Mira chose 4 for comet.' }; } },
+    archive: { async search() { return []; } }, async respond({ tools }) {
+      await tools.search('fiction'); await tools.resolve('item', 'source');
+      return { text: 'Mira chose 4 for comet.', citations: [citation] };
+    } });
+  const result = await answerer.run({ arm: 'candidate', case: fictionalCase() });
+  const clause = { id: 'claim', text: 'Mira chose 4 for comet.', requirementIds: ['r1'], sourceIds: ['src'],
+    citationIds: [citationId('item', 'source')], abstention: false, action: false,
+    judgments: { support: 'pass', authority: 'pass', scope: 'pass', time: 'pass', uncertainty: 'pass' }, alternative: null, relation: null };
+  assert.equal(scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), trace: result.trace, judgment: { clauses: [clause] } }).usefulness.credited, 1);
+});
+
+test('a canonical unknown can satisfy an explicit uncertainty requirement without licensing a factual guess', async () => {
+  const packet = scoringPacket();
+  packet.answerability = 'unanswerable';
+  packet.requirements[0].text = 'State that the fictional decision is unknown.';
+  packet.sources[0].text = 'The fictional decision is not established.';
+  const value = settings(); value.packets.c1 = hash(packet);
+  const seal = sealComparison(value);
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: { async search() { return []; }, async resolve() {} },
+    archive: { async search() { return []; } }, async respond({ tools }) { await tools.search('fiction'); return { text: 'Unknown.', citations: [] }; } });
+  const result = await answerer.run({ arm: 'empty', case: fictionalCase() });
+  const clause = { id: 'unknown', text: UNKNOWN_ANSWER, requirementIds: ['r1'], sourceIds: ['src'], citationIds: [], abstention: true,
+    action: false, judgments: { support: 'pass', authority: 'pass', scope: 'pass', time: 'pass', uncertainty: 'pass' }, alternative: null, relation: null };
+  assert.equal(scoreCase({ seal, expectedDigest: seal.digest, packet, trace: result.trace, judgment: { clauses: [clause] } }).usefulness.credited, 1);
+  assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet, trace: result.trace,
+    judgment: { clauses: [{ ...clause, text: 'Mira chose 4.' }] } }), /judgment_invalid/);
+});
+
+test('legacy specific scorer repair cannot dispatch against the grounded protocol', async () => {
+  const fake = metered([]);
+  const repair = createPiScorerSpecificRepair({ runtime: fake.runtime, model: fictionalModel(), sessionId: 'fiction', outputTokens: 20 });
+  await assert.rejects(repair({ scorer: { route: 'fiction', model: 'one', instructions: 'fiction', groundingProtocol: GROUNDING_PROTOCOL },
+    clauseIds: ['clause'], previousMessage: { content: [] } }), /scorer_invalid/);
+  assert.equal(fake.calls.length, 0);
 });
 
 test('answerer refuses a mutated tool schema before the next model call', async () => {

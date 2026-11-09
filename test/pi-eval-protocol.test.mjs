@@ -1,8 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sealComparison, verifySeal } from '../pi-extension/evaluation/seal.mjs';
-import { createAnswerer as createAnchoredAnswerer } from '../pi-extension/evaluation/answerer.mjs';
-import { fictionalSettings, fictionalCase } from '../pi-extension/evaluation/fictional.mjs';
+import { createAnswerer as createAnchoredAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
+import { fictionalSettings as baseSettings, fictionalCase } from '../pi-extension/evaluation/fictional.mjs';
+import { GROUNDING_PROTOCOL, CITED_RUBRIC_VERSION, CITED_RUBRIC, CITED_WORKED_EXAMPLES } from '../pi-extension/evaluation/rubric.mjs';
+
+function fictionalSettings() {
+  const value = baseSettings();
+  value.answerer.citationProtocol = CITATION_PROTOCOL;
+  value.scorer.groundingProtocol = GROUNDING_PROTOCOL;
+  value.rubric = { version: CITED_RUBRIC_VERSION, instructions: CITED_RUBRIC, examples: CITED_WORKED_EXAMPLES };
+  return value;
+}
 
 const createAnswerer = options => createAnchoredAnswerer({ ...options, expectedDigest: options.seal.digest });
 

@@ -14,13 +14,15 @@ test('pilot plan freezes model roles, named empty baseline and strict safety bef
     ['empty-derived (no prior memory system)', 'claude-sonnet-5-5', 'claude-sonnet-5-5', '100000000000', 0]);
 });
 
-test('fresh cited plan seals answerer v5 without changing candidate or scorer settings', () => {
+test('fresh cited plan seals grounded scorer and leaves candidate and model routes unchanged', () => {
   const options = { cases: [{ publicCase: fictionalCase(), packet: scoringPacket() }], sourceSha256: 'a'.repeat(64),
     datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64), codeSha: 'd'.repeat(40),
     routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } } };
   const legacy = createPilotPlan(options).spec, cited = createCitedPilotPlan(options).spec;
   assert.deepEqual([cited.answerer.version, cited.answerer.citationProtocol, cited.answerer.tools_sha256,
-    cited.budget.purposes.answerer.taskVersion, cited.budget.purposes.candidate, cited.scorer],
-  ['answerer-r2-v5', 'returned-evidence-v1', ANSWERER_CITED_TOOLS_SHA256, 'answerer-r2-v5', legacy.budget.purposes.candidate, legacy.scorer]);
+    cited.budget.purposes.answerer.taskVersion, cited.budget.purposes.candidate, cited.scorer.route, cited.scorer.model,
+    cited.scorer.version, cited.scorer.groundingProtocol, cited.rubric.version],
+  ['answerer-r2-v5', 'returned-evidence-v1', ANSWERER_CITED_TOOLS_SHA256, 'answerer-r2-v5', legacy.budget.purposes.candidate,
+    legacy.scorer.route, legacy.scorer.model, 'scorer-r2-v3-grounded', 'answerer-cited-evidence-v1', 'semantic-rubric-v2-citation-grounded']);
   assert.throws(() => createCitedPilotPlan({ ...options, resume: {} }), /resume_transition_forbidden/);
 });

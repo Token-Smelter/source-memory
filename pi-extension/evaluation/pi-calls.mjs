@@ -1,14 +1,18 @@
 import { hash } from './seal.mjs';
 import { METERED_RUNTIME } from './pi-wrapper.mjs';
+import { GROUNDING_PROTOCOL } from './rubric.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const schema = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
 const string = { type: 'string' }, strings = { type: 'array', items: string };
 const grades = { type: 'string', enum: ['pass', 'fail', 'uncertain'] };
-const judgmentSchema = schema({ clauses: { type: 'array', items: schema({ id: string, text: string, requirementIds: strings, sourceIds: strings,
+const clauseProperties = { id: string, text: string, requirementIds: strings, sourceIds: strings,
   action: { type: 'boolean' }, judgments: schema({ support: grades, authority: grades, scope: grades, time: grades, uncertainty: grades }),
   alternative: { anyOf: [{ type: 'null' }, schema({ rationale: string, sourceIds: strings })] },
-  relation: { anyOf: [{ type: 'null' }, schema({ required: { type: 'boolean' }, recoverable: { anyOf: [{ type: 'boolean' }, { type: 'null' }] }, itemIds: strings })] } }) } });
+  relation: { anyOf: [{ type: 'null' }, schema({ required: { type: 'boolean' }, recoverable: { anyOf: [{ type: 'boolean' }, { type: 'null' }] }, itemIds: strings })] } };
+const judgmentSchema = schema({ clauses: { type: 'array', items: schema(clauseProperties) } });
+const groundedJudgmentSchema = schema({ clauses: { type: 'array', items: schema({ ...clauseProperties, citationIds: strings,
+  abstention: { type: 'boolean' } }) } });
 export const ANSWERER_TOOLS = Object.freeze([
   { name: 'memory_search', description: 'Search permitted derived-memory items; after the fixed item budget is spent, later searches return a budget-exhausted result.', parameters: schema({ query: string }) },
   { name: 'memory_resolve', description: 'Resolve evidence for an item returned by memory_search.', parameters: schema({ item_id: string, evidence_id: string }) },
@@ -20,10 +24,12 @@ export const ANSWERER_CITED_TOOLS = Object.freeze([
     parameters: schema({ answer: string, citations: { type: 'array', maxItems: 16, items: schema({ item_id: string, evidence_id: string }) } }) },
 ]);
 export const SCORER_TOOLS = Object.freeze([{ name: 'submit_score', description: 'Submit the complete clause-level judgment.', parameters: judgmentSchema }]);
+export const SCORER_GROUNDED_TOOLS = Object.freeze([{ name: 'submit_score', description: 'Submit the complete clause-level judgment, including cited evidence IDs.', parameters: groundedJudgmentSchema }]);
 export const ANSWERER_TOOLS_SHA256 = hash(ANSWERER_TOOLS);
 export const ANSWERER_CITED_TOOLS_SHA256 = hash(ANSWERER_CITED_TOOLS);
 export const ANSWERER_TOOLS_V2_SHA256 = hash([{ ...ANSWERER_TOOLS[0], description: 'Search the permitted derived-memory items.' }, ...ANSWERER_TOOLS.slice(1)]);
 export const SCORER_TOOLS_SHA256 = hash(SCORER_TOOLS);
+export const SCORER_GROUNDED_TOOLS_SHA256 = hash(SCORER_GROUNDED_TOOLS);
 export const ANSWERER_FORMAT_SUFFIX = ' Submit the final answer with the submit_answer tool.';
 export const ANSWERER_BUDGET_SUFFIX = ' If the item budget is exhausted, answer from retrieved items or state uncertainty.';
 export const ANSWERER_CITATION_SUFFIX = ' Search the permitted memory before answering. If no relevant information supports an answer, say you do not know; never guess. Cite only evidence actually returned by memory_resolve using its item_id and evidence_id. If memory_search directly returns raw evidence without evidence handles, use the returned id as both item_id and evidence_id. If no evidence supports an answer, submit an empty citations array.';
@@ -31,6 +37,7 @@ export const SCORER_FORMAT_SUFFIX = ' Submit the complete judgment with the subm
 export const ANSWERER_REPAIR = 'The previous output was not a valid final submission. Call submit_answer with the complete answer; do not change its substance merely to fix formatting.';
 export const ANSWERER_CITED_REPAIR = 'The previous submission was invalid. Search before answering and submit the answer with citations only to evidence actually returned by the tools; if none supports an answer, submit no citations and say you do not know.';
 export const SCORER_REPAIR = 'The previous submission was invalid. Call submit_score with the complete judgment matching the schema and supplied IDs; retain substantive judgments unless correction is required for validity.';
+export const SCORER_GROUNDED_REPAIR = 'The previous submission was invalid. Call submit_score with the complete judgment and supplied reference and cited-evidence IDs. Factual support passes only when both reference and cited evidence support the clause. The exact canonical unknown may be a nonfactual abstention with no citation IDs. Otherwise choose fail or uncertain.';
 export const SCORER_SPECIFIC_REPAIR = 'For clause {clause_id}: support=pass requires at least one packet source ID; if no packet source supports the clause, choose fail or uncertain. Submit the complete judgment with submit_score.';
 export const SCORER_MULTI_REPAIR = 'For each clause in {clause_ids}: support=pass requires at least one packet source ID; if no packet source supports the clause, choose fail or uncertain. Submit the complete judgment with submit_score.';
 
@@ -59,13 +66,14 @@ async function call(runtime, model, context, options, onRaw, metadata) {
 function exact(value, keys) {
   return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
 }
-function validScore(value) {
+function validScore(value, grounded = false) {
   const dimensions = ['support', 'authority', 'scope', 'time', 'uncertainty'];
   return exact(value, ['clauses']) && Array.isArray(value.clauses) && value.clauses.every(c => exact(c,
-    ['id', 'text', 'requirementIds', 'sourceIds', 'action', 'judgments', 'alternative', 'relation'])
+    ['id', 'text', 'requirementIds', 'sourceIds', 'action', 'judgments', 'alternative', 'relation', ...(grounded ? ['citationIds', 'abstention'] : [])])
     && typeof c.id === 'string' && c.id.trim() && typeof c.text === 'string' && c.text.trim() && typeof c.action === 'boolean'
     && Array.isArray(c.requirementIds) && c.requirementIds.every(x => typeof x === 'string')
-    && Array.isArray(c.sourceIds) && c.sourceIds.every(x => typeof x === 'string') && exact(c.judgments, dimensions)
+    && Array.isArray(c.sourceIds) && c.sourceIds.every(x => typeof x === 'string')
+    && (!grounded || (Array.isArray(c.citationIds) && c.citationIds.every(x => typeof x === 'string') && typeof c.abstention === 'boolean')) && exact(c.judgments, dimensions)
     && dimensions.every(key => ['pass', 'fail', 'uncertain'].includes(c.judgments[key]))
     && (c.alternative === null || (exact(c.alternative, ['rationale', 'sourceIds']) && typeof c.alternative.rationale === 'string'
       && Array.isArray(c.alternative.sourceIds) && c.alternative.sourceIds.every(x => typeof x === 'string')))
@@ -157,6 +165,7 @@ export function createPiScorerSpecificRepair({ runtime, model, sessionId, output
   if (!Number.isSafeInteger(outputTokens) || outputTokens < 1 || typeof onRaw !== 'function') throw fail('scorer_invalid');
   return async ({ packet, answer, trace, scorer, rubric, packetSchema, validate, previousMessage, clauseId, clauseIds = clauseId ? [clauseId] : [] }) => {
     if (scorer?.route !== model.provider || scorer?.model !== model.id || typeof scorer.instructions !== 'string'
+      || scorer.groundingProtocol === GROUNDING_PROTOCOL
       || !Array.isArray(clauseIds) || !clauseIds.length || new Set(clauseIds).size !== clauseIds.length
       || clauseIds.some(id => typeof id !== 'string' || !id || id.length > 256) || !Array.isArray(previousMessage?.content)) throw fail('scorer_invalid');
     const calls = previousMessage.content.filter(part => part.type === 'toolCall');
@@ -188,19 +197,24 @@ export function createPiScorerJudge({ runtime, model, sessionId, outputTokens, o
   check({ runtime, model, sessionId });
   if (!Number.isSafeInteger(outputTokens) || outputTokens < 1 || typeof onRaw !== 'function') throw fail('scorer_invalid');
   return async ({ packet, answer, trace, scorer, rubric, packetSchema, validate }) => {
+    const grounded = scorer?.groundingProtocol === GROUNDING_PROTOCOL;
+    const scorerTools = grounded ? SCORER_GROUNDED_TOOLS : SCORER_TOOLS;
+    const expectedTools = grounded ? SCORER_GROUNDED_TOOLS_SHA256 : SCORER_TOOLS_SHA256;
+    const repair = grounded ? SCORER_GROUNDED_REPAIR : SCORER_REPAIR;
     if (scorer?.route !== model.provider || scorer?.model !== model.id || typeof scorer.instructions !== 'string'
-      || (scorer.tools_sha256 !== undefined && scorer.tools_sha256 !== SCORER_TOOLS_SHA256)
+      || (grounded ? scorer.tools_sha256 !== expectedTools : scorer.tools_sha256 !== undefined && scorer.tools_sha256 !== expectedTools)
       || (scorer.formatRepairCalls !== undefined && scorer.formatRepairCalls !== 1)
-      || (scorer.repair_instruction !== undefined && scorer.repair_instruction !== SCORER_REPAIR)) throw fail('scorer_invalid');
-    const context = { systemPrompt: scorer.instructions, tools: SCORER_TOOLS, messages: [{ role: 'user',
+      || (scorer.repair_instruction !== undefined && scorer.repair_instruction !== repair)) throw fail('scorer_invalid');
+    const context = { systemPrompt: scorer.instructions, tools: structuredClone(scorerTools), messages: [{ role: 'user',
       content: JSON.stringify({ packet, answer, trace, rubric, packet_schema: packetSchema }), timestamp: Date.now() }] };
     for (let attempt = 0; attempt < 2; attempt++) {
+      if (hash(context.tools) !== expectedTools) throw fail('scorer_tools_mismatch');
       const message = await call(runtime, model, context, { maxTokens: outputTokens, reasoning: scorer.reasoning, maxRetries: 0, sessionId }, onRaw,
         { role: 'scorer', attempt: attempt + 1 });
       context.messages.push(message);
       const calls = message.content.filter(part => part.type === 'toolCall');
       const submission = message.stopReason === 'toolUse' && calls.length === 1 && calls[0].name === 'submit_score' ? calls[0] : null;
-      let valid = Boolean(submission && validScore(submission.arguments));
+      let valid = Boolean(submission && validScore(submission.arguments, grounded));
       if (valid && typeof validate === 'function') {
         try { validate(submission.arguments); }
         catch (error) {
@@ -211,7 +225,7 @@ export function createPiScorerJudge({ runtime, model, sessionId, outputTokens, o
       if (valid) return submission.arguments;
       if (attempt) throw Object.assign(fail('scorer_output_invalid'), { last_message: structuredClone(message) });
       for (const tool of calls) context.messages.push(toolResult(tool, { error: 'invalid_submission' }, true));
-      context.messages.push({ role: 'user', content: SCORER_REPAIR, timestamp: Date.now() });
+      context.messages.push({ role: 'user', content: repair, timestamp: Date.now() });
     }
     throw fail('scorer_output_invalid');
   };

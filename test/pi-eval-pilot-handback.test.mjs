@@ -4,10 +4,18 @@ import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extensi
 import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
 import { scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { fictionalSettings, fictionalCase, fictionalTrace, scoringPacket, clause } from '../pi-extension/evaluation/fictional.mjs';
-import { UNKNOWN_ANSWER } from '../pi-extension/evaluation/answerer.mjs';
+import { CITATION_PROTOCOL, UNKNOWN_ANSWER } from '../pi-extension/evaluation/answerer.mjs';
+import { GROUNDING_PROTOCOL, CITED_RUBRIC_VERSION, CITED_RUBRIC, CITED_WORKED_EXAMPLES } from '../pi-extension/evaluation/rubric.mjs';
 
-function fixture() {
-  const seal = sealComparison(fictionalSettings()), packet = scoringPacket(), trace = fictionalTrace(), judgment = { clauses: [clause('c', ['r1'])] };
+function fixture({ grounded = false } = {}) {
+  const settings = fictionalSettings();
+  if (grounded) {
+    settings.answerer.citationProtocol = CITATION_PROTOCOL;
+    settings.scorer.groundingProtocol = GROUNDING_PROTOCOL;
+    settings.rubric = { version: CITED_RUBRIC_VERSION, instructions: CITED_RUBRIC, examples: CITED_WORKED_EXAMPLES };
+  }
+  const seal = sealComparison(settings), packet = scoringPacket(), trace = { ...fictionalTrace(), sealDigest: seal.digest },
+    judgment = { clauses: grounded ? [] : [clause('c', ['r1'])] };
   const score = scoreCase({ seal, expectedDigest: seal.digest, packet, trace, judgment });
   const resultRows = [], ledgerRows = [], outputRows = [];
   for (const [i, arm] of ['candidate', 'baseline', 'empty', 'raw-only'].entries()) {
@@ -55,6 +63,7 @@ test('case handback refuses a missing raw model output or altered score', () => 
   assert.throws(() => validateCaseHandback({ ...f, outputRows: f.outputRows.slice(1) }), /handback_outputs_missing/);
   const rows = structuredClone(f.resultRows); rows.find(row => row.type === 'judgment').score.usefulness.credited = 0;
   assert.throws(() => validateCaseHandback({ ...f, resultRows: rows }), /handback_score_mismatch/);
-  const changedAnswer = structuredClone(f.resultRows); changedAnswer.find(row => row.type === 'answer').answer.answer.text = 'Invented.';
-  assert.throws(() => validateCaseHandback({ ...f, resultRows: changedAnswer }), /citation_trace_invalid/);
+  const bound = fixture({ grounded: true });
+  const changedAnswer = structuredClone(bound.resultRows); changedAnswer.find(row => row.type === 'answer').answer.answer.text = 'Invented.';
+  assert.throws(() => validateCaseHandback({ ...bound, resultRows: changedAnswer }), /citation_trace_invalid/);
 });

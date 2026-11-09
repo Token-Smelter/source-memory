@@ -543,7 +543,7 @@ async function main() {
                 meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: seal.spec.answerer.version, policy_version: seal.spec.policyVersion };
                 const answer = await answerer.run({ arm, case: item.publicCase });
                 results.append({ type: 'answer', case_id: item.publicCase.id, arm, answer });
-                meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: 'scorer-r2-v2', policy_version: seal.spec.policyVersion };
+                meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: seal.spec.scorer.version, policy_version: seal.spec.policyVersion };
                 try {
                   const judged = await scorer.score({ packet: item.packet, answer: answer.answer, trace: answer.trace });
                   arms[arm] = judged.score;

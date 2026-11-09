@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { CITED_RUBRIC, CITED_RUBRIC_VERSION, CITED_WORKED_EXAMPLES, GROUNDING_PROTOCOL } from './rubric.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const nonempty = value => typeof value === 'string' && value.trim().length > 0;
@@ -40,7 +41,15 @@ function validate(s) {
     || Object.keys(s.cases).sort().join('\0') !== Object.keys(s.packets).sort().join('\0')
     || a.retrievalInterface !== 'returned-item-evidence-v1'
     || (a.citationProtocol !== undefined && a.citationProtocol !== 'returned-evidence-v1')
-    || (a.version === 'answerer-r2-v5' && a.citationProtocol !== 'returned-evidence-v1') || s.packetSchema.version !== 'packet-v1'
+    || (a.citationProtocol === 'returned-evidence-v1' && sc.groundingProtocol !== 'answerer-cited-evidence-v1')
+    || (sc.groundingProtocol !== undefined && sc.groundingProtocol !== 'answerer-cited-evidence-v1')
+    || (a.version === 'answerer-r2-v5' && (a.citationProtocol !== 'returned-evidence-v1' || sc.groundingProtocol !== 'answerer-cited-evidence-v1'
+      || !/^[a-f0-9]{64}$/.test(a.tools_sha256 ?? '') || !nonempty(a.repair_instruction) || a.limits?.formatRepairCalls !== 1
+      || sc.version !== 'scorer-r2-v3-grounded' || !/^[a-f0-9]{64}$/.test(sc.tools_sha256 ?? '')
+      || !nonempty(sc.repair_instruction) || sc.formatRepairCalls !== 1))
+    || (sc.groundingProtocol === GROUNDING_PROTOCOL && (a.citationProtocol !== 'returned-evidence-v1'
+      || s.rubric.version !== CITED_RUBRIC_VERSION || s.rubric.instructions !== CITED_RUBRIC
+      || hash(s.rubric.examples) !== hash(CITED_WORKED_EXAMPLES))) || s.packetSchema.version !== 'packet-v1'
     || s.comparison.primary !== 'candidate-minus-named-baseline' || s.comparison.uncertainty !== 'conservative' || s.comparison.caseWeight !== 'equal'
     || s.baseline.storeId === s.stores.candidate || !uint(s.budget.maxSlotsPerPlan) || s.budget.maxSlotsPerPlan < 1
     || !uint(s.budget.maxPlans) || s.budget.maxPlans < 1

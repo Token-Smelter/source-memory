@@ -1,10 +1,11 @@
 import { RUBRIC, RUBRIC_VERSION, WORKED_EXAMPLES } from './rubric.mjs';
 import { hash, modelFingerprint, sealComparison } from './seal.mjs';
+import { textSha256, UNKNOWN_ANSWER } from './answerer.mjs';
 
 export function fictionalSettings() {
   return {
     version: 'fiction-v1', policyVersion: 'fiction-policy-v1', freezeBasis: 'fiction-before-observations',
-    answerer: { route: 'fiction', model: 'one', reasoning: 'low', version: 'a1', citationProtocol: 'returned-evidence-v1', contextPolicy: 'request-and-tools-only',
+    answerer: { route: 'fiction', model: 'one', reasoning: 'low', version: 'a1', contextPolicy: 'request-and-tools-only',
       retrievalInterface: 'returned-item-evidence-v1', instructions: 'Answer only from the permitted tools.',
       limits: { searchCalls: 2, resolveCalls: 2, returnedItems: 3, evidenceBytes: 1024, retrievalBytes: 1024,
         queryBytes: 200, responseBytes: 4096, inputTokens: 100, outputTokens: 20, modelCalls: 2, costNano: '10000' } },
@@ -32,7 +33,8 @@ export function fictionalTrace() {
   const c = fictionalCase();
   return { caseId: c.id, caseDigest: hash(c), sealDigest: sealComparison(fictionalSettings()).digest,
     context: { request: c.request, actor: c.actor, queryTime: c.queryTime, readScopes: c.readScopes, evidenceScopes: c.evidenceScopes },
-    returnedItemIds: [], returnedEvidence: [], citations: [], abstention: 'host_enforced_no_citations' };
+    returnedItemIds: [], returnedEvidence: [], citedEvidence: [], citations: [], budgetRefusals: [],
+    model_text_sha256: textSha256(UNKNOWN_ANSWER), host_replaced_text: false, abstention: 'host_enforced_no_citations' };
 }
 export function clause(id, requirementIds, overrides = {}) {
   const { alternative = null, relation = null, action = false, ...grades } = overrides;

@@ -11,7 +11,8 @@ import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
 import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
 import { createDerivedAdapter, searchDerived, resolveDerived } from '../pi-extension/derived-retrieval.mjs';
-import { createAnswerer } from '../pi-extension/evaluation/answerer.mjs';
+import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
+import { GROUNDING_PROTOCOL, CITED_RUBRIC_VERSION, CITED_RUBRIC, CITED_WORKED_EXAMPLES } from '../pi-extension/evaluation/rubric.mjs';
 import { fictionalCase, fictionalSettings } from '../pi-extension/evaluation/fictional.mjs';
 import { hash, sealComparison } from '../pi-extension/evaluation/seal.mjs';
 
@@ -1099,6 +1100,9 @@ export async function runIntegration(database, scratch) {
     await check('cited answerer returns only evidence resolved from its selected Neo4j record', async () => {
       const request = { ...fictionalCase(), readScopes: ['demo'], evidenceScopes: ['demo'] };
       const settings = fictionalSettings();
+      settings.answerer.citationProtocol = CITATION_PROTOCOL;
+      settings.scorer.groundingProtocol = GROUNDING_PROTOCOL;
+      settings.rubric = { version: CITED_RUBRIC_VERSION, instructions: CITED_RUBRIC, examples: CITED_WORKED_EXAMPLES };
       settings.access = { readScopes: ['demo'], evidenceScopes: ['demo'] };
       settings.answerer.limits.retrievalBytes = 32000;
       settings.answerer.limits.evidenceBytes = 32000;
