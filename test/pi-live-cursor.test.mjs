@@ -10,7 +10,7 @@ import { canonical, digest } from '../src/core.mjs';
 import { Memory } from '../src/memory.mjs';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createCursorStore } from '../pi-extension/cursor-store.mjs';
-import { createLiveController, registerLiveMemory } from '../pi-extension/live.mjs';
+import { admitAll, createLiveController, registerLiveMemory } from '../pi-extension/live.mjs';
 import { ownerRecord } from '../pi-extension/owner-lock.mjs';
 import { defaultJournalBytes } from './helpers/default-journal-script.mjs';
 
@@ -61,7 +61,7 @@ function harness(directory, store, { distill = 'record', sessionKey = 'fiction-s
         return { status: 'complete', disposition: 'committed' };
       } } };
   };
-  const controller = createLiveController({ journal, cursorStore, conversationId: 'fiction', open });
+  const controller = createLiveController({ journal, cursorStore, conversationId: 'fiction', open, gate: admitAll });
   return { journal, cursorStore, controller, opened, close: () => journal.close() };
 }
 
@@ -296,7 +296,7 @@ test('a cursor the journal never covered is refused', () => privateDir(async dir
 
 test('the controller requires a journal opened with effect IDs and an owner lock', () => privateDir(async directory => {
   const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
-  assert.throws(() => createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: 'fiction' }), conversationId: 'fiction',
+  assert.throws(() => createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: 'fiction' }), conversationId: 'fiction', gate: admitAll,
     open: async () => ({}) }), /controller_invalid/);
   journal.close();
 }));

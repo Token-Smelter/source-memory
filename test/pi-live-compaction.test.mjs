@@ -8,7 +8,7 @@ import { distillThrough, sourceInterval } from '../pi-extension/core.mjs';
 import { createCoverageJournal, runCoveredInterval } from '../pi-extension/coverage.mjs';
 import { createCursorStore } from '../pi-extension/cursor-store.mjs';
 import { createIncrementalSession } from '../pi-extension/incremental.mjs';
-import { createLiveController, registerLiveMemory } from '../pi-extension/live.mjs';
+import { admitAll, createLiveController, registerLiveMemory } from '../pi-extension/live.mjs';
 import { contextMessages, createPiDistiller, WITHHELD_SUMMARY } from '../pi-extension/pi-runtime.mjs';
 import { compactResult } from './helpers/compact-fixture.mjs';
 import { fictionalCoverage } from '../pi-extension/policy.mjs';
@@ -97,7 +97,7 @@ test('the live controller covers intervals across a compaction and journals its 
   const journal = createCoverageJournal({ directory, sessionKey: 'fiction', effectIds: true, pidLock: true });
   const ingested = [];
   const memory = journal.track({ async ingest(_scope, turn) { ingested.push(turn.entries.map(row => row.id)); return { id: `turn-${turn.turn_id}` }; } });
-  const controller = createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: 'fiction' }), conversationId: 'fiction',
+  const controller = createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: 'fiction' }), conversationId: 'fiction', gate: admitAll,
     open: async () => ({ conversation_id: 'fiction', scopes: ['private'], memory,
       distiller: { memory, async run() { return { status: 'complete', disposition: 'abstained' }; } } }) });
   const before = await controller.settle({ leafId: 'a2', entries: compacted.slice(0, 4) });

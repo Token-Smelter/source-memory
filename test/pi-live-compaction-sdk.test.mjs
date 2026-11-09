@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { sourceInterval } from '../pi-extension/core.mjs';
 import { createCoverageJournal, runCoveredInterval } from '../pi-extension/coverage.mjs';
 import { createIncrementalSession } from '../pi-extension/incremental.mjs';
-import { createLiveController, registerLiveMemory } from '../pi-extension/live.mjs';
+import { admitAll, createLiveController, registerLiveMemory } from '../pi-extension/live.mjs';
 import { createCursorStore } from '../pi-extension/cursor-store.mjs';
 import { contextMessages, createPiDistiller } from '../pi-extension/pi-runtime.mjs';
 import { compactResult } from './helpers/compact-fixture.mjs';
@@ -43,7 +43,7 @@ test('a failed interval across a compaction is retried and covered', () => priva
   const journal = createCoverageJournal({ directory, sessionKey: 'fiction', effectIds: true, pidLock: true });
   let calls = 0;
   const memory = journal.track({ async ingest() { return { id: 'turn' }; } });
-  const controller = createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: 'fiction' }), conversationId: 'fiction',
+  const controller = createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: 'fiction' }), conversationId: 'fiction', gate: admitAll,
     open: async () => ({ conversation_id: 'fiction', scopes: ['private'], memory, distiller: { memory, async run() {
       if (++calls === 2) throw Object.assign(new Error('provider'), { code: 'provider_unavailable' });
       return { status: 'complete', disposition: 'abstained' };

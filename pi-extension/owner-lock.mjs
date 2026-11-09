@@ -28,6 +28,18 @@ export function ownerGone(owner, self = ownerRecord()) {
   return owner.start !== null && now !== null && owner.start !== now;
 }
 
+/**
+ * The opposite proof, for spend: an owner is alive only when it is this process, or it names this host, boot and PID namespace
+ * and its PID exists with the recorded start time. Anything unprovable (no /proc, another namespace or host) is not alive.
+ */
+export function ownerAlive(owner, self = ownerRecord()) {
+  if (!owner || owner.v !== 1 || owner.host !== self.host || !Number.isSafeInteger(owner.pid) || owner.pid < 1) return false;
+  if (!owner.boot || owner.boot !== self.boot || !owner.pidns || owner.pidns !== self.pidns || owner.start === null) return false;
+  if (owner.pid === self.pid) return owner.start === self.start;
+  try { process.kill(owner.pid, 0); } catch (problem) { if (problem.code !== 'EPERM') return false; }
+  return startTime(owner.pid) === owner.start;
+}
+
 /** Create the lock with its owner record in one step: write a private temp file, then hard-link it into place. */
 function place(lockPath, bytes) {
   const temporary = `${lockPath}.${randomUUID()}.tmp`;

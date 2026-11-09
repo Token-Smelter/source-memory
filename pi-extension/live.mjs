@@ -8,6 +8,10 @@ import { createSessionQueue, settledSnapshot } from './index.mjs';
 const fail = code => Object.assign(new Error(code), { code });
 const covered = new Set(['committed', 'abstained', 'ineligible_by_policy']);
 const settledEffect = new Set(['confirmed', 'refused']);
+const safeCode = value => typeof value?.code === 'string' && /^[a-z_]{1,80}$/.test(value.code) ? value.code : 'gate_refused';
+
+/** Explicit opt-out for replay and tests: admits every interval and is recorded as ungated. */
+export const admitAll = Object.assign(async () => ({ admitted: true }), { ungated: true });
 
 /** Active-branch entry IDs from the leaf to the root, in that order. */
 function ancestryOf(entries, leafId) {
@@ -45,17 +49,31 @@ export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onE
  * pointer that must agree with it. Each settle derives its cursor as the end of the covered prefix of the active branch,
  * so a failed cursor save, a crash, a fork inside a covered interval or a branch switch never ingests a covered entry again.
  */
-export function createLiveController({ journal, cursorStore, conversationId, open, maxRetries = 3 }) {
-  if (!journal || !journal.options?.effectIds || !journal.options?.pidLock || !cursorStore || typeof open !== 'function'
+export function createLiveController({ journal, cursorStore, conversationId, open, gate, maxRetries = 3 }) {
+  if (!journal || !journal.options?.effectIds || !journal.options?.pidLock || !cursorStore || typeof open !== 'function' || typeof gate !== 'function'
     || typeof conversationId !== 'string' || !conversationId || !Number.isSafeInteger(maxRetries) || maxRetries < 0) throw fail('controller_invalid');
   // Live sessions compact; summaries follow the dependency-closure rule instead of blocking every later interval.
   const summaryPolicy = 'dependency_closure';
   let session = null;
   let busy = false;
 
+  /** Only an explicit { admitted: true } admits; anything else, including a thrown error, is a refusal. */
+  async function admit(request) {
+    try {
+      const decision = await gate(request);
+      if (decision?.admitted === true) return null;
+      return safeCode(decision);
+    } catch (problem) { return problem?.refused ? safeCode(problem) : 'gate_unavailable'; }
+  }
+
   async function getSession() {
     if (!session) {
       const opened = await open();
+      // The admitted scope and budget must be the ones this session writes and spends through.
+      if ((gate.scope !== undefined && opened?.scopes?.[0] !== gate.scope) || (gate.budget !== undefined && opened?.budget !== gate.budget)) {
+        try { await opened?.close?.(); } catch {}
+        throw fail('gate_binding_mismatch');
+      }
       if (opened?.conversation_id !== conversationId) {
         try { await opened?.close?.(); } catch {}
         throw fail('session_identity_changed');
@@ -133,6 +151,9 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
   }
 
   async function run(entries, through, cursor, retry) {
+    // Admission precedes the journal begin and the Memory process, so a refusal leaves no row, no ingest and no spend.
+    const refusal = await admit({ phase: 'interval', through, cursor, retry });
+    if (refusal) return { refused: true, through, cursor, code: refusal };
     const current = await getSession();
     const result = await runCoveredInterval({ journal, session: { ...current, entries }, through, cursor, retry, summaryPolicy });
     if (covered.has(result.disposition)) {
@@ -145,13 +166,26 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
 
   return {
     /** Process the source suffix through one settled leaf; returns a status object and never advances past an uncovered interval. */
-    async settle({ leafId, entries }) {
+    async settle(snapshot) {
+      const result = await settleOnce(snapshot);
+      return gate.ungated ? { ...result, ungated: true } : result;
+    },
+    async close() { await dropSession(); },
+  };
+
+  async function settleOnce({ leafId, entries }) {
       if (busy) throw fail('controller_busy');
       busy = true;
       const results = [];
       let reconciled = null;
       try {
         if (!Array.isArray(entries) || !entries.some(row => row?.id === leafId)) return { status: 'skipped', code: 'source_unavailable', results, reconciled };
+        const pending = journal.state();
+        if (pending.status === 'uncertain' || pending.reconciliation_required) {
+          // Reconciliation reads Memory, so the scope grants are checked first; it spends no model budget.
+          const refusal = await admit({ phase: 'reconcile', id: pending.id });
+          if (refusal) return { status: 'refused', code: refusal, results, reconciled };
+        }
         reconciled = await reconcile();
         if (reconciled?.blocked) return { status: 'blocked', code: reconciled.blocked, id: journal.state().id, results, reconciled };
         const path = ancestryOf(entries, leafId);
@@ -163,7 +197,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
           catch { return { status: 'blocked', code: 'coverage_gap_unreachable', id: state.id, results, reconciled }; }
           const retried = await run(entries, state.through, state.cursor, true);
           results.push(retried);
-          if (!covered.has(retried.disposition)) return { status: 'stopped', results, reconciled };
+          if (!covered.has(retried.disposition)) return { status: retried.refused ? 'refused' : 'stopped', code: retried.code, results, reconciled };
         }
         const cursor = resolveCursor(entries, path);
         if (leafId === cursor) return { status: 'current', cursor, results, reconciled };
@@ -172,9 +206,8 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         const result = await run(entries, leafId, cursor, false);
         results.push(result);
         const done = covered.has(result.disposition);
-        return { status: done ? 'covered' : 'stopped', cursor: done ? leafId : cursor, results, reconciled };
+        return { status: done ? 'covered' : result.refused ? 'refused' : 'stopped', ...(result.refused ? { code: result.code } : {}),
+          cursor: done ? leafId : cursor, results, reconciled };
       } finally { busy = false; }
-    },
-    async close() { await dropSession(); },
-  };
+  }
 }

@@ -71,15 +71,21 @@ The cursor is the last covered **source entry ID**, not a message count. Process
 ```mermaid
 flowchart TD
     Settle["settle(leaf, entries)"] --> Rec{"journal uncertain or reconciliation required?"}
-    Rec -->|"yes"| Ids["Fresh Memory process: ingest is an idempotent replay; enrich and outcome IDs are checked with recordPresence"]
+    Rec -->|"yes"| Grants{"gate grants check (phase reconcile)"}
+    Grants -->|"refused"| Refused
+    Grants -->|"admitted"| Ids["Fresh Memory process: ingest is an idempotent replay; enrich and outcome IDs are checked with recordPresence"]
     Ids --> Gap["persist evidence file, reconcile as failed"]
     Rec -->|"no"| Retry
     Gap --> Retry{"failed gap?"}
-    Retry -->|"yes, still valid and within maxRetries"| Same["retry the same cursor and through: same turn ID"]
+    Retry -->|"yes, still valid and within maxRetries"| RetryGate{"gate admits?"}
+    RetryGate -->|"no"| Refused
+    RetryGate -->|"yes"| Same["retry the same cursor and through: same turn ID"]
     Retry -->|"no"| Resolve
     Same --> Resolve["cursor = end of the covered prefix of the active branch"]
     Resolve --> Check["pure sourceInterval check: skip without a journal row"]
-    Check --> Run["runCoveredInterval, then atomic cursor save"]
+    Check --> Gate{"gate admits?"}
+    Gate -->|"no"| Refused["refused: no journal row, no Memory process, no ingest"]
+    Gate -->|"yes"| Run["runCoveredInterval, then atomic cursor save"]
 ```
 
 Wiring for a custom host, with one journal and cursor per Pi session:
@@ -92,7 +98,7 @@ registerLiveMemory(pi, { controllerFor: () => controller, onError });
 // At shutdown: await controller.close(); journal.close();  (releases the lock)
 ```
 
-`open()` must return `{ conversation_id, scopes: [scope], memory: journal.track(client), distiller, close }`, with the distiller using that same tracked `memory`, and must start a new Memory process each time it is called. The controller closes its own session before reconciling, but it cannot stop a process another host left running.
+`open()` must return `{ conversation_id, scopes: [scope], memory: journal.track(client), distiller, budget, close }` (`budget` is required when the gate exposes one), with the distiller using that same tracked `memory`, and must start a new Memory process each time it is called. The controller closes its own session before reconciling, but it cannot stop a process another host left running.
 
 | Behavior | Contract |
 |---|---|
@@ -125,6 +131,20 @@ The live controller passes `summaryPolicy: 'dependency_closure'` to the core. Th
 Trust assumption: Pi does not record `/compact <instructions>` or a `session_before_compact` handler that changes the preparation without returning its own compaction. A standard compaction is taken to summarize exactly its recorded span. The verdicts are checked against Pi's own `prepareCompaction` for repeated compactions, cuts inside a previous kept region, branch summaries in a span or kept region, split turns, and hook compactions.
 
 Summaries inside the interval are returned in `omissions.summaries`. A covered or uncertain `finish` row records them as `boundaries`; a failed one does not. Every inadmissible summary on the path is passed to the distiller as `excludedSummaryIds`. `createPiDistiller` replaces each of these summaries in its Pi context with a fixed user-role placeholder that carries no derived text (`contextMessages`), so the context stays user-first and refuses with `summary_exclusion_unavailable` if compaction could run in the distiller session and re-admit them. Any other distiller must honor the list itself. `registerLiveMemory` steps from a summary leaf (for example Pi's end-of-run compaction) to the message before it, so that turn is covered at the same settle. Later intervals continue normally. Without the option, the core keeps the sealed `coverage-r2-v1` behavior, so replay and the harness still raise `source_boundary_unresolved`.
+
+### Budget and permission gate before ingest (implemented)
+
+`createLiveController({ gate })` requires a gate and runs it before each interval, including a retry. It runs before the journal `begin`, before the Memory process opens, and before `ingest`. Only a returned `{ admitted: true }` admits. A refusal returns `status: 'refused'` with no journal row, no source write and no model call. A thrown error without a typed refusal is `gate_unavailable`. Any other return value is a refusal with its own safe `code` when it carries one (`/^[a-z_]{1,80}$/`), otherwise `gate_refused`. None of these is ever permission. Before reconciling an uncertain interval, which reads Memory but makes no model call, the controller asks the gate with `phase: 'reconcile'`, and only the grants are checked. The gate's `scope` and `budget` must be the opened session's `scopes[0]` and `budget`, or the settle fails with `gate_binding_mismatch`; the same budget must also be bound into the distiller's runtime (`boundPiRuntime`) and passed to the distiller and reviewer. `admitAll` is the explicit ungated opt-out for replay and tests; its results carry `ungated: true`.
+
+`pi-extension/live-gate.mjs` provides the standard gate:
+
+| Part | Contract |
+|---|---|
+| `createUsageLedger({ directory })` | A private, append-only, fsynced `usage.jsonl` (directory fsynced at creation) holding model call starts, reported usage and admitted intervals per UTC day. Every ledger on the directory, in any process, appends to the same file and re-reads it before each decision. A call start with no usage row is in flight only while its owner is provably alive: this process, or one on the same host, boot and PID namespace whose PID still has the recorded start time. Otherwise it is unknown usage on the day the call started. Without `/proc` (for example macOS) and across containers, nothing can be proven alive, so another process's crashed or still-running call refuses the day. A call that the budget refused before dispatch, and that Pi then reports with empty usage, is not lost spend. This process's own unknown flag ends with its UTC day. A torn, unreadable or malformed line is acknowledged once and counts as unknown usage on the day it is found. A failed write closes the ledger (`ledger_write_uncertain`); a closed ledger never writes (`ledger_closed`). |
+| `createDailyInputBudget({ ledger, limit })` | The distiller's budget interface over the ledger. `limit` is required. Each call start is written before dispatch. Reported input, cache-read and cache-write tokens count against the day's durable total, as in the harness. Unknown usage on a day refuses that day (`input_budget_unknown`). Use one budget per live session. |
+| `createLiveGate({ scope, grants, budget, ledger, maxIntervalsPerDay, minRemaining })` | `grants` is the `{ read, write }` arrays the host passes, normally the Memory configuration's `scopes`. It refuses `scope_permission_denied` unless both arrays name the scope. It also refuses `input_budget_unknown`, `input_budget_exhausted`, `input_budget_reserve` (fewer than `minRemaining` tokens left, failing closed), and `interval_limit` at the durable daily cap. That cap counts admissions, including retries and intervals that later fail to open. |
+
+The budget is a between-call token guard over reported usage. A single admitted call can overshoot it, and concurrent processes can each admit one call before seeing the other's usage. Admission (budget check, reserve, interval cap and the interval row) runs under a short `usage.lock`, so the daily interval cap is exact across processes; a held lock for about 2 s refuses with `ledger_busy`. The gate requires a `createDailyInputBudget` on the same ledger. It is not a dollar reservation or a provider bill. The ledger is read in full at open and grows without bound; rotate it only while no live session uses the directory.
 
 ### Legacy `registerPiMemory` boundary
 
@@ -172,7 +192,7 @@ Turns created by this adapter use source `pi-memory`. Their `turn_id` is derived
 | Area | Implemented and exercised | Still required or planned |
 |---|---|---|
 | Event adapter | Injectable `agent_settled` hook and per-session in-memory queue; nonblocking registration has a fictional test | Real host bootstrap, queue ordering/error/cursor-save tests, lifecycle and operational authorization |
-| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries** | Budget-before-ingest; operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
+| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries, and a durable budget and permission gate before ingest** | Operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
 | Retrieval | Scoped Memory search and proposal handles; bounded-state disclosure | Compact per-record results and chosen-handle evidence fetch; eliminate the observed truncation fault |
 | Distiller | Private incremental Pi copy, sequential memory tools, metering interfaces and fictional/offline SDK tests | Production route qualification, bounded provider costs and host-level access controls |
 | Evidence and identity | Current-turn evidence labels, private image blobs, explicit `pi-memory` source | Cross-source deduplication and visual-content citation |
