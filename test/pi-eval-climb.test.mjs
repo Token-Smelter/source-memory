@@ -54,8 +54,8 @@ test('both reference layouts bind ordinals to checkpoint entries and stay additi
 });
 
 test('resume handback descriptors expose every path field to the holdout guard', () => {
-  const artifacts = { 'seal.json': { path: '/run/seal.json' }, carried_cases: [{ caseId: 'c', sourceReportPath: '/prior/REPORT.json', sourceSnapshotPath: '/prior/s.json' }] };
-  assert.deepEqual(pathFields(artifacts).sort(), ['/prior/REPORT.json', '/prior/s.json', '/run/seal.json']);
+  const artifacts = { 'seal.json': { path: '/run/seal.json' }, carried_cases: [{ caseId: 'c', sourceReportPath: '/prior/REPORT.json', sourceSnapshotPath: '/prior/s.json' }], other: { snapshot_path: '/x/s.json', run_dir: '/x' } };
+  assert.deepEqual(pathFields(artifacts).sort(), ['/prior/REPORT.json', '/prior/s.json', '/run/seal.json', '/x', '/x/s.json']);
 });
 
 test('only allowlisted development sessions and non-holdout paths are accepted', () => {

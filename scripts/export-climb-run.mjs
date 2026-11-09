@@ -21,7 +21,7 @@ export function writeNew(path, bytes) {
 
 // Every path-valued field, including resume handback descriptors, is checked against the holdout guard.
 export const pathFields = value => Array.isArray(value) ? value.flatMap(pathFields) : value && typeof value === 'object'
-  ? Object.entries(value).flatMap(([key, item]) => (/(^p|P)ath$/.test(key) ? [item] : []).concat(typeof item === 'object' ? pathFields(item) : [])) : [];
+  ? Object.entries(value).flatMap(([key, item]) => (/(path|dir)$/i.test(key) && typeof item === 'string' ? [item] : []).concat(typeof item === 'object' ? pathFields(item) : [])) : [];
 
 function openReport(reportPath, reportSha) {
   const runDir = dirname(reportPath), report = JSON.parse(readPinned(reportPath, reportSha, 50_000_000));
@@ -42,7 +42,7 @@ export function loadRun(reportPath, reportSha) {
   for (let seal = head.seal; seal.spec.resume;) {
     const prior = [...snapshotDirs].filter(dir => !chain.some(row => row.runDir === dir)).map(dir => JSON.parse(readFileSync(join(dir, 'REPORT.json'))))
       .find(row => row.seal_sha256 === seal.spec.resume.priorSealDigest);
-    if (!prior) break;
+    if (!prior) throw fail('resume_chain_incomplete');
     const path = join(prior.run_dir, 'REPORT.json'), opened = openReport(path, sha(readFileSync(path)));
     if (opened.report.run_id !== seal.spec.resume.priorRunId) throw fail('resume_chain_mismatch');
     chain.push(opened);
