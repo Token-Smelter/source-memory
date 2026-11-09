@@ -147,13 +147,33 @@ test('scoring refuses citations or unknown text altered after answer generation'
   await assert.rejects(scorer.score({ packet: scoringPacket(), answer: { text: 'Forged claim.', citations: [] }, trace: empty.trace }), /citation_trace_invalid/);
 });
 
-test('raw-only repeated ids are rejected before citation identity becomes ambiguous', async () => {
+test('a raw source returned again keeps one citation identity; changed text is refused', async () => {
   const seal = sealComparison(settings());
-  const answerer = createAnswerer({ seal, expectedDigest: seal.digest,
+  let text = 'Fiction.';
+  const make = () => createAnswerer({ seal, expectedDigest: seal.digest,
     memory: { async search() { return []; }, async resolve() {} },
-    archive: { async search() { return [{ id: 'raw', scope: 'fiction', text: 'Fiction.' }]; } },
-    async respond({ tools }) { await tools.search('one'); await tools.search('two'); return { text: 'Fiction.', citations: [] }; } });
-  await assert.rejects(answerer.run({ arm: 'raw-only', case: fictionalCase() }), /duplicate_item/);
+    archive: { async search() { return [{ id: 'raw', scope: 'fiction', text }]; } },
+    async respond({ tools }) { await tools.search('one'); text = textAfter; await tools.search('two');
+      return { text: 'Fiction.', citations: [{ item_id: 'raw', evidence_id: 'raw' }] }; } });
+  let textAfter = 'Fiction.';
+  const result = await make().run({ arm: 'raw-only', case: fictionalCase() });
+  assert.deepEqual([result.trace.returnedItemIds, result.trace.returnedEvidence.length, result.trace.returnedItems], [['raw'], 1, 2]);
+  text = 'Fiction.'; textAfter = 'Changed.';
+  await assert.rejects(make().run({ arm: 'raw-only', case: fictionalCase() }), /retrieval_failed|evidence_identity_changed/);
+});
+
+test('a derived item returned by a later search is accepted unless its evidence changed or it repeats in one response', async () => {
+  const seal = sealComparison(settings());
+  const run = rowsFor => createAnswerer({ seal, expectedDigest: seal.digest,
+    memory: { async search({ query }) { return rowsFor(query); }, async resolve(request) { return { id: request.evidenceId, scope: 'fiction', text: 'Fictional source.' }; } },
+    archive: { async search() { return []; } },
+    async respond({ tools }) { await tools.search('one'); await tools.search('two'); await tools.resolve('item', 'source');
+      return { text: 'Fiction.', citations: [citation] }; } }).run({ arm: 'candidate', case: fictionalCase() });
+  const repeated = await run(() => [item]);
+  assert.deepEqual([repeated.trace.returnedItemIds, repeated.answer.citations], [['item'], [citation]]);
+  const changed = { ...item, evidence: [{ id: 'other', scope: 'fiction' }] };
+  await assert.rejects(run(query => [query === 'one' ? item : changed]), /retrieval_failed|duplicate_item/);
+  await assert.rejects(run(() => [item, item]), /retrieval_failed|duplicate_item/);
 });
 
 test('legacy uncited answerers cannot execute through the fixed answerer', () => {
