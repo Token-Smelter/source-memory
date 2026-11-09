@@ -9,6 +9,7 @@ import { BLOCK_EVIDENCE_CONTRACT } from './dev-dataset.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
+export const DESIGN_SHA256 = '5b0c1fc1d3a94117c9518b8180b7587551514460ec0c9e47a35275063c5eaa6e';
 const scorerInstructions = 'Judge each asserted answer or action clause against the supplied source evidence and frozen rubric. Preserve uncertainty and do not omit unsupported additions. Return JSON only, without a code fence: {"clauses":[{"id":"unique","text":"clause","requirementIds":["id"],"sourceIds":["id"],"action":false,"judgments":{"support":"pass|fail|uncertain","authority":"pass|fail|uncertain","scope":"pass|fail|uncertain","time":"pass|fail|uncertain","uncertainty":"pass|fail|uncertain"},"alternative":null,"relation":null}]}. For a source-supported alternative use {"rationale":"why equivalent and useful","sourceIds":["id"]}. For a required relationship use {"required":true,"recoverable":true|false|null,"itemIds":["returned item id"]}. Each field is required; no other text.';
 const answerInstructions = 'Answer the user using only the permitted retrieval tools. Preserve source attribution, authority, scope, time and uncertainty. If the returned information is insufficient, say so. Do not perform external actions.';
 const groundedScorerInstructions = 'Judge each asserted answer or action clause against the supplied reference packet and the answerer’s own cited evidence using the frozen rubric. Support passes only when both support a factual clause; a correct guess with irrelevant cited evidence fails. Factual support graded pass or uncertain requires citationIds containing supplied citation_id values. Preserve uncertainty and do not omit unsupported additions. Submit clauses with id, text, requirementIds, sourceIds, citationIds, abstention, action, judgments for support/authority/scope/time/uncertainty, alternative and relation. For the exact canonical unknown with no citations, an abstention clause may have abstention=true, the exact answer text, action=false, no relation and empty citationIds; use reference sourceIds to judge any explicit uncertainty requirement. Do not assign an abstention to any requirement when the packet is answerable. All factual clauses have abstention=false. For an alternative use a reference-source-linked rationale. For a required relationship use required, recoverable and returned itemIds.' + SCORER_FORMAT_SUFFIX;
@@ -90,6 +91,7 @@ export function createCitedPilotPlan(options) {
   if (!/^[a-f0-9]{64}$/.test(options.toolCallReviewSha256 ?? '')) throw fail('pilot_plan_invalid');
   const settings = structuredClone(createPilotPlan(options).spec);
   settings.toolCallReviewSha256 = options.toolCallReviewSha256;
+  settings.designSha256 = DESIGN_SHA256;
   settings.answerer.version = 'answerer-r2-v5';
   settings.answerer.citationProtocol = CITATION_PROTOCOL;
   settings.answerer.instructions += ANSWERER_CITATION_SUFFIX;

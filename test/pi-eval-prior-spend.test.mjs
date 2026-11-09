@@ -42,14 +42,14 @@ test('a graceful interruption retains all completed usage without inventing a di
 });
 
 test('an attested prior total includes recorded spend and requires a reserve for unresolved calls', () => {
-  const unknown = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ type: 'started', id: 1 }),
+  const unknown = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ type: 'started', id: 1, estimated_nano: '50' }),
     line({ type: 'result', id: 1, outcome: 'unknown', stop: 'dispatch_unknown' }),
     line({ type: 'close', in_flight: false, stopped: 'dispatch_unknown', calls_started: 1, spent_nano: '0' })].join('\n');
   const digest = text => createHash('sha256').update(text).digest('hex');
   const attestation = reserve => ({ schema: 'prior-spend-attestation/v1', unresolved_reserve_nano: reserve,
     ledgers: [{ path: '/fiction/a', sha256: digest(known) }, { path: '/fiction/b', sha256: digest(unknown) }] });
   assert.deepEqual(attestedPriorSpend(attestation('100'), [known, unknown]), { totalNano: '123', unresolvedCalls: 1 });
-  assert.throws(() => attestedPriorSpend(attestation('0'), [known, unknown]), /prior_attestation_invalid/);
+  assert.throws(() => attestedPriorSpend(attestation('99'), [known, unknown]), /prior_attestation_invalid/);
   assert.throws(() => attestedPriorSpend(attestation('100'), [known, known]), /prior_attestation_invalid/);
 });
 

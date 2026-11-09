@@ -15,17 +15,23 @@ export function attestedPriorSpend(attestation, ledgerTexts) {
   if (attestation?.schema !== 'prior-spend-attestation/v1' || !Array.isArray(attestation.ledgers) || !Array.isArray(ledgerTexts)
     || ledgerTexts.length !== attestation.ledgers.length || !/^(0|[1-9]\d*)$/.test(attestation.unresolved_reserve_nano ?? '')
     || new Set(attestation.ledgers.map(row => row?.sha256)).size !== attestation.ledgers.length) throw fail('prior_attestation_invalid');
-  let total = BigInt(attestation.unresolved_reserve_nano), unresolved = 0;
+  let total = BigInt(attestation.unresolved_reserve_nano), unresolved = 0, required = 0n;
   ledgerTexts.forEach((text, index) => {
     let rows;
     try { rows = text.trimEnd().split('\n').map(JSON.parse); } catch { throw fail('prior_ledger_invalid'); }
     const close = rows.at(-1);
-    if (sha(text) !== attestation.ledgers[index].sha256 || rows[0]?.type !== 'open' || close?.type !== 'close' || close.in_flight !== false
-      || !/^(0|[1-9]\d*)$/.test(close.spent_nano ?? '')) throw fail('prior_attestation_invalid');
+    if (sha(text) !== attestation.ledgers[index].sha256 || rows[0]?.type !== 'open' || rows[0].version !== 'soft-sdk-ledger/v1'
+      || close?.type !== 'close' || close.in_flight !== false || !/^(0|[1-9]\d*)$/.test(close.spent_nano ?? '')) throw fail('prior_attestation_invalid');
     total += BigInt(close.spent_nano);
-    unresolved += rows.filter(row => row.type === 'result' && row.outcome !== 'received' && row.outcome !== 'not_sent').length;
+    for (const row of rows.filter(item => item.type === 'result' && item.outcome !== 'received' && item.outcome !== 'not_sent')) {
+      const started = rows.find(item => item.type === 'started' && item.id === row.id);
+      if (!/^(0|[1-9]\d*)$/.test(started?.estimated_nano ?? '')) throw fail('prior_attestation_invalid');
+      required += 2n * BigInt(started.estimated_nano);
+      unresolved++;
+    }
   });
-  if (unresolved > 0 && BigInt(attestation.unresolved_reserve_nano) === 0n) throw fail('prior_attestation_invalid');
+  // Matches the live stop rule: an unresolved call may have cost up to twice its estimate.
+  if (BigInt(attestation.unresolved_reserve_nano) < required) throw fail('prior_attestation_invalid');
   return { totalNano: total.toString(), unresolvedCalls: unresolved };
 }
 

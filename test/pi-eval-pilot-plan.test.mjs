@@ -26,6 +26,6 @@ test('fresh cited plan seals grounded scorer and leaves candidate and model rout
   ['answerer-r2-v5', 'returned-evidence-v1', ANSWERER_CITED_TOOLS_SHA256, 'answerer-r2-v5', legacy.budget.purposes.candidate,
     legacy.scorer.route, legacy.scorer.model, 'scorer-r2-v3-grounded', 'answerer-cited-evidence-v1', 'semantic-rubric-v2-citation-grounded']);
   assert.throws(() => createCitedPilotPlan({ ...options, resume: {} }), /resume_transition_forbidden/);
-  assert.equal(cited.toolCallReviewSha256, 'f'.repeat(64));
+  assert.deepEqual([cited.toolCallReviewSha256, cited.designSha256], ['f'.repeat(64), '5b0c1fc1d3a94117c9518b8180b7587551514460ec0c9e47a35275063c5eaa6e']);
   assert.throws(() => createCitedPilotPlan({ ...options, toolCallReviewSha256: undefined }), /pilot_plan_invalid/);
 });

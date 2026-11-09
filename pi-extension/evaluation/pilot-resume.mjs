@@ -30,7 +30,7 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   }
   if (!clarification && hash(original.interpretation ?? null) !== hash(current.interpretation ?? null)) throw fail('resume_treatment_mismatch');
   if (clarification && current.interpretation?.id !== 'INTERPRETATION-02') throw fail('resume_treatment_mismatch');
-  const unchanged = ['policyVersion', 'policySha256', 'sourceSha256', 'datasetSha256', 'toolCallReviewSha256', 'sdkSha256', 'rubric',
+  const unchanged = ['policyVersion', 'policySha256', 'sourceSha256', 'datasetSha256', 'toolCallReviewSha256', 'designSha256', 'sdkSha256', 'rubric',
     'packetSchema', 'alternativeRule', 'baseline', 'stores', 'access', 'safety', 'cases', 'packets', 'dependenciesDigest', 'comparison', 'resampling',
     ...(!evaluatorChange && !answererBudgetChange ? ['answerer', 'scorer'] : answererBudgetChange ? ['scorer'] : [])];
   if (answererBudgetChange && !answererBudgetFormatCompatible(original.answerer, current.answerer)) throw fail('resume_treatment_mismatch');

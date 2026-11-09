@@ -21,7 +21,7 @@ import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runti
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases, toolCallReviewSummary, verifyToolCallReview } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { createCitedPilotPlan, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
@@ -123,6 +123,7 @@ async function main() {
   if (!proofs.length || !cases.length || proofs.some(row => row.snapshot_path !== source.snapshot_path || row.source_sha256 !== source.source_sha256)) throw fail('dataset_invalid');
   const sourceBytes = pinned(source.snapshot_path, source.source_sha256);
   pinned(process.env.SOURCE_MEMORY_INTERPRETATION_PATH, INTERPRETATION_02_SHA256, 100000);
+  pinned(process.env.SOURCE_MEMORY_DESIGN_PATH, DESIGN_SHA256, 1_000_000);
   pinned(sdkIndex, sdkIndexSha, 5_000_000); pinned(sdkSession, sdkSessionSha, 5_000_000);
   const pi = await import(pathToFileURL(sdkIndex).href), builder = await import(pathToFileURL(sdkSession).href);
   const verified = proofs.map(proof => verifyChronologicalCheckpoint({ bytes: sourceBytes, proof, availability, pi: builder }));
