@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { constants, closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readPinned, refuseHoldoutPaths, runExport, storeGraph } from '../pi-extension/evaluation/climb.mjs';
+import { verifySeal } from '../pi-extension/evaluation/seal.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -27,6 +28,7 @@ export function loadRun(reportPath, reportSha) {
   if (artifacts.some(row => !row.path?.startsWith(`${runDir}/`))) throw fail('artifact_outside_run');
   const artifact = name => readPinned(report.artifacts[name].path, report.artifacts[name].sha256);
   const seal = JSON.parse(artifact('seal.json'));
+  verifySeal(seal, report.seal_sha256);
   const journals = readdirSync(runDir).filter(name => /^coverage-[a-f0-9]{64}\.jsonl$/.test(name));
   if (journals.length !== 1) throw fail('coverage_journal_ambiguous');
   const journalBytes = readFileSync(join(runDir, journals[0]));
