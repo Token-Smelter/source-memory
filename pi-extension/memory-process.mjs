@@ -43,15 +43,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
     async recordVectorStatus({ scope, ids }) { allowed(scope); return memory.recordVectorStatus(scope, ids); },
     async turnVectorStatus({ scope, turn }) { allowed(scope); return memory.turnVectorStatus(scope, turn); },
     async sourceChunks({ scope, turn }) { allowed(scope); return memory.sourceChunks(scope, turn); },
-    // Record IDs are content-addressed, so presence after the writing process ended settles an unknown write outcome.
-    async recordPresence({ scope, ids }) {
-      allowed(scope);
-      if (!Array.isArray(ids) || !ids.length || ids.length > 64 || new Set(ids).size !== ids.length
-        || ids.some(id => typeof id !== 'string' || !id || id.length > 512)) throw fail('invalid_input');
-      if (typeof memory.store?.getRecords !== 'function') throw fail('presence_unavailable');
-      const found = new Set((await memory.store.getRecords(scope, ids)).filter(row => row?.scope === scope).map(row => row.id));
-      return { present: ids.filter(id => found.has(id)), absent: ids.filter(id => !found.has(id)) };
-    },
+    async recordPresence({ scope, ids }) { allowed(scope); return memory.recordPresence(scope, ids); },
     async index({ scope, input }) {
       allowed(scope);
       const flight = indexing ??= Promise.resolve().then(() => memory.index(scope, input));

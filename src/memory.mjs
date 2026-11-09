@@ -107,6 +107,15 @@ export class Memory {
     return { visible: await this.store.turnVectorsVisible(scope, key, turn) };
   }
 
+  // Record IDs are content-addressed, so presence after the writing process ended settles an unknown write outcome.
+  async recordPresence(scope, ids) {
+    authorize(this.config, scope);
+    requireThat(Array.isArray(ids) && ids.length > 0 && ids.length <= 64 && new Set(ids).size === ids.length, 'invalid_input');
+    ids.forEach(id => text(id, 512));
+    const found = new Set((await this.store.getRecords(scope, ids)).filter(row => row?.scope === scope).map(row => row.id));
+    return { present: ids.filter(id => found.has(id)), absent: ids.filter(id => !found.has(id)) };
+  }
+
   async recordVectorStatus(scope, ids) {
     authorize(this.config, scope);
     requireThat(Array.isArray(ids) && ids.length > 0 && ids.length <= 16 && new Set(ids).size === ids.length, 'invalid_input');
