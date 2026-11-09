@@ -24,10 +24,19 @@ const groundedScorerInstructions = 'Judge each asserted answer or action clause 
 // with "length", failing the checkpoint; 16,384 is the declared distiller ceiling for every arm (baseline v2.1 onward).
 export const DISTILLER_MAX_OUTPUT_TOKENS = 16384, EVALUATOR_MAX_OUTPUT_TOKENS = 4096;
 
+export const BASELINE_CANDIDATE_ROUTE = 'anthropic/claude-haiku-5-5';
+
 /** Sealed treatment surfaces; a run without one is the baseline. */
 export const TREATMENTS = Object.freeze({
   // D0's oracle is the candidate's own earlier store in the run's scope, not the reference catalog.
   D0: Object.freeze({ id: 'D0', surface: 'distiller retrieval', retrieval: 'oracle-catalog', catalog: 'candidate-store-in-scope', product: false }),
+  // A model arm changes only the candidate distiller route; the reviewer, answerer and scorer stay Sonnet. Rates are the
+  // provider's published peak tier (off-peak is half), so API-equivalent spend is conservative.
+  'M-DS': Object.freeze({ id: 'M-DS', surface: 'candidate distiller model', candidateRoute: 'deepseek/deepseek-v4-flash',
+    servedVersion: 'DeepSeek-V4.1-Flash-1017 (provider docs: the legacy deepseek-v4-flash name is served by it)', imageInput: false,
+    rateCard: Object.freeze({ source: 'https://api-docs.deepseek.com/quick_start/pricing (read 2026-11-09)', tier: 'peak',
+      usdPerMillion: Object.freeze({ cacheHit: 0.006, cacheMiss: 0.3, output: 1.2 }), offPeakUsdPerMillion: Object.freeze({ cacheHit: 0.003, cacheMiss: 0.15, output: 0.6 }) }),
+    product: true }),
   T1: Object.freeze({ id: 'T1', surface: 'distiller instructions', guidance: 'typed-records-and-links-v2', guidanceSha256: GUIDANCE_SHA256, product: true }),
 });
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
@@ -53,10 +62,11 @@ export function validCodeTransition(value, from, to) {
 
 /** Freeze the same fictional-calibrated prompt, tool and score contract before any candidate observation. */
 export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256, codeSha, routes,
-  capNano = '100000000000', priorSpendNano = '0', resume = null, interpretationSha256 = INTERPRETATION_02_SHA256 }) {
+  capNano = '100000000000', priorSpendNano = '0', resume = null, interpretationSha256 = INTERPRETATION_02_SHA256, candidateRoute = BASELINE_CANDIDATE_ROUTE }) {
   if (!Array.isArray(cases) || !cases.length || !/^[a-f0-9]{64}$/.test(sourceSha256 ?? '')
     || !/^[a-f0-9]{64}$/.test(datasetSha256 ?? '') || !/^[a-f0-9]{64}$/.test(sdkSha256 ?? '')
     || !/^[a-f0-9]{40}$/.test(codeSha ?? '') || interpretationSha256 !== INTERPRETATION_02_SHA256 || !routes?.candidate || !routes?.reviewer
+    || ![BASELINE_CANDIDATE_ROUTE, ...Object.values(TREATMENTS).map(row => row.candidateRoute).filter(Boolean)].includes(candidateRoute)
     || !/^[1-9]\d*$/.test(capNano) || !/^(0|[1-9]\d*)$/.test(priorSpendNano)
     || BigInt(capNano) + BigInt(priorSpendNano) > WORKER_SHARE_NANO
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
@@ -88,7 +98,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
   if (!Array.isArray(scopes) || !scopes.length || cases.some(row => hash(row.publicCase.readScopes) !== hash(scopes)
     || hash(row.publicCase.evidenceScopes) !== hash(scopes))) throw fail('pilot_scope_invalid');
   const policy = retentionPolicy();
-  const candidateRoute = 'anthropic/claude-haiku-5-5', evaluatorRoute = 'anthropic/claude-sonnet-5-5';
+  const evaluatorRoute = 'anthropic/claude-sonnet-5-5';
   const cap = capNano;
   const settings = {
     version: 'memory-pilot-r2-v1', policyVersion: policy.value.id,
@@ -127,7 +137,7 @@ export function createCitedPilotPlan(options) {
   if (options?.resume != null && !CITED_RESUME_TRANSITIONS.includes(options.resume.transition)) throw fail('resume_transition_forbidden');
   if (!Array.isArray(options?.cases) || options.cases.some(row => row?.packet?.evidenceContract !== BLOCK_EVIDENCE_CONTRACT)) throw fail('packet_contract_mismatch');
   if (!/^[a-f0-9]{64}$/.test(options.toolCallReviewSha256 ?? '')) throw fail('pilot_plan_invalid');
-  const settings = structuredClone(createPilotPlan(options).spec);
+  const settings = structuredClone(createPilotPlan({ ...options, candidateRoute: options.treatment?.candidateRoute ?? BASELINE_CANDIDATE_ROUTE }).spec);
   settings.toolCallReviewSha256 = options.toolCallReviewSha256;
   settings.designSha256 = DESIGN_SHA256;
   if (options.treatment !== undefined && options.treatment !== null) {
