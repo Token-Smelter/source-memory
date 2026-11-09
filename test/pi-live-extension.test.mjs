@@ -374,6 +374,42 @@ test('a failure after the journal opens releases its lock, so the real error rep
   await shutdown(session);
 });
 
+test('a prior-action outcome review nested in the distiller\'s tool call is admitted and covered', { skip: !sdkPath }, async () => {
+  const pi = await loadPi();
+  const paths = layout('nested-review');
+  const { spawnMemory } = fakeMemory();
+  const outcomes = [];
+  const memoryFactory = () => {
+    const child = spawnMemory();
+    child.memory.searchCompact = async () => compactResult({ records: [{ id: 'prior-action', kind: 'action', text: 'Fictional prior action.', action_handle: 'action-prior' }] });
+    child.memory.beginOutcome = async (_scope, _trigger, outcome) => { outcomes.push(outcome.id);
+      return { token: 'outcome', proposal: { requires_review: true, proposal_sha256: 'f'.repeat(64), proposals: [{ index: 0 }], packet: {} } }; };
+    child.memory.applyOutcome = async () => ({ status: 'written', records: [outcomes.at(-1)] });
+    return child;
+  };
+  let reviews = 0;
+  const script = scriptedRuntime(async context => {
+    if (JSON.stringify(context.messages?.[0] ?? '').includes('Review each offered proposed memory link')) {
+      reviews++;
+      return { content: [{ type: 'text', text: '{"verdicts":[{"index":0,"verdict":"approve","reason":"Fiction."}]}' }], stopReason: 'stop' };
+    }
+    const results = (context.messages ?? []).filter(row => row.role === 'toolResult').length;
+    if (results === 0) return { content: [{ type: 'toolCall', id: 's', name: 'memory_search', arguments: { query: 'fiction', kinds: [] } }], stopReason: 'toolUse' };
+    if (results === 1) return { content: [{ type: 'toolCall', id: 'o', name: 'memory_record', arguments: { kind: 'outcome', text: 'Fictional outcome.',
+      evidence_labels: ['ref-000001'], action_handle: 'action-prior' } }], stopReason: 'toolUse' };
+    if (results === 2) return { content: [{ type: 'toolCall', id: 'd', name: 'memory_submit', arguments: { result: 'done_with_writes', reason: 'Fiction.' } }], stopReason: 'toolUse' };
+    return { content: [{ type: 'text', text: 'Submitted.' }], stopReason: 'stop' };
+  });
+  const results = [];
+  const factory = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory: memoryFactory, resolveModels: fakeModels(script),
+    onResult: result => results.push(result) });
+  const { session } = await hostSession(pi, { ...paths, factories: [factory] });
+  await session.prompt('Fictional: the prior action worked.');
+  await waitFor(() => results.length === 1);
+  assert.deepEqual([results[0].status, results[0].results.map(row => row.disposition), reviews, outcomes.length], ['covered', ['committed'], 1, 1]);
+  await shutdown(session);
+});
+
 test('a session whose first turns were refused is not baselined away when it is resumed', { skip: !sdkPath }, async () => {
   const pi = await loadPi();
   const paths = layout('refused-first');

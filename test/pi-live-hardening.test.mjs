@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
@@ -186,9 +187,10 @@ test('a dropped entry inside a covered interval blocks rather than re-ingesting 
 }));
 
 test('the machine identity in owner records is a keyed hash, never the raw machine ID', { skip: !ownerRecord().machine }, () => {
-  const raw = (() => { try { return readFileSync('/etc/machine-id', 'utf8').trim(); } catch { return readFileSync('/var/lib/dbus/machine-id', 'utf8').trim(); } })();
+  const read = path => { try { return readFileSync(path, 'utf8').trim(); } catch { return ''; } };
+  const raw = read('/etc/machine-id') || read('/var/lib/dbus/machine-id');
   const { machine } = ownerRecord();
-  assert.deepEqual([/^[0-9a-f]{64}$/.test(machine), machine.includes(raw)], [true, false]);
+  assert.deepEqual([machine, machine.includes(raw)], [createHmac('sha256', raw).update('source-memory/owner/v1').digest('hex'), false]);
 });
 
 test('a contended admission waits without blocking the host and then refuses ledger_busy', () => privateDir(async directory => {
