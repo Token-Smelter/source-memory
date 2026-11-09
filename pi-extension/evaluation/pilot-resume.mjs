@@ -1,5 +1,6 @@
 import { hash, verifySeal } from './seal.mjs';
 import { CITATION_PROTOCOL } from './answerer.mjs';
+import { validCodeTransition } from './pilot-plan.mjs';
 import { ANSWERER_TOOLS_V2_SHA256, SCORER_TOOLS_SHA256, ANSWERER_FORMAT_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, SCORER_REPAIR,
   answererBudgetFormatCompatible } from './pi-calls.mjs';
 
@@ -18,15 +19,25 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   const evaluatorChange = current.resume?.transition === 'structured-evaluator-submission-only';
   const answererBudgetChange = current.resume?.transition === 'answerer-item-budget-result-only';
   const clarification = current.resume?.transition === 'interpretation-02-abstention-clarification';
-  if (current.resume?.transition === 'same-treatment-resume') {
+  const codeTransition = current.resume?.transition === 'default-path-code-transition';
+  if (current.resume?.transition === 'same-treatment-resume' || codeTransition) {
     const oldBudget = structuredClone(original.budget), newBudget = structuredClone(current.budget);
     if (![oldBudget.priorSpendNano ?? '0', newBudget.priorSpendNano ?? '0'].every(value => /^(0|[1-9]\d*)$/.test(value))) throw fail('resume_treatment_mismatch');
     const oldTotal = BigInt(oldBudget.capNano) + BigInt(oldBudget.priorSpendNano ?? '0');
     const newTotal = BigInt(newBudget.capNano) + BigInt(newBudget.priorSpendNano ?? '0');
     delete oldBudget.capNano; delete oldBudget.priorSpendNano;
     delete newBudget.capNano; delete newBudget.priorSpendNano;
+    // A code transition may carry an operator-approved larger share; the cap is still bounded by the sealed share.
+    if (codeTransition) { delete oldBudget.shareCapNano; delete newBudget.shareCapNano; }
+    const ceiling = codeTransition ? BigInt(current.budget.shareCapNano) : oldTotal;
     if (original.answerer.citationProtocol !== CITATION_PROTOCOL || current.answerer.citationProtocol !== CITATION_PROTOCOL
-      || original.codeSha !== current.codeSha || newTotal > oldTotal || hash(oldBudget) !== hash(newBudget)) throw fail('resume_treatment_mismatch');
+      || (codeTransition ? !validCodeTransition(current.resume.codeTransition, original.codeSha, current.codeSha) : original.codeSha !== current.codeSha)
+      || newTotal > ceiling || hash(oldBudget) !== hash(newBudget)) throw fail('resume_treatment_mismatch');
+    if (codeTransition) {
+      const rows = report.coverage?.dispositions ?? [], at = rows.findIndex(row => row.through === cursor);
+      if (at < 0 || rows.length !== at + 2 || rows[at + 1].disposition !== 'failed' || rows[at + 1].through !== current.resume.codeTransition.failedCheckpoint
+        || rows[at + 1].code !== current.resume.codeTransition.failureCode) throw fail('resume_treatment_mismatch');
+    }
   }
   if (!clarification && hash(original.interpretation ?? null) !== hash(current.interpretation ?? null)) throw fail('resume_treatment_mismatch');
   if (clarification && current.interpretation?.id !== 'INTERPRETATION-02') throw fail('resume_treatment_mismatch');
@@ -53,7 +64,7 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
     || current.resume?.priorRunId !== report.run_id || current.resume?.priorSealDigest !== seal.digest
     || current.resume?.priorCodeSha !== original.codeSha || current.resume?.cursor !== cursor
     || current.resume?.snapshotSha256 !== snapshotSha256 || current.resume?.journalSha256 !== journalSha256
-    || !['same-treatment-resume', 'structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback', 'specific-scorer-repair-continuation'].includes(current.resume?.transition)
+    || !['same-treatment-resume', 'structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback', 'specific-scorer-repair-continuation', 'default-path-code-transition'].includes(current.resume?.transition)
     || hash(current.resume?.ledgerReconciliationSha256s ?? []) !== hash(reconciliationSha256s)
     || hash(current.resume?.caseHandbacks ?? []) !== hash(caseHandbacks)
     || hash(current.resume?.partialCaseHandback ?? null) !== hash(partialCaseHandback)

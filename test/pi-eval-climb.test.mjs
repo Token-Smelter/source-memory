@@ -84,4 +84,6 @@ test('an alignment must cover every reference once with offered candidates only'
   const item = (reference_id, verdict, candidate_ids) => ({ reference_id, verdict, candidate_ids, reason: 'Fictional.' });
   assert.equal(validAlignment({ items: [item('r1', 'matched', ['c1']), item('r2', 'no_match', [])] }, refs, candidates), true);
   assert.equal(validAlignment({ items: [item('r1', 'matched', ['c9']), item('r2', 'no_match', [])] }, refs, candidates), false);
+  assert.equal(validAlignment({ items: [item('r1', 'uncertain', ['c1']), item('r2', 'no_match', [])] }, refs, candidates), true);
+  assert.equal(validAlignment({ items: [item('r1', 'no_match', ['c1']), item('r2', 'no_match', [])] }, refs, candidates), false);
 });
