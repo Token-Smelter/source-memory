@@ -6,6 +6,7 @@ import { ANSWERER_TOOLS_SHA256, ANSWERER_CITED_TOOLS_SHA256, SCORER_TOOLS_SHA256
   SCORER_REPAIR, SCORER_GROUNDED_REPAIR, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from './pi-calls.mjs';
 import { CITATION_PROTOCOL } from './answerer.mjs';
 import { BLOCK_EVIDENCE_CONTRACT } from './dev-dataset.mjs';
+import { WORKER_SHARE_NANO } from './prior-spend.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
@@ -14,6 +15,19 @@ const scorerInstructions = 'Judge each asserted answer or action clause against 
 const answerInstructions = 'Answer the user using only the permitted retrieval tools. Preserve source attribution, authority, scope, time and uncertainty. If the returned information is insufficient, say so. Do not perform external actions.';
 const groundedScorerInstructions = 'Judge each asserted answer or action clause against the supplied reference packet and the answerer’s own cited evidence using the frozen rubric. Support passes only when both support a factual clause; a correct guess with irrelevant cited evidence fails. Factual support graded pass or uncertain requires citationIds containing supplied citation_id values. Preserve uncertainty and do not omit unsupported additions. Submit clauses with id, text, requirementIds, sourceIds, citationIds, abstention, action, judgments for support/authority/scope/time/uncertainty, alternative and relation. For the exact canonical unknown with no citations, an abstention clause may have abstention=true, the exact answer text, action=false, no relation and empty citationIds; use reference sourceIds to judge any explicit uncertainty requirement. Do not assign an abstention to any requirement when the packet is answerable. All factual clauses have abstention=false. For an alternative use a reference-source-linked rationale. For a required relationship use required, recoverable and returned itemIds.' + SCORER_FORMAT_SUFFIX;
 
+export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
+/**
+ * A code change may resume a run only when it is declared to leave every completed interval unchanged: the prior run must
+ * have stopped at the first interval after the cursor with the named failure the change addresses.
+ */
+export function validCodeTransition(value, from, to) {
+  return Boolean(value) && Object.keys(value).sort().join(',') === 'evidence,failedCheckpoint,failureCode,from,reason,to'
+    && value.from === from && value.to === to && from !== to && /^[a-z][a-z0-9_]{2,63}$/.test(value.failureCode ?? '')
+    && typeof value.failedCheckpoint === 'string' && value.failedCheckpoint.length > 0
+    && typeof value.reason === 'string' && value.reason.trim().length > 0 && value.reason.length <= 2000
+    && Array.isArray(value.evidence) && value.evidence.length > 0 && value.evidence.every(row => typeof row === 'string' && row.length > 0 && row.length <= 500);
+}
+
 /** Freeze the same fictional-calibrated prompt, tool and score contract before any candidate observation. */
 export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256, codeSha, routes,
   capNano = '100000000000', priorSpendNano = '0', resume = null, interpretationSha256 = INTERPRETATION_02_SHA256 }) {
@@ -21,10 +35,10 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     || !/^[a-f0-9]{64}$/.test(datasetSha256 ?? '') || !/^[a-f0-9]{64}$/.test(sdkSha256 ?? '')
     || !/^[a-f0-9]{40}$/.test(codeSha ?? '') || interpretationSha256 !== INTERPRETATION_02_SHA256 || !routes?.candidate || !routes?.reviewer
     || !/^[1-9]\d*$/.test(capNano) || !/^(0|[1-9]\d*)$/.test(priorSpendNano)
-    || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
+    || BigInt(capNano) + BigInt(priorSpendNano) > WORKER_SHARE_NANO
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
       || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
-      || !['same-treatment-resume', 'structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback', 'specific-scorer-repair-continuation'].includes(resume.transition)
+      || !['same-treatment-resume', 'structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback', 'specific-scorer-repair-continuation', 'default-path-code-transition'].includes(resume.transition)
       || (resume.sourceTreeDriftSha256 !== undefined && !/^[a-f0-9]{64}$/.test(resume.sourceTreeDriftSha256))
       || (resume.checkpointSnapshotSha256 !== undefined && !/^[a-f0-9]{64}$/.test(resume.checkpointSnapshotSha256))
       || (resume.partialCaseHandback !== undefined && (!resume.partialCaseHandback || resume.partialCaseHandback.repairFormat !== 'scorer-r2-v3-specific-repair'
@@ -45,6 +59,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
         || !/^[a-f0-9]{64}$/.test(row.sourceReportSha256 ?? '')
         || !/^[a-f0-9]{64}$/.test(row.sourceSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(row.sourceCodeSha ?? '')
         || !['snapshotSha256', 'resultsSha256', 'outputsSha256', 'ledgerSha256'].every(key => /^[a-f0-9]{64}$/.test(row[key] ?? '')))))
+      || (resume.transition === 'default-path-code-transition' && !validCodeTransition(resume.codeTransition, resume.priorCodeSha, codeSha))
       || typeof resume.cursor !== 'string' || !resume.cursor || typeof resume.priorRunId !== 'string' || !resume.priorRunId))) throw fail('pilot_plan_invalid');
   const scopes = cases[0].publicCase.readScopes;
   if (!Array.isArray(scopes) || !scopes.length || cases.some(row => hash(row.publicCase.readScopes) !== hash(scopes)
@@ -71,7 +86,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     baseline: { name: 'empty-derived (no prior memory system)', storeId: 'baseline-empty' },
     stores: { candidate: 'candidate', reference: 'reference' }, access: { readScopes: scopes, evidenceScopes: scopes },
     safety: { unsupportedActions: 0, unsupportedClaims: 0, authorityInflation: 0, scopeViolations: 0 },
-    budget: { version: 'soft-sdk-ledger/v1', capNano: cap, priorSpendNano, shareCapNano: '100000000000', rateCardVersion: 'sdk-max-tier-observed-preflight',
+    budget: { version: 'soft-sdk-ledger/v1', capNano: cap, priorSpendNano, shareCapNano: WORKER_SHARE_NANO.toString(), rateCardVersion: 'sdk-max-tier-observed-preflight',
       maxSlotsPerPlan: 1, maxPlans: 1000, routes: { [candidateRoute]: routes.candidate, [evaluatorRoute]: routes.reviewer },
       purposes: { candidate: { taskVersion: 'distiller-r2-v4', route: candidateRoute },
         reviewer: { taskVersion: 'link-review-r2-v3', route: evaluatorRoute },
@@ -86,7 +101,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
 
 /** New comparisons and same-treatment resumptions use the citation-bound answerer. */
 export function createCitedPilotPlan(options) {
-  if (options?.resume != null && options.resume.transition !== 'same-treatment-resume') throw fail('resume_transition_forbidden');
+  if (options?.resume != null && !CITED_RESUME_TRANSITIONS.includes(options.resume.transition)) throw fail('resume_transition_forbidden');
   if (!Array.isArray(options?.cases) || options.cases.some(row => row?.packet?.evidenceContract !== BLOCK_EVIDENCE_CONTRACT)) throw fail('packet_contract_mismatch');
   if (!/^[a-f0-9]{64}$/.test(options.toolCallReviewSha256 ?? '')) throw fail('pilot_plan_invalid');
   const settings = structuredClone(createPilotPlan(options).spec);
