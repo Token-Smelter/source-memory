@@ -11,6 +11,8 @@ import { DISTILLER_GUIDANCE } from '../pi-runtime.mjs';
 import { createHash } from 'node:crypto';
 // T1 v1 (action-only outcomes) is historical; T1 now seals v2, written for outcome_of targets widened to decisions and intentions.
 const GUIDANCE_SHA256 = createHash('sha256').update(DISTILLER_GUIDANCE['typed-records-and-links-v2']).digest('hex');
+// T1b = T1 v2 plus a narrow question-retention rule (T1 was policy-suspect for over-retained open questions).
+const GUIDANCE_T1B_SHA256 = createHash('sha256').update(DISTILLER_GUIDANCE['typed-records-and-links-v3']).digest('hex');
 
 const fail = code => Object.assign(new Error(code), { code });
 export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
@@ -39,6 +41,7 @@ export const TREATMENTS = Object.freeze({
     rateCard: Object.freeze({ source: 'https://api-docs.deepseek.com/quick_start/pricing (read 2026-11-09)', tier: 'peak',
       usdPerMillion: Object.freeze({ cacheHit: 0.006, cacheMiss: 0.3, output: 1.2 }), offPeakUsdPerMillion: Object.freeze({ cacheHit: 0.003, cacheMiss: 0.15, output: 0.6 }) }),
     product: true }),
+  T1b: Object.freeze({ id: 'T1b', surface: 'distiller instructions', guidance: 'typed-records-and-links-v3', guidanceSha256: GUIDANCE_T1B_SHA256, product: true }),
   T1: Object.freeze({ id: 'T1', surface: 'distiller instructions', guidance: 'typed-records-and-links-v2', guidanceSha256: GUIDANCE_SHA256, product: true }),
 });
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
