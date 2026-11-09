@@ -242,8 +242,10 @@ test('grounded scorer receives exact cited text and rejects support without a ci
   const emptyScore = scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), trace: empty.trace, judgment: { clauses: [] } });
   assert.deepEqual([scored.score.usefulness.credited, emptyScore.usefulness.credited, empty.answer.text,
     scored.score.safety.unsupportedClaims, payload.trace.citedEvidence[0].text], [0, 0, UNKNOWN_ANSWER, 1, 'The weather was mild.']);
-  const bad = structuredClone(clause); bad.judgments.support = 'pass'; bad.citationIds = [];
-  assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), trace: result.trace, judgment: { clauses: [bad] } }), /judgment_invalid/);
+  for (const support of ['pass', 'uncertain']) {
+    const bad = structuredClone(clause); bad.judgments.support = support; bad.citationIds = [];
+    assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), trace: result.trace, judgment: { clauses: [bad] } }), /judgment_invalid/);
+  }
 });
 
 test('a supported claim can receive credit only with a returned cited evidence ID', async () => {
@@ -276,6 +278,15 @@ test('a canonical unknown can satisfy an explicit uncertainty requirement withou
   assert.equal(scoreCase({ seal, expectedDigest: seal.digest, packet, trace: result.trace, judgment: { clauses: [clause] } }).usefulness.credited, 1);
   assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet, trace: result.trace,
     judgment: { clauses: [{ ...clause, text: 'Mira chose 4.' }] } }), /judgment_invalid/);
+  const answerableSeal = sealComparison(settings());
+  const answerable = await fixture({ async respond({ tools }) { await tools.search('fiction'); return { text: 'Unknown.', citations: [] }; } })
+    .run({ arm: 'empty', case: fictionalCase() });
+  assert.throws(() => scoreCase({ seal: answerableSeal, expectedDigest: answerableSeal.digest, packet: scoringPacket(),
+    trace: answerable.trace, judgment: { clauses: [clause] } }), /judgment_invalid/);
+  const unmet = { ...clause, requirementIds: [], judgments: { ...clause.judgments, support: 'fail' } };
+  const score = scoreCase({ seal: answerableSeal, expectedDigest: answerableSeal.digest, packet: scoringPacket(),
+    trace: answerable.trace, judgment: { clauses: [unmet] } });
+  assert.deepEqual([score.usefulness.credited, score.safety.unsupportedClaims], [0, 0]);
 });
 
 test('legacy specific scorer repair cannot dispatch against the grounded protocol', async () => {
