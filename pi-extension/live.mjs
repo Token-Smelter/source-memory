@@ -166,7 +166,14 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
 
   return {
     /** Process the source suffix through one settled leaf; returns a status object and never advances past an uncovered interval. */
-    async settle({ leafId, entries }) {
+    async settle(snapshot) {
+      const result = await settleOnce(snapshot);
+      return gate.ungated ? { ...result, ungated: true } : result;
+    },
+    async close() { await dropSession(); },
+  };
+
+  async function settleOnce({ leafId, entries }) {
       if (busy) throw fail('controller_busy');
       busy = true;
       const results = [];
@@ -200,9 +207,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         results.push(result);
         const done = covered.has(result.disposition);
         return { status: done ? 'covered' : result.refused ? 'refused' : 'stopped', ...(result.refused ? { code: result.code } : {}),
-          cursor: done ? leafId : cursor, results, reconciled, ...(gate.ungated ? { ungated: true } : {}) };
+          cursor: done ? leafId : cursor, results, reconciled };
       } finally { busy = false; }
-    },
-    async close() { await dropSession(); },
-  };
+  }
 }

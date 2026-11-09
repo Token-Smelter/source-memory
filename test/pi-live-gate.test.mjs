@@ -9,6 +9,10 @@ import { createCursorStore } from '../pi-extension/cursor-store.mjs';
 import { createLiveController } from '../pi-extension/live.mjs';
 import { createDailyInputBudget, createLiveGate, createUsageLedger } from '../pi-extension/live-gate.mjs';
 import { ownerRecord } from '../pi-extension/owner-lock.mjs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const exec = promisify(execFile);
 
 const entries = [{ type: 'message', id: 'u', parentId: null, message: { role: 'user', content: 'Fictional request.' } },
   { type: 'message', id: 'a', parentId: 'u', message: { role: 'assistant', content: 'Fictional reply.', stopReason: 'stop' } }];
@@ -182,13 +186,74 @@ test('malformed rows are unknown usage rather than ignored', () => privateDir(as
   }
 }));
 
-test('a missing limit and an unknown reserve fail closed', () => privateDir(async directory => {
-  const ledger = createUsageLedger({ directory });
+test('a missing limit, an unknown reserve or a budget on another ledger fail closed', () => privateDir(async directory => {
+  const ledger = createUsageLedger({ directory, now: clock('2026-03-01T10:00:00Z') });
   assert.throws(() => createDailyInputBudget({ ledger }), /input_budget_invalid/);
   const budget = createDailyInputBudget({ ledger, limit: 10_000 });
   spend(budget, 9_000);
   await assert.rejects(createLiveGate({ scope: 'private', grants, budget, ledger, minRemaining: 5_000 })({}), { code: 'input_budget_reserve' });
   assert.throws(() => createLiveGate({ scope: 'private', grants, budget: { reason: () => null, used: () => 0 }, ledger }), /gate_invalid/);
+  assert.throws(() => createLiveGate({ scope: 'private', grants, budget: createInputBudget(), ledger }), /gate_invalid/);
+  ledger.close();
+}));
+
+test('a call refused before dispatch is not lost spend, and the next day admits in the same process', () => privateDir(async directory => {
+  const now = clock('2026-03-01T10:00:00Z');
+  const { ledger, budget, gate } = standardGate(directory, { now, limit: 10 });
+  const runtime = boundPiRuntime({ streamSimple: () => ({}) }, budget);
+  await gate({});
+  runtime.streamSimple({});
+  budget.record({ input: 10, cacheRead: 0, cacheWrite: 0, output: 1 });
+  assert.throws(() => runtime.streamSimple({}), /input_budget_exhausted/);
+  // Pi's run-failure path reports the prevented call with empty usage.
+  budget.record({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0, totalTokens: 0 });
+  assert.equal(budget.reason(), 'input_budget_exhausted');
+  now.set('2026-03-02T00:00:01Z');
+  assert.deepEqual([budget.reason(), await gate({})], [null, { admitted: true }]);
+  budget.record({ input: 3, cacheRead: 0, cacheWrite: 0 });
+  assert.equal(budget.reason(), 'input_budget_unknown');
+  now.set('2026-03-03T00:00:01Z');
+  assert.equal(budget.reason(), null);
+  ledger.close();
+}));
+
+test('a receipt-less call whose owner cannot be proven alive is unknown usage', () => privateDir(async directory => {
+  const now = clock('2026-03-01T10:00:00Z');
+  const self = ownerRecord();
+  const owners = [{ ...self, pid: 999999999, boot: null, pidns: null, start: null }, { ...self, pid: process.ppid, pidns: 'pid:[1]' },
+    { ...self, pid: process.ppid, host: 'another-host' }, { ...ownerRecord(process.ppid), start: '1' }];
+  for (const [index, owner] of owners.entries()) {
+    const ledger = createUsageLedger({ directory, now });
+    ledger.append({ kind: 'call', id: `unprovable-${index}`, owner });
+    ledger.close();
+    const reopened = standardGate(directory, { now });
+    await assert.rejects(reopened.gate({}), { code: 'input_budget_unknown' }, JSON.stringify(owner));
+    reopened.ledger.close();
+    now.set(`2026-03-0${index + 2}T10:00:00Z`);
+  }
+}));
+
+test('concurrent processes cannot all pass the daily interval cap', () => privateDir(async directory => {
+  createUsageLedger({ directory }).close();
+  const contender = new URL('./helpers/gate-contender.mjs', import.meta.url).pathname;
+  const startAt = String(Date.now() + 1500);
+  const outcomes = await Promise.all(Array.from({ length: 6 }, () => exec(process.execPath, [contender, directory, startAt]).then(row => row.stdout.trim())));
+  assert.deepEqual(outcomes.sort(), ['admitted', ...Array(5).fill('interval_limit')]);
+}));
+
+test('the standard gate admits a covered interval and records it with the session spend', () => privateDir(async directory => {
+  const now = clock('2026-03-01T10:00:00Z');
+  const { ledger, budget, gate } = standardGate(directory, { now });
+  const live = harness(directory, gate, { distill: async () => {
+    const runtime = boundPiRuntime({ streamSimple: () => ({}) }, budget);
+    runtime.streamSimple({});
+    budget.record({ input: 10, cacheRead: 0, cacheWrite: 0, output: 1 });
+    return { status: 'complete', disposition: 'abstained' };
+  } });
+  const result = await live.controller.settle({ leafId: 'a', entries });
+  const rows = readFileSync(ledger.path, 'utf8').trim().split('\n').map(JSON.parse).map(row => row.kind);
+  assert.deepEqual([result.status, rows, budget.used()], ['covered', ['interval', 'call', 'usage'], 10]);
+  live.journal.close();
   ledger.close();
 }));
 
@@ -197,7 +262,8 @@ test('a closed or failed ledger never writes again', () => privateDir(async dire
   ledger.close();
   ledger.close();
   assert.throws(() => ledger.append({ kind: 'interval' }), /ledger_closed/);
-  const budget = createDailyInputBudget({ ledger: { callStart: () => 'c', used: () => 0, unknown: () => false, append() { throw new Error('ENOSPC'); } }, limit: 10 });
+  const budget = createDailyInputBudget({ ledger: { day: () => '2026-03-01', callStart: () => 'c', used: () => 0, unknown: () => false,
+    append() { throw new Error('ENOSPC'); } }, limit: 10 });
   budget.beforeCall();
   assert.throws(() => budget.record({ input: 1, cacheRead: 0, cacheWrite: 0 }), /usage_receipt_unavailable/);
   assert.equal(budget.reason(), 'input_budget_unknown');
