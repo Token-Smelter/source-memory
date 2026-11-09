@@ -37,14 +37,19 @@ export function parseFinalResult(text) {
   catch { throw fail('disposition_invalid'); }
 }
 
-/** Pi's compaction-aware context, minus summaries whose dependency closure is not permitted. */
+export const WITHHELD_SUMMARY = '[Earlier context withheld: summary dependency closure not permitted]';
+
+/** Pi's compaction-aware context, with each summary whose dependency closure is not permitted replaced by a placeholder. */
 export function contextMessages(pi, manager, excludedSummaryIds) {
   // An empty exclusion list is Pi's own context by construction.
   if (excludedSummaryIds === undefined || (Array.isArray(excludedSummaryIds) && !excludedSummaryIds.length)) return manager.buildSessionContext().messages;
   if (!Array.isArray(excludedSummaryIds) || typeof manager.buildContextEntries !== 'function'
     || typeof pi.sessionEntryToContextMessages !== 'function') throw fail('summary_exclusion_unavailable');
   const excluded = new Set(excludedSummaryIds);
-  return manager.buildContextEntries().filter(entry => !excluded.has(entry.id)).flatMap(entry => pi.sessionEntryToContextMessages(entry));
+  // A fixed placeholder keeps the context user-first, as some routes require, without carrying any derived text.
+  return manager.buildContextEntries().flatMap(entry => excluded.has(entry.id)
+    ? [{ role: 'user', content: [{ type: 'text', text: WITHHELD_SUMMARY }], timestamp: 0 }]
+    : pi.sessionEntryToContextMessages(entry));
 }
 
 /** Reopen one incremental private Pi file for each side branch while keeping its fixed session ID. */

@@ -61,7 +61,7 @@ function summaryVerdicts(ancestry) {
     if (row.type !== 'compaction') return;
     const kept = typeof row.firstKeptEntryId === 'string' ? index.get(row.firstKeptEntryId) : undefined;
     let reason = null;
-    // Pi treats any truthy fromHook as extension-provided.
+    // Pi treats any truthy fromHook as extension-provided; anything but absent or false is treated as unproved here.
     if ((row.fromHook !== undefined && row.fromHook !== false) || kept === undefined || kept >= position) reason = 'summary_closure_unproved';
     else {
       let start = 0;
