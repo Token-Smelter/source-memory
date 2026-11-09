@@ -21,7 +21,7 @@ export function verifyToolCallReview({ bytes, expectedSha256, datasetManifestSha
   if (value?.schema !== 'source-memory-dev-v2-block-evidence-metadata/v1'
     || value.development_manifest_sha256 !== datasetManifestSha256 || value.source_review_sha256 !== sourceReviewSha256
     || !Array.isArray(value.selected_toolcall_occurrences)) throw fail('toolcall_review_unverified');
-  const approvals = new Set();
+  const approvals = new Map();
   for (const row of value.selected_toolcall_occurrences) {
     const indices = selectedIndices(row?.selected_indices);
     if (!nonempty(row?.case_id) || !['requirement', 'correction_chain'].includes(row?.location_type)
@@ -30,18 +30,20 @@ export function verifyToolCallReview({ bytes, expectedSha256, datasetManifestSha
       || !indices || !Number.isSafeInteger(row.selected_toolcall_index) || !indices.includes(row.selected_toolcall_index)) throw fail('toolcall_review_unverified');
     const key = approvalKey(row.case_id, row.location_type, row.location_id, row, indices, row.selected_toolcall_index);
     if (approvals.has(key)) throw fail('toolcall_review_unverified');
-    approvals.add(key);
+    approvals.set(key, row.source_key);
   }
   const token = Object.freeze({ sha256: expectedSha256, datasetManifestSha256, sourceReviewSha256 });
   reviews.set(token, { approvals, used: new Set() });
   return token;
 }
 
-export function toolCallReviewSummary(token) {
+/** Counts for one source, or for the whole map when sourceKey is omitted. */
+export function toolCallReviewSummary(token, sourceKey = null) {
   const review = reviews.get(token);
   if (!review) throw fail('toolcall_review_unverified');
-  return { sha256: token.sha256, datasetManifestSha256: token.datasetManifestSha256,
-    sourceReviewSha256: token.sourceReviewSha256, approved: review.approvals.size, used: review.used.size };
+  const keys = [...review.approvals].filter(([, source]) => sourceKey === null || source === sourceKey).map(([key]) => key);
+  return { sha256: token.sha256, datasetManifestSha256: token.datasetManifestSha256, sourceReviewSha256: token.sourceReviewSha256,
+    ...(sourceKey === null ? {} : { sourceKey }), approved: keys.length, used: keys.filter(key => review.used.has(key)).length };
 }
 
 function evidenceText({ row, ref, item, locationType, locationId, toolCallReview, usedApprovals }) {
@@ -52,8 +54,8 @@ function evidenceText({ row, ref, item, locationType, locationId, toolCallReview
     const block = content[index];
     if (!block || typeof block !== 'object' || Array.isArray(block)) throw fail('evidence_block_forbidden');
     if (['text', 'input_text', 'output_text'].includes(block.type)) {
-      if (typeof block.text !== 'string') throw fail('evidence_block_forbidden');
-      if (block.text) pieces.push(block.text);
+      if (!nonempty(block.text)) throw fail('evidence_block_forbidden');
+      pieces.push(block.text);
       continue;
     }
     if (!['toolCall', 'tool_use'].includes(block.type)) throw fail('evidence_block_forbidden');
@@ -91,6 +93,7 @@ export function prepareDevelopmentCases({ cases, proofs, verified, entries, avai
   }
   const selected = cases.filter(row => row?.split === 'development' && row.pre_answer_store_snapshot?.source_key === sourceKey);
   if (!selected.length) throw fail('cases_unavailable');
+  if (new Set(selected.map(row => row.case_id)).size !== selected.length || selected.some(row => !nonempty(row.case_id))) throw fail('case_invalid');
   const usedApprovals = new Set();
   const prepared = selected.map(item => {
     const checkpoint = item.pre_answer_store_snapshot;

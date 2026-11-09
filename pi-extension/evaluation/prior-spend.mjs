@@ -10,6 +10,25 @@ export function validatePriorSpendContinuity(previousNano, priorReportedNano) {
   return previousNano;
 }
 
+/** Conservative prior total from closed ledgers' recorded spend plus an explicit reserve for unresolved calls. */
+export function attestedPriorSpend(attestation, ledgerTexts) {
+  if (attestation?.schema !== 'prior-spend-attestation/v1' || !Array.isArray(attestation.ledgers) || !Array.isArray(ledgerTexts)
+    || ledgerTexts.length !== attestation.ledgers.length || !/^(0|[1-9]\d*)$/.test(attestation.unresolved_reserve_nano ?? '')
+    || new Set(attestation.ledgers.map(row => row?.sha256)).size !== attestation.ledgers.length) throw fail('prior_attestation_invalid');
+  let total = BigInt(attestation.unresolved_reserve_nano), unresolved = 0;
+  ledgerTexts.forEach((text, index) => {
+    let rows;
+    try { rows = text.trimEnd().split('\n').map(JSON.parse); } catch { throw fail('prior_ledger_invalid'); }
+    const close = rows.at(-1);
+    if (sha(text) !== attestation.ledgers[index].sha256 || rows[0]?.type !== 'open' || close?.type !== 'close' || close.in_flight !== false
+      || !/^(0|[1-9]\d*)$/.test(close.spent_nano ?? '')) throw fail('prior_attestation_invalid');
+    total += BigInt(close.spent_nano);
+    unresolved += rows.filter(row => row.type === 'result' && row.outcome !== 'received' && row.outcome !== 'not_sent').length;
+  });
+  if (unresolved > 0 && BigInt(attestation.unresolved_reserve_nano) === 0n) throw fail('prior_attestation_invalid');
+  return { totalNano: total.toString(), unresolvedCalls: unresolved };
+}
+
 /** A closed ledger may exclude a pre-dispatch call only with a typed or pinned reconciliation receipt. */
 export function priorSoftSpend(text, { reconciliations = [] } = {}) {
   let rows;

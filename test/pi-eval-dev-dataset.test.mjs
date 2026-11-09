@@ -88,6 +88,22 @@ for (const [name, index] of [['thinking', 1], ['image', 5]]) test(`${name} block
   assert.throws(() => prepareDevelopmentCases(fixture({ requirementIndices: [0, index] })), /evidence_block_forbidden/);
 });
 
+test('a selected empty text block and duplicate case IDs are refused', () => {
+  const empty = fixture();
+  empty.entries[0].message.content[0].text = '  ';
+  assert.throws(() => prepareDevelopmentCases(empty), /evidence_block_forbidden/);
+  const duplicate = fixture();
+  duplicate.cases.push(structuredClone(duplicate.cases[0]));
+  assert.throws(() => prepareDevelopmentCases(duplicate), /case_invalid/);
+});
+
+test('review usage is reported per source', () => {
+  const review = verify(reviewMap([occurrence([3], 3), { ...occurrence([3], 3), source_key: 'other' }]));
+  prepareDevelopmentCases(fixture({ requirementIndices: [3], review }));
+  assert.deepEqual([toolCallReviewSummary(review, 'session').approved, toolCallReviewSummary(review, 'session').used,
+    toolCallReviewSummary(review, 'other').used, toolCallReviewSummary(review).approved], [1, 1, 0, 2]);
+});
+
 test('invalid correction-chain indices are refused', () => {
   assert.throws(() => prepareDevelopmentCases(fixture({ chainIndices: [] })), /evidence_indices_invalid/);
 });

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
+import { attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 
 const line = value => JSON.stringify(value);
 const known = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ type: 'started', id: 1 }),
@@ -39,6 +39,18 @@ test('a graceful interruption retains all completed usage without inventing a di
     line({ type: 'result', id: 1, outcome: 'received', stop: 'operator_interrupted', api_equivalent_nano: '23' }),
     line({ type: 'close', in_flight: false, stopped: 'operator_interrupted', calls_started: 1, spent_nano: '23' })].join('\n');
   assert.equal(priorSoftSpend(ledger), '23');
+});
+
+test('an attested prior total includes recorded spend and requires a reserve for unresolved calls', () => {
+  const unknown = [line({ type: 'open', version: 'soft-sdk-ledger/v1' }), line({ type: 'started', id: 1 }),
+    line({ type: 'result', id: 1, outcome: 'unknown', stop: 'dispatch_unknown' }),
+    line({ type: 'close', in_flight: false, stopped: 'dispatch_unknown', calls_started: 1, spent_nano: '0' })].join('\n');
+  const digest = text => createHash('sha256').update(text).digest('hex');
+  const attestation = reserve => ({ schema: 'prior-spend-attestation/v1', unresolved_reserve_nano: reserve,
+    ledgers: [{ path: '/fiction/a', sha256: digest(known) }, { path: '/fiction/b', sha256: digest(unknown) }] });
+  assert.deepEqual(attestedPriorSpend(attestation('100'), [known, unknown]), { totalNano: '123', unresolvedCalls: 1 });
+  assert.throws(() => attestedPriorSpend(attestation('0'), [known, unknown]), /prior_attestation_invalid/);
+  assert.throws(() => attestedPriorSpend(attestation('100'), [known, known]), /prior_attestation_invalid/);
 });
 
 test('a typed pre-dispatch stop requires no fabricated usage', () => {

@@ -87,7 +87,9 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
 export function createCitedPilotPlan(options) {
   if (options?.resume != null && options.resume.transition !== 'same-treatment-resume') throw fail('resume_transition_forbidden');
   if (!Array.isArray(options?.cases) || options.cases.some(row => row?.packet?.evidenceContract !== BLOCK_EVIDENCE_CONTRACT)) throw fail('packet_contract_mismatch');
+  if (!/^[a-f0-9]{64}$/.test(options.toolCallReviewSha256 ?? '')) throw fail('pilot_plan_invalid');
   const settings = structuredClone(createPilotPlan(options).spec);
+  settings.toolCallReviewSha256 = options.toolCallReviewSha256;
   settings.answerer.version = 'answerer-r2-v5';
   settings.answerer.citationProtocol = CITATION_PROTOCOL;
   settings.answerer.instructions += ANSWERER_CITATION_SUFFIX;

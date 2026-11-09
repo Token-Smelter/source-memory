@@ -30,7 +30,7 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
   }
   if (!clarification && hash(original.interpretation ?? null) !== hash(current.interpretation ?? null)) throw fail('resume_treatment_mismatch');
   if (clarification && current.interpretation?.id !== 'INTERPRETATION-02') throw fail('resume_treatment_mismatch');
-  const unchanged = ['policyVersion', 'policySha256', 'sourceSha256', 'datasetSha256', 'sdkSha256', 'rubric',
+  const unchanged = ['policyVersion', 'policySha256', 'sourceSha256', 'datasetSha256', 'toolCallReviewSha256', 'sdkSha256', 'rubric',
     'packetSchema', 'alternativeRule', 'baseline', 'stores', 'access', 'safety', 'cases', 'packets', 'dependenciesDigest', 'comparison', 'resampling',
     ...(!evaluatorChange && !answererBudgetChange ? ['answerer', 'scorer'] : answererBudgetChange ? ['scorer'] : [])];
   if (answererBudgetChange && !answererBudgetFormatCompatible(original.answerer, current.answerer)) throw fail('resume_treatment_mismatch');
@@ -48,7 +48,7 @@ export function validatePilotResume({ report, seal, currentSeal, progress, journ
     for (const key of ['version', 'tools_sha256', 'repair_instruction', 'formatRepairCalls', 'instructions']) { delete oldScorer[key]; delete newScorer[key]; }
     if (hash(oldAnswerer) !== hash(newAnswerer) || hash(oldScorer) !== hash(newScorer)) throw fail('resume_treatment_mismatch');
   }
-  if (unchanged.some(key => hash(original[key]) !== hash(current[key]))
+  if (unchanged.some(key => hash(original[key] ?? null) !== hash(current[key] ?? null))
     || ['candidate', 'reviewer', 'answerer', 'scorer'].some(key => original.budget.purposes[key]?.route !== current.budget.purposes[key]?.route)
     || current.resume?.priorRunId !== report.run_id || current.resume?.priorSealDigest !== seal.digest
     || current.resume?.priorCodeSha !== original.codeSha || current.resume?.cursor !== cursor

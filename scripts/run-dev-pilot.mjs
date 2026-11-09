@@ -19,10 +19,10 @@ import { openUnixEmbeddingRelay } from '../pi-extension/unix-relay.mjs';
 import { openDockerMemory } from '../pi-extension/docker-memory.mjs';
 import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runtime.mjs';
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
-import { prepareDevelopmentCases } from '../pi-extension/evaluation/dev-dataset.mjs';
+import { prepareDevelopmentCases, toolCallReviewSummary, verifyToolCallReview } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
 import { createCitedPilotPlan, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
-import { priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
+import { attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
 import { validateCaseContinuation } from '../pi-extension/evaluation/pilot-continuation.mjs';
@@ -95,17 +95,14 @@ function exactRoute(model) {
 }
 
 async function main() {
-  const [manifestPath, manifestSha, sourceKey, sdkIndex, sdkIndexSha, sdkSession, sdkSessionSha, parentDir] = process.argv.slice(2);
-  if (process.argv.length !== 10 || basename(manifestPath ?? '') !== 'CASE-MANIFEST.json' || basename(dirname(manifestPath ?? '')) !== 'development'
-    || !isAbsolute(parentDir ?? '')) throw fail('arguments_invalid');
+  const [manifestPath, manifestSha, sourceKey, reviewMapPath, reviewMapSha, sdkIndex, sdkIndexSha, sdkSession, sdkSessionSha, parentDir] = process.argv.slice(2);
+  if (process.argv.length !== 12 || basename(manifestPath ?? '') !== 'MANIFEST.json' || !isAbsolute(parentDir ?? '')) throw fail('arguments_invalid');
   const parent = realpathSync(parentDir), parentStat = statSync(parent);
   if (parent !== parentDir || !parentStat.isDirectory() || parentStat.uid !== process.getuid() || (parentStat.mode & 0o077)) throw fail('work_dir_invalid');
   const manifest = JSON.parse(pinned(manifestPath, manifestSha, 2_000_000).toString('utf8'));
-  if (manifest.schema !== 'source-memory-r2-development-case-manifest/v1' || !String(manifest.state).includes('frozen')
-    || !manifest.case_sources?.includes(sourceKey) || manifest.frozen_design_sha256 !== '5b0c1fc1d3a94117c9518b8180b7587551514460ec0c9e47a35275063c5eaa6e') throw fail('manifest_invalid');
-  const roots = manifest.source_pins.filter(row => row.source_key === sourceKey);
-  if (roots.length !== 1) throw fail('source_invalid');
-  const source = roots[0], datasetRoot = dirname(dirname(manifestPath));
+  if (manifest.schema !== 'source-memory-change-development-manifest/v2' || !String(manifest.status).startsWith('frozen')
+    || !Number.isSafeInteger(manifest.counts_by_source?.[sourceKey]) || manifest.review_sha256 !== manifest.files?.['REVIEW.json']?.sha256) throw fail('manifest_invalid');
+  const datasetRoot = dirname(manifestPath);
   const input = key => {
     const descriptor = manifest.files?.[key];
     if (!descriptor || !Number.isSafeInteger(descriptor.bytes)) throw fail('manifest_invalid');
@@ -113,9 +110,16 @@ async function main() {
     if (bytes.length !== descriptor.bytes) throw fail('input_changed');
     return bytes.toString('utf8');
   };
-  const proofs = JSON.parse(input('development/checkpoint-proofs.json')).cases.filter(row => row.source_key === sourceKey);
-  const availability = input('development/availability.jsonl').trimEnd().split('\n').map(JSON.parse).filter(row => row.source_key === sourceKey);
-  const cases = input('development/cases.jsonl').trimEnd().split('\n').map(JSON.parse).filter(row => row.split === 'development' && row.pre_answer_store_snapshot?.source_key === sourceKey);
+  const roots = JSON.parse(input('SOURCES.json')).sources.filter(row => row.source_key === sourceKey);
+  if (roots.length !== 1) throw fail('source_invalid');
+  const source = { source_key: roots[0].source_key, source_sha256: roots[0].source_sha256, snapshot_path: roots[0].source_snapshot_path,
+    conversation_id: roots[0].source_session_id, leaf_entry_id: roots[0].active_leaf_entry_id };
+  const toolCallReview = verifyToolCallReview({ bytes: pinned(reviewMapPath, reviewMapSha, 1_000_000), expectedSha256: reviewMapSha,
+    datasetManifestSha256: manifestSha, sourceReviewSha256: manifest.review_sha256 });
+  const proofs = JSON.parse(input('checkpoint-proofs.json')).cases.filter(row => row.source_key === sourceKey);
+  const availability = input('availability.jsonl').trimEnd().split('\n').map(JSON.parse).filter(row => row.source_key === sourceKey);
+  const cases = input('cases.final.jsonl').trimEnd().split('\n').map(JSON.parse).filter(row => row.split === 'development' && row.pre_answer_store_snapshot?.source_key === sourceKey);
+  if (cases.length !== manifest.counts_by_source[sourceKey]) throw fail('dataset_invalid');
   if (!proofs.length || !cases.length || proofs.some(row => row.snapshot_path !== source.snapshot_path || row.source_sha256 !== source.source_sha256)) throw fail('dataset_invalid');
   const sourceBytes = pinned(source.snapshot_path, source.source_sha256);
   pinned(process.env.SOURCE_MEMORY_INTERPRETATION_PATH, INTERPRETATION_02_SHA256, 100000);
@@ -124,7 +128,9 @@ async function main() {
   const verified = proofs.map(proof => verifyChronologicalCheckpoint({ bytes: sourceBytes, proof, availability, pi: builder }));
   const rows = sourceBytes.toString('utf8').trimEnd().split('\n').map(JSON.parse).slice(1);
   const scope = cases[0].read_scopes?.[0];
-  const prepared = prepareDevelopmentCases({ cases, proofs, verified, entries: rows, availability, sourceKey, scope, sourceSha256: source.source_sha256 });
+  const prepared = prepareDevelopmentCases({ cases, proofs, verified, entries: rows, availability, sourceKey, scope, sourceSha256: source.source_sha256, toolCallReview });
+  const reviewUse = toolCallReviewSummary(toolCallReview, sourceKey);
+  if (reviewUse.used !== reviewUse.approved) throw fail('toolcall_review_unused');
   const byId = new Map(rows.map(row => [row.id, row]));
   const last = [...prepared].sort((a, b) => Date.parse(a.publicCase.queryTime) - Date.parse(b.publicCase.queryTime)).at(-1).through;
   const chain = [];
@@ -159,7 +165,15 @@ async function main() {
     try { priorLedgers = JSON.parse(process.env.PILOT_PRIOR_LEDGERS); } catch { throw fail('prior_ledger_invalid'); }
   }
   if (!Array.isArray(priorLedgers) || new Set(priorLedgers.map(row => row?.sha256)).size !== priorLedgers.length) throw fail('prior_ledger_invalid');
-  const previous = priorLedgers.reduce((sum, row) => {
+  const attestationPath = process.env.PILOT_PRIOR_ATTESTATION, attestationSha = process.env.PILOT_PRIOR_ATTESTATION_SHA256;
+  if (Boolean(attestationPath) !== Boolean(attestationSha) || (attestationPath && (priorLedgers.length || process.env.PILOT_RESUME))) throw fail('prior_ledger_invalid');
+  let priorAttestation = null;
+  if (attestationPath) {
+    const attestation = JSON.parse(pinned(attestationPath, attestationSha, 1_000_000).toString('utf8'));
+    const texts = (attestation.ledgers ?? []).map(row => pinned(row.path, row.sha256, 10_000_000).toString('utf8'));
+    priorAttestation = { path: attestationPath, sha256: attestationSha, ...attestedPriorSpend(attestation, texts) };
+  }
+  const previous = priorAttestation ? BigInt(priorAttestation.totalNano) : priorLedgers.reduce((sum, row) => {
     if (Boolean(row.reconciliationPath) !== Boolean(row.reconciliationSha256)) throw fail('prior_ledger_invalid');
     const reconciliations = [];
     if (row.reconciliationPath) {
@@ -308,6 +322,7 @@ async function main() {
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
   const seal = createCitedPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
     codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null,
+    toolCallReviewSha256: reviewMapSha,
     interpretationSha256: INTERPRETATION_02_SHA256 });
   if (resume?.handbackRows.length) pairedReport({ seal, expectedDigest: seal.digest, rows: resume.handbackRows, dependencies: [],
     provenance: resume.originSeals.filter(row => row.digest !== seal.digest) });
@@ -374,11 +389,12 @@ async function main() {
       if (!isolation.ok) return;
       const ready = { status: 'awaiting_go', run_id: runId, run_dir: dir, source_key: sourceKey, source_sha256: source.source_sha256,
         dataset_sha256: manifestSha, code_sha: codeSha, seal_sha256: seal.digest, interpretation_sha256: INTERPRETATION_02_SHA256,
+        toolcall_review: reviewUse,
         runtime_archive_sha256: runtimeTree.archive_sha256,
         sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
         models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
         routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
-        budget: { overall_effort_soft_usd: 250, share_soft_usd: 100, prior_spend_nano: previous.toString(),
+        budget: { overall_effort_soft_usd: 250, share_soft_usd: 100, prior_spend_nano: previous.toString(), prior_attestation: priorAttestation,
           remaining_soft_nano: remaining.toString(), prior_ledger_sha256s: priorLedgers.map(row => row.sha256),
           prior_reconciliation_sha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), one_call_in_flight: true, stop_unknown_usage: true,
           stop_above_twice_estimate: true, gateway_attempt_ledger: 'partial: gateway-internal failover/retry attempts not correlatable', rate_card: routeRates },
