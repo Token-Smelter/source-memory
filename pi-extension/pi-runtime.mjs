@@ -91,7 +91,9 @@ export function createContextWindow({ contextWindow }) {
       if (total(cut) > contextWindow * thresholdFraction) {
         // Cut only before a user message so no tool result is separated from its call.
         const starts = messages.map((row, i) => row.role === 'user' && i > cut ? i : -1).filter(i => i > 0);
-        const next = starts.find(i => total(i) <= contextWindow * targetFraction) ?? starts.at(-1);
+        // Prefer the target; otherwise the smallest cut that clears the threshold. When only the prompt is too large,
+        // cutting history cannot help and would persist, so the cut is left unchanged and the request is disclosed.
+        const next = starts.find(i => total(i) <= contextWindow * targetFraction) ?? starts.find(i => total(i) <= contextWindow * thresholdFraction);
         if (next !== undefined) { cut = next; recut = true; }
         // The estimate is deliberately pessimistic, so an uncuttable request is sent and disclosed rather than refused;
         // a real overflow is still rejected by the provider and stops the run.

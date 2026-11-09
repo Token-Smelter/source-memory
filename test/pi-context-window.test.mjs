@@ -41,6 +41,14 @@ test('a later overflow moves the cut forward, and an uncuttable estimate is sent
   assert.deepEqual([over.status.over_estimate, over.status.omitted_messages], [true, 0]);
 });
 
+test('a prompt-dominated checkpoint leaves the history cut unchanged for later checkpoints', () => {
+  const messages = history(400), window = createContextWindow({ contextWindow: 1_000_000 });
+  const dense = window.apply(messages, { promptBytes: 1_900_000 });
+  assert.deepEqual([dense.status.over_estimate, dense.status.omitted_messages, dense.messages === messages], [true, 0, true]);
+  const next = [...messages, user(400)];
+  assert.deepEqual([window.apply(next, { promptBytes: 20_000 }).messages === next, window.state().cut], [true, 0]);
+});
+
 test('a large context of sparse tokens is not cut once its observed usage shows it fits', () => {
   const messages = history(40), size = bytes(messages);
   const window = createContextWindow({ contextWindow: Math.ceil(size * 0.5) });
