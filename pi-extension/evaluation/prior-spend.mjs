@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 const fail = code => Object.assign(new Error(code), { code });
 const sha = value => createHash('sha256').update(value).digest('hex');
 const localStops = new Set(['input_budget_exhausted', 'input_budget_unknown']);
+/** Operator-approved worker soft share, API-equivalent at SDK rates (raised from 100 USD for D0 and T1–T5). */
+export const WORKER_SHARE_NANO = 250_000_000_000n;
 
 export function validatePriorSpendContinuity(previousNano, priorReportedNano) {
   if (!/^(0|[1-9]\d*)$/.test(previousNano ?? '') || !/^(0|[1-9]\d*)$/.test(priorReportedNano ?? '')

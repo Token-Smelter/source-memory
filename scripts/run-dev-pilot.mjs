@@ -21,8 +21,8 @@ import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runti
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases, toolCallReviewSummary, verifyToolCallReview } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
-import { attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
+import { CITED_RESUME_TRANSITIONS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { WORKER_SHARE_NANO, attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
 import { validateCaseContinuation } from '../pi-extension/evaluation/pilot-continuation.mjs';
@@ -33,6 +33,15 @@ import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
 import { createSnapshotVerifier } from '../pi-extension/evaluation/snapshot-verifier.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
+// Recomputed from git so a transition cannot under-declare what changed between the two sealed commits.
+function changedPaths(from, to) {
+  if (!/^[a-f0-9]{40}$/.test(from ?? '') || !/^[a-f0-9]{40}$/.test(to ?? '')) throw fail('resume_invalid');
+  const names = execFileSync('git', ['diff', '--name-only', '--no-renames', from, to], { encoding: 'utf8' }).split('\n').filter(Boolean).sort();
+  return names.map(path => {
+    try { return { path, blob: execFileSync('git', ['rev-parse', `${to}:${path}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() }; }
+    catch { return { path, blob: null }; }
+  });
+}
 const sha = value => createHash('sha256').update(value).digest('hex');
 const sleep = ms => new Promise(resolveReply => setTimeout(resolveReply, ms));
 function pinned(path, expected, max = 100_000_000) {
@@ -167,12 +176,12 @@ async function main() {
   }
   if (!Array.isArray(priorLedgers) || new Set(priorLedgers.map(row => row?.sha256)).size !== priorLedgers.length) throw fail('prior_ledger_invalid');
   const attestationPath = process.env.PILOT_PRIOR_ATTESTATION, attestationSha = process.env.PILOT_PRIOR_ATTESTATION_SHA256;
-  if (Boolean(attestationPath) !== Boolean(attestationSha) || (attestationPath && (priorLedgers.length || process.env.PILOT_RESUME))) throw fail('prior_ledger_invalid');
+  if (Boolean(attestationPath) !== Boolean(attestationSha) || (attestationPath && priorLedgers.length)) throw fail('prior_ledger_invalid');
   let priorAttestation = null;
   if (attestationPath) {
     const attestation = JSON.parse(pinned(attestationPath, attestationSha, 1_000_000).toString('utf8'));
     const texts = (attestation.ledgers ?? []).map(row => pinned(row.path, row.sha256, 10_000_000).toString('utf8'));
-    priorAttestation = { path: attestationPath, sha256: attestationSha, ...attestedPriorSpend(attestation, texts) };
+    priorAttestation = { path: attestationPath, sha256: attestationSha, ledgerSha256s: attestation.ledgers.map(row => row.sha256), ...attestedPriorSpend(attestation, texts) };
   }
   const previous = priorAttestation ? BigInt(priorAttestation.totalNano) : priorLedgers.reduce((sum, row) => {
     if (Boolean(row.reconciliationPath) !== Boolean(row.reconciliationSha256)) throw fail('prior_ledger_invalid');
@@ -205,7 +214,7 @@ async function main() {
       || request.journalPath !== join(priorDir, `coverage-${digest(['coverage-session/v1', sourceKey])}.jsonl`)
       || !checkpointMatch || !snapshotPathMatch) throw fail('resume_provenance_mismatch');
     const priorSeal = JSON.parse(pinned(request.sealPath, request.sealSha256, 10_000_000).toString('utf8'));
-    if (priorSeal.spec?.answerer?.citationProtocol !== CITATION_PROTOCOL || request.transition !== 'same-treatment-resume') throw fail('legacy_resume_forbidden');
+    if (priorSeal.spec?.answerer?.citationProtocol !== CITATION_PROTOCOL || !CITED_RESUME_TRANSITIONS.includes(request.transition)) throw fail('legacy_resume_forbidden');
     const progressBytes = pinned(request.progressPath, request.progressSha256, 10_000_000);
     const journalBytes = pinned(request.journalPath, request.journalSha256, 20_000_000);
     const snapshotBytes = pinned(request.snapshotPath, request.snapshotSha256, 128_000_000);
@@ -258,7 +267,11 @@ async function main() {
     const plan = { priorRunId: report.run_id, priorSealDigest: priorSeal.digest, priorCodeSha: priorSeal.spec?.codeSha,
       cursor: request.cursor, snapshotSha256: request.snapshotSha256, journalSha256: request.journalSha256,
       transition: request.transition, ledgerReconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean),
-      caseHandbacks: handbacks, checkpointSnapshotSha256: checkpointRef.sha256, ...(driftBytes ? { sourceTreeDriftSha256: driftSha } : {}) };
+      caseHandbacks: handbacks, checkpointSnapshotSha256: checkpointRef.sha256, ...(driftBytes ? { sourceTreeDriftSha256: driftSha } : {}),
+      ...(request.transition === 'default-path-code-transition' ? { codeTransition: { from: priorSeal.spec?.codeSha, to: codeSha,
+        failureCode: request.codeTransition?.failureCode, failedCheckpoint: request.codeTransition?.failedCheckpoint,
+        reason: request.codeTransition?.reason, evidence: request.codeTransition?.evidence, reviewedPaths: request.codeTransition?.reviewedPaths,
+        changedPaths: changedPaths(priorSeal.spec?.codeSha, codeSha) } } : {}) };
     let superseded = null, partialCase = null;
     const pendingCases = prepared.filter(item => item.through === request.cursor && !completedCases.includes(item));
     if (pendingCases.length) {
@@ -319,7 +332,7 @@ async function main() {
     resume = { report, priorSeal, progress, journalBytes, snapshotBytes, checkpointSnapshotEquivalent, driftBytes, plan, superseded, partialCase,
       handbacks, handbackRows, carriedRows, carriedSnapshots, originSeals, carriedCases, originBundles };
   }
-  const remaining = 100000000000n - previous;
+  const remaining = WORKER_SHARE_NANO - previous;
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
   const seal = createCitedPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
     codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null,
@@ -357,7 +370,7 @@ async function main() {
     try {
       resumeValidation = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal: priorJournal,
         checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
-        sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
+        sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorAttestation?.ledgerSha256s ?? priorLedgers.map(row => row.sha256),
         reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks,
         partialCaseHandback: resume.partialCase?.descriptor ?? null, checkpointSnapshotEquivalent: resume.checkpointSnapshotEquivalent,
         sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
@@ -395,7 +408,7 @@ async function main() {
         sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
         models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
         routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
-        budget: { overall_effort_soft_usd: 250, share_soft_usd: 100, prior_spend_nano: previous.toString(), prior_attestation: priorAttestation,
+        budget: { overall_effort_soft_usd: 250, share_soft_usd: Number(WORKER_SHARE_NANO / 1_000_000_000n), prior_spend_nano: previous.toString(), prior_attestation: priorAttestation,
           remaining_soft_nano: remaining.toString(), prior_ledger_sha256s: priorLedgers.map(row => row.sha256),
           prior_reconciliation_sha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), one_call_in_flight: true, stop_unknown_usage: true,
           stop_above_twice_estimate: true, gateway_attempt_ledger: 'partial: gateway-internal failover/retry attempts not correlatable', rate_card: routeRates },
@@ -432,7 +445,7 @@ async function main() {
         if (resume) {
           const current = validatePilotResume({ report: resume.report, seal: resume.priorSeal, currentSeal: seal, progress: resume.progress, journal,
             checkpoints, cases: prepared, cursor: resume.plan.cursor, snapshotSha256: resume.plan.snapshotSha256, journalSha256: resume.plan.journalSha256,
-            sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorLedgers.map(row => row.sha256),
+            sourceSha256: source.source_sha256, datasetSha256: manifestSha, priorLedgerSha256s: priorAttestation?.ledgerSha256s ?? priorLedgers.map(row => row.sha256),
             reconciliationSha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), caseHandbacks: resume.handbacks,
             partialCaseHandback: resume.partialCase?.descriptor ?? null, checkpointSnapshotEquivalent: resume.checkpointSnapshotEquivalent,
             sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
@@ -676,10 +689,12 @@ async function main() {
     stage_attribution: reportRows.map(row => ({ case_id: row.caseId, status: 'pending_reference_freeze',
       reason: 'Reference catalog and candidate-trace semantic comparison have not been validated.' })),
     snapshot: snapshot ?? null, budget: { ...budget.state(), prior_spend_nano: previous.toString(),
-      total_spent_nano: (previous + BigInt(budget.state().spent_nano)).toString(), share_cap_nano: '100000000000' },
+      total_spent_nano: (previous + BigInt(budget.state().spent_nano)).toString(), share_cap_nano: WORKER_SHARE_NANO.toString() },
     ledger_completeness: 'partial: gateway-internal failover/retry attempts not correlatable',
     image_limitation: 'Original image blobs are archived by SHA-256; image content is not text-citable.',
     latency_limitation: 'Local embedding latency is environment-sensitive; a later sample showed 100% GPU and elevated host load, not proof of contention during any call.', artifacts,
+    mixed_code: seal.spec.resume?.codeTransition ? { from: seal.spec.resume.codeTransition.from, to: seal.spec.resume.codeTransition.to,
+      cursor: seal.spec.resume.cursor, changed_paths: seal.spec.resume.codeTransition.changedPaths.length } : null,
     run_dir: dir, run_id: runId, seal_sha256: seal.digest };
   writePrivate(join(dir, 'REPORT.json'), final);
   process.stdout.write(`${JSON.stringify({ status: final.status, run_id: runId, run_dir: dir, failure: final.failure })}\n`);

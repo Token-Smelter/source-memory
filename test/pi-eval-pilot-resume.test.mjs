@@ -73,6 +73,27 @@ test('same-treatment cited resume requires the same code, budget and prior answe
   assert.throws(() => validatePilotResume({ ...args, report: legacyReport, seal: legacy, currentSeal: sealComparison(legacyCurrent) }), /resume_treatment_mismatch/);
 }));
 
+test('a declared default-path code transition resumes only after the failure it names and within the sealed share', () => fixture(async ({ args }) => {
+  const options = { cases: args.cases.map(row => ({ ...row, packet: { ...row.packet, evidenceContract: BLOCK_EVIDENCE_CONTRACT } })),
+    sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
+    codeSha: 'd'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } }, toolCallReviewSha256: 'f'.repeat(64) };
+  const previous = createCitedPilotPlan(options);
+  const codeTransition = { from: 'd'.repeat(40), to: 'e'.repeat(40), failureCode: 'fictional_failure', failedCheckpoint: 'b',
+    reason: 'Fictional fix for the failed interval only.', evidence: ['fictional golden test'],
+    changedPaths: [{ path: 'docs/notes.md', blob: '1'.repeat(40) }, { path: 'src/fiction.mjs', blob: '2'.repeat(40) }], reviewedPaths: ['src/fiction.mjs'] };
+  const resume = { priorRunId: args.report.run_id, priorSealDigest: previous.digest, priorCodeSha: options.codeSha, cursor: 'a',
+    snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256, transition: 'default-path-code-transition', codeTransition };
+  const current = createCitedPilotPlan({ ...options, codeSha: 'e'.repeat(40), capNano: '200000000000', priorSpendNano: '50000000000', resume });
+  const report = { ...args.report, seal_sha256: previous.digest,
+    coverage: { dispositions: [{ through: 'a', disposition: 'committed' }, { through: 'b', disposition: 'failed', code: 'fictional_failure' }] } };
+  assert.equal(validatePilotResume({ ...args, report, seal: previous, currentSeal: current }).transition, 'default-path-code-transition');
+  const otherFailure = { ...report, coverage: { dispositions: [report.coverage.dispositions[0], { ...report.coverage.dispositions[1], code: 'other' }] } };
+  assert.throws(() => validatePilotResume({ ...args, report: otherFailure, seal: previous, currentSeal: current }), /resume_treatment_mismatch/);
+  assert.throws(() => createCitedPilotPlan({ ...options, codeSha: 'e'.repeat(40), resume: { ...resume, codeTransition: { ...codeTransition, to: '0'.repeat(40) } } }), /pilot_plan_invalid/);
+  assert.throws(() => createCitedPilotPlan({ ...options, codeSha: 'e'.repeat(40), capNano: '250000000000', priorSpendNano: '1', resume }), /pilot_plan_invalid/);
+  assert.throws(() => createCitedPilotPlan({ ...options, codeSha: 'e'.repeat(40), resume: { ...resume, codeTransition: { ...codeTransition, reviewedPaths: [] } } }), /pilot_plan_invalid/);
+}));
+
 test('resume refuses a prefix with unproven search completeness', () => fixture(async ({ args }) => {
   const progress = structuredClone(args.progress); delete progress[0].search_incomplete;
   assert.throws(() => validatePilotResume({ ...args, progress }), /resume_search_completeness_unproven/);
