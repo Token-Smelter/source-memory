@@ -25,8 +25,7 @@ const eligible = n => `(size($exclude) = 0
 
 // Above this many eligible tree vectors a read uses the shared ANN index; at or below it, an exact cosine scan.
 export const TREE_SCAN_LIMIT = 4096;
-const TREE_BACKFILL_BATCH = 1000;
-const TREE_BACKFILL_BATCHES = 50;
+const TREE_BACKFILL = { batch: 1000, batches: 50 };
 
 /**
  * Where a read looks. A flat scope (depth 1 or a non-path name) keeps its own labels and indexes and the exact `scope`
@@ -50,7 +49,8 @@ export function selection(target) {
   return { scope, subtree, tree: true, names: layout.indexes, labels: layout.labels,
     members: { turn: `SMTurn:${layout.labels.turn}`, chunk: `SMChunk:${layout.labels.chunk}`, record: `SMRecord:${layout.labels.record}` },
     params: subtree ? { scope, scopePrefix: `${scope}/`, scopeRegex: depth < 8 ? `${scope}(/[A-Za-z0-9_-]{1,64}){1,${8 - depth}}` : '(?!)' } : { scope },
-    where: subtree ? n => `(${n}.scope=$scope OR (${n}.scope STARTS WITH $scopePrefix AND ${n}.scope =~ $scopeRegex))` : n => `${n}.scope=$scope`,
+    where: subtree ? n => `(${n}.scope=$scope OR (${n}.scope STARTS WITH $scopePrefix AND size(${n}.scope) <= 256 AND ${n}.scope =~ $scopeRegex))`
+      : n => `${n}.scope=$scope`,
     owns: subtree ? value => value === scope || (typeof value === 'string' && value.startsWith(`${scope}/`) && scopePath(value) !== null)
       : value => value === scope,
     lucene: query => `text:(${query}) AND scope_terms:${term}^0` };
@@ -90,6 +90,8 @@ export class Neo4jStore {
       connectionTimeout: 10000, maxTransactionRetryTime: 10000,
     });
     this.database = config.database ?? 'neo4j';
+    // Batch size and batches per `init` call when labelling a selection for its tree; tests lower them.
+    this.backfill = { ...TREE_BACKFILL };
   }
 
   async close() { await this.driver.close(); }
@@ -183,16 +185,16 @@ export class Neo4jStore {
     }
     let labelled = 0;
     for (const kind of ['turn', 'chunk', 'record']) {
-      for (let batch = 0; batch < TREE_BACKFILL_BATCHES; batch += 1) {
+      for (let batch = 0; batch < this.backfill.batches; batch += 1) {
         const count = await this.transaction('write', async tx => {
           const rows = (await tx.run(`MATCH (n:${base[kind]}) WHERE ${sel.where('n')} AND NOT n:${sel.labels[kind]}
-            RETURN n.uid AS uid, n.scope AS scope LIMIT $limit`, { ...sel.params, limit: neo4j.int(TREE_BACKFILL_BATCH) })).records
+            RETURN n.uid AS uid, n.scope AS scope LIMIT $limit`, { ...sel.params, limit: neo4j.int(this.backfill.batch) })).records
             .map(row => ({ uid: row.get('uid'), terms: scopeTerms(row.get('scope')) }));
           if (rows.length) await tx.run(`UNWIND $rows AS row MATCH (n:${base[kind]} {uid:row.uid}) SET n:${sel.labels[kind]}, n.scope_terms=row.terms`, { rows });
           return rows.length;
         });
         labelled += count;
-        if (count < TREE_BACKFILL_BATCH) break;
+        if (count < this.backfill.batch) break;
       }
     }
     const states = dimensions === null ? null : await Promise.all(['chunk', 'record'].map(kind => this.vectorIndexStatus(target, kind, dimensions)));
@@ -634,13 +636,14 @@ export class Neo4jStore {
     });
   }
 
-  async indexedVectors(scope, kind, model, vector, limit, perConversation = null, exclude = [], budget = { remaining: 7 }) {
+  // `census` lets a caller that already counted the eligible nodes pass that count in.
+  async indexedVectors(scope, kind, model, vector, limit, perConversation = null, exclude = [], budget = { remaining: 7 }, census = null) {
     integer(limit, undefined, 1, 256);
     if (perConversation !== null) integer(perConversation, undefined, 1, 4);
     const sel = selection(scope);
     const index = sel.names[kind === 'chunk' ? 'vectorChunks' : 'vectorRecords'];
     // A short approximate result is not exhaustion evidence. Census both grouped and ordinary queries independently.
-    const { total, unindexed } = await this.vectorCounts(scope, kind, model, exclude);
+    const { total, unindexed } = census ?? await this.vectorCounts(scope, kind, model, exclude);
     const empty = perConversation === null ? { nodes: [] } : { hits: [], omitted: [], admitted_conversations: 0, exhausted: total > limit };
     const cap = 4096;
     let k = Math.max(limit * 4, 64);
@@ -685,10 +688,30 @@ export class Neo4jStore {
     return this.transaction('read', async tx => {
       // A tree read scans only what the tree indexes hold; unlabelled nodes are reported as pending instead.
       const base = kind === null ? '(n:SMChunk OR n:SMRecord)' : kind === 'chunk' ? 'n:SMChunk' : 'n:SMRecord';
-      const labels = !sel.tree ? base : kind === null ? '(n:SMTreeChunk OR n:SMTreeRecord)' : `${base}:${sel.labels[kind]}`;
+      const labels = !sel.tree ? base : kind === null ? `(n:SMChunk:${sel.labels.chunk} OR n:SMRecord:${sel.labels.record})` : `${base}:${sel.labels[kind]}`;
       const result = await tx.run(`MATCH (n) WHERE ${labels} AND ${sel.where('n')} AND n.embedding_key=$model AND ${eligible('n')}
         RETURN n ORDER BY n.uid LIMIT $limit`, { ...sel.params, model, limit: neo4j.int(limit), exclude });
       return result.records.map(row => unwrap(row.get('n')));
+    });
+  }
+
+  /**
+   * Exact cosine over a nested scope's or subtree's tree-labelled vectors, scored in Cypher so no embedding leaves the
+   * database: the top `limit` hits with the fields a recall hit needs, and every eligible uid for grouped admission.
+   */
+  async treeVectorScan(target, kind, model, vector, limit, exclude = []) {
+    const sel = selection(target);
+    requireThat(sel.tree, 'invalid_input');
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`MATCH (n:${sel.members[kind]} {embedding_key:$model}) WHERE ${sel.where('n')} AND ${eligible('n')}
+        WITH n, vector.similarity.cosine(n.embedding, $vector) AS score ORDER BY score DESC, n.uid
+        WITH collect({uid:n.uid, scope:n.scope, turn_uid:n.turn_uid, record_id:n.record_id, entry_id:n.entry_id, start:n.start, end:n.end,
+          text:n.text}) AS rows
+        RETURN rows[..$limit] AS top, [row IN rows | row.uid] AS uids`, { ...sel.params, model, vector, exclude, limit: neo4j.int(limit) });
+      const row = result.records[0];
+      const top = row.get('top');
+      requireThat(top.every(node => sel.owns(node.scope)), 'index_scope_mismatch');
+      return { nodes: top, uids: row.get('uids') };
     });
   }
 

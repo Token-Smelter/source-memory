@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { markStage, normalizeEnrichment, OUTCOME_REFERENT_KINDS } from '../src/core.mjs';
+import { isSelector, markStage, normalizeEnrichment, OUTCOME_REFERENT_KINDS } from '../src/core.mjs';
 import * as defaultLinks from '../src/link-proposals.mjs';
 import { searchDerived, resolveDerived, searchRaw } from './derived-retrieval.mjs';
 import { createAtomicOutcomes } from './atomic-outcome.mjs';
@@ -21,7 +21,8 @@ const deferred = () => {
 
 /** The process retains the original proposal object; NDJSON exposes only a token and frozen offer. */
 export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks, beforeAppend, offerTimeoutMs = 30000 }) {
-  if (!Array.isArray(scopes) || scopes.length !== 1 || typeof scopes[0] !== 'string' || !scopes[0]) throw fail('scope_unresolved');
+  // One exact scope: offers and handles are keyed by it, so a subtree selector would conflate same-id records across scopes.
+  if (!Array.isArray(scopes) || scopes.length !== 1 || typeof scopes[0] !== 'string' || !scopes[0] || isSelector(scopes[0])) throw fail('scope_unresolved');
   if (!Number.isSafeInteger(offerTimeoutMs) || offerTimeoutMs <= 0) throw fail('timeout_invalid');
   const allowed = scope => { if (scope !== scopes[0]) throw fail('scope_denied'); };
   const slots = new Map(), compactOffers = new Map(), compactByIdentity = new Map();

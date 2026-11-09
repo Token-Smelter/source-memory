@@ -3,6 +3,7 @@ import test from 'node:test';
 import { authorize, authorizeTarget, fuse, isNested, isSelector, scopePath, scopeTerm, scopeTerms, treeLayout } from '../src/core.mjs';
 import { selection } from '../src/store.mjs';
 import { Memory } from '../src/memory.mjs';
+import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
 
 const config = (read, write = read) => ({ scopes: { read, write } });
 const denied = action => assert.throws(action, { code: 'scope_denied' });
@@ -80,8 +81,11 @@ test('fusion keeps same-id records of different scopes apart and flat hits uncha
 test('reads and writes that take one exact scope refuse a selector before touching storage', async () => {
   const store = new Proxy({}, { get: () => () => { throw new Error('store touched'); } });
   const memory = new Memory(config(['acme/**']), store);
-  for (const [method, input] of [['show', { kind: 'record', id: 'x' }], ['index', {}], ['ingest', {}], ['enrich', {}]]) {
+  for (const [method, input] of [['show', { kind: 'record', id: 'x' }], ['index', {}], ['ingest', {}], ['enrich', {}], ['recordPresence', ['x']],
+    ['recordVectorStatus', ['x']], ['turnVectorStatus', 'turn_x'], ['sourceChunks', 'turn_x']]) {
     await assert.rejects(memory[method]('acme/**', input), { code: 'scope_denied' }, method);
   }
+  assert.throws(() => createMemoryHandlers({ memory, scopes: ['acme/**'] }), { code: 'scope_unresolved' });
+  assert.doesNotThrow(() => createMemoryHandlers({ memory, scopes: ['acme/x'] }).close());
   await assert.rejects(new Memory(config(['acme']), store).recall('acme/**', { query: 'q' }), { code: 'scope_denied' });
 });

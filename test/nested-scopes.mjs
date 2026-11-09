@@ -2,13 +2,12 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { Memory } from '../src/memory.mjs';
-import { canonical, digest, identity, indexNames, namespace, scopeTerm, treeLayout } from '../src/core.mjs';
+import { canonical, digest, identity, indexNames, namespace, scopeTerm, scopeTerms, treeLayout } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
 import { exportScope } from '../pi-extension/export-scope.mjs';
 import { goldenFixtures, goldenIdentities, readGoldenCorpus, writeGoldenCorpus } from './flat-golden.mjs';
@@ -16,8 +15,8 @@ import { goldenFixtures, goldenIdentities, readGoldenCorpus, writeGoldenCorpus }
 const exec = promisify(execFile);
 
 // The commit before nested scopes. Its Memory writes and reads the golden corpus first; this checkout must read it identically.
-export const BASE_COMMIT = '589658d';
-export const FLAT_GOLDEN_SHA256 = '0ade1361aa344bc00baf769fb1e4727992943f6d96be66590268bff76c8e265b';
+export const BASE_COMMIT = '589658daca0ba7797bef633cb1baf775b0269db4';
+export const FLAT_GOLDEN_SHA256 = '6f976787826aaa6ff7c85eb2e4f288c38a903aaadcd5494451c417afd4390a71';
 
 const FIVE = ['chunk_lexical', 'chunk_vector', 'record_lexical', 'record_vector', 'turn_lexical'];
 const FIVE_READY = Object.fromEntries(FIVE.map(name => [name, 'ready']));
@@ -42,15 +41,13 @@ function canonicalSnapshot(snapshot, scope) {
   return canonical(value);
 }
 
-/** The base commit's src/, extracted under the git-ignored .memory-local so it resolves this checkout's node_modules. */
+/** The base commit's src/, freshly extracted under the git-ignored .memory-local so it resolves this checkout's node_modules. */
 async function baseMemoryClass() {
   const root = fileURLToPath(new URL('..', import.meta.url));
-  const dir = join(root, '.memory-local', `base-${BASE_COMMIT}`);
-  if (!existsSync(join(dir, 'src', 'memory.mjs'))) {
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    await exec('git', ['-C', root, 'archive', '--format=tar', '-o', join(dir, 'src.tar'), BASE_COMMIT, 'src'], { timeout: 30000 });
-    await exec('tar', ['-xf', join(dir, 'src.tar'), '-C', dir], { timeout: 30000 });
-  }
+  await mkdir(join(root, '.memory-local'), { recursive: true, mode: 0o700 });
+  const dir = await mkdtemp(join(root, '.memory-local', 'base-'));
+  await exec('git', ['-C', root, 'archive', '--format=tar', '-o', join(dir, 'src.tar'), BASE_COMMIT, 'src'], { timeout: 30000 });
+  await exec('tar', ['-xf', join(dir, 'src.tar'), '-C', dir], { timeout: 30000 });
   return (await import(pathToFileURL(join(dir, 'src', 'memory.mjs')).href)).Memory;
 }
 
@@ -67,7 +64,7 @@ export async function runNestedScopes(database, scratch = null) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const embedding = { url: `http://127.0.0.1:${server.address().port}/embed`, model: 'nested-fixture', dimensions: 4 };
-  const grants = ['acme/**', 'other/**', 'acme/odd name', 'team/**'];
+  const grants = ['acme/**', 'other/**', 'acme/odd name', 'team/**', 'vec/**', 'bf/**'];
   const config = { neo4j: database, scopes: { read: grants, write: grants }, embedding };
   const memory = new Memory(config);
   const narrow = new Memory({ ...config, scopes: { read: ['acme/proj-1/actor-a', 'acme/proj-1'], write: ['acme/proj-1/actor-a'] } }, memory.store);
@@ -162,7 +159,7 @@ export async function runNestedScopes(database, scratch = null) {
       assert.notEqual(uids.a, uids.b, 'identity hashes the full scope');
       const rows = await labelsOf(Object.values(uids));
       const tree = treeLayout('acme').labels;
-      assert.deepEqual(rows[uids.a].labels.sort(), ['SMTurn', tree.turn].sort());
+      assert.deepEqual([rows[uids.a].labels.sort(), rows[uids.a].terms], [['SMTurn', tree.turn].sort(), scopeTerms('acme/proj-1/actor-a')]);
       assert.deepEqual([rows[uids.root].labels.sort(), rows[uids.root].terms], [['SMTurn', `${namespace('acme')}Turn`].sort(), null]);
       assert.deepEqual([rows[uids.odd].labels.sort(), rows[uids.odd].terms], [['SMTurn', `${namespace('acme/odd name')}Turn`].sort(), null]);
       assert.ok(rows[uids.other].labels.includes(treeLayout('other').labels.turn) && !rows[uids.other].labels.includes(tree.turn), 'roots are separate trees');
@@ -191,6 +188,10 @@ export async function runNestedScopes(database, scratch = null) {
       for (const bundle of reply.bundles) for (const row of bundle.records) assert.equal(row.scope, bundle.scope);
       const seeds = await memory.recall('acme/proj-1/**', { query: 'quartz cobalt' }, { seedsOnly: true });
       assert.ok(seeds.ranked.every(item => item.scope.startsWith('acme/proj-1')));
+      assert.deepEqual(seeds.scope_tree, { pending: { turn: 0, chunk: 0, record: 0 } });
+      const excluded = await memory.recall('acme/proj-1/**', { query: 'quartz cobalt tiles lobby', limit: 32,
+        exclude_conversations: [{ source: 'nested-fixture', conversation_id: 'c-shared' }] });
+      assert.deepEqual([...new Set(excluded.bundles.map(bundle => bundle.scope))], ['acme/proj-1'], 'an exclusion applies in every scope of the subtree');
     });
 
     await check('a root that has not opted in is reported pending in its subtree until init on the root labels it', async () => {
@@ -232,6 +233,49 @@ export async function runNestedScopes(database, scratch = null) {
       const result = await memory.store.indexedVectors({ scope: 'acme/proj-1', subtree: true }, 'record', key, [1, 0, 0, 0], 4);
       assert.equal(result.partial, false);
       assert.ok(result.nodes.length >= 1 && result.nodes.every(node => node.scope.startsWith('acme/proj-1/')));
+    });
+
+    await check('above the scan limit a selection is read through its root ANN index with the census passed in', async () => {
+      const calls = [];
+      const original = memory.store.indexedVectors;
+      memory.store.indexedVectors = function (...args) { calls.push(args); return original.apply(this, args); };
+      memory.treeScanLimit = 1;
+      try {
+        const reply = await memory.recall('acme/proj-1/**', { query: 'quartz tiles', limit: 32 });
+        assert.deepEqual([reply.channels.chunk_vector.status, reply.channels.record_vector.status], ['ready', 'ready']);
+        assert.ok(reply.bundles.some(bundle => bundle.match.channels.some(trace => trace.channel === 'record_vector')));
+        assert.equal(calls.length, 2);
+        assert.ok(calls.every(args => args[8] && Number.isInteger(args[8].total)), 'the census is not run twice');
+      } finally { memory.treeScanLimit = 4096; memory.store.indexedVectors = original; }
+    });
+
+    await check('a root whose tree vector indexes are missing still scans its vectors and finds them', async () => {
+      const bare = new Memory({ ...config, embedding: undefined }, memory.store);
+      await bare.init('vec/a');
+      const uid = (await bare.ingest('vec/a', turn('c-vec', 'v1', 'A quartz lantern note.'))).id;
+      await bare.ingest('vec/a/b', turn('c-vec2', 'v2', 'A cobalt lantern note.'));
+      assert.equal((await memory.index('vec/a')).status, 'ready');
+      assert.equal((await memory.index('vec/a/b')).status, 'ready');
+      for (const scope of ['vec/a', 'vec/a/**']) {
+        const reply = await memory.recall(scope, { query: 'quartz' });
+        assert.equal(reply.channels.chunk_vector.status, 'ready', scope);
+        assert.ok(reply.bundles.some(bundle => bundle.source?.id === uid
+          && bundle.match.channels.some(trace => trace.channel === 'chunk_vector')), `${scope} finds the vector hit`);
+      }
+      assert.equal((await memory.status('vec/a')).vector_indexes.chunk, 'missing');
+    });
+
+    await check('init labels a selection in bounded batches and reports what is left until a rerun finishes', async () => {
+      await memory.init('bf');
+      await seed('bf', 'c-bf', 'b1', 'First batch fixture.', [['bf-1', 'One.'], ['bf-2', 'Two.']]);
+      await seed('bf', 'c-bf', 'b2', 'Second batch fixture.');
+      memory.store.backfill = { batch: 1, batches: 1 };
+      try {
+        const first = await memory.init('bf/**');
+        assert.deepEqual([first.scope_tree.labelled, first.scope_tree.pending], [3, { turn: 1, chunk: 1, record: 1 }]);
+        const second = await memory.init('bf/**');
+        assert.deepEqual([second.scope_tree.labelled, second.scope_tree.pending], [3, { turn: 0, chunk: 0, record: 0 }]);
+      } finally { memory.store.backfill = { batch: 1000, batches: 50 }; }
     });
 
     await check('grants: an exact grant never reads a subtree or a sibling, and a selector is never written or shown', async () => {

@@ -123,19 +123,15 @@ export async function readGoldenCorpus(memory, config) {
 }
 
 /**
- * Recall runs its channels concurrently and fuses them in completion order, at the base commit too, so two identical reads
- * can differ in the last bit of a fused score and, in the ranking-only reply, in key and trace order and in the text, match
- * and conversation fields copied from whichever channel found an item first. Only those are normalized: fused scores to 12
- * significant digits, and in the ranking-only reply channel keys and traces sorted by name and first-channel fields dropped.
+ * Recall runs its lexical channels concurrently and fuses them in completion order, at the base commit too. In the
+ * ranking-only reply that order shows as the channel-key order, each item's trace order, and the text, match and
+ * conversation fields an item keeps from whichever channel found it first. Only those are normalized: keys and traces
+ * sorted by name, first-channel fields dropped. Fused scores are exact (at most two lexical terms per item), so they are not.
  */
 function canonicalRun(replies) {
-  const round = value => Array.isArray(value) ? value.map(round) : value && typeof value === 'object'
-    ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, ['score', 'rank_score'].includes(key) && typeof item === 'number'
-      ? Number(item.toPrecision(12)) : round(item)]))
-    : value;
-  return round(replies).map(reply => !reply.ranked ? reply : { ...reply,
+  return replies.map(reply => !reply.ranked ? reply : { ...reply,
     channels: Object.fromEntries(Object.entries(reply.channels).sort(([a], [b]) => a.localeCompare(b))),
-    ranked: reply.ranked.map(({ text: _text, match: _match, matches: _matches, conversation: _conversation, conversations: _conversations, ...item }) =>
+    ranked: reply.ranked.map(({ text: _text, match: _match, conversation: _conversation, ...item }) =>
       ({ ...item, channels: [...item.channels].sort((a, b) => a.channel.localeCompare(b.channel)) })) });
 }
 

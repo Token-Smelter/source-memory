@@ -28,6 +28,8 @@ export class Memory {
   constructor(config, store = null) {
     this.config = config;
     this.store = store ?? new Neo4jStore(config.neo4j);
+    // Largest tree selection scored by exact scan rather than its root's ANN index; tests lower it.
+    this.treeScanLimit = TREE_SCAN_LIMIT;
   }
 
   async close() { await this.store.close(); }
@@ -363,10 +365,10 @@ export class Memory {
         const [queryVector] = await embed(this.config.embedding, [query]);
         const catalog = await vectorCatalog(this.store, target, queryVector.length);
         const missing = catalog.filter(entry => entry.vector_index === 'missing');
-        const prepareFallback = async (kind, bound = vectorLimit) => {
-          const vectors = await this.store.vectors(target, key, bound + 1, exclude, kind);
-          const selected = vectors.slice(0, bound);
-          return { scanned: selected.map(row => row.uid), scan_truncated: vectors.length > bound,
+        const prepareFallback = async kind => {
+          const vectors = await this.store.vectors(target, key, vectorLimit + 1, exclude, kind);
+          const selected = vectors.slice(0, vectorLimit);
+          return { scanned: selected.map(row => row.uid), scan_truncated: vectors.length > vectorLimit,
             ranked: grouped ? [] : selected.map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
               .filter(row => Number.isFinite(row.similarity)).sort((a, b) => b.similarity - a.similarity || a.uid.localeCompare(b.uid)) };
         };
@@ -380,16 +382,22 @@ export class Memory {
             let result;
             let unindexed;
             let scan_truncated = false;
-            // The shared tree ANN index is filtered after its top-k; a small selection is scored exactly instead.
+            // A root's ANN index is filtered after its top-k, so a small selection is scored exactly, inside the database.
             const census = tree && vector_index === 'online' ? await this.store.vectorCounts(target, kind, key, exclude) : null;
-            if (vector_index === 'online' && !(census && census.total <= TREE_SCAN_LIMIT)) {
-              result = await this.store.indexedVectors(target, kind, key, queryVector, candidates, grouped ? perConversation : null, exclude, budget);
+            if (census && census.total <= Math.min(this.treeScanLimit, vectorLimit)) {
+              const scan = await this.store.treeVectorScan(target, kind, key, queryVector, candidates, exclude);
+              unindexed = census.unindexed;
+              result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, scan.uids, candidates, perConversation, exclude)
+                : { hits: vectorHits(kind, scan.nodes, sel.subtree) };
+            } else if (vector_index === 'online') {
+              result = await this.store.indexedVectors(target, kind, key, queryVector, candidates, grouped ? perConversation : null, exclude, budget,
+                ...(census ? [census] : []));
               unindexed = result.unindexed;
               if (!grouped) result.hits = vectorHits(kind, result.nodes, sel.subtree);
             } else {
               // Share only a truly combined missing-index scan. One kind's failure never blocks an online sibling.
-              const fallback = census ? prepareFallback(kind, TREE_SCAN_LIMIT) : missing.length === 2 ? sharedFallback ??= prepareFallback(null) : prepareFallback(kind);
-              const [data, counts] = await Promise.all([fallback, census ?? this.store.vectorCounts(target, kind, key, exclude)]);
+              const fallback = missing.length === 2 ? sharedFallback ??= prepareFallback(null) : prepareFallback(kind);
+              const [data, counts] = await Promise.all([fallback, this.store.vectorCounts(target, kind, key, exclude)]);
               unindexed = counts.unindexed;
               scan_truncated = data.scan_truncated;
               result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, data.scanned, candidates, perConversation, exclude)
@@ -437,7 +445,8 @@ export class Memory {
     if (seedsOnly) {
       requireThat(!grouped, 'invalid_input');
       return { scope, ranked, candidate_limit: candidates, channels: Object.fromEntries(Object.entries(availability).map(([name, state]) =>
-        [name, { ...state, ...(channels[name] ? { candidate_limit_reached: channels[name].length >= candidates } : {}) }])) };
+        [name, { ...state, ...(channels[name] ? { candidate_limit_reached: channels[name].length >= candidates } : {}) }])),
+        ...(pending ? { scope_tree: { pending } } : {}) };
     }
 
     const bundles = [];
