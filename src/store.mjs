@@ -717,7 +717,6 @@ export class Neo4jStore {
     });
   }
 
-
   /**
    * One page of a selection's turns and records, newest first by (created_at, uid), strictly after `after`, filtered
    * inside the query so its limit counts matches only. A node without a datetime `created_at` sorts as the oldest

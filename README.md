@@ -191,7 +191,7 @@ Every root segment has its own tree: labels `SMTree<d>Turn`, `SMTree<d>Chunk`, `
 | Filters | `kind`: `turn` or a record kind; `status` (records only); `source` and `conversation_id` match a turn, or any evidence turn of a record |
 | Turn items | `{kind:"turn", scope, id, source, conversation_id, turn_id, parent_turn_id, occurred_at, stored_at, entry_count}`, cut from the stored envelope inside the database so entry text is never returned; text via `show` |
 | Record items | `{kind:"record", scope, id, record_kind, status, text, attribution, evidence, stored_at}`; evidence as span coordinates; excerpts via `show` |
-| Bounds | `limit` 1–64 (default 16); `max_bytes` 4,096–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before an item that would exceed it. An item larger than `max_bytes` by itself is listed as `{kind, scope, id, stored_at, bytes, content_omitted:"max_bytes"}` and the walk moves on |
+| Bounds | `limit` 1–64 (default 16); `max_bytes` 4,096–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before an item that would exceed it. An item that cannot fit in `items` alone (`bytes + 2 > max_bytes`) is listed as `{kind, scope, id, stored_at, bytes, content_omitted:"max_bytes"}` and the walk moves on |
 | Cursor | Opaque and bound to the request's scope and filters; any other use is `invalid_input` |
 | Cost | One query per page: filters run inside it, before its limit, and it sorts the matching part of the selection. With the scope range indexes (created by any nested or subtree `init`) selection is a seek; a store without them scans every turn or record |
 

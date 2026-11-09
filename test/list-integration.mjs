@@ -26,7 +26,7 @@ const ids = pages => pages.flatMap(page => page.items.map(item => `${item.scope}
 export async function runList(database, scratch = null) {
   const results = [];
   const check = async (name, fn) => { await fn(); results.push({ name, pass: true }); console.log(`PASS ${name}`); };
-  const grants = ['lst', 'lst/**', 'lst/a b', 'tie', 'legacy'];
+  const grants = ['lst', 'lst/**', 'lst/a b', 'tie', 'legacy', 'stat'];
   const config = { neo4j: database, scopes: { read: grants, write: grants } };
   const memory = new Memory(config);
   const seed = async (scope, conversation, turnIds, records = []) => {
@@ -118,6 +118,17 @@ export async function runList(database, scratch = null) {
       assert.deepEqual(ids(await walk(memory, 'legacy', { conversation_id: 'c-other' })), [], 'quoted text inside an entry never matches');
       const legacyTurn = (await memory.list('legacy', { kind: 'turn' })).items[0];
       assert.deepEqual([legacyTurn.source, legacyTurn.conversation_id, legacyTurn.turn_id, legacyTurn.entry_count], ['list-fixture', 'c-legacy', 'old', 1]);
+    });
+
+    await check('a status filter matches the stored status, not a decoy inside record text', async () => {
+      const [uid] = await seed('stat', 'c-stat', ['s1']);
+      await memory.enrich('stat', { records: [
+        { id: 'accepted-1', kind: 'decision', status: 'accepted', text: 'Fictional accepted.', attribution: 'fixture', evidence: [{ turn: uid, entry_id: 's1-u', start: 0, end: 5 }] },
+        { id: 'decoy-1', kind: 'decision', text: 'Decoy ,"status":"accepted","attribution": inside.', attribution: 'fixture,"kind":"episode","text":',
+          evidence: [{ turn: uid, entry_id: 's1-u', start: 0, end: 5 }] }], relations: [] });
+      assert.deepEqual(ids(await walk(memory, 'stat', { status: 'accepted' })), ['stat:accepted-1']);
+      assert.deepEqual(ids(await walk(memory, 'stat', { status: 'proposed' })), ['stat:decoy-1']);
+      assert.deepEqual(ids(await walk(memory, 'stat', { kind: 'episode' })), []);
     });
 
     await check('the CLI lists with or without --input, never waits on stdin, and refuses a foreign cursor', async () => {

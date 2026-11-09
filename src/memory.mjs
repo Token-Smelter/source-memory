@@ -664,7 +664,8 @@ const vectorHits = (kind, nodes, withScope = false) => nodes.map(row => kind ===
 } : { kind: 'record', id: row.record_id, text: row.text, ...(withScope ? { scope: row.scope } : {}) });
 
 const LIST_KEYS = ['kind', 'status', 'source', 'conversation_id', 'limit', 'max_bytes', 'cursor'];
-// The text Neo4j gives `toString` of a zoned datetime; anything else would fail inside the query instead of here.
+// The shape of Neo4j's `toString` of a zoned datetime, with in-range fields. Only a hand-made cursor can still name an
+// impossible date (such as February 30) or an unknown zone; Neo4j then refuses it.
 const STORED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2}(:\d{2})?)(\[[A-Za-z0-9_+/-]{1,64}\])?$/u;
 
 const encodeCursor = (binding, key) => Buffer.from(JSON.stringify({ v: 1, q: binding, at: key.at, uid: key.uid })).toString('base64url');
@@ -675,14 +676,14 @@ function decodeCursor(value, binding) {
   let cursor;
   try { cursor = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); } catch { cursor = null; }
   requireThat(cursor && cursor.v === 1 && cursor.q === binding && typeof cursor.at === 'string' && cursor.at.length <= 128
-    && STORED_AT.test(cursor.at) && typeof cursor.uid === 'string' && cursor.uid.length <= 128, 'invalid_input');
+    && STORED_AT.test(cursor.at) && Number.isFinite(Date.parse(cursor.at.replace(/\[[^\]]*\]$/u, ''))) && typeof cursor.uid === 'string' && cursor.uid.length <= 128, 'invalid_input');
   return { at: cursor.at, uid: cursor.uid };
 }
 
 const listPage = (scope, items, last, binding) => ({ kind: 'list', scope, order: 'stored_desc', items,
   next_cursor: last === null ? null : encodeCursor(binding, last) });
 
-// A turn header comes from its stored envelope; a body this store did not write falls back to the node's own properties.
+// Turn fields come from the node's own properties first, then from its stored envelope header (a legacy turn has no properties).
 function listItem(row) {
   const stored = row.untimed ? null : row.at;
   if (row.type === 'turn') {
