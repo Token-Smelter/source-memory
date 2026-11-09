@@ -11,6 +11,7 @@ import { createStreamSink } from '../src/phase-diagnostic.mjs';
 const HELP = `source-memory <init|ingest|enrich|index|recall|show|status|warm> [--config FILE] --scope SCOPE [--input FILE]
 
 --config defaults to $SOURCE_MEMORY_CONFIG.
+--scope S/** names the subtree under path scope S for recall, status and init; every other command takes one exact scope.
 
 JSON input is read from --input or stdin for ingest/enrich/recall/show.
 index accepts optional --input {"limit":256}; init/status/warm need no input.

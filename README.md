@@ -56,7 +56,7 @@ echo '{"query":"dashboard"}' | node bin/memory.mjs recall --config config/host.j
 | `neo4j.database`, `neo4j.user` | Database name (default `neo4j`) and user (default `neo4j`). |
 | `neo4j.password_env` | Name of the environment variable holding the password; the password never lives in the file. |
 | `neo4j.auth` | `"none"` only for a disposable, isolated test database. |
-| `scopes.read`, `scopes.write` | Allowlists. Every command names a scope; others are refused before storage is touched. |
+| `scopes.read`, `scopes.write` | Allowlists. An entry names one scope exactly, or `S/**` names `S` and every descendant (see [Nested scopes](#nested-scopes)). Every command names a scope; others are refused before storage is touched. |
 | `chunking.words`, `chunking.overlap` | Word-window size and overlap for embedding chunks (default 256 / 32). |
 | `index_on_write` | `false` makes `ingest`/`enrich` return without embedding; run `index` separately. Use it on latency-sensitive paths. |
 | `embedding` | Optional `{url, model, dimensions, timeout_ms, allow_remote}`; OpenAI-compatible `/v1/embeddings`. |
@@ -73,7 +73,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 
 | Command | Input | Behavior |
 |---|---|---|
-| `init` | None | Create uniqueness constraints, scope full-text indexes, and native vector indexes when embedding is configured |
+| `init` | None | Create uniqueness constraints, scope full-text indexes, and native vector indexes when embedding is configured; for a nested scope or `S/**`, the shared tree indexes and the subtree's labels |
 | `ingest` | Turn envelope | Atomically retain exact source and its chunks; then embed unless `index_on_write` is false |
 | `enrich` | Records and relations | Validate source spans and endpoints; commit the whole bundle atomically |
 | `index` | Optional `{"limit":256}` | Embed missing or out-of-date chunks/records |
@@ -161,6 +161,23 @@ Chunks are word windows inside a single entry, recorded with exact UTF-16 offset
 - Records and relations are append-only by identity. Record a correction as a new record with a `supersedes` or `qualifies` relation. Chronology and similarity never create relations automatically.
 - Limits: 128 records and 256 relations per call; 16 spans per item; 16,000 characters per span, 32,000 per item. Any invalid span, endpoint, or identity conflict rolls back the entire call.
 
+## Nested scopes
+
+A scope that is a path, 1–8 segments of `[A-Za-z0-9_-]{1,64}` joined by `/` (at most 256 characters), also names a subtree: `acme/init-7/actor-3` sits under `acme/init-7` and `acme`. Any other name (for example `my scope`) is an opaque scope with no parent or subtree.
+
+| Rule | Behaviour |
+|---|---|
+| Grants | `"S"` grants exactly `S`. `"S/**"` grants `S` and every descendant, including ones created later. A subtree read `S/**` needs a pattern on `S` or an ancestor; exact grants on its members never add up to it. Opaque names are granted only exactly |
+| Writes | `ingest`, `enrich` and `index` name one exact scope. A selector is refused `scope_denied` with `stage:"before_write"`. Evidence and relation endpoints stay in the written scope |
+| Reads | `recall`, `status` and `init` accept `--scope 'S/**'` (quote it in a shell). Every subtree hit, bundle and unit names its own exact `scope`; relations, evidence and following stay inside it. `show` takes an exact scope only |
+| Identity | Unchanged: ids hash the full scope, so the same record id in two scopes is two records. `RECORD_CONTRACT` stays `source-memory.record/1` |
+
+A flat scope (a depth-1 path or an opaque name) keeps its own labels and indexes, and its stored nodes and reads are byte-identical to those before nested scopes: an integration check has `589658d` write and read a fixed corpus, then reads it with this code before and after opt-in and after a replay, and compares the `export-scope` snapshot of a flat scope written by each commit. The normalizations cover only what `589658d` itself does not fix: recall fuses its concurrent lexical channels in completion order, so a candidate keeps the text, match and conversation fields of whichever channel found it first, and that text is what a reranker scores. The check sorts the ranking-only reply's channel keys and traces, drops those first-channel fields there, and uses a fixture reranker that scores the sentence every representation of a turn shares. Fused scores are exact and are compared unchanged.
+
+Every root segment has its own tree: labels `SMTree<d>Turn`, `SMTree<d>Chunk`, `SMTree<d>Record` and indexes `smtree_t_<d>`, `smtree_r_<d>`, `smtree_c_<d>`, `smtree_vc_<d>`, `smtree_vr_<d>`, where `<d>` is a digest of the root. Every write to a nested scope sets its root's labels and a `scope_terms` property (one term per ancestor-or-self, one exact term). A depth-1 root's own writes join its tree only after `init 'root/**'` has opted it in; until then the root's stored data is exactly what it was. Full-text queries filter by scope term inside Lucene before their limit, with boost 0 so the filter leaves scores unchanged. The tree vector indexes have no pre-filter: a selection with at most 4,096 eligible vectors is scored exactly; a larger one uses its root's ANN index, filtered inside the existing widening loop, and can report `partial` / `vector_overfetch_cap`. Nested and subtree rankings are computed over the root's tree and are not comparable to a flat read's. Roots are isolated from one another and each has its own vector dimension.
+
+`init acme/x` (nested) creates its root's tree and the scope range indexes without waiting for them to populate, and labels `acme/x`'s own unlabelled nodes. `init 'acme/**'` (write grant on `acme/**`) also opts in the depth-1 root `acme` and labels every unlabelled path-scope node of the subtree (data the root held before opt-in, or a name containing `/` written before nested scopes) in bounded batches. Both reply `scope_tree: {labelled, pending, indexes}`; rerun until `pending` is all zero. Until then, nested and subtree reads mark each affected channel `partial` with `reason:"scope_tree_pending"` and `scope_tree_pending`, and add `scope_tree.pending` by kind. `status` on a nested scope or subtree reports the same counts and index states. A nested name that a pre-r1 `init` gave its own index is flagged `legacy_flat_index: true` by `init` and `status`; such names now read through the tree (owner ruling; no supported writer produced them). `pi-extension/export-scope.mjs` and `restore-scope.mjs` stay flat-only: restore refuses the tree labels of an opted-in root or a nested scope.
+
 ## Following a conversation
 
 `show {"kind":"following"}` walks exact parent links forward from one turn and returns up to `limit` later turns (default 2, at most 16) with their entries and roles.
@@ -176,7 +193,7 @@ Later turns are context, not supersession: a later statement does not by itself 
 
 ## Recall
 
-Five independent channels run under the requested scope: `turn_lexical`, `chunk_lexical`, `record_lexical`, `chunk_vector`, `record_vector`. Query text is treated as literal terms, never as Lucene or Cypher syntax. Results merge by reciprocal rank fusion; an optional reranker then reorders them. Each scope has its own full-text and vector indexes; traversals and evidence reads enforce scope, and native vector candidates are scope/model/exclusion-filtered inside the query before the channel limit.
+Five independent channels run under the requested scope: `turn_lexical`, `chunk_lexical`, `record_lexical`, `chunk_vector`, `record_vector`. Query text is treated as literal terms, never as Lucene or Cypher syntax. Results merge by reciprocal rank fusion; an optional reranker then reorders them. Each flat scope has its own full-text and vector indexes, and nested scopes and subtrees use the shared tree indexes ([Nested scopes](#nested-scopes)); traversals and evidence reads enforce scope, and native vector candidates are scope/model/exclusion-filtered inside the query before the channel limit.
 
 Chunk lexical hits identify the entry, role, UTF-16 span, and qualified `conversation` key (`scope`, `source`, `conversation_id`). Legacy roles resolve from the parent turn's stored entries; a missing or ambiguous entry yields `unknown` without dropping the hit. Body-derived conversation keys carry `legacy: true` and are informational only. The channel queries only an `ONLINE` chunk index: `POPULATING` reports `pending` without hits; missing or failed indexes report `unavailable`.
 

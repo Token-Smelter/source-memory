@@ -46,7 +46,7 @@ A caller concept that needs state transitions (open/closed, assigned, due) stays
 | Prepare a scope or subtree | `init` | built; subtree in PR 1 | exact scope or `S/**` (write grant) |
 | Keep the embedding model resident; warm the database read paths | `warm`; `warm --db v1` | built | exact scope |
 
-Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence` on the extension transport, refuses it `scope_denied` inside `authorize`, before any storage call.
+Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence`, refuses it `scope_denied` inside `authorize`, before any storage call. The extension transport (`pi-extension/memory-process.mjs`) serves one exact scope and refuses a selector at startup with `scope_unresolved`.
 
 ## Scopes (PR 1)
 
@@ -123,7 +123,7 @@ A flat exact read uses the same labels, index names, Lucene query text, vector i
 
 Test (pinned digest): the corpus written by r1 into a fresh, non-opted-in flat scope has the same `export-scope` snapshot as `589658d`'s, excluding `created_at`. The corpus is written by `589658d` and read by it; then, in the same database, r1 runs `init 'golden/**'` (opt-in, labelling the corpus), writes nested data under `golden/`, and reads the corpus again. Both reads must hash to the pinned value. Reads covered, with embedding and reranker fixtures: ungrouped recall, grouped `evidence_advice` with `follow`, `history_search` with exclusion, `seedsOnly`, `show` (`bundle`, `units`, `record`), and `status` without `store.database_id`. Nested and subtree reads (new) are ranked over their root's tree and are not compared with flat reads.
 
-Recall fuses its concurrently run channels in completion order, and `589658d` already does so: two identical flat reads can differ in the last bit of a fused score, and fusion keeps the text, match and conversation fields of whichever channel found an item first, which is also the text a reranker scores. The comparison normalizes only that: fused scores to 12 significant digits, the ranking-only reply's key and trace order and first-channel fields, and a fixture reranker that scores the entry sentence every representation shares. This is a property of the base commit, not of r1, and a reranker-configured flat recall is not byte-reproducible across runs on either.
+Recall fuses its concurrently run lexical channels in completion order, and `589658d` already does so: fusion keeps the text, match and conversation fields of whichever channel found an item first, which is also the text a reranker scores. Fused scores are exact (an item gets at most two lexical terms, then the vector terms in fixed order). The comparison normalizes only the ranking-only reply's key and trace order and first-channel fields, and uses a fixture reranker that scores the entry sentence every representation shares. This is a property of the base commit, not of r1, and a reranker-configured flat recall is not byte-reproducible across runs on either.
 
 ### Completeness and omission reporting
 

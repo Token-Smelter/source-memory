@@ -43,10 +43,72 @@ export const namespace = scope => `SMN${digest(scope)}`;
 export const indexNames = scope => ({ turns: `smt_${digest(scope)}`, records: `smr_${digest(scope)}`, chunks: `smc_${digest(scope)}`,
   vectorChunks: `smvc_${digest(scope)}`, vectorRecords: `smvr_${digest(scope)}` });
 
+const SEGMENT = /^[A-Za-z0-9_-]{1,64}$/u;
+
+/** The segments of a path scope (1–8 segments of [A-Za-z0-9_-]{1,64}, at most 256 characters), or null for any other name. */
+export function scopePath(scope) {
+  if (typeof scope !== 'string' || scope.length > 256) return null;
+  const segments = scope.split('/');
+  return segments.length <= 8 && segments.every(segment => SEGMENT.test(segment)) ? segments : null;
+}
+
+// A path of depth 1 and any non-path (opaque) name keep their per-scope labels and indexes; deeper paths use the shared tree.
+export const isNested = scope => (scopePath(scope)?.length ?? 0) >= 2;
+const subtreeRoot = value => typeof value === 'string' && value.length <= 256 && value.endsWith('/**') && scopePath(value.slice(0, -3))
+  ? value.slice(0, -3) : null;
+export const isSelector = value => subtreeRoot(value) !== null;
+
+const within = (root, path) => root.length <= path.length && root.every((segment, index) => segment === path[index]);
+
+// A grant entry `A/**` (A a path) covers A and every descendant; any other entry grants exactly the name it spells.
+function covered(grants, scope, exactAllowed) {
+  if (exactAllowed && grants.includes(scope)) return true;
+  const path = scopePath(scope);
+  return path !== null && grants.some(entry => {
+    const root = subtreeRoot(entry);
+    return root !== null && within(root.split('/'), path);
+  });
+}
+
+const grantsFor = (config, operation) => {
+  requireThat(config.scopes && Array.isArray(config.scopes[operation]), 'scope_denied');
+  return config.scopes[operation];
+};
+
+/** One exact scope. A subtree selector is never an exact scope, so it can never be written. */
 export function authorize(config, scope, operation = 'read') {
   text(scope, 256);
-  requireThat(config.scopes && Array.isArray(config.scopes[operation]) && config.scopes[operation].includes(scope), 'scope_denied');
+  requireThat(!isSelector(scope) && covered(grantsFor(config, operation), scope, true), 'scope_denied');
   return scope;
+}
+
+/**
+ * An exact scope (returned as the string) or a subtree selector `S/**` (returned as {scope:S, subtree:true}). A subtree is
+ * granted only by a pattern on S or an ancestor: exact grants on its current members never add up to an open-ended subtree.
+ */
+export function authorizeTarget(config, value, operation = 'read') {
+  const root = subtreeRoot(value);
+  if (root === null) return authorize(config, value, operation);
+  requireThat(covered(grantsFor(config, operation), root, false), 'scope_denied');
+  return { scope: root, subtree: true };
+}
+
+export const targetName = target => typeof target === 'string' ? target : `${target.scope}/**`;
+
+export const scopeTerm = (scope, exact) => `${exact ? 'x' : 't'}${digest(['source-memory.scope/1', scope])}`;
+
+/** Shared-tree filter terms of a path scope: one subtree term per ancestor-or-self and one exact term. */
+export function scopeTerms(scope) {
+  const path = scopePath(scope);
+  requireThat(path !== null, 'scope_denied');
+  return [...path.map((_, index) => scopeTerm(path.slice(0, index + 1).join('/'), false)), scopeTerm(scope, true)].join(' ');
+}
+
+/** Labels and indexes shared by every nested scope under one root segment; a selector never spans roots. */
+export function treeLayout(root) {
+  const d = digest(['source-memory.tree/1', root]);
+  return { root, labels: { turn: `SMTree${d}Turn`, chunk: `SMTree${d}Chunk`, record: `SMTree${d}Record` },
+    indexes: { turns: `smtree_t_${d}`, records: `smtree_r_${d}`, chunks: `smtree_c_${d}`, vectorChunks: `smtree_vc_${d}`, vectorRecords: `smtree_vr_${d}` } };
 }
 
 function timestamp(value) {
@@ -196,7 +258,8 @@ export function fuse(channels) {
     const seen = new Set();
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      const key = `${item.kind}:${item.id}`;
+      // Only subtree hits carry a scope; a record id is unique only within its scope.
+      const key = item.scope === undefined ? `${item.kind}:${item.id}` : JSON.stringify([item.kind, item.id, item.scope]);
       if (seen.has(key)) continue;
       seen.add(key);
       const previous = hits.get(key) ?? { ...item, score: 0, channels: [] };
@@ -207,7 +270,7 @@ export function fuse(channels) {
       hits.set(key, previous);
     }
   }
-  return [...hits.values()].sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  return [...hits.values()].sort((a, b) => b.score - a.score || a.id.localeCompare(b.id) || (a.scope ?? '').localeCompare(b.scope ?? ''));
 }
 
 export function lexicalQuery(query) {

@@ -1,11 +1,11 @@
 import {
-  authorize, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
+  authorize, authorizeTarget, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
   normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, requireThat, sourceExcerpt, text,
 } from './core.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, embeddingIdentity, rerank } from './models.mjs';
 import { passthrough, scoped, tracer } from './phase-diagnostic.mjs';
-import { Neo4jStore } from './store.mjs';
+import { Neo4jStore, selection, TREE_SCAN_LIMIT } from './store.mjs';
 
 const MODE_CONTRACTS = {
   evidence_advice: 'Evidence advice: prioritizes extracted claims that cite user spans; a cited user span may be a question, so this is not user assertion or authority. May return no relevant history. Omitted material may correct shown claims. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
@@ -28,14 +28,17 @@ export class Memory {
   constructor(config, store = null) {
     this.config = config;
     this.store = store ?? new Neo4jStore(config.neo4j);
+    // Largest tree selection scored by exact scan rather than its root's ANN index; tests lower it.
+    this.treeScanLimit = TREE_SCAN_LIMIT;
   }
 
   async close() { await this.store.close(); }
 
+  // A subtree selector prepares the shared tree and labels the subtree's older nodes, so it needs a write grant on the subtree.
   async init(scope) {
-    authorize(this.config, scope, 'write');
+    const target = authorizeTarget(this.config, scope, 'write');
     const dimensions = this.config.embedding ? integer(this.config.embedding.dimensions, undefined, 1, 4096) : null;
-    return this.store.init(scope, dimensions);
+    return this.store.init(target, dimensions);
   }
 
   async ingest(scope, input) {
@@ -97,12 +100,14 @@ export class Memory {
   }
 
   async status(scope) {
-    authorize(this.config, scope);
+    const target = authorizeTarget(this.config, scope);
     const key = embeddingIdentity(this.config.embedding);
     const dimensions = this.config.embedding?.dimensions ?? null;
-    const catalog = await vectorCatalog(this.store, scope, dimensions);
+    const catalog = await vectorCatalog(this.store, target, dimensions);
     const errors = Object.fromEntries(catalog.filter(entry => entry.reason).map(entry => [entry.kind, entry.reason]));
-    return { scope, ...(await this.store.status(scope, key)),
+    const tree = !selection(target).tree ? {} : { scope_tree: { pending: await this.store.treePending(target), indexes: await this.store.treeIndexStates(target) },
+      ...(await this.store.legacyFlatIndex(target) ? { legacy_flat_index: true } : {}) };
+    return { scope, ...(await this.store.status(target, key)), ...tree,
       // A changed database_id is another store, a changed record_contract another record contract: each needs a new binding.
       store: { ...(await this.store.identity()), record_contract: RECORD_CONTRACT },
       embedding: key ? { configured: true, model: this.config.embedding.model, key } : { configured: false },
@@ -299,7 +304,9 @@ export class Memory {
 
   // `phases` is an opt-in marker sink (src/phase-diagnostic.mjs). Absent, recall makes exactly the calls it always made.
   async recall(scope, input, { phases = null, seedsOnly = false } = {}) {
-    authorize(this.config, scope);
+    const target = authorizeTarget(this.config, scope);
+    const sel = selection(target);
+    const tree = sel.tree;
     const trace = tracer(phases);
     // Only the grouped admission query has finer steps worth bracketing; it takes the trace as an extra trailing argument.
     const traced = phases ? [trace] : [];
@@ -327,20 +334,22 @@ export class Memory {
       const name = `${kind}_lexical`;
       try {
         if (grouped) {
-          const state = await trace(`lexical.${kind}.status`, () => this.store.lexicalStatus(scope, kind));
+          const state = await trace(`lexical.${kind}.status`, () => this.store.lexicalStatus(target, kind));
           if (state.status !== 'ready') {
             channels[name] = [];
             availability[name] = state;
             return;
           }
-          const result = await trace(`lexical.${kind}.query`, () => this.store.admittedLexical(scope, kind, query, candidates, perConversation, exclude, ...traced));
+          const result = await trace(`lexical.${kind}.query`, () => this.store.admittedLexical(target, kind, query, candidates, perConversation, exclude, ...traced));
           channels[name] = result.hits;
           omitted.push(...result.omitted);
           availability[name] = { ...state, admitted_conversations: result.admitted_conversations, exhausted: result.exhausted };
         } else {
-          const state = kind === 'chunk' ? await trace('lexical.chunk.status', () => this.store.chunkLexicalStatus(scope)) : { status: 'ready' };
+          // A flat scope checks only its chunk index, as it always has; the shared tree indexes are checked for every kind.
+          const state = kind === 'chunk' ? await trace('lexical.chunk.status', () => this.store.chunkLexicalStatus(target))
+            : tree ? await this.store.lexicalStatus(target, kind) : { status: 'ready' };
           channels[name] = state.status !== 'ready' ? [] : await trace(`lexical.${kind}.query`, () => kind === 'chunk'
-            ? this.store.chunkLexical(scope, query, candidates, exclude) : this.store.lexical(scope, kind, query, candidates, exclude));
+            ? this.store.chunkLexical(target, query, candidates, exclude) : this.store.lexical(target, kind, query, candidates, exclude));
           availability[name] = state;
         }
       } catch (error) {
@@ -354,10 +363,10 @@ export class Memory {
       try {
         const key = embeddingIdentity(this.config.embedding);
         const [queryVector] = await embed(this.config.embedding, [query]);
-        const catalog = await vectorCatalog(this.store, scope, queryVector.length);
+        const catalog = await vectorCatalog(this.store, target, queryVector.length);
         const missing = catalog.filter(entry => entry.vector_index === 'missing');
         const prepareFallback = async kind => {
-          const vectors = await this.store.vectors(scope, key, vectorLimit + 1, exclude, kind);
+          const vectors = await this.store.vectors(target, key, vectorLimit + 1, exclude, kind);
           const selected = vectors.slice(0, vectorLimit);
           return { scanned: selected.map(row => row.uid), scan_truncated: vectors.length > vectorLimit,
             ranked: grouped ? [] : selected.map(row => ({ ...row, similarity: cosine(queryVector, row.embedding) }))
@@ -373,18 +382,26 @@ export class Memory {
             let result;
             let unindexed;
             let scan_truncated = false;
-            if (vector_index === 'online') {
-              result = await this.store.indexedVectors(scope, kind, key, queryVector, candidates, grouped ? perConversation : null, exclude, budget);
+            // A root's ANN index is filtered after its top-k, so a small selection is scored exactly, inside the database.
+            const census = tree && vector_index === 'online' ? await this.store.vectorCounts(target, kind, key, exclude) : null;
+            if (census && census.total <= Math.min(this.treeScanLimit, vectorLimit)) {
+              const scan = await this.store.treeVectorScan(target, kind, key, queryVector, grouped ? 0 : candidates, exclude);
+              unindexed = census.unindexed;
+              result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, scan.uids, candidates, perConversation, exclude)
+                : { hits: vectorHits(kind, scan.nodes, sel.subtree) };
+            } else if (vector_index === 'online') {
+              result = await this.store.indexedVectors(target, kind, key, queryVector, candidates, grouped ? perConversation : null, exclude, budget,
+                ...(census ? [census] : []));
               unindexed = result.unindexed;
-              if (!grouped) result.hits = vectorHits(kind, result.nodes);
+              if (!grouped) result.hits = vectorHits(kind, result.nodes, sel.subtree);
             } else {
               // Share only a truly combined missing-index scan. One kind's failure never blocks an online sibling.
               const fallback = missing.length === 2 ? sharedFallback ??= prepareFallback(null) : prepareFallback(kind);
-              const [data, counts] = await Promise.all([fallback, this.store.vectorCounts(scope, kind, key, exclude)]);
+              const [data, counts] = await Promise.all([fallback, this.store.vectorCounts(target, kind, key, exclude)]);
               unindexed = counts.unindexed;
               scan_truncated = data.scan_truncated;
-              result = grouped ? await this.store.admittedVectors(scope, kind, key, queryVector, data.scanned, candidates, perConversation, exclude)
-                : { hits: vectorHits(kind, data.ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates)) };
+              result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, data.scanned, candidates, perConversation, exclude)
+                : { hits: vectorHits(kind, data.ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates), sel.subtree) };
             }
             const state = { status: result.partial || scan_truncated || unindexed > 0 ? 'partial' : 'ready',
               scan_truncated, unindexed, embedding_key: key,
@@ -408,6 +425,13 @@ export class Memory {
       availability.chunk_vector = { status: 'unconfigured' };
       availability.record_vector = { status: 'unconfigured' };
     }
+    // Nodes of the selection that the tree indexes cannot see yet make every channel over that kind partial.
+    const pending = tree ? await this.store.treePending(target) : null;
+    if (pending) for (const [name, kind] of Object.entries(CHANNEL_KINDS)) {
+      const state = availability[name];
+      if (!pending[kind] || !['ready', 'partial'].includes(state.status)) continue;
+      availability[name] = { ...state, status: 'partial', scope_tree_pending: pending[kind], ...(state.reason ? {} : { reason: 'scope_tree_pending' }) };
+    }
     let ranked = grouped ? fuse(channels) : fuse(channels).slice(0, candidates);
     if (this.config.reranker && ranked.length) {
       try {
@@ -421,7 +445,8 @@ export class Memory {
     if (seedsOnly) {
       requireThat(!grouped, 'invalid_input');
       return { scope, ranked, candidate_limit: candidates, channels: Object.fromEntries(Object.entries(availability).map(([name, state]) =>
-        [name, { ...state, ...(channels[name] ? { candidate_limit_reached: channels[name].length >= candidates } : {}) }])) };
+        [name, { ...state, ...(channels[name] ? { candidate_limit_reached: channels[name].length >= candidates } : {}) }])),
+        ...(pending ? { scope_tree: { pending } } : {}) };
     }
 
     const bundles = [];
@@ -436,7 +461,7 @@ export class Memory {
     } else {
       for (const [index, seed] of ranked.slice(0, limit).entries()) {
         const label = `bundle.${index}`;
-        const bundle = await trace(label, () => this.bundle(scope, seed, query, maxNodes, maxHops, null, scoped(trace, label)));
+        const bundle = await trace(label, () => this.bundle(seed.scope ?? scope, seed, query, maxNodes, maxHops, null, scoped(trace, label)));
         const size = JSON.stringify(bundle).length;
         if (chars + size > maxChars) { budgetOmitted += 1; continue; }
         bundles.push(bundle);
@@ -457,11 +482,13 @@ export class Memory {
       authority: 'Evidence and attributed records; not execution permission or a guarantee of current state.',
       ...groupedOutput,
       ...(mode === undefined ? {} : { mode, mode_contract: MODE_CONTRACTS[mode] }),
+      ...(pending ? { scope_tree: { pending } } : {}),
     };
   }
 
+  // In a subtree read every seed names its own scope, and so does the unit key it is packaged under.
   async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops, follow = null, trace = passthrough) {
-    authorize(this.config, scope);
+    authorizeTarget(this.config, scope);
     const reads = new Map();
     const priority = new Map();
     for (const [rank, seed] of ranked.entries()) for (const context of seed.conversations) {
@@ -499,17 +526,17 @@ export class Memory {
       const seeds = [];
       for (const candidate of unit.candidates) {
         const label = `bundle.${ordinal++}`;
-        const bundle = await trace(label, () => this.bundle(scope, candidate, query, maxNodes, maxHops, reads, scoped(trace, label)));
+        const bundle = await trace(label, () => this.bundle(candidate.scope ?? scope, candidate, query, maxNodes, maxHops, reads, scoped(trace, label)));
         seeds.push(bundle);
         const evidence = [bundle.source, ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence)].filter(Boolean);
         for (const span of evidence) {
-          const key = { scope, source: span.source, conversation_id: span.conversation_id };
+          const key = { scope: unit.key.scope, source: span.source, conversation_id: span.conversation_id };
           if (conversationToken(key) !== conversationToken(unit.key)) unit.also.set(conversationToken(key), key);
         }
       }
       const rendered = { key: unit.key, ...(unit.legacy ? { legacy: true } : {}), seeds,
         seeds_truncated: truncated.get(conversationToken(unit.key))?.size ?? 0, also_cites: [...unit.also.values()].sort(compareConversationKeys),
-        ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, followingCache, reads) } : {}) };
+        ...(follow ? { following: await this.followingForBundles(unit.key.scope, seeds, follow, followingCache, reads) } : {}) };
       const size = Buffer.byteLength(JSON.stringify(rendered));
       // Admission limits seeds; rendering budgets may only skip an entire unit, never a seed or part of its evidence.
       if (bytes + size > maxBytes) { budgetOmitted += 1; continue; }
@@ -571,6 +598,7 @@ export class Memory {
       match: { kind: seed.kind, id: seed.id, rank_score: seed.score,
         channels: [...seed.channels].sort((a, b) => a.channel.localeCompare(b.channel)),
         ...(seed.rerank_score === undefined ? {} : { rerank_score: seed.rerank_score }) },
+      ...(seed.scope === undefined ? {} : { scope: seed.scope }),
       source, records: withEvidence, relations: edges,
       relationship_context_complete: gaps.size === 0, gaps: [...gaps],
     };
@@ -587,10 +615,12 @@ async function vectorCatalog(store, scope, dimensions) {
   }));
 }
 
-const vectorHits = (kind, nodes) => nodes.map(row => kind === 'chunk' ? {
-  kind: 'turn', id: row.turn_uid, text: row.text,
+const vectorHits = (kind, nodes, withScope = false) => nodes.map(row => kind === 'chunk' ? {
+  kind: 'turn', id: row.turn_uid, text: row.text, ...(withScope ? { scope: row.scope } : {}),
   match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
-} : { kind: 'record', id: row.record_id, text: row.text });
+} : { kind: 'record', id: row.record_id, text: row.text, ...(withScope ? { scope: row.scope } : {}) });
+
+const CHANNEL_KINDS = { turn_lexical: 'turn', chunk_lexical: 'chunk', record_lexical: 'record', chunk_vector: 'chunk', record_vector: 'record' };
 
 const followingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, occurred_at: turn.occurred_at ?? null,
   entries: turn.entries.map(entry => ({ id: entry.id, role: entry.role, text: entry.text })) });
@@ -602,7 +632,7 @@ function followingOptions(input, allowed) {
   return { turns: integer(input.turns, 8, 1, 16), bytes: integer(input.bytes, 16384, 1, 65536) };
 }
 
-const seedToken = seed => JSON.stringify([seed.kind, seed.id]);
+const seedToken = seed => JSON.stringify(seed.scope === undefined ? [seed.kind, seed.id] : [seed.kind, seed.id, seed.scope]);
 const conversationToken = key => JSON.stringify([key.scope, key.source, key.conversation_id]);
 const compareConversationKeys = (a, b) => a.scope.localeCompare(b.scope) || a.source.localeCompare(b.source) || a.conversation_id.localeCompare(b.conversation_id);
 
