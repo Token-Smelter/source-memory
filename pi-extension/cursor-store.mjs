@@ -11,22 +11,45 @@ function syncDirectory(dir) {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
+function readOwnFile(path) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || !owned(st)) throw fail('durable_file_conflict');
+    return readFileSync(fd);
+  } finally { closeSync(fd); }
+}
+
 /**
  * Write a new private file durably and whole: a fsynced temp file is hard-linked into place, so the name never shows a partial
- * file. An existing file with the same bytes is accepted; different bytes refuse with durable_file_conflict.
+ * file. An existing file with the same bytes is accepted. An existing file that fails `valid` (for example a content-addressed
+ * name whose bytes no longer hash to it) is provably corrupt and is renamed aside before relinking; anything else refuses with
+ * durable_file_conflict.
  */
-export function writeDurableFile(directory, name, bytes) {
+export function writeDurableFile(directory, name, bytes, { valid = () => true } = {}) {
   const path = join(directory, name);
+  // Temp files from a crash before the link are never the file; younger ones may belong to a concurrent writer.
+  for (const entry of readdirSync(directory)) {
+    if (!entry.startsWith(`.${name}.`) || !entry.endsWith('.tmp')) continue;
+    try { if (Date.now() - statSync(join(directory, entry)).mtimeMs > 60000) unlinkSync(join(directory, entry)); } catch {}
+  }
   const temporary = join(directory, `.${name}.${randomUUID()}.tmp`);
-  const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
   try {
-    for (let offset = 0; offset < bytes.length;) offset += writeSync(fd, bytes, offset, bytes.length - offset);
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-  try { linkSync(temporary, path); }
-  catch (problem) {
-    if (problem.code !== 'EEXIST') throw problem;
-    if (!readFileSync(path).equals(bytes)) throw fail('durable_file_conflict');
+    const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try {
+      for (let offset = 0; offset < bytes.length;) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    try { linkSync(temporary, path); }
+    catch (problem) {
+      if (problem.code !== 'EEXIST') throw problem;
+      const existing = readOwnFile(path);
+      if (!existing.equals(bytes)) {
+        if (valid(existing)) throw fail('durable_file_conflict');
+        renameSync(path, join(directory, `${name}.corrupt-${randomUUID()}`));
+        linkSync(temporary, path);
+      }
+    }
   } finally { try { unlinkSync(temporary); } catch {} }
   syncDirectory(directory);
   return path;

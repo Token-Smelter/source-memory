@@ -212,7 +212,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
       }
     },
     /** Stop the running sub-session's model stream; the run then ends as aborted. */
-    abort() { try { activeSession?.agent?.abort?.(); } catch {} },
+    abort() { try { activeSession?.agent?.abort?.(); } catch {} try { reviewer?.abort?.(); } catch {} },
     async close() {},
   };
 }

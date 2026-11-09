@@ -152,8 +152,10 @@ export function createDailyInputBudget({ ledger, limit }) {
   if (!Number.isSafeInteger(limit) || limit <= 0 || typeof ledger?.callStart !== 'function') throw fail('input_budget_invalid');
   const own = [];
   let unknownDay = null, prevented = 0, stopped = false;
-  const check = () => {
-    if (unknownDay === ledger.day() || own.some(call => !call.receipt) || ledger.unknown()) return 'input_budget_unknown';
+  // A reviewer call nests inside the distiller's tool call, before Pi reports the distiller's usage; this process's own
+  // open calls are provably in flight, so they block only the external reason(), not a nested dispatch.
+  const check = ({ nested = false } = {}) => {
+    if (unknownDay === ledger.day() || (!nested && own.some(call => !call.receipt)) || ledger.unknown()) return 'input_budget_unknown';
     return ledger.used() >= limit ? 'input_budget_exhausted' : null;
   };
   return {
@@ -162,13 +164,14 @@ export function createDailyInputBudget({ ledger, limit }) {
     stop() { stopped = true; },
     beforeCall() {
       if (stopped) { prevented++; throw fail('dispatch_prevented'); }
-      const reason = check();
+      const reason = check({ nested: true });
       // Pi reports a dispatch it never made with empty usage; that report must not read as lost spend.
       if (reason) { prevented++; throw fail(reason); }
       own.push({ id: ledger.callStart(), receipt: null });
     },
     record(usage) {
-      const call = own.find(row => !row.receipt);
+      // Nested calls report innermost first, so a report settles the most recent open call.
+      const call = own.findLast(row => !row.receipt);
       // An empty report answers a prevented dispatch first, so it can never settle an open call as zero tokens.
       if (prevented && usage && counted.every(key => usage[key] === 0)) { prevented--; return; }
       const valid = usage && tokens(usage) && Number.isSafeInteger(counted.reduce((sum, key) => sum + usage[key], 0));
@@ -184,7 +187,7 @@ export function createDailyInputBudget({ ledger, limit }) {
     used: () => ledger.used(),
     started: () => own.length,
     receipts: () => own.filter(row => row.receipt).map(row => structuredClone(row.receipt)),
-    reason: check,
+    reason: () => check(),
     limit,
   };
 }

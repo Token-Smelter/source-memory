@@ -138,7 +138,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
     const evidence = { kind: 'live-reconcile/v1', interval: state.id, cursor: state.cursor, through: state.through,
       ingest, confirmed, present: present.sort(), absent: absent.sort() };
     const sha = digest(evidence);
-    writeDurableFile(dirname(journal.path), `reconcile-${sha}.json`, Buffer.from(canonical(evidence)));
+    writeDurableFile(dirname(journal.path), `reconcile-${sha}.json`, Buffer.from(canonical(evidence)), { valid: existing => digest(existing.toString('utf8')) === sha });
     journal.reconcile({ id: state.id, disposition: 'failed', evidenceRef: `${evidence.kind}:${sha}` });
     return evidence;
   }
@@ -219,7 +219,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         if (!Array.isArray(entries) || !entries.some(row => row?.id === leafId)) return { status: 'skipped', code: 'source_unavailable', results, reconciled };
         // Covered prefixes are computed from the whole append-only tree; a branch-only view would re-ingest shared source.
         const present = new Set(entries.map(row => row?.id));
-        if (journal.intervals().some(row => !present.has(row.through))) return { status: 'skipped', code: 'source_incomplete', results, reconciled };
+        if (journal.intervals().some(row => !present.has(row.through))) return { status: 'blocked', code: 'source_incomplete', results, reconciled };
         const pending = journal.state();
         if (pending.status === 'uncertain' || pending.reconciliation_required) {
           // Reconciliation reads Memory, so the scope grants are checked first; it spends no model budget.

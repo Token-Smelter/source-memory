@@ -5,8 +5,9 @@ import { basename, dirname, join } from 'node:path';
 
 const fail = code => Object.assign(new Error(code), { code });
 const read = (load, fallback = null) => { try { return load(); } catch { return fallback; } };
-// The hostname alone can repeat across machines sharing a directory (NFS, cloned VMs, containers); the machine ID cannot.
-const machineId = () => read(() => readFileSync('/etc/machine-id', 'utf8').trim()) ?? read(() => readFileSync('/var/lib/dbus/machine-id', 'utf8').trim());
+// A boot ID proves the same kernel only within one boot. Across boots, the hostname alone can repeat on machines sharing a
+// directory (NFS, containers); the machine ID narrows that, though cloned VMs and baked images can share it too.
+const machineId = () => read(() => readFileSync('/etc/machine-id', 'utf8').trim()) || read(() => readFileSync('/var/lib/dbus/machine-id', 'utf8').trim());
 const bootId = () => read(() => readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim());
 const pidNamespace = () => read(() => readlinkSync('/proc/self/ns/pid'));
 // Field 22 of /proc/<pid>/stat (after the parenthesised command) is the start time in clock ticks since boot.
@@ -24,8 +25,8 @@ export function ownerRecord(pid = process.pid) {
  */
 export function ownerGone(owner, self = ownerRecord()) {
   if (!owner || owner.v !== 1 || owner.host !== self.host || !Number.isSafeInteger(owner.pid) || owner.pid < 1) return false;
-  if (!owner.machine || owner.machine !== self.machine) return false;
-  if (owner.boot && self.boot && owner.boot !== self.boot) return true;
+  // An earlier boot is gone only if it was this machine; equal boot IDs already prove the same kernel below.
+  if (owner.boot && self.boot && owner.boot !== self.boot) return Boolean(owner.machine) && owner.machine === self.machine;
   if (!owner.boot || owner.boot !== self.boot || !owner.pidns || owner.pidns !== self.pidns) return false;
   if (owner.pid === self.pid) return owner.start !== null && self.start !== null && owner.start !== self.start;
   try { process.kill(owner.pid, 0); }
@@ -35,13 +36,12 @@ export function ownerGone(owner, self = ownerRecord()) {
 }
 
 /**
- * The opposite proof, for spend: an owner is alive only when it names this host, machine, boot and PID namespace and its PID
+ * The opposite proof, for spend: an owner is alive only when it names this host, boot and PID namespace and its PID
  * runs with the recorded start time. Anything unprovable (no /proc, another namespace or host) is not alive; callers that
  * need to recognize their own process tag their records instead (live-gate instance IDs).
  */
 export function ownerAlive(owner, self = ownerRecord()) {
   if (!owner || owner.v !== 1 || owner.host !== self.host || !Number.isSafeInteger(owner.pid) || owner.pid < 1) return false;
-  if (!owner.machine || owner.machine !== self.machine) return false;
   if (!owner.boot || owner.boot !== self.boot || !owner.pidns || owner.pidns !== self.pidns || owner.start === null) return false;
   if (owner.pid === self.pid) return owner.start === self.start;
   try { process.kill(owner.pid, 0); } catch (problem) { if (problem.code !== 'EPERM') return false; }
@@ -85,12 +85,15 @@ export function acquireOwnerLock(lockPath, { beforeBreak } = {}) {
     } finally { closeSync(guard); try { unlinkSync(guardPath); } catch {} }
   }
   // Temp files a crash left between write and link are stale after a minute; younger ones may belong to a live opener.
-  const prefix = `${basename(lockPath)}.`;
-  for (const name of readdirSync(dirname(lockPath))) {
-    if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue;
-    const path = join(dirname(lockPath), name);
-    try { if (Date.now() - statSync(path).mtimeMs > 60000) unlinkSync(path); } catch {}
-  }
+  // The sweep is best effort and must never lose the release handle for the lock just placed.
+  try {
+    const prefix = `${basename(lockPath)}.`;
+    for (const name of readdirSync(dirname(lockPath))) {
+      if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue;
+      const path = join(dirname(lockPath), name);
+      try { if (Date.now() - statSync(path).mtimeMs > 60000) unlinkSync(path); } catch {}
+    }
+  } catch {}
   return {
     record,
     release() {

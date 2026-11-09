@@ -5,6 +5,7 @@ const fail = code => Object.assign(new Error(code), { code });
 /** A second Pi prompt judges the exact offered proposals; it cannot create new links or evidence. */
 export function createPiReviewer({ pi, workDir, model, modelRuntime, budget, thinkingLevel }) {
   if (!pi?.SessionManager || typeof pi.createAgentSession !== 'function' || !workDir || !model?.provider || !model?.id) throw fail('reviewer_invalid');
+  const active = new Set();
   return {
     async review({ proposal, mode }) {
       if (!['separate', 'self_review'].includes(mode) || !proposal || !Array.isArray(proposal.proposals)) throw fail('review_invalid');
@@ -19,6 +20,7 @@ export function createPiReviewer({ pi, workDir, model, modelRuntime, budget, thi
       }
       const { session } = await pi.createAgentSession({ cwd: workDir, agentDir: workDir, modelRuntime, model, thinkingLevel, tools: [], sessionManager: manager,
         ...(resourceLoader ? { resourceLoader, settingsManager } : {}) });
+      active.add(session);
       try {
         if (budget) {
           if (typeof session.subscribe !== 'function') throw fail('usage_unavailable');
@@ -48,7 +50,9 @@ export function createPiReviewer({ pi, workDir, model, modelRuntime, budget, thi
         return { reviewer: `${model.provider}/${model.id}`, decision_ref: `pi-review-${digest([mode, proposal.proposal_sha256, text])}`,
           approved: parsed.verdicts.filter(row => row.verdict === 'approve').map(row => row.index).sort((a, b) => a - b),
           usage: reply.usage ?? null };
-      } finally { await session.dispose?.(); }
+      } finally { active.delete(session); await session.dispose?.(); }
     },
+    /** Stop every review stream in flight; each review then ends as unavailable. */
+    abort() { for (const session of active) { try { session.agent?.abort?.(); } catch {} } },
   };
 }
