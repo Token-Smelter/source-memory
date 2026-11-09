@@ -2,7 +2,7 @@
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { Memory } from '../src/memory.mjs';
-import { MemoryError, requireThat } from '../src/core.mjs';
+import { markStage, MemoryError, requireThat } from '../src/core.mjs';
 import { warm } from '../src/warm.mjs';
 import { warmDb } from '../src/warm-db.mjs';
 import { isPoolRequest, serializePoolReply } from '../src/envelope.mjs';
@@ -40,6 +40,21 @@ async function fileJson(path, max) {
   return JSON.parse(await readBounded(createReadStream(path), max));
 }
 
+// Write commands whose failure replies carry `stage`, the write provenance qualified in QUALIFICATION.md.
+const STAGED_COMMANDS = ['ingest', 'enrich'];
+
+export function failureReply(command, error) {
+  // Database/model responses may contain connection details or user content.
+  const code = error instanceof MemoryError ? error.code
+    : error instanceof SyntaxError ? 'invalid_json'
+      : ['ENOENT', 'EACCES'].includes(error?.code) ? 'input_file_unavailable' : 'operation_failed';
+  if (!STAGED_COMMANDS.includes(command)) return { ok: false, error: code };
+  return { ok: false, error: code, stage: ['before_write', 'rolled_back'].includes(error?.stage) ? error.stage : 'unknown' };
+}
+
+// The outcome is decided before close; a close failure must not turn a committed write into a reported failure.
+const closeQuietly = memory => memory.close().catch(() => {});
+
 // `io` lets tests supply a store and capture the streams; the CLI passes nothing.
 export async function main(argv = process.argv.slice(2), io = {}) {
   const { store, stdout = process.stdout, stderr = process.stderr } = io;
@@ -48,32 +63,36 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     return;
   }
   const [command, ...rest] = argv;
-  requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'status', 'warm'].includes(command), 'unknown_command');
   const options = {};
-  for (let i = 0; i < rest.length; i += 2) {
-    requireThat(['--config', '--scope', '--input', '--diagnostic-phases', '--db'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
-    options[rest[i]] = rest[i + 1];
-  }
-  requireThat(options['--diagnostic-phases'] === undefined || (command === 'recall' && options['--diagnostic-phases'] === 'v1'), 'invalid_arguments');
-  const configPath = options['--config'] ?? process.env.SOURCE_MEMORY_CONFIG;
-  requireThat(configPath && options['--scope'], 'config_and_scope_required');
-  requireThat(options['--db'] === undefined || (command === 'warm' && options['--db'] === 'v1'), 'invalid_arguments');
-  const config = await fileJson(configPath, 64000);
+  let config;
   let input = {};
-  if (options['--input']) input = await fileJson(options['--input'], 4_000_000);
-  else if (['ingest', 'enrich', 'recall', 'show'].includes(command)) input = JSON.parse(await readBounded(process.stdin));
+  try {
+    requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'status', 'warm'].includes(command), 'unknown_command');
+    for (let i = 0; i < rest.length; i += 2) {
+      requireThat(['--config', '--scope', '--input', '--diagnostic-phases', '--db'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
+      options[rest[i]] = rest[i + 1];
+    }
+    requireThat(options['--diagnostic-phases'] === undefined || (command === 'recall' && options['--diagnostic-phases'] === 'v1'), 'invalid_arguments');
+    const configPath = options['--config'] ?? process.env.SOURCE_MEMORY_CONFIG;
+    requireThat(configPath && options['--scope'], 'config_and_scope_required');
+    requireThat(options['--db'] === undefined || (command === 'warm' && options['--db'] === 'v1'), 'invalid_arguments');
+    config = await fileJson(configPath, 64000);
+    if (options['--input']) input = await fileJson(options['--input'], 4_000_000);
+    else if (['ingest', 'enrich', 'recall', 'show'].includes(command)) input = JSON.parse(await readBounded(process.stdin));
+  } catch (error) { throw markStage(error, 'before_write'); }
   if (command === 'warm' && options['--db']) {
     const memory = new Memory(config, store);
     try {
       stdout.write(`${JSON.stringify({ ok: true, ...await warmDb(config, options['--scope'], memory.store) })}\n`);
-    } finally { await memory.close(); }
+    } finally { await closeQuietly(memory); }
     return;
   }
   if (command === 'warm') {
     stdout.write(`${JSON.stringify({ ok: true, ...await warm(config, options['--scope']) })}\n`);
     return;
   }
-  const memory = new Memory(config, store);
+  let memory;
+  try { memory = new Memory(config, store); } catch (error) { throw markStage(error, 'before_write'); }
   const phases = options['--diagnostic-phases'] ? createStreamSink(stderr) : null;
   try {
     const result = await memory[command](options['--scope'], input, ...(phases ? [{ phases }] : []));
@@ -82,17 +101,13 @@ export async function main(argv = process.argv.slice(2), io = {}) {
       : `${JSON.stringify(reply)}\n`);
   } finally {
     phases?.finish();
-    await memory.close();
+    await closeQuietly(memory);
   }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch(error => {
-    // Database/model responses may contain connection details or user content.
-    const code = error instanceof MemoryError ? error.code
-      : error instanceof SyntaxError ? 'invalid_json'
-        : ['ENOENT', 'EACCES'].includes(error.code) ? 'input_file_unavailable' : 'operation_failed';
-    process.stderr.write(`${JSON.stringify({ ok: false, error: code })}\n`);
+    process.stderr.write(`${JSON.stringify(failureReply(process.argv[2], error))}\n`);
     process.exitCode = 1;
   });
 }

@@ -1,6 +1,6 @@
 import neo4j from 'neo4j-driver';
 import { passthrough } from './phase-diagnostic.mjs';
-import { digest, identity, indexNames, integer, namespace, requireThat, sourceExcerpt, lexicalQuery } from './core.mjs';
+import { digest, identity, indexNames, integer, markStage, MemoryError, namespace, requireThat, sourceExcerpt, lexicalQuery } from './core.mjs';
 
 const unwrap = node => node?.properties ?? null;
 const decodeTurn = props => props ? { id: props.uid, scope: props.scope, ...JSON.parse(props.body) } : null;
@@ -45,6 +45,25 @@ export class Neo4jStore {
     finally { await session.close(); }
   }
 
+  // One write transaction. A refusal it raises on its first attempt rolled back with nothing committed. The driver may
+  // retry after a commit whose reply was lost, so a refusal from a later attempt stays unmarked (outcome unknown).
+  async atomicWrite(action) {
+    let attempts = 0;
+    try { return await this.transaction('write', tx => { attempts += 1; return action(tx); }); }
+    catch (error) {
+      if (error instanceof MemoryError && attempts === 1) markStage(error, 'rolled_back');
+      throw error;
+    }
+  }
+
+  // The database's own store id changes when the database is recreated, so it names this physical store.
+  async identity() {
+    return this.transaction('read', async tx => {
+      const row = (await tx.run('CALL db.info() YIELD id, name RETURN id, name')).records[0];
+      return { system: 'neo4j', database_id: row.get('id'), database: row.get('name') };
+    });
+  }
+
   async init(scope, dimensions = null) {
     if (dimensions !== null) integer(dimensions, undefined, 1, 4096);
     for (const label of ['SMTurn', 'SMChunk', 'SMRecord', 'SMRelation']) {
@@ -81,7 +100,7 @@ export class Neo4jStore {
     const hash = digest({ ...placed, parent_turn_id: null });
     const accepted = [hash, digest(turn)];
     const ns = namespace(scope);
-    return this.transaction('write', async tx => {
+    return this.atomicWrite(async tx => {
       // Lineage properties exist only on turns ingested with them; older turns are never backfilled.
       const result = await tx.run(`MERGE (t:SMTurn {uid:$uid})
         ON CREATE SET t:${ns}Turn, t.scope=$scope, t.hash=$hash, t.body=$body, t.text=$text, t.created_at=datetime(),
@@ -165,7 +184,7 @@ export class Neo4jStore {
   }
 
   async enrich(scope, payload) {
-    return this.transaction('write', async tx => {
+    return this.atomicWrite(async tx => {
       const allSpans = [...payload.records, ...payload.relations].flatMap(row => row.evidence);
       const turns = new Map();
       for (const uid of new Set(allSpans.map(span => span.turn))) {
