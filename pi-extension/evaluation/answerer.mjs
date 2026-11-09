@@ -80,7 +80,7 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
                 const evidenceId = rawEvidenceId(row.id, row.text);
                 if (next.has(row.id)) throw fail('duplicate_item');
                 next.set(row.id, new Map([...(offered.get(row.id) ?? []), [evidenceId, row.scope]]));
-                return { id: row.id, scope: row.scope, text: row.text, evidence: [{ id: evidenceId, scope: row.scope }] };
+                return { id: row.id, kind: 'source_excerpt', scope: row.scope, text: row.text, evidence: [{ id: evidenceId, scope: row.scope }] };
               }
               if (!Array.isArray(row.evidence)) throw fail('retrieval_invalid');
               const evidence = row.evidence.filter(e => nonempty(e?.id) && access.evidenceScopes.includes(e.scope)).map(e => ({ id: e.id, scope: e.scope }));

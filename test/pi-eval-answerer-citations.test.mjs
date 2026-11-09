@@ -154,6 +154,7 @@ test('a raw source returned again with query-dependent excerpts keeps each excer
     memory: { async search() { return []; }, async resolve() {} },
     archive: { async search({ query }) { return [{ id: 'raw', scope: 'fiction', text: query === 'one' ? 'First excerpt.' : second }]; } },
     async respond({ tools }) { const [a] = await tools.search('one'); const [b] = await tools.search('two');
+      assert.deepEqual([a.kind, b.kind], ['source_excerpt', 'source_excerpt']);
       return { text: 'Fiction.', citations: [...new Set([a.evidence[0].id, b.evidence[0].id])].map(evidence_id => ({ item_id: 'raw', evidence_id })) }; } })
     .run({ arm: 'raw-only', case: fictionalCase() });
   const same = await run('First excerpt.');
