@@ -69,7 +69,7 @@ Model endpoints receive memory text. They are loopback-only unless that endpoint
 
 ## Commands
 
-Every command prints one JSON object on stdout. Failures print `{"ok":false,"error":"<code>"}` on stderr with a nonzero exit; database and model error text is not echoed. JSON input comes from `--input FILE` or stdin.
+Every command prints one JSON object on stdout. Failures print `{"ok":false,"error":"<code>"}` on stderr with a nonzero exit; database and model error text is not echoed. `ingest` and `enrich` failures add `"stage"`: `before_write` or `rolled_back` (nothing was written) or `unknown` (the write may have committed; settle it with an exact `show`). Once their write commits, `ingest` and `enrich` always reply `ok:true` and report an indexing failure in `indexing`. See [QUALIFICATION.md](QUALIFICATION.md) for every code. JSON input comes from `--input FILE` or stdin.
 
 | Command | Input | Behavior |
 |---|---|---|
@@ -85,7 +85,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `show` | `{"kind":"units","units":[{"key":{"scope":"...","source":"...","conversation_id":"..."},"seeds":[{"kind":"turn"\|"record","id":"..."}]}],"follow":{}}` | Recheck up to 4 units of up to 20 exact seeds each, optionally folding following; no ranking or exclusion |
 | `show` | `{"kind":"following","turn":"<turn id>","limit":2}` | Later turns of the same conversation by exact `parent_turn_id` links (see below) |
 | `show` | `{"kind":"turn_by_key","source":"...","conversation_id":"...","turn_ids":["..."]}` | Which of up to 16 caller turn keys already name stored turns (`found`, in request order); for callers that must reuse an existing identity |
-| `status` | None | Counts, unindexed items, configured models |
+| `status` | None | Counts, unindexed items, configured models, and `store` (`system`, `database_id`, `database`, `record_contract`) naming the physical store and the record-contract version |
 | `warm` | None | Sends one fixed embedding request (no memory text) through the configured `embedding` endpoint, never connecting to Neo4j or writing, and returns `{warm:{model,embedding_key,ms}}`, or `{warm:{status:"unconfigured"}}` with no request. It keeps a local embedding model resident: that consumes shared model memory on the endpoint, so callers should schedule it only while recall is in use |
 | `warm --db v1` | None | Opt-in database warm-up (below). Needs read authorization for `--scope`; makes no model call and no write |
 
@@ -320,7 +320,7 @@ npm run check            # syntax and JSON checks
 npm run test:integration # disposable loopback Neo4j container; needs Docker
 ```
 
-`npm run test:integration` starts a throwaway `neo4j:5.26.14-community` container with no published credentials, runs transaction, search, scope, graph, outage, and CLI checks with fictional data and deterministic model fixtures, and stops the container. Set `SOURCE_MEMORY_REAL_EMBEDDING_URL` (and optionally `SOURCE_MEMORY_REAL_EMBEDDING_MODEL`, default `embeddinggemma`) to additionally exercise a real local embedding endpoint. Fixture results test plumbing, not retrieval quality. `node scripts/vector-benchmark.mjs` runs the isolated 768-dimensional 10k/50k scan-versus-index benchmark under the same disposable resource limits; any 50k resource/timeout failure is reported explicitly.
+`npm run test:integration` starts a throwaway `neo4j:5.26.14-community` container with no published credentials, runs transaction, search, scope, graph, outage, and CLI checks with fictional data and deterministic model fixtures, then the Q-SM-1…6 write qualification ([QUALIFICATION.md](QUALIFICATION.md); `-- --suite qualification` runs only that), and stops the container. Set `SOURCE_MEMORY_REAL_EMBEDDING_URL` (and optionally `SOURCE_MEMORY_REAL_EMBEDDING_MODEL`, default `embeddinggemma`) to additionally exercise a real local embedding endpoint. Fixture results test plumbing, not retrieval quality. `node scripts/vector-benchmark.mjs` runs the isolated 768-dimensional 10k/50k scan-versus-index benchmark under the same disposable resource limits; any 50k resource/timeout failure is reported explicitly.
 
 ### Vector-stage benchmark
 

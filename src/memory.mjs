@@ -1,6 +1,6 @@
 import {
-  authorize, chunkEntries, cosine, fuse, identity, integer, MemoryError,
-  normalizeEnrichment, normalizeTurn, requireThat, sourceExcerpt, text,
+  authorize, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
+  normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, requireThat, sourceExcerpt, text,
 } from './core.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, embeddingIdentity, rerank } from './models.mjs';
@@ -39,28 +39,44 @@ export class Memory {
   }
 
   async ingest(scope, input) {
-    authorize(this.config, scope, 'write');
-    const turn = normalizeTurn(input);
-    const size = integer(this.config.chunking?.words, 256, 8, 4096);
-    const overlap = integer(this.config.chunking?.overlap, Math.min(32, size - 1), 0, size - 1);
-    const result = await this.store.ingest(scope, turn, chunkEntries(turn, size, overlap));
+    const { turn, chunks } = beforeWrite(() => {
+      authorize(this.config, scope, 'write');
+      const turn = normalizeTurn(input);
+      const size = integer(this.config.chunking?.words, 256, 8, 4096);
+      const overlap = integer(this.config.chunking?.overlap, Math.min(32, size - 1), 0, size - 1);
+      return { turn, chunks: chunkEntries(turn, size, overlap) };
+    });
+    const result = await this.store.ingest(scope, turn, chunks);
     return { ...result, indexing: await this.indexAfterWrite(scope) };
   }
 
   async enrich(scope, input) {
-    authorize(this.config, scope, 'write');
-    const result = await this.store.enrich(scope, normalizeEnrichment(input));
+    const payload = beforeWrite(() => {
+      authorize(this.config, scope, 'write');
+      return normalizeEnrichment(input);
+    });
+    const result = await this.store.enrich(scope, payload);
     return { ...result, indexing: await this.indexAfterWrite(scope) };
   }
 
+  // Runs after the write committed, so it reports every failure in `indexing` and never throws: a throw here would make a
+  // committed write look unwritten. The write already authorized this scope against the same configuration.
   // Callers on a latency-sensitive path set index_on_write:false and run `index` separately.
   async indexAfterWrite(scope) {
-    if (this.config.embedding && this.config.index_on_write === false) return { status: 'deferred', indexed: 0 };
-    return this.index(scope);
+    try {
+      if (this.config.embedding && this.config.index_on_write === false) return { status: 'deferred', indexed: 0 };
+      return await this.#indexPending(scope);
+    } catch (error) {
+      return { status: 'unavailable', reason: safeCode(error), source_retained: true };
+    }
   }
 
   async index(scope, input = {}) {
     authorize(this.config, scope, 'write');
+    return this.#indexPending(scope, input);
+  }
+
+  async #indexPending(scope, input = {}) {
     if (!this.config.embedding) return { status: 'unconfigured', indexed: 0 };
     try {
       const key = embeddingIdentity(this.config.embedding);
@@ -87,6 +103,8 @@ export class Memory {
     const catalog = await vectorCatalog(this.store, scope, dimensions);
     const errors = Object.fromEntries(catalog.filter(entry => entry.reason).map(entry => [entry.kind, entry.reason]));
     return { scope, ...(await this.store.status(scope, key)),
+      // A changed database_id is another store, a changed record_contract another record contract: each needs a new binding.
+      store: { ...(await this.store.identity()), record_contract: RECORD_CONTRACT },
       embedding: key ? { configured: true, model: this.config.embedding.model, key } : { configured: false },
       reranker: { configured: Boolean(this.config.reranker) },
       vector_indexes: Object.fromEntries(catalog.map(entry => [entry.kind, entry.vector_index])),
@@ -627,6 +645,10 @@ function sourceView(turn, matches, query) {
     parent_turn_id: turn.parent_turn_id, occurred_at: turn.occurred_at,
     excerpts: spans, full_turn_available_via_show: true,
     excerpted: turn.entries.some(entry => !spans.some(span => span.entry_id === entry.id && span.start === 0 && span.end === entry.text.length)) };
+}
+
+function beforeWrite(prepare) {
+  try { return prepare(); } catch (error) { throw markStage(error, 'before_write'); }
 }
 
 export function safeCode(error) {

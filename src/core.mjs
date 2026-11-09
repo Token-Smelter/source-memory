@@ -7,6 +7,13 @@ export class MemoryError extends Error {
   }
 }
 
+// Write provenance for an ingest/enrich failure: 'before_write' (raised before its write transaction began) or 'rolled_back'
+// (raised inside it on the first attempt, so nothing committed). An unmarked failure may follow a commit.
+export function markStage(error, stage) {
+  if (error && typeof error === 'object' && error.stage === undefined) error.stage = stage;
+  return error;
+}
+
 export function requireThat(condition, code = 'invalid_input') {
   if (!condition) throw new MemoryError(code);
 }
@@ -121,6 +128,10 @@ export function sourceExcerpt(turn, span) {
   requireThat(entry.role !== 'derived', 'derived_is_not_original_evidence');
   return { ...span, role: entry.role, text: entry.text.slice(span.start, span.end), occurred_at: entry.occurred_at ?? turn.occurred_at };
 }
+
+// Names the stored record contract: uid derivation, normalizeEnrichment output and the digest compared on replay. A change
+// that alters a stored uid, body or hash for the same input is a new version; test/qualification.test.mjs pins version 1.
+export const RECORD_CONTRACT = 'source-memory.record/1';
 
 export const RELATIONS = ['supersedes', 'qualifies', 'contradicts', 'depends_on', 'outcome_of'];
 

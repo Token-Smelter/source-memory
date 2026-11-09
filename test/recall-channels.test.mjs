@@ -33,6 +33,7 @@ function fixture(t, url, states, indexed = { hits: [], nodes: [], omitted: [], u
     vectors: async () => [], vectorCounts: async () => ({ unindexed: 0 }),
     admittedVectors: async () => ({ hits: [], omitted: [], admitted_conversations: 0, exhausted: true }),
     status: async () => ({ initialized: true }),
+    identity: async () => ({ system: 'neo4j', database_id: 'fixture', database: 'neo4j' }),
   };
   return new Memory({ scopes: { read: ['test'], write: [] }, embedding: { url, model: 'fixture', dimensions: 2 } }, store);
 }
