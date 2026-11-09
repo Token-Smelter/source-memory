@@ -44,10 +44,13 @@ export function entryText(row) { return entryData(row).text; }
 const SUMMARY_TYPES = new Set(['compaction', 'branch_summary']);
 
 /**
- * Frozen availability rule: a summary is admissible only when its full dependency closure is permitted on the active branch.
- * A Pi compaction summarizes the path from the previous kept boundary up to its firstKeptEntryId, with the previous summary as
- * context; a branch summary describes an abandoned branch, which is never on the active path. Extension-provided summaries
- * have no provable closure.
+ * memory-retention/r2-v1 availability invariant, verbatim: "Use only material proven available and eligible on the selected
+ * active branch at the checkpoint. A summary is admissible only when its full dependency closure is permitted."
+ * Interpretation: permitted means on the active path. A Pi compaction summarizes the path from the previous kept boundary up
+ * to its firstKeptEntryId, with the previous summary as context; a branch summary describes an abandoned branch, which is never
+ * on the active path, so it and every compaction depending on it are gaps. Extension-provided (fromHook) summaries have no
+ * provable closure. Trust assumption: /compact instructions and session_before_compact handlers that mutate the preparation
+ * leave no trace in the entry, so a standard compaction is taken to summarize exactly its recorded span.
  */
 function summaryVerdicts(ancestry) {
   const index = new Map(ancestry.map((row, position) => [row.id, position]));
@@ -58,7 +61,8 @@ function summaryVerdicts(ancestry) {
     if (row.type !== 'compaction') return;
     const kept = typeof row.firstKeptEntryId === 'string' ? index.get(row.firstKeptEntryId) : undefined;
     let reason = null;
-    if (row.fromHook === true || kept === undefined || kept >= position) reason = 'summary_closure_unproved';
+    // Pi treats any truthy fromHook as extension-provided.
+    if ((row.fromHook !== undefined && row.fromHook !== false) || kept === undefined || kept >= position) reason = 'summary_closure_unproved';
     else {
       let start = 0;
       if (previous) {

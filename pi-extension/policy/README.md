@@ -15,7 +15,7 @@ flowchart LR
 |---|---|
 | `retention-r2-v1.json` | Frozen selection, evidence, authority, scope, availability and processing invariants; stable candidate task prefix. |
 | `calibration-r2-v1.json` | Fictional selection and failure distinctions, including silence, rare consequence, scoped override, inaccessible prior, interruption, uncertain write and recovery. |
-| `coverage-r2-v1.json` | Fictional ancestry and failure fixtures. Unproved compaction closure and batch overflow remain explicit failed gaps; they are not treated as successful processing. |
+| `coverage-r2-v1.json` | Fictional ancestry and failure fixtures. Without `summaryPolicy`, unproved compaction closure and batch overflow remain explicit failed gaps; they are not treated as successful processing. The live controller's `dependency_closure` policy instead records an unproved summary as a gap and continues with the original entries. |
 | `../policy.mjs` | Verifies byte hashes, limits treatment diffs to declared presentation/search surfaces, and compares independently produced structured assessments against every calibration case. |
 
 Changes to policy or fixture bytes require a new version and corresponding hash. A treatment must supply a reason for every changed surface and independently assessed outputs for every case. The drift check cannot establish assessor independence, semantic truth, or a valid pre-observation freeze by itself.

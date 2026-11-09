@@ -84,6 +84,10 @@ test('a real Pi session settles immediately while the extension distills its tur
   const cursor = JSON.parse(readFileSync(join(sessions, readdirSync(sessions)[0], cursorFile), 'utf8')).cursor;
   assert.deepEqual([errors, results.map(row => row.status), store.ingests.map(row => row.length), store.records.size, cursor],
     [[], ['covered', 'covered'], [2, 2], 2, sessionManager.getLeafId()]);
+  const ledger = readFileSync(join(paths.config.state_dir, 'usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const calls = ledger.filter(row => row.kind === 'call');
+  assert.deepEqual([calls.length > 0, calls.every(call => ledger.some(row => row.kind === 'usage' && row.call === call.id && row.input === 10)),
+    ledger.filter(row => row.kind === 'interval').length], [true, true, 2]);
   await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
   session.dispose();
   assert.equal(store.closed, 1);

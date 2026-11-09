@@ -39,7 +39,8 @@ export function parseFinalResult(text) {
 
 /** Pi's compaction-aware context, minus summaries whose dependency closure is not permitted. */
 export function contextMessages(pi, manager, excludedSummaryIds) {
-  if (excludedSummaryIds === undefined) return manager.buildSessionContext().messages;
+  // An empty exclusion list is Pi's own context by construction.
+  if (excludedSummaryIds === undefined || (Array.isArray(excludedSummaryIds) && !excludedSummaryIds.length)) return manager.buildSessionContext().messages;
   if (!Array.isArray(excludedSummaryIds) || typeof manager.buildContextEntries !== 'function'
     || typeof pi.sessionEntryToContextMessages !== 'function') throw fail('summary_exclusion_unavailable');
   const excluded = new Set(excludedSummaryIds);
@@ -129,6 +130,8 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           tools: ['memory_search', 'memory_fetch', 'memory_record', 'memory_link_offer', 'memory_link', 'memory_submit'], sessionManager: manager, ...(resourceLoader ? { resourceLoader } : {}) }));
         if (session.sessionId !== sessionId || session.agent?.sessionId !== sessionId) throw fail('session_identity_changed');
         activeSession = session;
+        // A distiller-side compaction would rebuild the context from Pi's own view and re-admit a withheld summary.
+        if (input.excludedSummaryIds?.length && session.settingsManager?.getCompactionSettings?.()?.enabled !== false) throw fail('summary_exclusion_unavailable');
         session.agent.state.messages = contextMessages(pi, manager, input.excludedSummaryIds);
         const priorMessages = session.messages.length;
         const startReceipt = budget?.receipts().length ?? 0;

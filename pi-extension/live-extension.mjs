@@ -120,7 +120,7 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
       const reviewer = createPiReviewer({ pi: sdk, workDir, model: models.reviewerModel, modelRuntime: runtime, budget, thinkingLevel: config.distiller.reviewerThinking });
       const distiller = await createPiDistiller({ pi: sdk, incremental, workDir, model: models.model, modelRuntime: runtime, memory, scope: config.scope,
         reviewer, budget, ensureIndexed: readiness, createOptions: { thinkingLevel: config.distiller.thinking } });
-      return { conversation_id: sessionId, scopes: [config.scope], memory, distiller, ensureIndexed: readiness, close };
+      return { conversation_id: sessionId, scopes: [config.scope], memory, distiller, budget, ensureIndexed: readiness, close };
     } catch (error) { await close(); throw error; }
   }
 

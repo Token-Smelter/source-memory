@@ -2,6 +2,7 @@ import { constants, closeSync, fstatSync, fsyncSync, openSync, readFileSync, rea
 import { join } from 'node:path';
 import { digest } from '../src/core.mjs';
 import { distillThrough } from './core.mjs';
+import { acquireOwnerLock } from './owner-lock.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const effects = new Set(['ingest', 'enrich', 'applyLinks', 'applyOutcome']);
@@ -9,23 +10,13 @@ const tracking = Symbol('coverage-tracking');
 const covered = new Set(['committed', 'abstained', 'ineligible_by_policy']);
 const safeCode = error => typeof error?.code === 'string' && /^[a-z_]{1,80}$/.test(error.code) ? error.code : 'operation_failed';
 
-function staleLock(lockPath) {
-  let owner;
-  try { owner = readFileSync(lockPath, 'utf8'); } catch { return false; }
-  if (!/^[1-9][0-9]{0,9}\n$/.test(owner)) return false;
-  const pid = Number(owner);
-  if (pid === process.pid) return false;
-  try { process.kill(pid, 0); return false; }
-  catch (problem) { return problem.code === 'ESRCH'; }
-}
-
 const idList = value => Array.isArray(value) && value.length <= 64 && value.every(id => typeof id === 'string' && id && id.length <= 512);
 
 /**
  * One private, append-only journal per session. An orphan lock requires operator inspection, not automatic recovery.
  * effectIds records the deterministic record IDs a derived write names, so a restart can settle an unknown outcome by reading them.
- * pidLock writes the owner's process ID into the lock and breaks only a lock whose recorded owner no longer exists on this host;
- * an empty or unreadable lock still requires an operator.
+ * pidLock writes an owner record (host, boot, PID namespace, PID, start time) into the lock and takes over only a lock whose
+ * recorded owner is provably gone (owner-lock.mjs); an empty, foreign or unreadable lock still requires an operator.
  */
 export function createCoverageJournal({ directory, sessionKey, effectIds = false, pidLock = false }) {
   if (typeof sessionKey !== 'string' || !sessionKey) throw fail('session_invalid');
@@ -35,16 +26,11 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
   const name = `coverage-${digest(['coverage-session/v1', sessionKey])}`;
   const path = join(dir, `${name}.jsonl`);
   const lockPath = join(dir, `${name}.lock`);
-  let lock, file;
-  const takeLock = () => openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  let lock, file, owner;
+  const releaseLock = () => { if (owner) owner.release(); else { closeSync(lock); unlinkSync(lockPath); } };
   try {
-    try { lock = takeLock(); }
-    catch (problem) {
-      if (problem.code !== 'EEXIST' || !pidLock || !staleLock(lockPath)) throw problem;
-      unlinkSync(lockPath);
-      lock = takeLock();
-    }
-    if (pidLock) { writeSync(lock, `${process.pid}\n`); fsyncSync(lock); }
+    if (pidLock) owner = acquireOwnerLock(lockPath);
+    else lock = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
     file = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
     const st = fstatSync(file);
     if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o077) !== 0) throw fail('journal_invalid');
@@ -52,7 +38,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
     try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   } catch (problem) {
     if (file !== undefined) closeSync(file);
-    if (lock !== undefined) { closeSync(lock); unlinkSync(lockPath); }
+    if (lock !== undefined || owner) releaseLock();
     throw problem.code === 'EEXIST' ? fail('journal_locked') : problem;
   }
   let closed = false;
@@ -133,12 +119,13 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
       previous = hash;
     }
   } catch (problem) {
-    closeSync(file); closeSync(lock); unlinkSync(lockPath);
+    closeSync(file); releaseLock();
     throw problem.code === 'journal_invalid' ? problem : fail('journal_invalid');
   }
   const outcomeIds = new Map();
   const api = {
     path,
+    options: Object.freeze({ effectIds, pidLock }),
     begin({ through, cursor, retry = false }) {
       if (typeof through !== 'string' || !through || (cursor !== null && (typeof cursor !== 'string' || !cursor))) throw fail('checkpoint_invalid');
       const id = digest(['coverage-interval/v1', sessionKey, cursor, through]);
@@ -195,7 +182,10 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
     },
     finish(disposition, code = null, search = null, { boundaries } = {}) {
       if (boundaries !== undefined && (!Array.isArray(boundaries) || !boundaries.length
-        || boundaries.some(row => typeof row?.entry_id !== 'string' || !['admissible', 'gap'].includes(row.disposition)))) throw fail('boundaries_invalid');
+        || boundaries.some(row => !row || Object.keys(row).sort().join(',') !== 'disposition,entry_id,reason,type'
+          || typeof row.entry_id !== 'string' || !row.entry_id || !['compaction', 'branch_summary'].includes(row.type)
+          || !['admissible', 'gap'].includes(row.disposition) || (row.disposition === 'gap') !== (typeof row.reason === 'string')
+          || (row.reason !== null && !/^summary_[a-z_]{1,64}$/.test(row.reason))))) throw fail('boundaries_invalid');
       if (!active) throw fail('interval_not_started');
       if (search !== null && (typeof search !== 'object' || typeof search.incomplete !== 'boolean' || !Array.isArray(search.statuses))) throw fail('search_status_invalid');
       const uncertain = [...active.effects.values()].some(row => !['confirmed', 'refused'].includes(row.state));
@@ -210,7 +200,9 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
     },
     reconcile({ id, disposition, evidenceRef }) {
       if (typeof evidenceRef !== 'string' || !evidenceRef.trim() || !['committed', 'failed'].includes(disposition)) throw fail('reconciliation_invalid');
-      if (!(active?.id === id || (gap?.id === id && (gap.disposition === 'uncertain' || gap.reconciliation_required)))) throw fail('reconciliation_invalid');
+      // Mirror apply() so a refused reconciliation is never written: a written row that apply rejects would corrupt the journal.
+      if (!(active?.id === id || (gap?.id === id && (gap.disposition === 'uncertain'
+        || (gap.disposition === 'failed' && gap.reconciliation_required && disposition === 'failed'))))) throw fail('reconciliation_invalid');
       append({ type: 'reconcile', id, disposition, evidence_ref: evidenceRef });
     },
     coveredDisposition({ through, cursor }) {
@@ -238,7 +230,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
     close() {
       if (closed) return;
       closed = true;
-      closeSync(file); closeSync(lock); unlinkSync(lockPath);
+      closeSync(file); releaseLock();
     },
   };
   return api;
@@ -247,6 +239,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
 /** The session's distiller and ingest path must both use the same journal-tracked memory facade. */
 export async function runCoveredInterval({ journal, session, through, cursor, allowInterrupted = false, retry = false, summaryPolicy }) {
   if (session?.memory?.[tracking] !== journal || session?.distiller?.memory !== session.memory) throw fail('tracking_required');
+  if (summaryPolicy !== undefined && summaryPolicy !== 'dependency_closure') throw fail('invalid_input');
   const id = journal.begin({ through, cursor, retry });
   try {
     const result = await distillThrough(session, through, cursor, { allowInterrupted, ...(summaryPolicy ? { summaryPolicy } : {}) });
