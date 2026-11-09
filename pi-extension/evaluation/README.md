@@ -28,6 +28,8 @@ flowchart LR
 
 A fresh driver run seals the cited answerer as `answerer-r2-v5`. The earlier uncited pilot is not resumable through that driver. Budget refusals are retained in the answer trace, and unknown answers after a refusal have a distinct marker. A same-treatment v5 resume requires the exact code and unchanged policy, model, evaluator and budget configuration, plus the existing snapshot, journal, reconciliation and provenance checks; the remaining soft budget may decrease, not increase. This is not automatic crash recovery.
 
+Development packets use `block-evidence/v1`: each requirement and correction-chain citation names exact zero-based indices into the original `entry.message.content` array. Only nonempty text blocks, and tool-call blocks approved by the pinned occurrence map and the case's `keep` semantic review, are citable. Messages whose content is a plain string, and thinking, image or unknown blocks, are not citable and fail closed. The driver takes the frozen development-v2 `MANIFEST.json` and the occurrence map; the map's SHA-256 is sealed, and every approval for the run's source must be used.
+
 `fictional.mjs` defines complete **fictional** settings, cases, packets, model, bounds and plan. It is test data, not an experimental configuration or live rate card. `test/pi-eval-*.test.mjs` exercises the interfaces without opening real cases, sessions, answer files, or memory databases.
 
 ## Ledger and reservation semantics

@@ -1,6 +1,7 @@
 import { hash, verifySeal } from './seal.mjs';
 import { CITATION_PROTOCOL, UNKNOWN_ANSWER, citationId, textSha256 } from './answerer.mjs';
 import { GROUNDING_PROTOCOL } from './rubric.mjs';
+import { BLOCK_EVIDENCE_CONTRACT } from './dev-dataset.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const text = s => typeof s === 'string' && s.trim().length > 0;
@@ -27,11 +28,16 @@ export function validatePacket(packet) {
     requirements.add(req.id);
   }
   if (packet.supportedAlternatives.some(alt => !text(alt?.text) || !Array.isArray(alt.sourceIds)
-      || !alt.sourceIds.length || alt.sourceIds.some(id => !sources.has(id)))) throw fail('packet_invalid');
+      || !alt.sourceIds.length || alt.sourceIds.some(id => !sources.has(id)))
+    || (packet.evidenceContract !== undefined && packet.evidenceContract !== BLOCK_EVIDENCE_CONTRACT)
+    || (packet.evidenceContract === BLOCK_EVIDENCE_CONTRACT && packet.correctionChains.some(chain => !text(chain?.stage)
+      || !Array.isArray(chain.sourceIds) || !chain.sourceIds.length || new Set(chain.sourceIds).size !== chain.sourceIds.length
+      || chain.sourceIds.some(id => !sources.has(id))))) throw fail('packet_invalid');
   return { sources, requirements };
 }
 
 function validateCaseTrace({ packet, trace, spec, seal }) {
+  if (spec.packetSchema.evidenceContract !== undefined && packet.evidenceContract !== spec.packetSchema.evidenceContract) throw fail('packet_contract_mismatch');
   const context = trace?.context;
   if (trace?.sealDigest !== seal.digest || trace.caseId !== packet.caseId || trace.caseDigest !== spec.cases[packet.caseId]
     || !context || context.request !== packet.request || context.actor !== packet.actor || context.queryTime !== packet.queryTime
