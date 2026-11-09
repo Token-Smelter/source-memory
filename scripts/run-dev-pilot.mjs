@@ -21,7 +21,7 @@ import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runti
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases, toolCallReviewSummary, verifyToolCallReview } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { CITED_RESUME_TRANSITIONS, DISTILLER_MAX_OUTPUT_TOKENS, EVALUATOR_MAX_OUTPUT_TOKENS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { BASELINE_CANDIDATE_ROUTE, CITED_RESUME_TRANSITIONS, DISTILLER_MAX_OUTPUT_TOKENS, EVALUATOR_MAX_OUTPUT_TOKENS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { WORKER_SHARE_NANO, attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
@@ -66,6 +66,11 @@ function writePrivate(path, value) {
   const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
   try { writeFileSync(fd, typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
 }
+function cardRates(card, maxOutputTokens) {
+  const nano = usd => Math.ceil(usd * 1000);
+  return { maxOutputTokens, ratesNanoPerToken: { input: nano(card.usdPerMillion.cacheMiss), cacheRead: nano(card.usdPerMillion.cacheHit), cacheWrite: 0,
+    output: nano(card.usdPerMillion.output) }, rateEvidence: `${card.source}; ${card.tier} tier; API-equivalent only` };
+}
 function rates(model, maxOutputTokens) {
   const tiers = [model.cost, ...(model.cost?.tiers ?? [])];
   const result = {};
@@ -97,9 +102,10 @@ function trackSnapshot(memory) {
       release() { lock = false; } };
   } };
 }
-function exactRoute(model) {
+// Inference goes through the local gateway, except a candidate route whose sealed treatment declares its provider origin.
+function exactRoute(model, allowedOrigin = 'http://127.0.0.1:3003') {
   const url = new URL(model.baseUrl);
-  if (url.origin !== 'http://127.0.0.1:3003' || url.username || url.password) throw fail('route_changed');
+  if (url.origin !== allowedOrigin || url.username || url.password) throw fail('route_changed');
   return `${model.provider}/${model.id}`;
 }
 
@@ -163,11 +169,18 @@ async function main() {
     const b = builder.buildSessionContext(rows, checkpoint.id).messages;
     if (sha(JSON.stringify(a)) !== sha(JSON.stringify(b))) throw fail('pi_context_mismatch');
   }
-  const { runtime, model, reviewerModel } = await resolvePiModels({ pi, modelId: 'anthropic/claude-haiku-5-5', reviewerId: 'anthropic/claude-sonnet-5-5' });
-  if (exactRoute(model) !== 'anthropic/claude-haiku-5-5' || exactRoute(reviewerModel) !== 'anthropic/claude-sonnet-5-5') throw fail('route_changed');
+  const treatment = process.env.PILOT_TREATMENT ? TREATMENTS[process.env.PILOT_TREATMENT] ?? null : null;
+  if (process.env.PILOT_TREATMENT && !treatment) throw fail('treatment_invalid');
+  const candidateRoute = treatment?.candidateRoute ?? BASELINE_CANDIDATE_ROUTE;
+  const { runtime, model, reviewerModel } = await resolvePiModels({ pi, modelId: candidateRoute, reviewerId: 'anthropic/claude-sonnet-5-5' });
+  const candidateOrigin = treatment?.candidateOrigin ?? 'http://127.0.0.1:3003';
+  if (exactRoute(model, candidateOrigin) !== candidateRoute || exactRoute(reviewerModel) !== 'anthropic/claude-sonnet-5-5') throw fail('route_changed');
+  // Pi replaces image blocks with a fixed placeholder for a text-only route; the sealed treatment must say so.
+  if (treatment?.imageInput !== undefined && model.input?.includes('image') !== treatment.imageInput) throw fail('route_changed');
   const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   if (execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim()) throw fail('working_tree_dirty');
-  const routeRates = { candidate: rates(model, DISTILLER_MAX_OUTPUT_TOKENS), reviewer: rates(reviewerModel, EVALUATOR_MAX_OUTPUT_TOKENS) };
+  const routeRates = { candidate: treatment?.rateCard ? cardRates(treatment.rateCard, DISTILLER_MAX_OUTPUT_TOKENS) : rates(model, DISTILLER_MAX_OUTPUT_TOKENS),
+    reviewer: rates(reviewerModel, EVALUATOR_MAX_OUTPUT_TOKENS) };
   const priorPath = process.env.PILOT_PRIOR_LEDGER, priorSha = process.env.PILOT_PRIOR_LEDGER_SHA256;
   if (Boolean(priorPath) !== Boolean(priorSha) || (process.env.PILOT_PRIOR_LEDGERS && priorPath)) throw fail('prior_ledger_invalid');
   let priorLedgers = priorPath ? [{ path: priorPath, sha256: priorSha }] : [];
@@ -196,8 +209,6 @@ async function main() {
     return sum + BigInt(priorSoftSpend(pinned(row.path, row.sha256, 10_000_000).toString('utf8'), { reconciliations }));
   }, 0n);
   let resume = null;
-  const treatment = process.env.PILOT_TREATMENT ? TREATMENTS[process.env.PILOT_TREATMENT] ?? null : null;
-  if (process.env.PILOT_TREATMENT && !treatment) throw fail('treatment_invalid');
   if (process.env.PILOT_RESUME) {
     let request;
     try { request = JSON.parse(process.env.PILOT_RESUME); } catch { throw fail('resume_invalid'); }
@@ -382,13 +393,18 @@ async function main() {
     chunking: { words: 256, overlap: 32 }, embedding: { url: 'http://127.0.0.1:18080/v1/embeddings', model: 'embeddinggemma', dimensions: 768, timeout_ms: 120000 }, index_on_write: false });
   const resources = privateWriter(join(dir, 'resources.jsonl')), progress = privateWriter(join(dir, 'progress.jsonl'));
   const memoryLog = privateWriter(join(dir, 'memory-receipts.jsonl')), results = privateWriter(join(dir, 'case-results.jsonl'));
+  const candidateResponseModels = new Set();
   const relayLog = privateWriter(join(dir, 'embedding-relay.jsonl')), rawOutputs = privateWriter(join(dir, 'model-outputs.jsonl')),
     snapshotChecks = privateWriter(join(dir, 'snapshot-verifications.jsonl'));
   const image = name => execFileSync('/usr/bin/docker', ['image', 'inspect', name, '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
   const docker = createNamespaceDocker({ databaseImage: image('neo4j:5.26.14-community'), driverImage: image('node:22-bookworm-slim'),
     mounts: { memory: runtimeDir, scratch: driverDir }, runId, onResource: row => resources.append(row) });
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
-    routes: { [exactRoute(model)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => rawOutputs.append(row) });
+    routes: { [exactRoute(model, candidateOrigin)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => {
+      // The provider may serve a route under a different model; each distinct reported model is kept for the report.
+      if (row?.purpose === 'candidate') candidateResponseModels.add(row.message?.responseModel ?? row.message?.model ?? 'unreported');
+      rawOutputs.append(row);
+    } });
   const onInterrupt = signal => { try { budget.requestStop(signal); } catch {} };
   const onSigint = () => onInterrupt('SIGINT'), onSigterm = () => onInterrupt('SIGTERM');
   process.on('SIGINT', onSigint); process.on('SIGTERM', onSigterm);
@@ -408,8 +424,12 @@ async function main() {
         toolcall_review: reviewUse, treatment,
         runtime_archive_sha256: runtimeTree.archive_sha256,
         sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
-        models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
-        routes: { origin: 'http://127.0.0.1:3003', privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
+        models: { candidate: exactRoute(model, candidateOrigin), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
+        candidate_model: { route: exactRoute(model, candidateOrigin), origin: candidateOrigin, api: model.api, image_input: model.input?.includes('image') === true, context_window: model.contextWindow,
+          catalog_cost: model.cost ?? null, served_version: treatment?.servedVersion ?? null },
+        routes: { origin: 'http://127.0.0.1:3003', ...(treatment?.candidateOrigin ? { candidate_origin: treatment.candidateOrigin,
+          candidate_privacy: 'operator-approved direct provider route: source transcript context is sent to this provider for distillation' } : {}),
+          privacy: 'configured Pi provider inference; local artifacts; no external review packets' },
         budget: { overall_effort_soft_usd: 250, share_soft_usd: Number(WORKER_SHARE_NANO / 1_000_000_000n), prior_spend_nano: previous.toString(), prior_attestation: priorAttestation,
           remaining_soft_nano: remaining.toString(), prior_ledger_sha256s: priorLedgers.map(row => row.sha256),
           prior_reconciliation_sha256s: priorLedgers.map(row => row.reconciliationSha256).filter(Boolean), one_call_in_flight: true, stop_unknown_usage: true,
@@ -476,7 +496,7 @@ async function main() {
           }
         }
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
-          memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
+          memory: guarded.client, modelId: exactRoute(model, candidateOrigin), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
           retrieval: treatment?.retrieval ?? 'search', guidance: treatment?.guidance ?? null,
           budget: createInputBudget(Number.MAX_SAFE_INTEGER),
           imageArchive: createImageArchive({ directory: imageDir }),
@@ -696,6 +716,9 @@ async function main() {
     ledger_completeness: 'partial: gateway-internal failover/retry attempts not correlatable',
     image_limitation: 'Original image blobs are archived by SHA-256; image content is not text-citable.',
     latency_limitation: 'Local embedding latency is environment-sensitive; a later sample showed 100% GPU and elevated host load, not proof of contention during any call.', artifacts,
+    candidate_model: { route: exactRoute(model, candidateOrigin), origin: candidateOrigin, image_input: model.input?.includes('image') === true,
+      response_models: [...candidateResponseModels].sort(), response_model_changed: candidateResponseModels.size > 1,
+      ...(treatment?.candidateOrigin ? { privacy: 'Operator-approved direct provider route: the replayed source context, including tool outputs and the source assistant\'s thinking converted to plain text (as for every arm), and each checkpoint task prompt were sent to this provider for distillation.' } : {}) },
     mixed_code: seal.spec.resume?.codeTransition ? { from: seal.spec.resume.codeTransition.from, to: seal.spec.resume.codeTransition.to,
       cursor: seal.spec.resume.cursor, changed_paths: seal.spec.resume.codeTransition.changedPaths.length } : null,
     run_dir: dir, run_id: runId, seal_sha256: seal.digest };
