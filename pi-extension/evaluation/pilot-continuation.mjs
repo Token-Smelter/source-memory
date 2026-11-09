@@ -1,5 +1,6 @@
 import { hash, verifySeal } from './seal.mjs';
-import { scoreCase } from './scorer.mjs';
+import { scoreCase, validateAnswerCitationBinding } from './scorer.mjs';
+import { CITATION_PROTOCOL } from './answerer.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 
@@ -16,9 +17,14 @@ export function validateCaseContinuation({ report, reportSha256, seal, resultRow
     || hash(ca[0]) !== hash(originalPartial.candidateAnswer) || hash(cj[0]) !== hash(originalPartial.candidateJudgment)
     || hash(ba[0]) !== hash(originalPartial.baselineAnswer) || bj[0].repair?.repairSealDigest !== seal.digest
     || bj[0].repair?.format !== 'scorer-r2-v3-specific-repair') throw fail('handback_seal_mismatch');
+  if (original.answerer.citationProtocol === CITATION_PROTOCOL) {
+    validateAnswerCitationBinding(ca[0].answer.answer, ca[0].answer.trace);
+    validateAnswerCitationBinding(ba[0].answer.answer, ba[0].answer.trace);
+  }
   const baseline = scoreCase({ seal: originalSeal, expectedDigest: originalSeal.digest, packet: item.packet, judgment: bj[0].judgment, trace: ba[0].answer.trace });
   if (hash(baseline) !== hash(bj[0].score)) throw fail('handback_score_mismatch');
   if (ea[0].answer?.caseId !== id || ea[0].answer?.condition !== 'empty' || ea[0].answer?.sealDigest !== seal.digest) throw fail('handback_seal_mismatch');
+  if (spec.answerer.citationProtocol === CITATION_PROTOCOL) validateAnswerCitationBinding(ea[0].answer.answer, ea[0].answer.trace);
   scoreCase({ seal, expectedDigest: seal.digest, packet: item.packet, judgment: { clauses: [] }, trace: ea[0].answer.trace });
   const starts = ledgerRows.filter(row => row.type === 'started' && row.checkpoint === item.through
     && ((row.arm === 'baseline' && row.purpose === 'scorer') || (row.arm === 'empty' && ['answerer', 'scorer'].includes(row.purpose))));

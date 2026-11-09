@@ -5,6 +5,7 @@ import { scoreCase as scoreAnchored, disagreement, createScorer as createAnchore
 import { pairedReport as reportAnchored } from '../pi-extension/evaluation/report.mjs';
 import { fictionalSettings, scoringPacket, fictionalTrace, clause } from '../pi-extension/evaluation/fictional.mjs';
 import { ANSWERER_BUDGET_SUFFIX, ANSWERER_TOOLS_V2_SHA256, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
+import { UNKNOWN_ANSWER } from '../pi-extension/evaluation/answerer.mjs';
 
 const withDigest = options => ({ ...options, expectedDigest: options.seal.digest });
 const scoreCase = options => scoreAnchored(withDigest({ ...options, trace: options.trace ?? fictionalTrace() }));
@@ -52,7 +53,7 @@ test('scorer uses the sealed packet and alternatives receive separate blinded au
   const c = clause('a', ['r1'], { alternative: { rationale: 'Equivalent', sourceIds: ['src'] } });
   const scorer = createScorer({ seal, async judge(input) { assert.equal(input.rubric.version, seal.spec.rubric.version); return { clauses: [c] }; } });
   await assert.rejects(scorer.score({ packet, answer: { text: 'Mira chose 4' }, trace: { ...fictionalTrace(), caseDigest: '0'.repeat(64) } }), /case_trace_mismatch/);
-  const result = await scorer.score({ packet, answer: { text: 'Mira chose 4' }, trace: fictionalTrace() });
+  const result = await scorer.score({ packet, answer: { text: UNKNOWN_ANSWER, citations: [] }, trace: fictionalTrace() });
   const sample = auditAlternatives({ seal, alternatives: result.score.alternatives });
   assert.equal(sample.complete, false);
   assert.equal('caseId' in sample.selected[0], false);

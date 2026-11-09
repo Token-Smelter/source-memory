@@ -18,10 +18,10 @@ import { runNamespaceHarness } from '../pi-extension/namespace-harness.mjs';
 import { openUnixEmbeddingRelay } from '../pi-extension/unix-relay.mjs';
 import { openDockerMemory } from '../pi-extension/docker-memory.mjs';
 import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runtime.mjs';
-import { createAnswerer } from '../pi-extension/evaluation/answerer.mjs';
+import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases } from '../pi-extension/evaluation/dev-dataset.mjs';
-import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_TOOLS_SHA256, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { createPilotPlan, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
+import { createCitedPilotPlan, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
@@ -190,6 +190,7 @@ async function main() {
       || request.journalPath !== join(priorDir, `coverage-${digest(['coverage-session/v1', sourceKey])}.jsonl`)
       || !checkpointMatch || !snapshotPathMatch) throw fail('resume_provenance_mismatch');
     const priorSeal = JSON.parse(pinned(request.sealPath, request.sealSha256, 10_000_000).toString('utf8'));
+    if (priorSeal.spec?.answerer?.citationProtocol !== CITATION_PROTOCOL || request.transition !== 'same-treatment-resume') throw fail('legacy_resume_forbidden');
     const progressBytes = pinned(request.progressPath, request.progressSha256, 10_000_000);
     const journalBytes = pinned(request.journalPath, request.journalSha256, 20_000_000);
     const snapshotBytes = pinned(request.snapshotPath, request.snapshotSha256, 128_000_000);
@@ -305,7 +306,7 @@ async function main() {
   }
   const remaining = 100000000000n - previous;
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
-  const seal = createPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
+  const seal = createCitedPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
     codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null,
     interpretationSha256: INTERPRETATION_02_SHA256 });
   if (resume?.handbackRows.length) pairedReport({ seal, expectedDigest: seal.digest, rows: resume.handbackRows, dependencies: [],
@@ -499,7 +500,7 @@ async function main() {
                 return value;
               } };
               const respond = createPiAnswererResponder({ runtime: evaluatorRuntime, model: reviewerModel, sessionId: `answer-${runId}-${item.publicCase.id}`,
-                expectedToolsSha256: ANSWERER_TOOLS_SHA256 });
+                expectedToolsSha256: seal.spec.answerer.tools_sha256 });
               const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: adapter, archive, respond });
               const judge = createPiScorerJudge({ runtime: evaluatorRuntime, model: reviewerModel, sessionId: `score-${runId}-${item.publicCase.id}`, outputTokens: 4096 });
               const scorer = createScorer({ seal, expectedDigest: seal.digest, judge });
@@ -539,10 +540,10 @@ async function main() {
                   await specific('baseline', partial.baselineAnswer.answer, resume.priorSeal, partial.previousMessage, [partial.clauseId]);
                   continue;
                 }
-                meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: 'answerer-r2-v4', policy_version: seal.spec.policyVersion };
+                meta = { purpose: 'answerer', arm, checkpoint: cursor, task_version: seal.spec.answerer.version, policy_version: seal.spec.policyVersion };
                 const answer = await answerer.run({ arm, case: item.publicCase });
                 results.append({ type: 'answer', case_id: item.publicCase.id, arm, answer });
-                meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: 'scorer-r2-v2', policy_version: seal.spec.policyVersion };
+                meta = { purpose: 'scorer', arm, checkpoint: cursor, task_version: seal.spec.scorer.version, policy_version: seal.spec.policyVersion };
                 try {
                   const judged = await scorer.score({ packet: item.packet, answer: answer.answer, trace: answer.trace });
                   arms[arm] = judged.score;

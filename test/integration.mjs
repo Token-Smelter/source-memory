@@ -10,6 +10,11 @@ import { Memory } from '../src/memory.mjs';
 import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
 import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
+import { createDerivedAdapter, searchDerived, resolveDerived } from '../pi-extension/derived-retrieval.mjs';
+import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
+import { GROUNDING_PROTOCOL, CITED_RUBRIC_VERSION, CITED_RUBRIC, CITED_WORKED_EXAMPLES } from '../pi-extension/evaluation/rubric.mjs';
+import { fictionalCase, fictionalSettings } from '../pi-extension/evaluation/fictional.mjs';
+import { hash, sealComparison } from '../pi-extension/evaluation/seal.mjs';
 
 const exec = promisify(execFile);
 const contracts = {
@@ -1091,6 +1096,32 @@ export async function runIntegration(database, scratch) {
         assert.ok(shown.relations.some(row => row.type === 'supersedes' && row.to_id === 'old-decision'));
         assert.equal(shown.immediate_relations_complete, true);
       } finally { handlers.close(); }
+    });
+    await check('cited answerer returns only evidence resolved from its selected Neo4j record', async () => {
+      const request = { ...fictionalCase(), readScopes: ['demo'], evidenceScopes: ['demo'] };
+      const settings = fictionalSettings();
+      settings.answerer.citationProtocol = CITATION_PROTOCOL;
+      settings.scorer.groundingProtocol = GROUNDING_PROTOCOL;
+      settings.rubric = { version: CITED_RUBRIC_VERSION, instructions: CITED_RUBRIC, examples: CITED_WORKED_EXAMPLES };
+      settings.access = { readScopes: ['demo'], evidenceScopes: ['demo'] };
+      settings.answerer.limits.retrievalBytes = 32000;
+      settings.answerer.limits.evidenceBytes = 32000;
+      settings.cases.c1 = hash(request);
+      const seal = sealComparison(settings), snapshot = 'fictional-snapshot';
+      const store = { scope: 'demo', snapshotId: snapshot, async authorize() { return true; }, async verifySnapshot() { return snapshot; },
+        client: { searchDerived: (scope, input) => searchDerived(memory, scope, input),
+          resolveDerived: (scope, input) => resolveDerived(memory, scope, input) } };
+      const adapter = createDerivedAdapter({ stores: { 'candidate-fiction': store } });
+      const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: adapter,
+        archive: { async search() { throw new Error('raw_forbidden'); } }, async respond({ tools }) {
+          const rows = await tools.search('blue'), selected = rows.find(row => row.id === 'old-decision');
+          assert.ok(selected?.evidence.length);
+          const evidence = selected.evidence[0];
+          await tools.resolve(selected.id, evidence.id);
+          return { text: 'The fictional earlier choice was blue.', citations: [{ item_id: selected.id, evidence_id: evidence.id }] };
+        } });
+      const result = await answerer.run({ arm: 'candidate', case: request });
+      assert.deepEqual([result.answer.citations.length, result.answer.citations[0].item_id, result.trace.abstention], [1, 'old-decision', 'not_enforced']);
     });
     const attemptInput = turn('attempt', 'I ran the demonstration check. It passed. Should we run another?');
     const attemptSource = await memory.ingest('demo', attemptInput);

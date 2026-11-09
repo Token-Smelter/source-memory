@@ -1,5 +1,6 @@
 import { hash, verifySeal } from './seal.mjs';
-import { scoreCase } from './scorer.mjs';
+import { scoreCase, validateAnswerCitationBinding } from './scorer.mjs';
+import { CITATION_PROTOCOL } from './answerer.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const arms = ['candidate', 'baseline', 'empty', 'raw-only'];
@@ -28,6 +29,7 @@ export function validateCaseHandback({ report, reportSha256, seal, progress, res
       const answer = answers[0].answer, verdict = judgments[0];
       if (answer?.caseId !== id || answer?.condition !== arm || answer?.sealDigest !== seal.digest
         || verdict.score?.sealDigest !== seal.digest || verdict.score.packetDigest !== spec.packets[id]) throw fail('handback_seal_mismatch');
+      if (spec.answerer.citationProtocol === CITATION_PROTOCOL) validateAnswerCitationBinding(answer.answer, answer.trace);
       const recomputed = scoreCase({ seal, expectedDigest: seal.digest, packet: item.packet, judgment: verdict.judgment, trace: answer.trace });
       if (hash(recomputed) !== hash(verdict.score)) throw fail('handback_score_mismatch');
       const starts = ledgerRows.filter(row => row.type === 'started' && row.checkpoint === item.through && row.arm === arm
@@ -57,6 +59,7 @@ export function validatePartialCaseHandback({ report, reportSha256, seal, result
   if (rows.length !== 3 || ca.length !== 1 || cj.length !== 1 || ba.length !== 1) throw fail('handback_incomplete');
   for (const [arm, row] of [['candidate', ca[0]], ['baseline', ba[0]]]) {
     if (row.answer?.caseId !== id || row.answer?.condition !== arm || row.answer?.sealDigest !== seal.digest) throw fail('handback_seal_mismatch');
+    if (spec.answerer.citationProtocol === CITATION_PROTOCOL) validateAnswerCitationBinding(row.answer.answer, row.answer.trace);
     scoreCase({ seal, expectedDigest: seal.digest, packet: item.packet, judgment: { clauses: [] }, trace: row.answer.trace });
   }
   const candidate = scoreCase({ seal, expectedDigest: seal.digest, packet: item.packet, judgment: cj[0].judgment, trace: ca[0].answer.trace });
