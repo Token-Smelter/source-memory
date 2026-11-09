@@ -38,7 +38,9 @@ function validate(s) {
     || s.rubric.examples.some(e => ![e?.source, e?.answer, e?.judgment].every(nonempty))
     || !digestMap(s?.cases) || !digestMap(s?.packets) || !/^[a-f0-9]{64}$/.test(s?.dependenciesDigest ?? '')
     || Object.keys(s.cases).sort().join('\0') !== Object.keys(s.packets).sort().join('\0')
-    || a.retrievalInterface !== 'returned-item-evidence-v1' || s.packetSchema.version !== 'packet-v1'
+    || a.retrievalInterface !== 'returned-item-evidence-v1'
+    || (a.citationProtocol !== undefined && a.citationProtocol !== 'returned-evidence-v1')
+    || (a.version === 'answerer-r2-v5' && a.citationProtocol !== 'returned-evidence-v1') || s.packetSchema.version !== 'packet-v1'
     || s.comparison.primary !== 'candidate-minus-named-baseline' || s.comparison.uncertainty !== 'conservative' || s.comparison.caseWeight !== 'equal'
     || s.baseline.storeId === s.stores.candidate || !uint(s.budget.maxSlotsPerPlan) || s.budget.maxSlotsPerPlan < 1
     || !uint(s.budget.maxPlans) || s.budget.maxPlans < 1

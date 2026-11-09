@@ -1,7 +1,10 @@
 import { retentionPolicy } from '../policy.mjs';
 import { hash, sealComparison } from './seal.mjs';
 import { RUBRIC, RUBRIC_VERSION, WORKED_EXAMPLES } from './rubric.mjs';
-import { ANSWERER_TOOLS_SHA256, SCORER_TOOLS_SHA256, ANSWERER_FORMAT_SUFFIX, ANSWERER_BUDGET_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, SCORER_REPAIR, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from './pi-calls.mjs';
+import { ANSWERER_TOOLS_SHA256, ANSWERER_CITED_TOOLS_SHA256, SCORER_TOOLS_SHA256, ANSWERER_FORMAT_SUFFIX,
+  ANSWERER_BUDGET_SUFFIX, ANSWERER_CITATION_SUFFIX, SCORER_FORMAT_SUFFIX, ANSWERER_REPAIR, ANSWERER_CITED_REPAIR,
+  SCORER_REPAIR, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from './pi-calls.mjs';
+import { CITATION_PROTOCOL } from './answerer.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
@@ -18,7 +21,7 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     || BigInt(capNano) + BigInt(priorSpendNano) > 100000000000n
     || (resume !== null && (!/^[a-f0-9]{64}$/.test(resume.snapshotSha256 ?? '') || !/^[a-f0-9]{64}$/.test(resume.journalSha256 ?? '')
       || !/^[a-f0-9]{64}$/.test(resume.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(resume.priorCodeSha ?? '')
-      || !['structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback', 'specific-scorer-repair-continuation'].includes(resume.transition)
+      || !['same-treatment-resume', 'structured-submission-format-only', 'deferred-bounded-indexing-only', 'remove-stale-input-cap-only', 'structured-evaluator-submission-only', 'retained-chunk-labels-and-case-handback', 'interpretation-02-abstention-clarification', 'answerer-item-budget-result-only', 'specific-scorer-repair-and-arm-handback', 'specific-scorer-repair-continuation'].includes(resume.transition)
       || (resume.sourceTreeDriftSha256 !== undefined && !/^[a-f0-9]{64}$/.test(resume.sourceTreeDriftSha256))
       || (resume.checkpointSnapshotSha256 !== undefined && !/^[a-f0-9]{64}$/.test(resume.checkpointSnapshotSha256))
       || (resume.partialCaseHandback !== undefined && (!resume.partialCaseHandback || resume.partialCaseHandback.repairFormat !== 'scorer-r2-v3-specific-repair'
@@ -75,5 +78,18 @@ export function createPilotPlan({ cases, sourceSha256, datasetSha256, sdkSha256,
     dependenciesDigest: hash([]), comparison: { primary: 'candidate-minus-named-baseline', uncertainty: 'conservative', caseWeight: 'equal' },
     resampling: { samples: 2000, seed: 517, confidence: 0.95 },
   };
+  return sealComparison(settings);
+}
+
+/** New comparisons and same-treatment resumptions use the citation-bound answerer. */
+export function createCitedPilotPlan(options) {
+  if (options?.resume != null && options.resume.transition !== 'same-treatment-resume') throw fail('resume_transition_forbidden');
+  const settings = structuredClone(createPilotPlan(options).spec);
+  settings.answerer.version = 'answerer-r2-v5';
+  settings.answerer.citationProtocol = CITATION_PROTOCOL;
+  settings.answerer.instructions += ANSWERER_CITATION_SUFFIX;
+  settings.answerer.tools_sha256 = ANSWERER_CITED_TOOLS_SHA256;
+  settings.answerer.repair_instruction = ANSWERER_CITED_REPAIR;
+  settings.budget.purposes.answerer.taskVersion = settings.answerer.version;
   return sealComparison(settings);
 }

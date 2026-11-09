@@ -1,4 +1,5 @@
 import { hash, verifySeal } from './seal.mjs';
+import { CITATION_PROTOCOL, UNKNOWN_ANSWER } from './answerer.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const text = s => typeof s === 'string' && s.trim().length > 0;
@@ -35,6 +36,17 @@ function validateCaseTrace({ packet, trace, spec, seal }) {
     || !context || context.request !== packet.request || context.actor !== packet.actor || context.queryTime !== packet.queryTime
     || hash(context.readScopes) !== hash(packet.readScopes) || hash(context.evidenceScopes) !== hash(packet.evidenceScopes)
     || packet.readScopes.some(scope => !spec.access.readScopes.includes(scope)) || packet.evidenceScopes.some(scope => !spec.access.evidenceScopes.includes(scope))) throw fail('case_trace_mismatch');
+  if (spec.answerer.citationProtocol === CITATION_PROTOCOL) {
+    const key = row => JSON.stringify([row.item_id, row.evidence_id]);
+    const valid = row => row && Object.keys(row).sort().join(',') === 'evidence_id,item_id' && text(row.item_id) && text(row.evidence_id);
+    if (!Array.isArray(trace.returnedEvidence) || !Array.isArray(trace.citations) || !Array.isArray(trace.returnedItemIds)
+      || trace.returnedEvidence.length > spec.answerer.limits.resolveCalls + spec.answerer.limits.returnedItems || trace.citations.length > 16
+      || trace.returnedEvidence.some(row => !valid(row) || !trace.returnedItemIds.includes(row.item_id))
+      || trace.citations.some(row => !valid(row)) || new Set(trace.returnedEvidence.map(key)).size !== trace.returnedEvidence.length
+      || new Set(trace.citations.map(key)).size !== trace.citations.length
+      || trace.citations.some(row => !trace.returnedEvidence.some(evidence => key(evidence) === key(row)))
+      || trace.abstention !== (trace.citations.length ? 'not_enforced' : 'host_enforced_no_citations')) throw fail('citation_trace_invalid');
+  }
 }
 
 export function scoreCase({ seal, expectedDigest, packet, judgment, trace }) {
@@ -85,6 +97,13 @@ export function scoreCase({ seal, expectedDigest, packet, judgment, trace }) {
     safety, alternatives };
 }
 
+export function validateAnswerCitationBinding(answer, trace) {
+  if (!text(answer?.text) || !Array.isArray(answer.citations) || !Array.isArray(trace?.citations)) throw fail('citation_trace_invalid');
+  let matches;
+  try { matches = hash(answer.citations) === hash(trace.citations); } catch { throw fail('citation_trace_invalid'); }
+  if (!matches || (!answer.citations.length && answer.text !== UNKNOWN_ANSWER)) throw fail('citation_trace_invalid');
+}
+
 export function createScorer({ seal, expectedDigest, judge }) {
   verifySeal(seal, expectedDigest);
   if (typeof judge !== 'function') throw fail('scorer_invalid');
@@ -94,6 +113,7 @@ export function createScorer({ seal, expectedDigest, judge }) {
     if (s.packets[packet.caseId] !== hash(packet)) throw fail('packet_seal_mismatch');
     if (!text(answer?.text) || !trace || typeof trace !== 'object') throw fail('packet_invalid');
     validateCaseTrace({ packet, trace, spec: s, seal });
+    if (s.answerer.citationProtocol === CITATION_PROTOCOL) validateAnswerCitationBinding(answer, trace);
     const validate = judgment => scoreCase({ seal, expectedDigest, packet, judgment, trace });
     const judgment = await judge({ packet: structuredClone(packet), answer: structuredClone(answer), trace: structuredClone(trace),
       scorer: structuredClone(s.scorer), rubric: structuredClone(s.rubric), packetSchema: structuredClone(s.packetSchema), validate });

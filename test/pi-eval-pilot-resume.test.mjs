@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
-import { createPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { createPilotPlan, createCitedPilotPlan } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { runPilotSequence } from '../pi-extension/evaluation/pilot-sequence.mjs';
 import { fictionalCase, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
@@ -48,6 +48,25 @@ async function fixture(fn) {
 test('resume validates the prior seal, covered journal prefix, clean snapshot and reconciled retry', () => fixture(async ({ args }) => {
   const result = validatePilotResume(args);
   assert.deepEqual([result.cursor, result.prefixCount, result.retryFirst, result.priorSealDigest], ['a', 1, true, args.seal.digest]);
+}));
+
+test('same-treatment cited resume requires the same code, budget and prior answerer protocol', () => fixture(async ({ args }) => {
+  const options = { cases: args.cases, sourceSha256: 'a'.repeat(64), datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64),
+    codeSha: 'd'.repeat(40), routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } } };
+  const previous = createCitedPilotPlan(options);
+  const current = createCitedPilotPlan({ ...options, resume: { priorRunId: args.report.run_id, priorSealDigest: previous.digest,
+    priorCodeSha: options.codeSha, cursor: 'a', snapshotSha256: args.snapshotSha256, journalSha256: args.journalSha256,
+    transition: 'same-treatment-resume' } });
+  const report = { ...args.report, seal_sha256: previous.digest };
+  assert.equal(validatePilotResume({ ...args, report, seal: previous, currentSeal: current }).transition, 'same-treatment-resume');
+  for (const key of ['codeSha', 'rateCardVersion']) {
+    const changed = structuredClone(current.spec);
+    if (key === 'codeSha') changed.codeSha = 'e'.repeat(40); else changed.budget.rateCardVersion = 'different';
+    assert.throws(() => validatePilotResume({ ...args, report, seal: previous, currentSeal: sealComparison(changed) }), /resume_treatment_mismatch/);
+  }
+  const legacy = args.seal, legacyReport = { ...args.report, seal_sha256: legacy.digest }, legacyCurrent = structuredClone(current.spec);
+  legacyCurrent.resume.priorSealDigest = legacy.digest;
+  assert.throws(() => validatePilotResume({ ...args, report: legacyReport, seal: legacy, currentSeal: sealComparison(legacyCurrent) }), /resume_treatment_mismatch/);
 }));
 
 test('resume refuses a prefix with unproven search completeness', () => fixture(async ({ args }) => {

@@ -4,13 +4,15 @@ import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extensi
 import { sealComparison } from '../pi-extension/evaluation/seal.mjs';
 import { scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { fictionalSettings, fictionalCase, fictionalTrace, scoringPacket, clause } from '../pi-extension/evaluation/fictional.mjs';
+import { UNKNOWN_ANSWER } from '../pi-extension/evaluation/answerer.mjs';
 
 function fixture() {
   const seal = sealComparison(fictionalSettings()), packet = scoringPacket(), trace = fictionalTrace(), judgment = { clauses: [clause('c', ['r1'])] };
   const score = scoreCase({ seal, expectedDigest: seal.digest, packet, trace, judgment });
   const resultRows = [], ledgerRows = [], outputRows = [];
   for (const [i, arm] of ['candidate', 'baseline', 'empty', 'raw-only'].entries()) {
-    resultRows.push({ type: 'answer', case_id: 'c1', arm, answer: { caseId: 'c1', condition: arm, sealDigest: seal.digest, trace } },
+    resultRows.push({ type: 'answer', case_id: 'c1', arm, answer: { caseId: 'c1', condition: arm, sealDigest: seal.digest, trace,
+      answer: { text: UNKNOWN_ANSWER, citations: [] } } },
       { type: 'judgment', case_id: 'c1', arm, judgment, score });
     for (const [j, purpose] of ['answerer', 'scorer'].entries()) {
       const id = i * 2 + j + 1;
@@ -53,4 +55,6 @@ test('case handback refuses a missing raw model output or altered score', () => 
   assert.throws(() => validateCaseHandback({ ...f, outputRows: f.outputRows.slice(1) }), /handback_outputs_missing/);
   const rows = structuredClone(f.resultRows); rows.find(row => row.type === 'judgment').score.usefulness.credited = 0;
   assert.throws(() => validateCaseHandback({ ...f, resultRows: rows }), /handback_score_mismatch/);
+  const changedAnswer = structuredClone(f.resultRows); changedAnswer.find(row => row.type === 'answer').answer.answer.text = 'Invented.';
+  assert.throws(() => validateCaseHandback({ ...f, resultRows: changedAnswer }), /citation_trace_invalid/);
 });

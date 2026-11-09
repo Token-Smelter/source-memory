@@ -7,7 +7,7 @@ import { createDerivedAdapter } from '../pi-extension/derived-retrieval.mjs';
 import { createAnswerer } from '../pi-extension/evaluation/answerer.mjs';
 import { fictionalBounds, fictionalCase, fictionalModel, fictionalSettings, scoringPacket, clause } from '../pi-extension/evaluation/fictional.mjs';
 import { openLedger } from '../pi-extension/evaluation/ledger.mjs';
-import { createPiAnswererResponder, createPiScorerJudge, ANSWERER_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
+import { createPiAnswererResponder, createPiScorerJudge, ANSWERER_CITED_TOOLS_SHA256 } from '../pi-extension/evaluation/pi-calls.mjs';
 import { createSingleFlightGate, wrapPiRuntime } from '../pi-extension/evaluation/pi-wrapper.mjs';
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
 import { createScorer, scoreCase } from '../pi-extension/evaluation/scorer.mjs';
@@ -22,18 +22,23 @@ test('fictional fixed arms, Pi calls, scorer, shared reservations and paired rep
   try {
     const settings = fictionalSettings();
     settings.budget.capNano = '100000';
+    settings.budget.maxSlotsPerPlan = 6;
     settings.scorer.model = 'one';
-    settings.answerer.tools_sha256 = ANSWERER_TOOLS_SHA256;
+    settings.answerer.limits.modelCalls = 3;
+    settings.answerer.tools_sha256 = ANSWERER_CITED_TOOLS_SHA256;
     const seal = sealComparison(settings);
     ledger = openLedger({ path: join(dir, 'ledger.sqlite'), seal, expectedDigest: seal.digest });
     const bounds = fictionalBounds();
     ledger.reservePlan({ id: 'fiction', arm: 'all', purpose: 'production', taskVersion: 'fiction-v1', policyVersion: settings.policyVersion,
       requestedRoute: 'fiction/one', checkpoint: 'fiction', sessionKey: 'fiction',
-      slots: Array.from({ length: 4 }, (_, i) => ({ id: `s${i}`, kind: 'initial', parent: null, bounds })) });
+      slots: Array.from({ length: 6 }, (_, i) => ({ id: `s${i}`, kind: 'initial', parent: null, bounds })) });
     const judgments = { clauses: [clause('c1', ['r1', 'r2'])] };
     const responses = [message([{ type: 'toolCall', id: 'search', name: 'memory_search', arguments: { query: 'Mira' } }], 'toolUse'),
-      message([{ type: 'toolCall', id: 'answer1', name: 'submit_answer', arguments: { answer: 'Mira chose 4 for comet.' } }], 'toolUse'),
-      message([{ type: 'toolCall', id: 'answer2', name: 'submit_answer', arguments: { answer: 'I do not know.' } }], 'toolUse'),
+      message([{ type: 'toolCall', id: 'resolve', name: 'memory_resolve', arguments: { item_id: 'record', evidence_id: 'ev' } }], 'toolUse'),
+      message([{ type: 'toolCall', id: 'answer1', name: 'submit_answer', arguments: { answer: 'Mira chose 4 for comet.',
+        citations: [{ item_id: 'record', evidence_id: 'ev' }] } }], 'toolUse'),
+      message([{ type: 'toolCall', id: 'search2', name: 'memory_search', arguments: { query: 'Mira' } }], 'toolUse'),
+      message([{ type: 'toolCall', id: 'answer2', name: 'submit_answer', arguments: { answer: 'I do not know.', citations: [] } }], 'toolUse'),
       message([{ type: 'toolCall', id: 'score', name: 'submit_score', arguments: judgments }], 'toolUse')];
     const host = { streamSimple() { const result = Promise.resolve(responses.shift()); return { result: () => result, async *[Symbol.asyncIterator]() {} }; } };
     let slot = 0;
@@ -45,7 +50,7 @@ test('fictional fixed arms, Pi calls, scorer, shared reservations and paired rep
       async resolveDerived(scope) { return { id: 'ev', scope, text: 'Mira chose 4 for comet' }; } };
     const store = { scope: 'fiction', snapshotId: 'snapshot', authorize: async () => true, verifySnapshot: async () => 'snapshot', client };
     const memory = createDerivedAdapter({ stores: { 'candidate-fiction': store, 'baseline-fiction': store, 'reference-fiction': store } });
-    const respond = createPiAnswererResponder({ runtime, model, sessionId: 'fiction', expectedToolsSha256: ANSWERER_TOOLS_SHA256 });
+    const respond = createPiAnswererResponder({ runtime, model, sessionId: 'fiction', expectedToolsSha256: ANSWERER_CITED_TOOLS_SHA256 });
     const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory, archive: { async search() { throw new Error('raw search forbidden'); } }, respond });
     const candidate = await answerer.run({ arm: 'candidate', case: fictionalCase() });
     const baseline = await answerer.run({ arm: 'baseline', case: fictionalCase() });
@@ -57,6 +62,6 @@ test('fictional fixed arms, Pi calls, scorer, shared reservations and paired rep
       sealDigest: seal.digest, packetDigest: candidateScore.packetDigest, arms: { candidate: candidateScore, baseline: baselineScore } }] });
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual([report.pairedDelta, report.clusters, report.confidence.kind, ledger.summary().attempts, ledger.summary().usageComplete],
-      [1, 1, 'descriptive-only', 4, false]);
+      [1, 1, 'descriptive-only', 6, false]);
   } finally { ledger?.close(); rmSync(dir, { recursive: true, force: true }); }
 });

@@ -4,6 +4,7 @@ import { validateCaseContinuation } from '../pi-extension/evaluation/pilot-conti
 import { sealComparison, hash } from '../pi-extension/evaluation/seal.mjs';
 import { scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { fictionalSettings, fictionalCase, fictionalTrace, scoringPacket, clause } from '../pi-extension/evaluation/fictional.mjs';
+import { UNKNOWN_ANSWER } from '../pi-extension/evaluation/answerer.mjs';
 
 function fixture() {
   const oldSpec = fictionalSettings(); oldSpec.codeSha = 'a'.repeat(40);
@@ -11,12 +12,15 @@ function fixture() {
   const seal = sealComparison(currentSpec), packet = scoringPacket();
   const oldTrace = { ...fictionalTrace(), sealDigest: oldSeal.digest }, emptyTrace = { ...fictionalTrace(), sealDigest: seal.digest };
   const oldJudgment = { clauses: [clause('c', ['r1'])] }, oldScore = scoreCase({ seal: oldSeal, expectedDigest: oldSeal.digest, packet, judgment: oldJudgment, trace: oldTrace });
-  const ca = { type: 'answer', case_id: 'c1', arm: 'candidate', answer: { caseId: 'c1', condition: 'candidate', sealDigest: oldSeal.digest, trace: oldTrace } };
+  const ca = { type: 'answer', case_id: 'c1', arm: 'candidate', answer: { caseId: 'c1', condition: 'candidate', sealDigest: oldSeal.digest, trace: oldTrace,
+    answer: { text: UNKNOWN_ANSWER, citations: [] } } };
   const cj = { type: 'judgment', case_id: 'c1', arm: 'candidate', judgment: oldJudgment, score: oldScore };
-  const ba = { type: 'answer', case_id: 'c1', arm: 'baseline', answer: { caseId: 'c1', condition: 'baseline', sealDigest: oldSeal.digest, trace: oldTrace } };
+  const ba = { type: 'answer', case_id: 'c1', arm: 'baseline', answer: { caseId: 'c1', condition: 'baseline', sealDigest: oldSeal.digest, trace: oldTrace,
+    answer: { text: UNKNOWN_ANSWER, citations: [] } } };
   const bj = { type: 'judgment', case_id: 'c1', arm: 'baseline', judgment: oldJudgment, score: oldScore,
     repair: { format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest } };
-  const ea = { type: 'answer', case_id: 'c1', arm: 'empty', answer: { caseId: 'c1', condition: 'empty', sealDigest: seal.digest, trace: emptyTrace } };
+  const ea = { type: 'answer', case_id: 'c1', arm: 'empty', answer: { caseId: 'c1', condition: 'empty', sealDigest: seal.digest, trace: emptyTrace,
+    answer: { text: UNKNOWN_ANSWER, citations: [] } } };
   const originalPartial = { descriptor: { caseId: 'c1', sourceSealDigest: oldSeal.digest, candidateScoreSha256: hash(oldScore), baselineAnswerSha256: hash(ba.answer) },
     candidateAnswer: ca, candidateJudgment: cj, baselineAnswer: ba };
   const bad = id => ({ id, judgments: { support: 'pass' }, sourceIds: [] });

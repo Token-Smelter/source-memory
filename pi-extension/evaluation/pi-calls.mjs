@@ -14,14 +14,22 @@ export const ANSWERER_TOOLS = Object.freeze([
   { name: 'memory_resolve', description: 'Resolve evidence for an item returned by memory_search.', parameters: schema({ item_id: string, evidence_id: string }) },
   { name: 'submit_answer', description: 'Submit the final answer after using any necessary retrieval tools.', parameters: schema({ answer: string }) },
 ]);
+export const ANSWERER_CITED_TOOLS = Object.freeze([
+  ANSWERER_TOOLS[0], ANSWERER_TOOLS[1],
+  { name: 'submit_answer', description: 'Submit the final answer with citations to evidence actually returned by the tools.',
+    parameters: schema({ answer: string, citations: { type: 'array', maxItems: 16, items: schema({ item_id: string, evidence_id: string }) } }) },
+]);
 export const SCORER_TOOLS = Object.freeze([{ name: 'submit_score', description: 'Submit the complete clause-level judgment.', parameters: judgmentSchema }]);
 export const ANSWERER_TOOLS_SHA256 = hash(ANSWERER_TOOLS);
+export const ANSWERER_CITED_TOOLS_SHA256 = hash(ANSWERER_CITED_TOOLS);
 export const ANSWERER_TOOLS_V2_SHA256 = hash([{ ...ANSWERER_TOOLS[0], description: 'Search the permitted derived-memory items.' }, ...ANSWERER_TOOLS.slice(1)]);
 export const SCORER_TOOLS_SHA256 = hash(SCORER_TOOLS);
 export const ANSWERER_FORMAT_SUFFIX = ' Submit the final answer with the submit_answer tool.';
 export const ANSWERER_BUDGET_SUFFIX = ' If the item budget is exhausted, answer from retrieved items or state uncertainty.';
+export const ANSWERER_CITATION_SUFFIX = ' Search the permitted memory before answering. If no relevant information supports an answer, say you do not know; never guess. Cite only evidence actually returned by memory_resolve using its item_id and evidence_id. If memory_search directly returns raw evidence without evidence handles, use the returned id as both item_id and evidence_id. If no evidence supports an answer, submit an empty citations array.';
 export const SCORER_FORMAT_SUFFIX = ' Submit the complete judgment with the submit_score tool.';
 export const ANSWERER_REPAIR = 'The previous output was not a valid final submission. Call submit_answer with the complete answer; do not change its substance merely to fix formatting.';
+export const ANSWERER_CITED_REPAIR = 'The previous submission was invalid. Search before answering and submit the answer with citations only to evidence actually returned by the tools; if none supports an answer, submit no citations and say you do not know.';
 export const SCORER_REPAIR = 'The previous submission was invalid. Call submit_score with the complete judgment matching the schema and supplied IDs; retain substantive judgments unless correction is required for validity.';
 export const SCORER_SPECIFIC_REPAIR = 'For clause {clause_id}: support=pass requires at least one packet source ID; if no packet source supports the clause, choose fail or uncertain. Submit the complete judgment with submit_score.';
 export const SCORER_MULTI_REPAIR = 'For each clause in {clause_ids}: support=pass requires at least one packet source ID; if no packet source supports the clause, choose fail or uncertain. Submit the complete judgment with submit_score.';
@@ -72,18 +80,22 @@ function toolResult(tool, value, isError = false) {
 /** The answerer sees the request, sealed settings and bounded retrieval tools only. */
 export function createPiAnswererResponder({ runtime, model, sessionId, expectedToolsSha256, onRaw = async () => {} }) {
   check({ runtime, model, sessionId });
-  if (expectedToolsSha256 !== ANSWERER_TOOLS_SHA256 || typeof onRaw !== 'function') throw fail('answerer_tools_mismatch');
+  const cited = expectedToolsSha256 === ANSWERER_CITED_TOOLS_SHA256;
+  const answererTools = cited ? ANSWERER_CITED_TOOLS : ANSWERER_TOOLS;
+  const repair = cited ? ANSWERER_CITED_REPAIR : ANSWERER_REPAIR;
+  if ((!cited && expectedToolsSha256 !== ANSWERER_TOOLS_SHA256) || typeof onRaw !== 'function') throw fail('answerer_tools_mismatch');
   return async ({ request, instructions, route, model: id, reasoning, inputTokens, outputTokens, modelCalls, formatRepairCalls = 1,
-    repairInstruction = null, costNano, tools }) => {
-    if (hash(ANSWERER_TOOLS) !== expectedToolsSha256) throw fail('answerer_tools_mismatch');
+    repairInstruction = null, costNano, tools, validateAnswer }) => {
+    if (hash(answererTools) !== expectedToolsSha256) throw fail('answerer_tools_mismatch');
     if (route !== model.provider || id !== model.id || typeof request !== 'string' || typeof instructions !== 'string'
       || !Number.isSafeInteger(inputTokens) || inputTokens < 1 || !/^[1-9]\d*$/.test(costNano ?? '')
       || !Number.isSafeInteger(outputTokens) || outputTokens < 1 || !Number.isSafeInteger(modelCalls) || modelCalls < 1
-      || formatRepairCalls !== 1 || (repairInstruction !== null && repairInstruction !== ANSWERER_REPAIR)
-      || typeof tools?.search !== 'function' || typeof tools?.resolve !== 'function') throw fail('answerer_invalid');
-    const context = { systemPrompt: instructions, tools: ANSWERER_TOOLS, messages: [{ role: 'user', content: request, timestamp: Date.now() }] };
+      || formatRepairCalls !== 1 || (repairInstruction !== null && repairInstruction !== repair)
+      || typeof tools?.search !== 'function' || typeof tools?.resolve !== 'function' || (cited && typeof validateAnswer !== 'function')) throw fail('answerer_invalid');
+    const context = { systemPrompt: instructions, tools: structuredClone(answererTools), messages: [{ role: 'user', content: request, timestamp: Date.now() }] };
     let usedInput = 0, usedCost = 0n, repairs = 0;
     for (let count = 0; count < modelCalls + 1; count++) {
+      if (hash(context.tools) !== expectedToolsSha256) throw fail('answerer_tools_mismatch');
       if (count >= modelCalls && repairs === 0) throw fail('model_call_limit');
       if (usedInput >= inputTokens || usedCost >= BigInt(costNano)) throw fail('answer_budget_exceeded');
       const message = await call(runtime, model, context, { maxTokens: outputTokens, reasoning, maxRetries: 0, sessionId }, onRaw,
@@ -99,8 +111,18 @@ export function createPiAnswererResponder({ runtime, model, sessionId, expectedT
       let invalid = message.stopReason !== 'toolUse' || !calls.length;
       for (const [index, tool] of calls.entries()) {
         const args = tool.arguments;
-        if (tool.name === 'submit_answer' && calls.length === 1 && index === 0 && exact(args, ['answer'])
-          && typeof args.answer === 'string' && args.answer.trim() && Buffer.byteLength(args.answer) <= 32000 && !invalid) return { text: args.answer };
+        if (tool.name === 'submit_answer' && calls.length === 1 && index === 0 && !invalid) {
+          if (!cited && exact(args, ['answer']) && typeof args.answer === 'string' && args.answer.trim()
+            && Buffer.byteLength(args.answer) <= 32000) return { text: args.answer };
+          if (cited && exact(args, ['answer', 'citations'])) {
+            const value = { text: args.answer, citations: args.citations };
+            try { validateAnswer(value); return value; }
+            catch (problem) {
+              if (!['answer_invalid', 'citation_invalid', 'citation_not_returned'].includes(problem?.code)) throw problem;
+              invalid = true; context.messages.push(toolResult(tool, { error: problem.code }, true)); continue;
+            }
+          }
+        }
         if (tool.name === 'memory_search' && exact(args, ['query']) && typeof args.query === 'string' && !invalid) {
           try { context.messages.push(toolResult(tool, await tools.search(args.query))); }
           catch (error) {
@@ -122,7 +144,7 @@ export function createPiAnswererResponder({ runtime, model, sessionId, expectedT
       }
       if (invalid) {
         if (repairs++) throw fail('answer_output_invalid');
-        context.messages.push({ role: 'user', content: ANSWERER_REPAIR, timestamp: Date.now() });
+        context.messages.push({ role: 'user', content: repair, timestamp: Date.now() });
       }
     }
     throw fail('model_call_limit');

@@ -3,10 +3,14 @@ import { hash, verifySeal } from './seal.mjs';
 const fail = code => Object.assign(new Error(code), { code });
 const nonempty = value => typeof value === 'string' && value.trim().length > 0;
 const subset = (values, allowed) => Array.isArray(values) && values.length > 0 && new Set(values).size === values.length && values.every(x => allowed.includes(x));
+export const CITATION_PROTOCOL = 'returned-evidence-v1';
+export const UNKNOWN_ANSWER = 'I do not know based on the available memory.';
+const pair = (item, evidence) => JSON.stringify([item, evidence]);
 
 export function createAnswerer({ seal, expectedDigest, memory, archive, respond }) {
   if (typeof respond !== 'function' || typeof memory?.search !== 'function' || typeof memory?.resolve !== 'function' || typeof archive?.search !== 'function') throw fail('adapter_invalid');
-  verifySeal(seal, expectedDigest);
+  const spec = verifySeal(seal, expectedDigest);
+  if (spec.answerer.citationProtocol !== CITATION_PROTOCOL) throw fail('citation_protocol_required');
   return {
     async run({ arm, case: input }) {
       const s = verifySeal(seal, expectedDigest);
@@ -18,8 +22,24 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
       const access = Object.freeze({ actor: input.actor, queryTime: input.queryTime,
         readScopes: Object.freeze([...input.readScopes]), evidenceScopes: Object.freeze([...input.evidenceScopes]) });
       const storeId = { candidate: s.stores.candidate, baseline: s.baseline.storeId, reference: s.stores.reference }[arm];
-      const offered = new Map();
+      const offered = new Map(), returnedEvidence = new Set();
       let searches = 0, resolves = 0, returned = 0, evidenceBytes = 0, retrievalBytes = 0, inFlight = 0, closed = false;
+      const validateAnswer = answer => {
+        if (!answer || Object.keys(answer).sort().join(',') !== 'citations,text' || !nonempty(answer.text)
+          || !Array.isArray(answer.citations) || answer.citations.length > 16 || !searches) throw fail('answer_invalid');
+        let serialized;
+        try { serialized = JSON.stringify(answer); } catch { throw fail('answer_invalid'); }
+        if (Buffer.byteLength(serialized) > limits.responseBytes) throw fail('answer_invalid');
+        const seen = new Set();
+        for (const citation of answer.citations) {
+          if (!citation || Object.keys(citation).sort().join(',') !== 'evidence_id,item_id'
+            || !nonempty(citation.item_id) || !nonempty(citation.evidence_id)) throw fail('citation_invalid');
+          const key = pair(citation.item_id, citation.evidence_id);
+          if (seen.has(key) || !returnedEvidence.has(key)) throw fail('citation_not_returned');
+          seen.add(key);
+        }
+        return true;
+      };
       const tools = Object.freeze({
         async search(query) {
           if (!nonempty(query) || Buffer.byteLength(query) > limits.queryBytes) throw fail('query_invalid');
@@ -39,6 +59,8 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
               if (!nonempty(row?.id) || !nonempty(row?.text) || !access.readScopes.includes(row.scope)) throw fail('retrieval_scope_invalid');
               if (arm === 'raw-only') {
                 if (!access.evidenceScopes.includes(row.scope)) throw fail('evidence_scope_invalid');
+                if (offered.has(row.id) || next.has(row.id)) throw fail('duplicate_item');
+                next.set(row.id, new Map([[row.id, row.scope]]));
                 return { id: row.id, scope: row.scope, text: row.text };
               }
               if (!Array.isArray(row.evidence)) throw fail('retrieval_invalid');
@@ -51,7 +73,10 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
             if (retrievalBytes + bytes > limits.retrievalBytes) throw fail('retrieval_bytes_limit');
             if (arm === 'raw-only' && evidenceBytes + bytes > limits.evidenceBytes) throw fail('evidence_limit');
             returned += rows.length; retrievalBytes += bytes;
-            if (arm === 'raw-only') evidenceBytes += bytes;
+            if (arm === 'raw-only') {
+              evidenceBytes += bytes;
+              for (const row of result) returnedEvidence.add(pair(row.id, row.id));
+            }
             for (const [id, refs] of next) offered.set(id, refs);
             return result;
           } finally { inFlight--; }
@@ -65,10 +90,12 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
             try {
               const row = await memory.resolve({ ...access, storeId, itemId, evidenceId });
               if (closed) throw fail('answer_closed');
-              if (row?.id !== evidenceId || row.scope !== offered.get(itemId).get(evidenceId) || !access.evidenceScopes.includes(row.scope) || typeof row.text !== 'string') throw fail('evidence_scope_invalid');
+              if (row?.id !== evidenceId || row.scope !== offered.get(itemId).get(evidenceId) || !access.evidenceScopes.includes(row.scope)
+                || typeof row.text !== 'string' || !row.text.trim()) throw fail('evidence_scope_invalid');
               const bytes = Buffer.byteLength(row.text);
               if (evidenceBytes + bytes > limits.evidenceBytes) throw fail('evidence_limit');
               evidenceBytes += bytes;
+              returnedEvidence.add(pair(itemId, evidenceId));
               return { id: row.id, scope: row.scope, text: row.text };
             } finally { inFlight--; }
           })();
@@ -79,14 +106,22 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
         answer = await respond({ request: input.request, instructions: s.answerer.instructions, route: s.answerer.route,
           model: s.answerer.model, reasoning: s.answerer.reasoning, outputTokens: limits.outputTokens,
           inputTokens: limits.inputTokens, modelCalls: limits.modelCalls, formatRepairCalls: limits.formatRepairCalls ?? 1,
-          repairInstruction: s.answerer.repair_instruction ?? null, costNano: limits.costNano, tools });
+          repairInstruction: s.answerer.repair_instruction ?? null, costNano: limits.costNano, tools, validateAnswer });
         if (inFlight) throw fail('outstanding_tool_calls');
       } finally { closed = true; }
       if (!answer || typeof answer.text !== 'string' || Buffer.byteLength(answer.text) > limits.responseBytes) throw fail('answer_invalid');
-      return { caseId: input.id, answer: { text: answer.text }, condition: arm, diagnostic: ['reference', 'raw-only'].includes(arm),
+      try { answer = structuredClone(answer); } catch { throw fail('answer_invalid'); }
+      validateAnswer(answer);
+      const abstained = answer.citations.length === 0;
+      return { caseId: input.id, answer: { text: abstained ? UNKNOWN_ANSWER : answer.text, citations: structuredClone(answer.citations) },
+        condition: arm, diagnostic: ['reference', 'raw-only'].includes(arm),
         trace: { caseId: input.id, caseDigest: s.cases[input.id], sealDigest: seal.digest,
           context: { request: input.request, actor: input.actor, queryTime: input.queryTime, readScopes: [...input.readScopes], evidenceScopes: [...input.evidenceScopes] },
-          searchCalls: searches, resolveCalls: resolves, returnedItems: returned, returnedItemIds: [...offered.keys()], evidenceBytes, retrievalBytes }, sealDigest: seal.digest };
+          searchCalls: searches, resolveCalls: resolves, returnedItems: returned, returnedItemIds: [...offered.keys()], evidenceBytes, retrievalBytes,
+          citations: structuredClone(answer.citations), returnedEvidence: [...returnedEvidence].map(value => {
+            const [item_id, evidence_id] = JSON.parse(value);
+            return { item_id, evidence_id };
+          }), abstention: abstained ? 'host_enforced_no_citations' : 'not_enforced' }, sealDigest: seal.digest };
     },
   };
 }
