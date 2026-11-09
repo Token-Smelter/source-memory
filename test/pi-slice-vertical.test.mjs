@@ -31,7 +31,7 @@ test('one fictional slice passes the gate, shared replay, fake Pi routing and me
           modelRuntime.streamSimple(selected, {});
           await registered.get('memory_search').execute('s', { query: 'fiction', kinds: [] });
           const message = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '{"result":"done_nothing_qualifies","reason":"No useful change."}' }], usage: { input: 10, cacheRead: 3, cacheWrite: 0, output: 2 } };
-          this.messages.push(message); subscriber({ type: 'turn_end', message });
+          this.messages.push(message); subscriber({ type: 'message_end', message }); subscriber({ type: 'turn_end', message });
         } } };
     } };
     const docker = { gateway: '172.30.0.1', async createNetwork() { return 'net'; }, async createDatabase() { return 'db'; },
