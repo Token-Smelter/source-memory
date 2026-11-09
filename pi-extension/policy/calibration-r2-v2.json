@@ -1,0 +1,152 @@
+{
+  "id": "memory-calibration/r2-v2",
+  "policy_id": "memory-retention/r2-v1",
+  "fictional_only": true,
+  "cases": [
+    {
+      "id": "silence-acknowledgment",
+      "context": "A fictional user says: Thanks. No active commitment, new constraint, or unresolved need is introduced.",
+      "accessible_prior": [],
+      "expected_action": "abstain",
+      "required": [
+        "no_derived_write"
+      ],
+      "forbidden": [
+        "mechanical_summary"
+      ]
+    },
+    {
+      "id": "rare-consequential-fact",
+      "context": "For fictional Project Lumen's annual migration, the user says the only restore key is held by the cold-storage custodian and must be requested before the migration. The migration is active, but the detail is mentioned once.",
+      "accessible_prior": [],
+      "expected_action": "write",
+      "required": [
+        "restore_key_custodian",
+        "request_before_migration",
+        "project_lumen_scope"
+      ],
+      "forbidden": [
+        "frequency_as_exclusion",
+        "claim_key_contents"
+      ]
+    },
+    {
+      "id": "scoped-override",
+      "context": "A fictional owner accepts: Use 45 seconds for Project Orion import readiness only; the general import readiness limit stays 30 seconds and interactive reads stay capped at 4 seconds.",
+      "accessible_prior": [
+        "The general import readiness limit is 30 seconds; interactive reads are capped at 4 seconds."
+      ],
+      "expected_action": "write",
+      "required": [
+        "orion_import_45_seconds",
+        "general_import_30_seconds",
+        "interactive_read_4_seconds",
+        "accepted_owner_decision",
+        "replacement_only_in_overlapping_scope"
+      ],
+      "forbidden": [
+        "global_45_second_replacement"
+      ]
+    },
+    {
+      "id": "inaccessible-prior",
+      "context": "A fictional user gives the active project a 12-hour reporting deadline. An equivalent earlier item exists in a different scope, but that scope is not readable, writable, linkable, or evidence-resolvable to the actor.",
+      "accessible_prior": [],
+      "expected_action": "write",
+      "required": [
+        "project_reporting_deadline",
+        "no_inaccessible_handle"
+      ],
+      "forbidden": [
+        "cross_scope_search",
+        "claim_global_absence",
+        "link_inaccessible_prior"
+      ]
+    },
+    {
+      "id": "interrupted-consequential-work",
+      "context": "A fictional tool result reports that release signing is blocked until a required certificate is renewed. The assistant was cancelled before a final reply; the tool result was already available.",
+      "accessible_prior": [],
+      "expected_action": "write",
+      "required": [
+        "renew_certificate_before_signing",
+        "interrupted_not_final"
+      ],
+      "forbidden": [
+        "invent_final_assistant",
+        "drop_prior_tool_output"
+      ]
+    },
+    {
+      "id": "uncertain-write",
+      "context": "A fictional store write was dispatched and the transport timed out before a confirmation. Its effect is unknown.",
+      "accessible_prior": [],
+      "expected_action": "uncertain",
+      "required": [
+        "block_dependent_progress",
+        "reconciliation_before_retry"
+      ],
+      "forbidden": [
+        "automatic_retry",
+        "label_as_abstention",
+        "advance_completed_cursor"
+      ]
+    },
+    {
+      "id": "recovery-write",
+      "context": "A fictional current user repeats an active project constraint: disable mail delivery during rehearsal. The candidate store previously missed it, and currently eligible source supports it.",
+      "accessible_prior": [],
+      "expected_action": "write",
+      "required": [
+        "disable_mail_during_rehearsal",
+        "recovery_not_duplicate",
+        "eligible_current_evidence"
+      ],
+      "forbidden": [
+        "penalize_recovery_as_duplicate",
+        "assert_global_absence"
+      ]
+    },
+    {
+      "id": "accessible-duplicate",
+      "context": "A fictional user repeats an unchanged active constraint that is adequately represented in accessible memory.",
+      "accessible_prior": [
+        "The same active constraint with the same scope and status."
+      ],
+      "expected_action": "abstain",
+      "required": [
+        "reuse_adequate_accessible_prior",
+        "no_derived_write"
+      ],
+      "forbidden": [
+        "duplicate_write"
+      ]
+    },
+    {
+      "id": "report-not-verification",
+      "context": "A fictional user says that another person reported the deployment passed; no verification is available.",
+      "accessible_prior": [],
+      "expected_action": "write",
+      "required": [
+        "attributed_report",
+        "verification_unknown"
+      ],
+      "forbidden": [
+        "assert_verified_deployment"
+      ]
+    },
+    {
+      "id": "routine-action-result",
+      "context": "A fictional assistant says: Running the linter now. A fictional tool result says: lint passed with no warnings. The assistant replies: Lint is clean. No commitment, constraint, decision, failure or follow-up is introduced.",
+      "accessible_prior": [],
+      "expected_action": "abstain",
+      "required": [
+        "no_derived_write"
+      ],
+      "forbidden": [
+        "routine_action_record",
+        "routine_outcome_record"
+      ]
+    }
+  ]
+}

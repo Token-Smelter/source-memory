@@ -7,6 +7,8 @@ const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const POLICY_SHA256 = '737f85bf69d9a5e6bc892bf5c06ca40c59c8167e3edc2cee5fccc1f9e786ff31';
 const CALIBRATION_SHA256 = '28cfd4378a286b781be665bf63876fc89615e5c49d354e36c5bf653751c52703';
 const COVERAGE_SHA256 = '907da5f0582b654b67fef43c75afbb7c37b608f685114d1c0984cb579f225e9f';
+// v2 adds a routine action/result case (expected abstain) for model-driven treatment checks; v1 stays the frozen contract set.
+const CALIBRATION_V2_SHA256 = '47ed4e8ad8a179270be11f19db2e851bdc40c3f55434ab8cbcc4ea2dd5d00c4d';
 
 function readSealed(name, expected) {
   const bytes = readFileSync(new URL(`./policy/${name}`, import.meta.url));
@@ -23,6 +25,12 @@ export function fictionalCalibration() {
   const value = readSealed('calibration-r2-v1.json', CALIBRATION_SHA256);
   if (value.policy_id !== retentionPolicy().value.id || value.fictional_only !== true) throw fail('calibration_invalid');
   return { sha256: CALIBRATION_SHA256, value };
+}
+
+export function fictionalCalibrationV2() {
+  const value = readSealed('calibration-r2-v2.json', CALIBRATION_V2_SHA256);
+  if (value.policy_id !== retentionPolicy().value.id || value.fictional_only !== true) throw fail('calibration_invalid');
+  return { sha256: CALIBRATION_V2_SHA256, value };
 }
 
 export function fictionalCoverage() {
