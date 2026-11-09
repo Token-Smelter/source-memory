@@ -52,6 +52,51 @@ export function contextMessages(pi, manager, excludedSummaryIds) {
     : pi.sessionEntryToContextMessages(entry));
 }
 
+/**
+ * Keeps the distiller under the model's context window without sliding: the oldest whole messages are dropped once, down
+ * to a target, and that cut stays fixed for later checkpoints (preserving the cached prefix) until the context overflows
+ * again. Contexts whose estimate is under the threshold are passed through unchanged.
+ *
+ * Token density varies several-fold across sessions (observed 0.13–0.34 tokens per JSON byte), so a fixed ratio would cut
+ * contexts that fit. The estimate instead extends the previous checkpoint's provider-reported input tokens for the same
+ * prefix by the new bytes at a dense-content rate; before any observation it uses that dense rate for everything.
+ */
+export const CONTEXT_WINDOW = Object.freeze({ thresholdFraction: 0.9, targetFraction: 0.7, denseTokensPerByte: 0.5 });
+export const omittedHistoryNote = count => `[Earlier history omitted (${count} messages); use Memory search for it.]`;
+export function createContextWindow({ contextWindow }) {
+  if (!Number.isSafeInteger(contextWindow) || contextWindow < 1) throw fail('context_window_unknown');
+  let cut = 0, last = null;
+  const bytesOf = messages => Buffer.byteLength(JSON.stringify(messages));
+  const estimate = (messages, at = cut) => {
+    const bytes = bytesOf(messages);
+    if (last && last.cut === at && bytes >= last.bytes) return Math.ceil(last.tokens + (bytes - last.bytes) * CONTEXT_WINDOW.denseTokensPerByte);
+    // A different cut is sized at the last observed density; the target leaves room for that approximation.
+    return Math.ceil(bytes * (last ? Math.max(last.tokens / last.bytes, 0.1) : CONTEXT_WINDOW.denseTokensPerByte));
+  };
+  const view = (messages, at) => at ? [{ role: 'user', content: [{ type: 'text', text: omittedHistoryNote(at) }], timestamp: 0 }, ...messages.slice(at)] : messages;
+  return {
+    apply(messages) {
+      if (cut > messages.length) throw fail('context_cut_invalid');
+      let recut = false;
+      if (estimate(view(messages, cut)) > contextWindow * CONTEXT_WINDOW.thresholdFraction) {
+        // Cut only before a user message so no tool result is separated from its call.
+        const starts = messages.map((row, i) => row.role === 'user' && i > cut ? i : -1).filter(i => i > 0);
+        const next = starts.find(i => estimate(view(messages, i), i) <= contextWindow * CONTEXT_WINDOW.targetFraction);
+        if (next === undefined) throw fail('context_window_exceeded');
+        cut = next; recut = true;
+      }
+      return { messages: view(messages, cut), status: cut ? { surface: 'context-window', omitted_messages: cut, kept_messages: messages.length - cut,
+        recut, estimated_tokens: estimate(view(messages, cut)) } : null };
+    },
+    /** Records the provider-reported input tokens for the context actually sent at the current cut. */
+    observe(messages, inputTokens) {
+      const bytes = bytesOf(messages);
+      if (bytes > 0 && Number.isSafeInteger(inputTokens) && inputTokens > 0) last = { cut, bytes, tokens: inputTokens };
+    },
+    state() { return { cut, last: last && { ...last } }; },
+  };
+}
+
 /** Reopen one incremental private Pi file for each side branch while keeping its fixed session ID. */
 export async function createPiDistiller({ pi, incremental, workDir, model, modelRuntime, memory, scope, reviewer, budget, ensureIndexed, reviewMode = 'separate', createOptions = {} }) {
   if (!pi?.SessionManager || typeof pi.createAgentSession !== 'function' || !incremental?.sessionId
@@ -119,6 +164,9 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
     createOptions = { ...createOptions, settingsManager };
   }
   let busy = false;
+  // Models without a declared window (fictional test doubles) get Pi's context unchanged.
+  const window = Number.isSafeInteger(model.contextWindow) ? createContextWindow({ contextWindow: model.contextWindow })
+    : { apply: messages => ({ messages, status: null }), observe() {} };
   return {
     sessionId,
     memory,
@@ -137,7 +185,8 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
         activeSession = session;
         // A distiller-side compaction would rebuild the context from Pi's own view and re-admit a withheld summary.
         if (input.excludedSummaryIds?.length && session.settingsManager?.getCompactionSettings?.()?.enabled !== false) throw fail('summary_exclusion_unavailable');
-        session.agent.state.messages = contextMessages(pi, manager, input.excludedSummaryIds);
+        const windowed = window.apply(contextMessages(pi, manager, input.excludedSummaryIds));
+        session.agent.state.messages = windowed.messages;
         const priorMessages = session.messages.length;
         const startReceipt = budget?.receipts().length ?? 0;
         const startCalls = budget?.started() ?? 0;
@@ -170,6 +219,8 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
             image_limitations: currentTools.imageNotes() }));
         await session.agent.waitForIdle?.();
         const reply = session.messages.slice(priorMessages).findLast(row => row.role === 'assistant');
+        const firstUsage = session.messages.slice(priorMessages).find(row => row.role === 'assistant')?.usage;
+        if (firstUsage) window.observe(windowed.messages, (firstUsage.input ?? 0) + (firstUsage.cacheRead ?? 0) + (firstUsage.cacheWrite ?? 0));
         if (budget && (budget.started() === startCalls || budget.reason() === 'input_budget_unknown')) throw fail('usage_unavailable');
         if (!reply || ['error', 'aborted'].includes(reply.stopReason)) throw fail(budget?.reason() ?? 'distillation_incomplete');
         const text = (reply.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('');
@@ -195,7 +246,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           link = { mode: reviewMode, receipt: await memory.applyLinks(pending.token, review) };
         }
         return { status: 'complete', disposition, model_result: modelResult.result, evaluation_reason: modelResult.reason, policy_sha256: policy.sha256,
-          search_limitations: { incomplete: stats.incomplete_search, statuses: stats.search_statuses,
+          search_limitations: { incomplete: stats.incomplete_search, statuses: windowed.status ? [...stats.search_statuses, windowed.status] : stats.search_statuses,
             returned_prior_ids: stats.returned_prior_ids, fetched_ids: stats.fetched_ids, link_candidate_ids: stats.link_candidate_ids,
             abstention_support: disposition === 'abstained' ? 'candidate_assessed_not_independently_verified' : null },
           usage: reply.usage ?? null, call_usage: budget?.receipts().slice(startReceipt) ?? [],
