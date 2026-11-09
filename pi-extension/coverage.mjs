@@ -150,6 +150,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
             if (typeof result?.token === 'string') outcomeIds.set(result.token, [args[2]?.id, args[3]?.id].filter(id => typeof id === 'string'));
             return result;
           };
+          if (effectIds && key === 'cancelOutcome') return async (...args) => { outcomeIds.delete(args[0]); return value.apply(target, args); };
           if (key === 'beginLinks') return async (...args) => {
             if (!active) throw fail('interval_not_started');
             const result = await value.apply(target, args), info = result?.packet?.retrieval;
@@ -168,6 +169,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
             if (active.effects.has(effect)) throw fail('effect_already_attempted');
             const ids = !effectIds ? null : key === 'enrich' ? args[1]?.records?.map(row => row?.id) ?? []
               : key === 'applyOutcome' ? outcomeIds.get(args[1]) ?? null : null;
+            if (key === 'applyOutcome') outcomeIds.delete(args[1]);
             append({ type: 'effect_begin', id, method: key, effect, ...(ids && idList(ids) ? { ids } : {}) });
             try {
               const result = await value.apply(target, args);
@@ -184,6 +186,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
       });
     },
     finish(disposition, code = null, search = null, { boundaries } = {}) {
+      outcomeIds.clear();
       if (boundaries !== undefined && (!Array.isArray(boundaries) || !boundaries.length
         || boundaries.some(row => !row || Object.keys(row).sort().join(',') !== 'disposition,entry_id,reason,type'
           || typeof row.entry_id !== 'string' || !row.entry_id || !['compaction', 'branch_summary'].includes(row.type)

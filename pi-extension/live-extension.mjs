@@ -84,7 +84,7 @@ export function readLiveConfig(path) {
 function readOwnJson(path, label) {
   let fd;
   try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
-  catch { throw fail(`${label}_unsafe`); }
+  catch (problem) { throw fail(problem.code === 'ENOENT' ? `${label}_missing` : `${label}_unsafe`); }
   try {
     const st = fstatSync(fd);
     if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o022) !== 0) throw fail(`${label}_unsafe`);
@@ -207,8 +207,11 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
         // First seen means no durable coverage state yet, not merely a missing directory.
         const fresh = !journal.intervals().length && journal.state().status === 'ready' && cursorStore.load() === null;
         const controller = createLiveController({ journal, cursorStore,
-          conversationId: sessionId, maxRetries: config.maxRetries, gate, baseline: fresh && !config.backfill ? baseline : null,
+          conversationId: sessionId, sessionId, maxRetries: config.maxRetries, gate, baseline: fresh && !config.backfill ? baseline : null,
           open: () => openSession(journal, sessionId, sessionFile, dir) });
+        // Mark the session seen now (a null cursor), so turns that fail before their first interval are not baselined away on
+        // a later resume; this instance still records its own baseline, if any, at the first settle.
+        if (fresh) cursorStore.save(null);
         entry = { controller, journal, sessionFile };
         controllers.set(sessionId, entry);
       }

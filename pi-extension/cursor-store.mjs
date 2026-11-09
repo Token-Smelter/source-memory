@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, fstatSync, fsyncSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, linkSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { digest } from '../src/core.mjs';
 
@@ -11,14 +11,46 @@ function syncDirectory(dir) {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-/** Write a new private file durably: exclusive create, fsync, directory fsync. An existing file is left unchanged. */
-export function writeDurableFile(directory, name, bytes) {
-  const path = join(directory, name);
-  const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+function readOwnFile(path) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    for (let offset = 0; offset < bytes.length;) offset += writeSync(fd, bytes, offset, bytes.length - offset);
-    fsyncSync(fd);
+    const st = fstatSync(fd);
+    if (!st.isFile() || !owned(st)) throw fail('durable_file_conflict');
+    return readFileSync(fd);
   } finally { closeSync(fd); }
+}
+
+/**
+ * Write a new private file durably and whole: a fsynced temp file is hard-linked into place, so the name never shows a partial
+ * file. An existing file with the same bytes is accepted. An existing file that fails `valid` (for example a content-addressed
+ * name whose bytes no longer hash to it) is provably corrupt and is renamed aside before relinking; anything else refuses with
+ * durable_file_conflict.
+ */
+export function writeDurableFile(directory, name, bytes, { valid = () => true } = {}) {
+  const path = join(directory, name);
+  // Temp files from a crash before the link are never the file; younger ones may belong to a concurrent writer.
+  for (const entry of readdirSync(directory)) {
+    if (!entry.startsWith(`.${name}.`) || !entry.endsWith('.tmp')) continue;
+    try { if (Date.now() - statSync(join(directory, entry)).mtimeMs > 60000) unlinkSync(join(directory, entry)); } catch {}
+  }
+  const temporary = join(directory, `.${name}.${randomUUID()}.tmp`);
+  try {
+    const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try {
+      for (let offset = 0; offset < bytes.length;) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    try { linkSync(temporary, path); }
+    catch (problem) {
+      if (problem.code !== 'EEXIST') throw problem;
+      const existing = readOwnFile(path);
+      if (!existing.equals(bytes)) {
+        if (valid(existing)) throw fail('durable_file_conflict');
+        renameSync(path, join(directory, `${name}.corrupt-${randomUUID()}`));
+        linkSync(temporary, path);
+      }
+    }
+  } finally { try { unlinkSync(temporary); } catch {} }
   syncDirectory(directory);
   return path;
 }

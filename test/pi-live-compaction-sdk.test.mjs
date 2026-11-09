@@ -31,7 +31,7 @@ test('a compaction with any truthy fromHook or a kept entry at or after itself h
   ['summary_closure_unproved', 'summary_closure_unproved', 'summary_closure_unproved', 'summary_closure_unproved', null]);
 });
 
-test('a compaction inherits an inadmissible previous summary even when that summary sits in its kept region', () => {
+test('a compaction inherits an inadmissible previous summary that precedes its kept boundary', () => {
   const entries = [user('u1', null, 'One.'), reply('a1', 'u1', 'One.'), compaction('c1', 'a1', undefined, { firstKeptEntryId: undefined }),
     user('u2', 'c1', 'Two.'), reply('a2', 'u2', 'Two.'), compaction('c2', 'a2', 'u2'), user('u3', 'c2', 'Three.'), reply('a3', 'u3', 'Three.')];
   const verdicts = sourceInterval(entries, 'a3', null, 'fiction', policy).omissions.summaries.map(row => [row.entry_id, row.reason]);
@@ -56,6 +56,14 @@ test('a failed interval across a compaction is retried and covered', () => priva
   assert.deepEqual([failed.status, retried.status, retried.results.map(row => row.disposition)], ['stopped', 'current', ['abstained']]);
   journal.close();
 }));
+
+test('the next compaction\'s span starts at the previous kept boundary, so a branch summary kept there taints it', () => {
+  const entries = [user('u1', null, 'One.'), reply('a1', 'u1', 'One.'), { type: 'branch_summary', id: 'b1', parentId: 'a1', summary: 'Elsewhere.', fromId: 'gone' },
+    user('u2', 'b1', 'Two.'), reply('a2', 'u2', 'Two.'), compaction('c1', 'a2', 'b1'), user('u3', 'c1', 'Three.'), reply('a3', 'u3', 'Three.'),
+    compaction('c2', 'a3', 'u3'), user('u4', 'c2', 'Four.'), reply('a4', 'u4', 'Four.')];
+  const verdicts = sourceInterval(entries, 'a4', null, 'fiction', policy).omissions.summaries.map(row => [row.entry_id, row.reason]);
+  assert.deepEqual(verdicts, [['b1', 'summary_source_off_branch'], ['c1', null], ['c2', 'summary_dependency_inadmissible']]);
+});
 
 test('journal boundaries must be exact summary verdicts and an invalid policy writes no interval', () => privateDir(async directory => {
   const journal = createCoverageJournal({ directory, sessionKey: 'fiction' });
@@ -160,12 +168,13 @@ test('the distiller never sends a withheld summary to the model, and an empty ex
   const model = { provider: 'fiction', id: 'model', api: 'anthropic-messages', baseUrl: 'http://127.0.0.1:1', contextWindow: 100000,
     maxTokens: 1000, input: ['text'], reasoning: false, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
   const run = async (exclusions, createOptions = {}) => {
-    const contexts = [], whole = [], firstRoles = [];
+    const contexts = [], whole = [], firstRoles = [], firstTexts = [];
     let calls = 0;
     const runtime = { hasConfiguredAuth: () => true, streamSimple(_model, context) {
       contexts.push(JSON.stringify(context.messages.slice(0, -1 - calls), (key, value) => key === 'timestamp' ? undefined : value));
       whole.push(JSON.stringify(context));
       firstRoles.push(context.messages[0]?.role);
+      firstTexts.push(JSON.stringify(context.messages[0]?.content ?? ''));
       const content = calls === 0 ? [{ type: 'toolCall', id: 's', name: 'memory_search', arguments: { query: 'fiction', kinds: [] } }]
         : calls === 1 ? [{ type: 'toolCall', id: 'd', name: 'memory_submit', arguments: { result: 'done_nothing_qualifies', reason: 'Fiction.' } }]
           : [{ type: 'text', text: 'Done.' }];
@@ -180,13 +189,13 @@ test('the distiller never sends a withheld summary to the model, and an empty ex
       scope: 'fiction', createOptions });
     const result = await distiller.run({ throughEntryId: leaf, turn: { turn_id: 'fiction', entries: [{ id: 'u', role: 'user', text: 'Fictional request after compaction.' }] },
       receipt: { id: 'turn' }, ...(exclusions === undefined ? {} : { excludedSummaryIds: exclusions }) });
-    return { result, contexts, whole, firstRoles };
+    return { result, contexts, whole, firstRoles, firstTexts };
   };
   const withheld = await run(excludedSummaryIds);
   const plain = await run(undefined);
   const empty = await run([]);
   assert.deepEqual([excludedSummaryIds.length, withheld.result.disposition, withheld.whole.some(text => text.includes('MARKER-TEXT')),
-    plain.contexts.some(text => text.includes('HOOK-MARKER-TEXT')), empty.contexts[0] === plain.contexts[0], withheld.firstRoles.every(role => role === 'user')],
+    plain.contexts.some(text => text.includes('HOOK-MARKER-TEXT')), empty.contexts[0] === plain.contexts[0], withheld.firstRoles.every(role => role === 'user') && withheld.firstTexts.every(text => text.includes('Earlier context withheld'))],
   [2, 'abstained', false, true, true, true]);
   const loader = new pi.DefaultResourceLoader({ cwd: directory, agentDir: directory, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
   await loader.reload();

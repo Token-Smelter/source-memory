@@ -306,6 +306,76 @@ test('a provider that ignores abort cannot write anything after shutdown or reac
   } finally { process.off('unhandledRejection', onUnhandled); }
 });
 
+test('a write that starts after shutdown is refused and journaled as refused, and late results never reach the host', { skip: !sdkPath }, async () => {
+  const pi = await loadPi();
+  const paths = layout('late-write');
+  writeFileSync(paths.configPath, JSON.stringify({ ...paths.config, shutdown_grace_ms: 400 }), { mode: 0o600 });
+  const { store, spawnMemory } = fakeMemory();
+  let releaseBegin, entered;
+  const beganOutcome = new Promise(resolve => { entered = resolve; });
+  const memoryFactory = () => {
+    const child = spawnMemory();
+    child.memory.beginOutcome = async () => { entered(); await new Promise(resolve => { releaseBegin = resolve; }); return { token: 'outcome', proposal: { requires_review: false } }; };
+    child.memory.applyOutcome = async () => ({ status: 'written', records: [] });
+    return child;
+  };
+  const script = scriptedRuntime(async context => {
+    const results = (context.messages ?? []).filter(row => row.role === 'toolResult').length;
+    if (!results) return { content: [{ type: 'toolCall', id: 's', name: 'memory_search', arguments: { query: 'fiction', kinds: [] } }], stopReason: 'toolUse' };
+    return { content: [{ type: 'toolCall', id: 'o', name: 'memory_record', arguments: { kind: 'outcome', text: 'Fictional outcome.', evidence_labels: ['ref-000001'],
+      new_action: { text: 'Fictional action.', evidence_labels: ['ref-000001'] } } }], stopReason: 'toolUse' };
+  });
+  const late = [];
+  let closed = false;
+  const factory = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory: memoryFactory, resolveModels: fakeModels(script),
+    onResult: result => { if (closed) late.push(result); }, onError: error => { if (closed) late.push(error.code); } });
+  const { session, sessionManager } = await hostSession(pi, { ...paths, factories: [factory] });
+  await session.prompt('Fictional: an outcome under review.');
+  await beganOutcome;
+  closed = true;
+  const closing = shutdown(session);
+  releaseBegin();
+  await closing;
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const journalRows = readFileSync(join(sessionDirOf(paths), readdirSync(sessionDirOf(paths)).find(name => name.endsWith('.jsonl'))), 'utf8')
+    .trim().split('\n').map(JSON.parse);
+  const begun = journalRows.find(row => row.type === 'effect_begin' && row.method === 'applyOutcome');
+  const ended = journalRows.find(row => row.type === 'effect_end' && row.effect === begun?.effect);
+  assert.deepEqual([ended?.outcome, journalRows.some(row => row.outcome === 'unknown'), late], ['refused', false, []]);
+  const results = [];
+  const next = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory, resolveModels: fakeModels(distillerRuntime()),
+    onResult: result => results.push(result) });
+  const resumed = await hostSession(pi, { ...paths, factories: [next], sessionFile: sessionManager.getSessionFile() });
+  await resumed.session.prompt('Fictional: after the restart.');
+  await waitFor(() => results.length === 1);
+  assert.deepEqual([results[0].status, results[0].reconciled?.blocked ?? null], ['covered', null]);
+  await shutdown(resumed.session);
+  assert.equal(store.spawned, store.closed);
+});
+
+test('a session whose first turns were refused is not baselined away when it is resumed', { skip: !sdkPath }, async () => {
+  const pi = await loadPi();
+  const paths = layout('refused-first');
+  writeFileSync(paths.config.memory.config, JSON.stringify({ neo4j: { uri: 'bolt://127.0.0.1:1', auth: 'none' }, scopes: { read: ['fiction'], write: [] } }), { mode: 0o600 });
+  const { store, spawnMemory } = fakeMemory();
+  const refused = [];
+  const first = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory, resolveModels: fakeModels(distillerRuntime()),
+    onResult: result => refused.push(result.status) });
+  const host = await hostSession(pi, { ...paths, factories: [first] });
+  await host.session.prompt('Fictional day-one turn.');
+  await waitFor(() => refused.length === 1);
+  await shutdown(host.session);
+  writeFileSync(paths.config.memory.config, JSON.stringify({ neo4j: { uri: 'bolt://127.0.0.1:1', auth: 'none' }, scopes: { read: ['fiction'], write: ['fiction'] } }), { mode: 0o600 });
+  const results = [];
+  const next = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory, resolveModels: fakeModels(distillerRuntime()),
+    onResult: result => results.push(result) });
+  const resumed = await hostSession(pi, { ...paths, factories: [next], sessionFile: host.sessionManager.getSessionFile() });
+  await resumed.session.prompt('Fictional day-two turn.');
+  await waitFor(() => results.length === 1);
+  assert.deepEqual([refused, results[0].status, store.ingests.map(row => row.length)], [['refused'], 'covered', [4]]);
+  await shutdown(resumed.session);
+});
+
 test('a session first seen with history starts after it, unless backfill is configured', { skip: !sdkPath }, async () => {
   const pi = await loadPi();
   for (const backfill of [false, true]) {

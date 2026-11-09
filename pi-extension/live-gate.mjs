@@ -7,6 +7,8 @@ const fail = code => Object.assign(new Error(code), { code });
 const refusal = code => Object.assign(new Error(code), { code, refused: true });
 const counted = ['input', 'cacheRead', 'cacheWrite'];
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
+// Identifies this process's own call starts in a ledger it shares with other processes.
+const INSTANCE = randomUUID();
 const tokens = row => counted.every(key => Number.isSafeInteger(row[key]) && row[key] >= 0);
 
 /** A row is understood only in its exact shapes; anything else is unknown usage. */
@@ -111,7 +113,8 @@ export function createUsageLedger({ directory, now = () => new Date() }) {
       const today = of(when);
       if (today.some(row => row.kind === 'usage' && row.status === 'unknown')) return true;
       const reported = receipts();
-      return today.some(row => row.kind === 'call' && !reported.has(row.id) && !ownerAlive(row.owner, self));
+      // A call started by this process is provably in flight even where /proc cannot prove anything.
+      return today.some(row => row.kind === 'call' && !reported.has(row.id) && row.owner?.instance !== INSTANCE && !ownerAlive(row.owner, self));
     },
     intervals: (when = day()) => of(when).filter(row => row.kind === 'interval').length,
     append(row) {
@@ -121,16 +124,17 @@ export function createUsageLedger({ directory, now = () => new Date() }) {
       refresh();
       return entry;
     },
-    callStart() { return this.append({ kind: 'call', id: randomUUID(), owner: self }).id; },
-    /** Run a check-and-append decision exclusively across processes sharing the directory. */
-    exclusive(action) {
+    callStart() { return this.append({ kind: 'call', id: randomUUID(), owner: { ...self, instance: INSTANCE } }).id; },
+    /** Run a check-and-append decision exclusively across processes sharing the directory, waiting without blocking the host. */
+    async exclusive(action) {
       const lockPath = join(dir, 'usage.lock');
       let lock;
       for (let attempt = 0; !lock; attempt++) {
         try { lock = acquireOwnerLock(lockPath); }
         catch (problem) {
-          if (problem.code !== 'journal_locked' || attempt >= 200) throw refusal('ledger_busy');
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          if (problem.code !== 'journal_locked') throw refusal('ledger_lock_unavailable');
+          if (attempt >= 200) throw refusal('ledger_busy');
+          await new Promise(resolve => setTimeout(resolve, 10));
         }
       }
       try { return action(); } finally { lock.release(); }
@@ -148,8 +152,10 @@ export function createDailyInputBudget({ ledger, limit }) {
   if (!Number.isSafeInteger(limit) || limit <= 0 || typeof ledger?.callStart !== 'function') throw fail('input_budget_invalid');
   const own = [];
   let unknownDay = null, prevented = 0, stopped = false;
-  const check = () => {
-    if (unknownDay === ledger.day() || own.some(call => !call.receipt) || ledger.unknown()) return 'input_budget_unknown';
+  // A reviewer call nests inside the distiller's tool call, before Pi reports the distiller's usage; this process's own
+  // open calls are provably in flight, so they block only the external reason(), not a nested dispatch.
+  const check = ({ nested = false } = {}) => {
+    if (unknownDay === ledger.day() || (!nested && own.some(call => !call.receipt)) || ledger.unknown()) return 'input_budget_unknown';
     return ledger.used() >= limit ? 'input_budget_exhausted' : null;
   };
   return {
@@ -158,18 +164,21 @@ export function createDailyInputBudget({ ledger, limit }) {
     stop() { stopped = true; },
     beforeCall() {
       if (stopped) { prevented++; throw fail('dispatch_prevented'); }
-      const reason = check();
+      const reason = check({ nested: true });
       // Pi reports a dispatch it never made with empty usage; that report must not read as lost spend.
       if (reason) { prevented++; throw fail(reason); }
       own.push({ id: ledger.callStart(), receipt: null });
     },
     record(usage) {
-      const call = own.find(row => !row.receipt);
-      if (!call && prevented && usage && counted.every(key => usage[key] === 0)) { prevented--; return; }
+      // Nested calls report innermost first, so a report settles the most recent open call.
+      const call = own.findLast(row => !row.receipt);
+      // An empty report answers a prevented dispatch first, so it can never settle an open call as zero tokens.
+      if (prevented && usage && counted.every(key => usage[key] === 0)) { prevented--; return; }
       const valid = usage && tokens(usage) && Number.isSafeInteger(counted.reduce((sum, key) => sum + usage[key], 0));
       const receipt = valid ? { input: usage.input, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite,
         output: Number.isSafeInteger(usage.output) ? usage.output : null } : { status: 'unknown' };
-      // The durable unknown row covers every process; this process's own flag ends with its day.
+      // An invalid report writes a durable unknown row for every process; a report without an open call is known only
+      // to this process, whose flag ends with its day.
       if (!valid || !call) unknownDay = ledger.day();
       if (call) call.receipt = receipt;
       try { ledger.append({ kind: 'usage', ...(call ? { call: call.id } : {}), ...receipt }); }
@@ -178,7 +187,7 @@ export function createDailyInputBudget({ ledger, limit }) {
     used: () => ledger.used(),
     started: () => own.length,
     receipts: () => own.filter(row => row.receipt).map(row => structuredClone(row.receipt)),
-    reason: check,
+    reason: () => check(),
     limit,
   };
 }
