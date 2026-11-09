@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { compactResult } from './helpers/compact-fixture.mjs';
+import { digest } from '../src/core.mjs';
 import { distillerRuntime, fakeModels, hostSession, scriptedRuntime } from './helpers/fake-pi.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'pi-live-extension-'));
@@ -351,6 +352,26 @@ test('a write that starts after shutdown is refused and journaled as refused, an
   assert.deepEqual([results[0].status, results[0].reconciled?.blocked ?? null], ['covered', null]);
   await shutdown(resumed.session);
   assert.equal(store.spawned, store.closed);
+});
+
+test('a failure after the journal opens releases its lock, so the real error repeats instead of journal_locked', { skip: !sdkPath }, async () => {
+  const pi = await loadPi();
+  const paths = layout('controller-failure');
+  const { spawnMemory } = fakeMemory();
+  const errors = [];
+  const factory = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory, resolveModels: fakeModels(distillerRuntime()),
+    onError: error => errors.push(error.code) });
+  const { session, sessionManager } = await hostSession(pi, { ...paths, factories: [factory] });
+  const id = sessionManager.getSessionId();
+  const dir = join(paths.config.state_dir, 'sessions', digest(['pi-live-session/v1', id]).slice(0, 32));
+  mkdirSync(join(dir, `cursor-${digest(['live-cursor/v1', id])}.json`), { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  await session.prompt('Fictional one.');
+  await waitFor(() => errors.length === 1);
+  await session.prompt('Fictional two.');
+  await waitFor(() => errors.length === 2);
+  assert.deepEqual(errors, ['cursor_store_invalid', 'cursor_store_invalid']);
+  await shutdown(session);
 });
 
 test('a session whose first turns were refused is not baselined away when it is resumed', { skip: !sdkPath }, async () => {

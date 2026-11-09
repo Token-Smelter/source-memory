@@ -30,7 +30,7 @@ export function writeDurableFile(directory, name, bytes, { valid = () => true } 
   const path = join(directory, name);
   // Temp files from a crash before the link are never the file; younger ones may belong to a concurrent writer.
   for (const entry of readdirSync(directory)) {
-    if (!entry.startsWith(`.${name}.`) || !entry.endsWith('.tmp')) continue;
+    if (!/^\..+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/.test(entry)) continue;
     try { if (Date.now() - statSync(join(directory, entry)).mtimeMs > 60000) unlinkSync(join(directory, entry)); } catch {}
   }
   const temporary = join(directory, `.${name}.${randomUUID()}.tmp`);

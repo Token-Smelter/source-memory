@@ -144,18 +144,21 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
   }
 
   /** End of the covered prefix of this branch: every entry on a covered interval's chain counts, not only its endpoints. */
+  /** Entries of a covered interval's chain, or null when the chain no longer reaches its cursor in these entries. */
+  function chainOf(row, parents) {
+    const chain = [];
+    let id = row.through;
+    for (; id && id !== row.cursor && parents.has(id) && chain.length <= parents.size; id = parents.get(id)) chain.push(id);
+    return (id ?? null) === row.cursor ? chain : null;
+  }
+
   function resolveCursor(entries, path) {
     const saved = cursorStore.load()?.cursor ?? null;
     const intervals = journal.intervals();
     if (saved !== null && !intervals.some(row => row.through === saved)) throw fail('cursor_journal_mismatch');
     const parents = new Map(entries.map(row => [row.id, row.parentId]));
     const coveredIds = new Set();
-    for (const row of intervals) {
-      const chain = [];
-      let id = row.through;
-      for (; id && id !== row.cursor && parents.has(id) && chain.length <= parents.size; id = parents.get(id)) chain.push(id);
-      if ((id ?? null) === row.cursor) for (const entry of chain) coveredIds.add(entry);
-    }
+    for (const row of intervals) for (const entry of chainOf(row, parents) ?? []) coveredIds.add(entry);
     let cursor = null;
     for (let index = path.length - 1; index >= 0 && coveredIds.has(path[index]); index--) cursor = path[index];
     return cursor;
@@ -219,7 +222,8 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         if (!Array.isArray(entries) || !entries.some(row => row?.id === leafId)) return { status: 'skipped', code: 'source_unavailable', results, reconciled };
         // Covered prefixes are computed from the whole append-only tree; a branch-only view would re-ingest shared source.
         const present = new Set(entries.map(row => row?.id));
-        if (journal.intervals().some(row => !present.has(row.through))) return { status: 'blocked', code: 'source_incomplete', results, reconciled };
+        const parents = new Map(entries.map(row => [row?.id, row?.parentId]));
+        if (journal.intervals().some(row => !present.has(row.through) || !chainOf(row, parents))) return { status: 'blocked', code: 'source_incomplete', results, reconciled };
         const pending = journal.state();
         if (pending.status === 'uncertain' || pending.reconciliation_required) {
           // Reconciliation reads Memory, so the scope grants are checked first; it spends no model budget.

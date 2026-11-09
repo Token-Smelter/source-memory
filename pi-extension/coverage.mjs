@@ -15,7 +15,7 @@ const idList = value => Array.isArray(value) && value.length <= 64 && value.ever
 /**
  * One private, append-only journal per session. An orphan lock requires operator inspection, not automatic recovery.
  * effectIds records the deterministic record IDs a derived write names, so a restart can settle an unknown outcome by reading them.
- * pidLock writes an owner record (host, boot, PID namespace, PID, start time) into the lock and takes over only a lock whose
+ * pidLock writes an owner record (host, machine hash, boot, PID namespace, PID, start time) into the lock and takes over only a lock whose
  * recorded owner is provably gone (owner-lock.mjs); an empty, foreign or unreadable lock still requires an operator.
  */
 export function createCoverageJournal({ directory, sessionKey, effectIds = false, pidLock = false }) {
