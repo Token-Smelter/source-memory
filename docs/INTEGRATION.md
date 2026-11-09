@@ -16,23 +16,25 @@ flowchart LR
     Proc --> Store["Scoped Source Memory"]
 ```
 
-Load `pi-extension/live-extension.mjs` as a Pi extension, for example with `pi -e /path/to/source-memory/pi-extension/live-extension.mjs` or by placing it in Pi's extension paths. It reads `SOURCE_MEMORY_PI_LIVE_CONFIG` or `~/.config/source-memory/pi-live.json`. **Without that file it does nothing.** `examples/pi-live.json` shows the shape:
+Load `pi-extension/live-extension.mjs` in place from a checkout, with `pi -e /path/to/source-memory/pi-extension/live-extension.mjs` or a path in Pi's settings `extensions` list. Copying the file elsewhere breaks its relative imports. It reads `SOURCE_MEMORY_PI_LIVE_CONFIG` or `~/.config/source-memory/pi-live.json`, which must be owned by the user and not group- or world-writable. **Without that file it does nothing.** `examples/pi-live.json` shows the shape; unknown keys and out-of-range values refuse the whole file:
 
 | Key | Meaning |
 |---|---|
 | `scope` | The one Memory scope written; the Memory configuration must grant both read and write on it, or the gate refuses. |
 | `state_dir` | Absolute private directory (created `0700`) for per-session journals, cursors, intents, private session copies, `usage.jsonl` and `live.log`. |
 | `memory.config` | Absolute path to the Memory configuration that `serve.mjs` uses (Neo4j, scopes, embedding). `memory.node`, `timeout_ms` and `index_timeout_ms` are optional. |
-| `distiller.model`, `distiller.reviewer`, `thinking` | Pi `provider/model` routes resolved through Pi's own `ModelRuntime` and auth; the reviewer defaults to the distiller model. |
-| `budget.input_tokens_per_day`, `max_intervals_per_day`, `min_remaining_tokens` | Daily gate before ingest. The token budget is required. |
-| `max_retries`, `shutdown_grace_ms`, `pi_sdk`, `enabled` | Retry cap per interval, drain time at `session_shutdown`, an explicit Pi SDK path (otherwise `PI_SDK_MODULE` or the running Pi package), and an off switch. |
+| `distiller.model`, `distiller.reviewer`, `thinking`, `reviewer_thinking` | Pi `provider/model` routes resolved through Pi's own `ModelRuntime` and auth; the reviewer defaults to the distiller model. |
+| `budget.input_tokens_per_day`, `max_intervals_per_day`, `min_remaining_tokens` | Daily gate before ingest, counted across every process sharing `state_dir`. The token budget is required. |
+| `modes` | Pi run modes processed, default `["tui"]`; add `"rpc"`, `"json"` or `"print"` explicitly. One-shot `pi -p` runs are not processed by default. |
+| `backfill` | Default `false`: a session first seen with history (resume, `/fork`, `/clone`) records that history as an `ineligible_by_policy` baseline and starts after it. `true` distills the whole history, subject to the 1,024-entry and 2 MB turn limits. |
+| `max_retries`, `shutdown_grace_ms`, `pi_sdk`, `enabled` | Retry cap per interval (at most 10), drain time at `session_shutdown` (at most 30,000 ms), an explicit Pi SDK path (otherwise `PI_SDK_MODULE` or the running Pi package's bundle), and a boolean off switch. |
 
 Runtime contract:
 
-- **Never blocks the session.** The `agent_settled` handler only snapshots and enqueues. Distillation runs after the handler returns, and the next prompt does not wait for it.
-- **Fails safe.** A missing, disabled or invalid configuration, an unavailable SDK, a failed Memory process or any interval error is written to `live.log` (codes only, no source text) and the `source-memory` footer status, and passed to `onError`. Nothing is thrown into Pi. A startup failure disables the extension for that Pi session.
-- **Lifecycle.** Nothing starts in the factory. The Memory process is spawned on the first admitted interval. `session_shutdown` drains for `shutdown_grace_ms`, then stops the process and closes the journals. Work cut off by shutdown is reconciled on the next start.
-- **Isolation.** Distiller and reviewer sub-sessions load no host extensions, skills or context files, and private session copies are removed when the Memory session closes. Ephemeral sessions without a session file are not processed.
+- **Does not await distillation.** The `agent_settled` handler only snapshots and enqueues; the next prompt does not wait for distillation. The snapshot copy and the private session sync run on the host's event loop and cost O(session size). The first interval also loads the SDK.
+- **Fails safe.** An invalid configuration, an unavailable SDK, a failed Memory process (with its exit code where `serve.mjs` reported one) or any interval error goes to the `source-memory` footer status and to `onError` when the host constructs the extension with `createLiveExtension`. It is also written to `live.log` (codes only, no source text) once the configuration and `state_dir` are valid. A missing or disabled configuration is silent. Nothing is thrown into Pi. A startup failure disables the extension for that Pi session.
+- **Lifecycle.** Nothing starts in the factory. The Memory process is spawned on the first admitted interval. `session_shutdown` marks the instance closed, so queued settles are dropped and a runtime that finishes starting late is closed. It then aborts the running distiller and waits up to `shutdown_grace_ms`, stops the Memory process and waits again (bounded) for the settle to end, closes the journals (releasing their locks) and finally the ledger. Quit, `/new`, `/resume`, `/fork` and `/reload` can therefore wait up to about three grace periods plus the Memory process's exit. An interval cut off by shutdown is retried or reconciled on the next start.
+- **Isolation.** Distiller and reviewer sub-sessions load no host extensions, skills or context files. Private session copies are removed when the Memory session closes, and copies left by a crash are removed when the next one opens. Sessions without a session file (`--no-session`) are not processed and load nothing.
 
 The extension holds one Memory process and one controller per Pi session. Two Pi processes on the same session are refused by the journal lock. Pi processes on different sessions with the same `state_dir` share `usage.jsonl`, so the daily total and interval cap are counted across them.
 
@@ -56,7 +58,7 @@ flowchart LR
 | Package | `source-memory`, private package, Node.js 22 or later, ES modules. The root `exports` entry is `src/memory.mjs`; it does **not** export the Pi integration as a package subpath. |
 | Host entry | `pi-extension/live-extension.mjs` is a default-export Pi extension (above). For a custom host adapter, import the named `registerPiMemory` export from `pi-extension/index.mjs`, or `registerLiveMemory` and `createLiveController` from `pi-extension/live.mjs`. This repository installs nothing into a host automatically. |
 | Registration | Call `registerPiMemory(pi, { prepare, onError })` from a host-owned adapter. The host must verify that its Pi runtime emits the expected `agent_settled` event with the `sessionManager` methods described below. |
-| Status | The live extension is exercised by fictional tests in a real Pi SDK session, and by an end-to-end check against the disposable Neo4j of `npm run test:integration` when `PI_SDK_MODULE` is set. Model routes, providers and spend in a production deployment have not been qualified. |
+| Status | The live extension is exercised by fictional tests in a real Pi SDK session, and by an end-to-end check against the disposable Neo4j of `npm run test:integration`. Both run only when `PI_SDK_MODULE` names the Pi SDK; otherwise those tests skip. Set `SOURCE_MEMORY_REQUIRE_PI_SDK=1` to make a missing SDK fail. The end-to-end check injects scripted models, so live provider routes, `resolvePiModels` against real auth, and spend in a production deployment have not been qualified. |
 
 Illustrative wiring, **not a complete or production-ready bootstrap**:
 

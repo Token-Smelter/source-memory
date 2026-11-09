@@ -9,11 +9,11 @@ const assistant = (content, stopReason) => ({ role: 'assistant', provider: ficti
 
 /** next(context) returns the assistant content and stop reason for each call; it may be async to hold a call open. */
 export function scriptedRuntime(next) {
-  return { hasConfiguredAuth() { return true; }, streamSimple(_model, context) {
+  return { hasConfiguredAuth() { return true; }, streamSimple(_model, context, options = {}) {
     let finish;
     const result = new Promise(resolve => { finish = resolve; });
     return { result: () => result, async *[Symbol.asyncIterator]() {
-      const { content, stopReason } = await next(context);
+      const { content, stopReason } = await next(context, options.signal);
       const message = assistant(content, stopReason);
       yield { type: 'start', partial: message };
       finish(message);
@@ -27,12 +27,16 @@ export const hostRuntime = () => scriptedRuntime(async () => ({ content: [{ type
 
 /** Distiller script: search, record one observation on the first offered label, submit, stop. */
 export function distillerRuntime({ before = async () => {} } = {}) {
-  return scriptedRuntime(async context => {
+  return scriptedRuntime(async (context, signal) => {
     const messages = context.messages ?? [];
     const lastUser = messages.findLastIndex(row => row.role === 'user');
     const results = messages.slice(lastUser + 1).filter(row => row.role === 'toolResult').length;
     if (results === 0) {
-      await before();
+      // A held call ends when Pi aborts it, as a provider stream would.
+      await Promise.race([before(), new Promise((_resolve, reject) => {
+        if (signal?.aborted) reject(new Error('aborted'));
+        signal?.addEventListener?.('abort', () => reject(new Error('aborted')), { once: true });
+      })]);
       return { content: [{ type: 'toolCall', id: 'search', name: 'memory_search', arguments: { query: 'fictional', kinds: [] } }], stopReason: 'toolUse' };
     }
     if (results === 1) return { content: [{ type: 'toolCall', id: 'record', name: 'memory_record',
@@ -47,7 +51,7 @@ export function distillerRuntime({ before = async () => {} } = {}) {
 export const fakeModels = runtime => async () => ({ runtime, model: fictionModel, reviewerModel: fictionModel });
 
 /** A host Pi session that loads extension factories through Pi's own resource loader and persists its session file. */
-export async function hostSession(pi, { cwd, agentDir, sessionDir, factories = [], extensionPaths = [], sessionFile }) {
+export async function hostSession(pi, { cwd, agentDir, sessionDir, factories = [], extensionPaths = [], sessionFile, mode = 'tui' }) {
   const settingsManager = pi.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
   const resourceLoader = new pi.DefaultResourceLoader({ cwd, agentDir, settingsManager, noSkills: true, noPromptTemplates: true, noThemes: true,
     noContextFiles: true, ...(extensionPaths.length ? { additionalExtensionPaths: extensionPaths } : { noExtensions: true }), extensionFactories: factories });
@@ -55,5 +59,7 @@ export async function hostSession(pi, { cwd, agentDir, sessionDir, factories = [
   const sessionManager = sessionFile ? pi.SessionManager.open(sessionFile, sessionDir) : pi.SessionManager.create(cwd, sessionDir);
   const { session } = await pi.createAgentSession({ cwd, agentDir, model: fictionModel, modelRuntime: hostRuntime(), tools: [], sessionManager,
     resourceLoader, settingsManager });
+  // Pi's run modes bind extensions, which sets ctx.mode and emits session_start; the bare SDK session does neither.
+  await session.bindExtensions({ mode });
   return { session, sessionManager, resourceLoader };
 }
