@@ -29,6 +29,7 @@ function fixture({ count = 40, partial = false, lexicalState = 'ready', linkModu
       async lexicalStatus() { return { status: lexicalState }; },
       async getRecords(_scope, ids) { return ids.map(id => rows.find(row => row.id === id)).filter(Boolean); },
       async recordsForTurn() { return []; },
+      async catalogRecords(_scope, limit) { reads.push(['catalog']); return rows.slice(0, limit); },
       async neighbors(_scope, ids, limit) { reads.push(['neighbors', ids[0]]); return edges.filter(edge => ids.includes(edge.from) || ids.includes(edge.to)).slice(0, limit); },
     },
     async show(_scope, input) {
@@ -352,4 +353,19 @@ test('a failed re-offer never reuses its cancelled token', async () => {
   await assert.rejects(tools.offer([found.records[1].id]), /fictional_refusal/);
   const third = await tools.offer([found.records[0].id]);
   assert.deepEqual([first.token, third.token], ['offer-1', 'offer-3']);
+});
+
+test('the D0 oracle catalog offers every prior record with its relations, ignoring query and kind', async () => {
+  const edges = [{ id: 'e1', type: 'supersedes', from: 'prior-2', to: 'prior-1' }];
+  const { handlers, reads } = fixture({ count: 30, directCount: 2, edges });
+  try {
+    const { surface, bindings } = await handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input: { query: 'x', kinds: ['decision'], limit: 48, max_bytes: 120000, catalog: true } });
+    assert.deepEqual([surface.status, surface.records.length, surface.relations.length, surface.declared_seed_limit, Object.keys(surface.channels), reads[0]],
+      ['ready', 30, 1, 256, ['catalog'], ['catalog']]);
+    assert.equal(new Set(bindings.map(row => row.id)).size, 30);
+    const tools = createTurnTools({ scope: 'fiction', turn: { turn_id: 't', entries: [] }, receipt: { id: 'turn' }, retrieval: 'oracle-catalog',
+      memory: { searchCompact: (scope, request, trigger) => handlers.searchCompact({ scope, input: request, trigger }) } });
+    assert.equal((await tools.search('anything', [])).records.length, 30);
+    await assert.rejects(handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input: { ...input, max_bytes: 120000 } }), /invalid_input/);
+  } finally { handlers.close(); }
 });

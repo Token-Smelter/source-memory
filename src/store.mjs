@@ -512,6 +512,14 @@ export class Neo4jStore {
     });
   }
 
+  /** Every record in the scope, for the D0 oracle-catalog diagnostic; ordered for a stable presentation. */
+  async catalogRecords(scope, limit) {
+    return this.transaction('read', async tx => {
+      const result = await tx.run('MATCH (r:SMRecord {scope:$scope}) RETURN r ORDER BY r.uid LIMIT $limit', { scope, limit: neo4j.int(limit) });
+      return result.records.map(row => decodeRecord(unwrap(row.get('r'))));
+    });
+  }
+
   async recordsForTurn(scope, uid, limit) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (r:SMRecord {scope:$scope})-[:SM_EVIDENCE]->(t:SMTurn {uid:$uid,scope:$scope})

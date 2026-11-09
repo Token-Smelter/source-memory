@@ -148,6 +148,8 @@ export function runExport({ treatment, seal, report, reportSha256, graph, answer
   if (typeof treatment !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(treatment)) throw fail('treatment_invalid');
   if (seal?.digest !== report?.seal_sha256 || report.coverage?.status !== 'complete' || !report.scorecard?.deltas
     || !/^[a-f0-9]{64}$/.test(reportSha256 ?? '')) throw fail('run_unqualified');
+  // The export label must agree with the sealed treatment; an unsealed run is a baseline.
+  if (seal.spec.treatment ? !treatment.startsWith(seal.spec.treatment.id) : /^(D|T)\d/.test(treatment)) throw fail('treatment_label_mismatch');
   const sourceKey = Object.keys(DEV_REFERENCES).find(key => DEV_REFERENCES[key].source_sha256 === seal.spec.sourceSha256);
   assertDevelopmentSource(sourceKey, seal.spec.sourceSha256);
   const dispositions = report.coverage.dispositions;
@@ -155,7 +157,7 @@ export function runExport({ treatment, seal, report, reportSha256, graph, answer
   const byArm = arm => answers.filter(row => row.arm === arm).map(row => row.answer.trace);
   const arms = [...new Set(answers.map(row => row.arm))].sort();
   return { schema: CLIMB_RUN_SCHEMA, treatment, source_key: sourceKey, source_sha256: seal.spec.sourceSha256, run_id: report.run_id, run_dir: report.run_dir,
-    code_sha: seal.spec.codeSha, mixed_code: seal.spec.resume?.codeTransition
+    treatment_spec: seal.spec.treatment ?? null, code_sha: seal.spec.codeSha, mixed_code: seal.spec.resume?.codeTransition
       ? { from: seal.spec.resume.codeTransition.from, to: seal.spec.resume.codeTransition.to, cursor: seal.spec.resume.cursor } : null,
     seal_sha256: report.seal_sha256, report_sha256: reportSha256, dataset_sha256: seal.spec.datasetSha256,
     models: Object.fromEntries(Object.entries(seal.spec.budget?.purposes ?? {}).map(([purpose, row]) => [purpose, row.route])),

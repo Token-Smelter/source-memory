@@ -169,7 +169,13 @@ export function createLinkChoices(packet) {
 }
 
 /** Tool-facing labels name only entries of the just-retained cursor turn. */
-export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [], requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate' }) {
+export const RETRIEVAL_MODES = ['search', 'oracle-catalog'];
+/** Diagnostic D0: 'oracle-catalog' replaces ranked search with every prior record in scope; it is not a product mode. */
+const SEARCH_SHAPE = { search: { channels: ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'], seeds: 48, pool: 64, bytes: 24000 },
+  'oracle-catalog': { channels: ['catalog'], seeds: 256, pool: 256, bytes: 120000 } };
+export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [], requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate', retrieval = 'search' }) {
+  if (!RETRIEVAL_MODES.includes(retrieval)) throw fail('invalid_input');
+  const shape = SEARCH_SHAPE[retrieval];
   if (typeof scope !== 'string' || !scope || !turn?.turn_id || !Array.isArray(turn.entries) || !receipt?.id || !memory) throw fail('invalid_input');
   const labels = new Map();
   const imageNotes = [];
@@ -249,13 +255,13 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       if (typeof query !== 'string' || !query || !Array.isArray(kinds) || kinds.some(kind => typeof kind !== 'string')) throw fail('invalid_input');
       try {
         if (typeof memory.searchCompact !== 'function') throw fail('search_unavailable');
-        const envelope = await memory.searchCompact(scope, { query, kinds, limit: 48, max_bytes: 24000 }, receipt.id);
+        const envelope = await memory.searchCompact(scope, { query, kinds, limit: 48, max_bytes: shape.bytes, ...(retrieval === 'oracle-catalog' ? { catalog: true } : {}) }, receipt.id);
         const result = envelope?.surface, bindings = envelope?.bindings;
         if (!Array.isArray(bindings) || !Array.isArray(result?.records) || bindings.length !== result.records.length
           || new Set(bindings.map(row => row?.handle)).size !== bindings.length || new Set(bindings.map(row => row?.id)).size !== bindings.length
           || bindings.some((row, index) => typeof row?.id !== 'string' || !row.id || typeof row.handle !== 'string'
             || row.handle !== result.records[index]?.id || (compactHandles.has(row.handle) && compactHandles.get(row.handle) !== row.id))) throw fail('search_incomplete');
-        const requiredChannels = ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'];
+        const requiredChannels = shape.channels;
         if (!['ready', 'no_matches', 'budget_limited'].includes(result?.status) || !Array.isArray(result.records)
           || result.records.length > 256 || !Array.isArray(result.relations) || result.relations.length > 512 || !result.channels
           || requiredChannels.some(name => result.channels[name]?.status !== 'ready')
@@ -263,8 +269,8 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
           || result.completeness_guaranteed !== false || !Array.isArray(result.graph_gaps)
           || new Set(result.graph_gaps).size !== result.graph_gaps.length
           || result.graph_gaps.some(gap => !['node_limit', 'edge_limit', 'hop_limit', 'summary_node_limit', 'summary_edge_limit'].includes(gap))
-          || result.declared_seed_limit !== 48 || result.candidate_pool_limit !== 64
-          || !Number.isSafeInteger(result.seed_count) || result.seed_count < 0 || result.seed_count > 48
+          || result.declared_seed_limit !== shape.seeds || result.candidate_pool_limit !== shape.pool
+          || !Number.isSafeInteger(result.seed_count) || result.seed_count < 0 || result.seed_count > shape.seeds
           || !Number.isSafeInteger(result.graph_edge_count) || result.graph_edge_count !== result.relations.length + result.edge_budget_omitted
           || !Number.isSafeInteger(result.collapsed_edge_count) || result.collapsed_edge_count < 0
           || typeof result.relationship_context_complete !== 'boolean' || !Number.isSafeInteger(result.ranked_count)

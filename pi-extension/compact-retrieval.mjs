@@ -17,6 +17,34 @@ const preview = value => {
 const edgeOrder = (a, b) => Number(b.type === 'supersedes') - Number(a.type === 'supersedes')
   || String(a.uid ?? a.id).localeCompare(String(b.uid ?? b.id));
 
+/**
+ * D0 oracle retrieval: every prior record in scope, with all relations among them, regardless of query or kind. It
+ * isolates distiller behavior from retrieval misses and is not a product search mode.
+ */
+export async function catalogCompactRecords(memory, scope) {
+  authorize(memory.config, scope);
+  if (typeof memory.store?.catalogRecords !== 'function' || typeof memory.store?.neighbors !== 'function') throw fail('search_unavailable');
+  const rows = await memory.store.catalogRecords(scope, maxCards + 1);
+  if (!Array.isArray(rows) || rows.some(row => row?.scope !== scope || typeof row.id !== 'string' || !kinds.has(row.kind) || typeof row.text !== 'string')) throw fail('search_incomplete');
+  const gaps = rows.length > maxCards ? ['summary_node_limit'] : [];
+  const records = rows.slice(0, maxCards).map(row => ({ id: row.id, kind: row.kind, score: null, ...preview(row.text) }));
+  const ids = new Set(records.map(row => row.id)), relations = new Map();
+  if (ids.size) {
+    const edges = await memory.store.neighbors(scope, [...ids], maxSummaryEdges + 1);
+    if (!Array.isArray(edges) || edges.some(row => !row?.id || !RELATIONS.includes(row.type))) throw fail('search_incomplete');
+    if (edges.length > maxSummaryEdges) gaps.push('summary_edge_limit');
+    for (const edge of edges.slice(0, maxSummaryEdges)) if (ids.has(edge.from) && ids.has(edge.to)) relations.set(edge.id, edge);
+  }
+  const pairs = new Map();
+  for (const edge of relations.values()) {
+    const key = JSON.stringify([edge.from, edge.to].sort());
+    if (!pairs.has(key)) pairs.set(key, { id: edge.id, type: edge.type, from: edge.from, to: edge.to });
+  }
+  return { records, edges: [...pairs.values()], ranked_count: records.length, seed_count: records.length, declared_seed_limit: maxCards,
+    candidate_pool_limit: maxCards, filtered_record_count: 0, filtered_edge_count: 0, collapsed_edge_count: relations.size - pairs.size,
+    related_kind_count: 0, graph_gaps: gaps, channels: { catalog: { status: 'ready' } } };
+}
+
 /** Use the normal recall ranking, expanding graph metadata but never source evidence. */
 export async function searchCompactRecords(memory, scope, input) {
   authorize(memory.config, scope);

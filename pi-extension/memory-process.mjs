@@ -3,7 +3,7 @@ import { normalizeEnrichment } from '../src/core.mjs';
 import * as defaultLinks from '../src/link-proposals.mjs';
 import { searchDerived, resolveDerived, searchRaw } from './derived-retrieval.mjs';
 import { createAtomicOutcomes } from './atomic-outcome.mjs';
-import { searchCompactRecords } from './compact-retrieval.mjs';
+import { catalogCompactRecords, searchCompactRecords } from './compact-retrieval.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const deferred = () => {
@@ -64,9 +64,10 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       if (typeof trigger !== 'string' || !trigger) throw fail('source_invalid');
       const shown = await memory.show(scope, { kind: 'turn', id: trigger });
       if (shown?.turn?.source !== 'pi-memory') throw fail('source_invalid');
-      const maxBytes = input?.max_bytes ?? 24000;
-      if (!Number.isSafeInteger(maxBytes) || maxBytes < 256 || maxBytes > 24000) throw fail('invalid_input');
-      const ranked = await searchCompactRecords(memory, scope, input);
+      const catalog = input?.catalog === true, maxBytes = input?.max_bytes ?? 24000;
+      if (input?.catalog !== undefined && !catalog) throw fail('invalid_input');
+      if (!Number.isSafeInteger(maxBytes) || maxBytes < 256 || maxBytes > (catalog ? 120000 : 24000)) throw fail('invalid_input');
+      const ranked = catalog ? await catalogCompactRecords(memory, scope) : await searchCompactRecords(memory, scope, input);
       const selected = [], edges = [], offers = [], indexes = new Map();
       const result = { status: 'budget_limited', records: selected, relations: edges, channels: ranked.channels,
         ranked_count: ranked.ranked_count, seed_count: ranked.seed_count, declared_seed_limit: ranked.declared_seed_limit,

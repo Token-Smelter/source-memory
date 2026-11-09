@@ -114,7 +114,7 @@ export function createContextWindow({ contextWindow }) {
 }
 
 /** Reopen one incremental private Pi file for each side branch while keeping its fixed session ID. */
-export async function createPiDistiller({ pi, incremental, workDir, model, modelRuntime, memory, scope, reviewer, budget, ensureIndexed, reviewMode = 'separate', createOptions = {} }) {
+export async function createPiDistiller({ pi, incremental, workDir, model, modelRuntime, memory, scope, reviewer, budget, ensureIndexed, reviewMode = 'separate', createOptions = {}, retrieval = 'search' }) {
   if (!pi?.SessionManager || typeof pi.createAgentSession !== 'function' || !incremental?.sessionId
     || typeof incremental.syncThrough !== 'function' || !workDir || !model) throw fail('runtime_invalid');
   if (!['separate', 'self_review'].includes(reviewMode)) throw fail('review_mode_invalid');
@@ -219,7 +219,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           sourceChunks = await memory.sourceChunks(scope, input.receipt.id);
         }
         currentTools = createTurnTools({ scope, turn: input.turn, receipt: input.receipt, memory, sourceChunks, requireSearch: true,
-          ensureIndexed, reviewer: boundedReviewer, reviewMode });
+          ensureIndexed, reviewer: boundedReviewer, reviewMode, retrieval });
         breakpoint = null;
         submittedResult = null;
         submissionViolation = false;

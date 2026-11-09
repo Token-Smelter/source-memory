@@ -21,7 +21,7 @@ import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runti
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases, toolCallReviewSummary, verifyToolCallReview } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { CITED_RESUME_TRANSITIONS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { CITED_RESUME_TRANSITIONS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { WORKER_SHARE_NANO, attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
@@ -196,6 +196,8 @@ async function main() {
     return sum + BigInt(priorSoftSpend(pinned(row.path, row.sha256, 10_000_000).toString('utf8'), { reconciliations }));
   }, 0n);
   let resume = null;
+  const treatment = process.env.PILOT_TREATMENT ? TREATMENTS[process.env.PILOT_TREATMENT] ?? null : null;
+  if (process.env.PILOT_TREATMENT && !treatment) throw fail('treatment_invalid');
   if (process.env.PILOT_RESUME) {
     let request;
     try { request = JSON.parse(process.env.PILOT_RESUME); } catch { throw fail('resume_invalid'); }
@@ -336,7 +338,7 @@ async function main() {
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
   const seal = createCitedPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
     codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null,
-    toolCallReviewSha256: reviewMapSha,
+    toolCallReviewSha256: reviewMapSha, treatment,
     interpretationSha256: INTERPRETATION_02_SHA256 });
   if (resume?.handbackRows.length) pairedReport({ seal, expectedDigest: seal.digest, rows: resume.handbackRows, dependencies: [],
     provenance: resume.originSeals.filter(row => row.digest !== seal.digest) });
@@ -403,7 +405,7 @@ async function main() {
       if (!isolation.ok) return;
       const ready = { status: 'awaiting_go', run_id: runId, run_dir: dir, source_key: sourceKey, source_sha256: source.source_sha256,
         dataset_sha256: manifestSha, code_sha: codeSha, seal_sha256: seal.digest, interpretation_sha256: INTERPRETATION_02_SHA256,
-        toolcall_review: reviewUse,
+        toolcall_review: reviewUse, treatment,
         runtime_archive_sha256: runtimeTree.archive_sha256,
         sdk_index_sha256: sdkIndexSha, sdk_session_sha256: sdkSessionSha,
         models: { candidate: exactRoute(model), reviewer: exactRoute(reviewerModel), answerer: exactRoute(reviewerModel), scorer: exactRoute(reviewerModel) },
@@ -475,6 +477,7 @@ async function main() {
         }
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
+          retrieval: treatment?.retrieval ?? 'search',
           budget: createInputBudget(Number.MAX_SAFE_INTEGER),
           imageArchive: createImageArchive({ directory: imageDir }),
           ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state,
