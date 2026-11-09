@@ -21,7 +21,7 @@ import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runti
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases, toolCallReviewSummary, verifyToolCallReview } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { CITED_RESUME_TRANSITIONS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { CITED_RESUME_TRANSITIONS, DISTILLER_MAX_OUTPUT_TOKENS, EVALUATOR_MAX_OUTPUT_TOKENS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { WORKER_SHARE_NANO, attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
@@ -66,7 +66,7 @@ function writePrivate(path, value) {
   const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
   try { writeFileSync(fd, typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
 }
-function rates(model) {
+function rates(model, maxOutputTokens) {
   const tiers = [model.cost, ...(model.cost?.tiers ?? [])];
   const result = {};
   for (const key of ['input', 'cacheRead', 'cacheWrite', 'output']) {
@@ -74,7 +74,7 @@ function rates(model) {
     if (!values.length) throw fail('rate_unavailable');
     result[key] = Math.ceil(Math.max(...values) * 1000);
   }
-  return { maxOutputTokens: 4096, ratesNanoPerToken: result, rateEvidence: 'preflight Pi SDK model catalog; highest declared tier; API-equivalent only' };
+  return { maxOutputTokens, ratesNanoPerToken: result, rateEvidence: 'preflight Pi SDK model catalog; highest declared tier; API-equivalent only' };
 }
 function trackSnapshot(memory) {
   let epoch = 0, lock = false, invalid = false;
@@ -167,7 +167,7 @@ async function main() {
   if (exactRoute(model) !== 'anthropic/claude-haiku-5-5' || exactRoute(reviewerModel) !== 'anthropic/claude-sonnet-5-5') throw fail('route_changed');
   const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   if (execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim()) throw fail('working_tree_dirty');
-  const routeRates = { candidate: rates(model), reviewer: rates(reviewerModel) };
+  const routeRates = { candidate: rates(model, DISTILLER_MAX_OUTPUT_TOKENS), reviewer: rates(reviewerModel, EVALUATOR_MAX_OUTPUT_TOKENS) };
   const priorPath = process.env.PILOT_PRIOR_LEDGER, priorSha = process.env.PILOT_PRIOR_LEDGER_SHA256;
   if (Boolean(priorPath) !== Boolean(priorSha) || (process.env.PILOT_PRIOR_LEDGERS && priorPath)) throw fail('prior_ledger_invalid');
   let priorLedgers = priorPath ? [{ path: priorPath, sha256: priorSha }] : [];
