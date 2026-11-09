@@ -477,7 +477,7 @@ async function main() {
         }
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
-          retrieval: treatment?.retrieval ?? 'search',
+          retrieval: treatment?.retrieval ?? 'search', guidance: treatment?.guidance ?? null,
           budget: createInputBudget(Number.MAX_SAFE_INTEGER),
           imageArchive: createImageArchive({ directory: imageDir }),
           ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state,
