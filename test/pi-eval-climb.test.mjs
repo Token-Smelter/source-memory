@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { digest } from '../src/core.mjs';
 import { DEV_REFERENCES, MATCH_BUCKETS, assertDevelopment, assertSameSchedule, dashboardHtml, referenceGraph, runExport, storeGraph } from '../pi-extension/evaluation/climb.mjs';
 import { validAlignment } from '../scripts/align-climb-run.mjs';
+import { pathFields } from '../scripts/export-climb-run.mjs';
 
 const node = (label, body) => ({ labels: [label], properties: { body: JSON.stringify(body) } });
 const record = (id, kind = 'decision') => node('SMRecord', { id, kind, text: `Fictional ${id}.` });
@@ -50,6 +51,11 @@ test('both reference layouts bind ordinals to checkpoint entries and stay additi
   assert.deepEqual([deltas.schedule, deltas.records[0].checkpoint_index], [['a', 'b'], 2]);
   assert.throws(() => referenceGraph({ format: 'checkpoints', checkpoints: [{ ordinal: 1, checkpoint_entry_id: 'a', records: [{ id: 'r' }], edges: [] },
     { ordinal: 2, checkpoint_entry_id: 'b', records: [{ id: 'r' }], edges: [] }] }), /reference_invalid/);
+});
+
+test('resume handback descriptors expose every path field to the holdout guard', () => {
+  const artifacts = { 'seal.json': { path: '/run/seal.json' }, carried_cases: [{ caseId: 'c', sourceReportPath: '/prior/REPORT.json', sourceSnapshotPath: '/prior/s.json' }], other: { snapshot_path: '/x/s.json', run_dir: '/x' } };
+  assert.deepEqual(pathFields(artifacts).sort(), ['/prior/REPORT.json', '/prior/s.json', '/run/seal.json', '/x', '/x/s.json']);
 });
 
 test('only allowlisted development sessions and non-holdout paths are accepted', () => {
