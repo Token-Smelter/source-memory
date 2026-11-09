@@ -66,7 +66,11 @@ function writePrivate(path, value) {
   const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
   try { writeFileSync(fd, typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
 }
-function rates(model) {
+// Haiku and Sonnet 5.5 use Pi's adaptive thinking (compat.forceAdaptiveThinking): there is no separate thinking budget,
+// so thinking and the answer share max_tokens. At 4,096 a distiller turn could spend the whole ceiling thinking and stop
+// with "length", failing the checkpoint; 16,384 is the declared distiller ceiling for every arm (baseline v2.1 onward).
+export const DISTILLER_MAX_OUTPUT_TOKENS = 16384, EVALUATOR_MAX_OUTPUT_TOKENS = 4096;
+function rates(model, maxOutputTokens) {
   const tiers = [model.cost, ...(model.cost?.tiers ?? [])];
   const result = {};
   for (const key of ['input', 'cacheRead', 'cacheWrite', 'output']) {
@@ -74,7 +78,7 @@ function rates(model) {
     if (!values.length) throw fail('rate_unavailable');
     result[key] = Math.ceil(Math.max(...values) * 1000);
   }
-  return { maxOutputTokens: 4096, ratesNanoPerToken: result, rateEvidence: 'preflight Pi SDK model catalog; highest declared tier; API-equivalent only' };
+  return { maxOutputTokens, ratesNanoPerToken: result, rateEvidence: 'preflight Pi SDK model catalog; highest declared tier; API-equivalent only' };
 }
 function trackSnapshot(memory) {
   let epoch = 0, lock = false, invalid = false;
@@ -167,7 +171,7 @@ async function main() {
   if (exactRoute(model) !== 'anthropic/claude-haiku-5-5' || exactRoute(reviewerModel) !== 'anthropic/claude-sonnet-5-5') throw fail('route_changed');
   const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   if (execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim()) throw fail('working_tree_dirty');
-  const routeRates = { candidate: rates(model), reviewer: rates(reviewerModel) };
+  const routeRates = { candidate: rates(model, DISTILLER_MAX_OUTPUT_TOKENS), reviewer: rates(reviewerModel, EVALUATOR_MAX_OUTPUT_TOKENS) };
   const priorPath = process.env.PILOT_PRIOR_LEDGER, priorSha = process.env.PILOT_PRIOR_LEDGER_SHA256;
   if (Boolean(priorPath) !== Boolean(priorSha) || (process.env.PILOT_PRIOR_LEDGERS && priorPath)) throw fail('prior_ledger_invalid');
   let priorLedgers = priorPath ? [{ path: priorPath, sha256: priorSha }] : [];
