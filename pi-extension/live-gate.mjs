@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, realpathSync, statSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
-import { ownerGone, ownerRecord } from './owner-lock.mjs';
+import { acquireOwnerLock, ownerAlive, ownerRecord } from './owner-lock.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const refusal = code => Object.assign(new Error(code), { code, refused: true });
@@ -21,7 +21,7 @@ function classify(row) {
 /**
  * A private, append-only ledger of model call starts, reported usage and admitted intervals per UTC day. Every process and
  * session using the same state directory appends to it and re-reads it before each decision, so the day total is durable and
- * shared. A call start without a usage row is in flight while its owner lives and unknown usage once the owner is gone.
+ * shared. A call start without a usage row is in flight only while its owner is provably alive, and unknown usage otherwise.
  * An unreadable line is acknowledged once, as unknown usage on the day it is found.
  */
 export function createUsageLedger({ directory, now = () => new Date() }) {
@@ -54,7 +54,11 @@ export function createUsageLedger({ directory, now = () => new Date() }) {
     const size = fstatSync(fd).size;
     if (size > offset) {
       const chunk = Buffer.alloc(size - offset);
-      for (let read = 0; read < chunk.length;) read += readSync(fd, chunk, read, chunk.length - read, offset + read);
+      for (let read = 0; read < chunk.length;) {
+        const count = readSync(fd, chunk, read, chunk.length - read, offset + read);
+        if (!count) throw fail('ledger_invalid');
+        read += count;
+      }
       const data = Buffer.concat([pendingTail, chunk]);
       const start = offset - pendingTail.length;
       let lineStart = 0;
@@ -107,7 +111,7 @@ export function createUsageLedger({ directory, now = () => new Date() }) {
       const today = of(when);
       if (today.some(row => row.kind === 'usage' && row.status === 'unknown')) return true;
       const reported = receipts();
-      return today.some(row => row.kind === 'call' && !reported.has(row.id) && ownerGone(row.owner, self));
+      return today.some(row => row.kind === 'call' && !reported.has(row.id) && !ownerAlive(row.owner, self));
     },
     intervals: (when = day()) => of(when).filter(row => row.kind === 'interval').length,
     append(row) {
@@ -118,6 +122,19 @@ export function createUsageLedger({ directory, now = () => new Date() }) {
       return entry;
     },
     callStart() { return this.append({ kind: 'call', id: randomUUID(), owner: self }).id; },
+    /** Run a check-and-append decision exclusively across processes sharing the directory. */
+    exclusive(action) {
+      const lockPath = join(dir, 'usage.lock');
+      let lock;
+      for (let attempt = 0; !lock; attempt++) {
+        try { lock = acquireOwnerLock(lockPath); }
+        catch (problem) {
+          if (problem.code !== 'journal_locked' || attempt >= 200) throw refusal('ledger_busy');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+      }
+      try { return action(); } finally { lock.release(); }
+    },
     close() { if (!closed) { closed = true; closeSync(fd); } },
   };
 }
@@ -130,26 +147,33 @@ export function createUsageLedger({ directory, now = () => new Date() }) {
 export function createDailyInputBudget({ ledger, limit }) {
   if (!Number.isSafeInteger(limit) || limit <= 0 || typeof ledger?.callStart !== 'function') throw fail('input_budget_invalid');
   const own = [];
-  let unknown = false;
+  let unknownDay = null, prevented = 0, stopped = false;
   const check = () => {
-    if (unknown || own.length !== own.filter(call => call.receipt).length || ledger.unknown()) return 'input_budget_unknown';
+    if (unknownDay === ledger.day() || own.some(call => !call.receipt) || ledger.unknown()) return 'input_budget_unknown';
     return ledger.used() >= limit ? 'input_budget_exhausted' : null;
   };
   return {
+    ledger,
+    /** Sticky: every later dispatch is refused before it is sent, so shutdown cannot start a model call. */
+    stop() { stopped = true; },
     beforeCall() {
+      if (stopped) { prevented++; throw fail('dispatch_prevented'); }
       const reason = check();
-      if (reason) throw fail(reason);
+      // Pi reports a dispatch it never made with empty usage; that report must not read as lost spend.
+      if (reason) { prevented++; throw fail(reason); }
       own.push({ id: ledger.callStart(), receipt: null });
     },
     record(usage) {
       const call = own.find(row => !row.receipt);
+      if (!call && prevented && usage && counted.every(key => usage[key] === 0)) { prevented--; return; }
       const valid = usage && tokens(usage) && Number.isSafeInteger(counted.reduce((sum, key) => sum + usage[key], 0));
       const receipt = valid ? { input: usage.input, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite,
         output: Number.isSafeInteger(usage.output) ? usage.output : null } : { status: 'unknown' };
-      if (!valid || !call) unknown = true;
+      // The durable unknown row covers every process; this process's own flag ends with its day.
+      if (!valid || !call) unknownDay = ledger.day();
       if (call) call.receipt = receipt;
       try { ledger.append({ kind: 'usage', ...(call ? { call: call.id } : {}), ...receipt }); }
-      catch { unknown = true; throw fail('usage_receipt_unavailable'); }
+      catch { unknownDay = ledger.day(); throw fail('usage_receipt_unavailable'); }
     },
     used: () => ledger.used(),
     started: () => own.length,
@@ -166,20 +190,23 @@ export function createDailyInputBudget({ ledger, limit }) {
  */
 export function createLiveGate({ scope, grants, budget, ledger, maxIntervalsPerDay = null, minRemaining = 0 }) {
   if (typeof scope !== 'string' || !scope || typeof budget?.reason !== 'function' || !Number.isSafeInteger(budget.limit) || budget.limit <= 0
-    || typeof ledger?.append !== 'function' || !grants || !Array.isArray(grants.read) || !Array.isArray(grants.write)
+    || typeof ledger?.append !== 'function' || typeof ledger.exclusive !== 'function' || budget.ledger !== ledger || !grants || !Array.isArray(grants.read) || !Array.isArray(grants.write)
     || (maxIntervalsPerDay !== null && (!Number.isSafeInteger(maxIntervalsPerDay) || maxIntervalsPerDay < 1))
     || !Number.isSafeInteger(minRemaining) || minRemaining < 0) throw fail('gate_invalid');
   const permitted = grants.read.includes(scope) && grants.write.includes(scope);
   const gate = async ({ phase = 'interval', through = null, cursor = null, retry = false } = {}) => {
     if (!permitted) throw refusal('scope_permission_denied');
     if (phase === 'reconcile') return { admitted: true };
-    const reason = budget.reason();
-    if (reason) throw refusal(reason);
-    const remaining = budget.limit - budget.used();
-    if (!Number.isSafeInteger(remaining) || remaining < minRemaining) throw refusal('input_budget_reserve');
-    if (maxIntervalsPerDay !== null && ledger.intervals() >= maxIntervalsPerDay) throw refusal('interval_limit');
-    ledger.append({ kind: 'interval', through, cursor, retry });
-    return { admitted: true };
+    // Check and record under the ledger lock so concurrent processes cannot all pass the interval cap.
+    return ledger.exclusive(() => {
+      const reason = budget.reason();
+      if (reason) throw refusal(reason);
+      const remaining = budget.limit - budget.used();
+      if (!Number.isSafeInteger(remaining) || remaining < minRemaining) throw refusal('input_budget_reserve');
+      if (maxIntervalsPerDay !== null && ledger.intervals() >= maxIntervalsPerDay) throw refusal('interval_limit');
+      ledger.append({ kind: 'interval', through, cursor, retry });
+      return { admitted: true };
+    });
   };
   return Object.assign(gate, { scope, budget });
 }

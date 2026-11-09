@@ -9,7 +9,7 @@ import { createCoverageJournal, runCoveredInterval } from '../pi-extension/cover
 import { createCursorStore } from '../pi-extension/cursor-store.mjs';
 import { createIncrementalSession } from '../pi-extension/incremental.mjs';
 import { admitAll, createLiveController, registerLiveMemory } from '../pi-extension/live.mjs';
-import { contextMessages, createPiDistiller } from '../pi-extension/pi-runtime.mjs';
+import { contextMessages, createPiDistiller, WITHHELD_SUMMARY } from '../pi-extension/pi-runtime.mjs';
 import { compactResult } from './helpers/compact-fixture.mjs';
 import { fictionalCoverage } from '../pi-extension/policy.mjs';
 
@@ -89,7 +89,7 @@ test('the distiller receives exclusions and its context drops only inadmissible 
   const manager = { buildSessionContext: () => ({ messages: ['all'] }), buildContextEntries: () => entries };
   const pi = { sessionEntryToContextMessages: entry => [entry.id] };
   assert.deepEqual([inputs[0], contextMessages(pi, manager, undefined), contextMessages(pi, manager, ['b']), contextMessages(pi, manager, [])],
-    [['b'], ['all'], ['u', 'a'], ['all']]);
+    [['b'], ['all'], ['u', { role: 'user', content: [{ type: 'text', text: WITHHELD_SUMMARY }], timestamp: 0 }, 'a'], ['all']]);
   assert.throws(() => contextMessages({}, manager, ['b']), /summary_exclusion_unavailable/);
 });
 

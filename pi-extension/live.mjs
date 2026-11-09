@@ -26,11 +26,13 @@ function ancestryOf(entries, leafId) {
  * agent_settled hook for live controllers. The handler only snapshots and enqueues, and never throws into Pi;
  * the session file path is captured synchronously because ctx must not be used after the handler returns.
  */
-export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onError = () => {} }) {
-  if (!pi || typeof pi.on !== 'function' || typeof controllerFor !== 'function') throw fail('extension_invalid');
+export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onError = () => {}, active = () => true }) {
+  if (!pi || typeof pi.on !== 'function' || typeof controllerFor !== 'function' || typeof active !== 'function') throw fail('extension_invalid');
   const queue = createSessionQueue(onError);
   pi.on('agent_settled', (_event, ctx) => {
     try {
+      // An inactive host pays nothing: the O(session) snapshot copy is taken only when work could follow.
+      if (!active(ctx)) return;
       const snapshot = settledSnapshot(ctx, { throughSummaries: true });
       if (!snapshot) return;
       snapshot.sessionFile = ctx.sessionManager.getSessionFile?.() ?? null;
@@ -166,7 +168,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
     const refusal = await admit({ phase: 'interval', through, cursor, retry });
     if (refusal) return { refused: true, through, cursor, code: refusal };
     const current = await getSession();
-    const result = await runCoveredInterval({ journal, session: { ...current, entries }, through, cursor, retry, summaryPolicy });
+    const result = await runCoveredInterval({ journal, session: { ...current, entries }, through, cursor, retry, summaryPolicy, interrupted: () => closing });
     if (covered.has(result.disposition)) {
       const saveError = save(through, result.id);
       return saveError ? { ...result, cursor_save: saveError } : result;
@@ -180,7 +182,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
     settle(snapshot) {
       if (closing) return Promise.resolve({ status: 'skipped', code: 'controller_closed', results: [], reconciled: null });
       if (busy) return Promise.reject(fail('controller_busy'));
-      running = settleOnce(snapshot);
+      running = settleOnce(snapshot).then(result => gate.ungated ? { ...result, ungated: true } : result);
       return running;
     },
     /**
@@ -193,6 +195,8 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         const timer = setTimeout(resolve, ms);
         Promise.resolve(promise).catch(() => {}).finally(() => { clearTimeout(timer); resolve(); });
       });
+      // Sticky: the session refuses new model dispatches and Memory writes from now on, even for a run not yet started.
+      try { session?.stop?.(); } catch {}
       try { session?.distiller?.abort?.(); } catch {}
       await wait(running, graceMs);
       await dropSession();
@@ -228,7 +232,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         const state = journal.state();
         if (['failed', 'unresolved_scope'].includes(state.status)) {
           // A gap is retried wherever it still validates, also on another branch; nothing else may begin before it closes.
-          if (journal.attempts(state.id) > maxRetries) return { status: 'blocked', code: 'retry_limit', id: state.id, results, reconciled };
+          if (journal.failures(state.id) > maxRetries) return { status: 'blocked', code: 'retry_limit', id: state.id, results, reconciled };
           try { sourceInterval(entries, state.through, state.cursor, conversationId, { summaryPolicy }); }
           catch { return { status: 'blocked', code: 'coverage_gap_unreachable', id: state.id, results, reconciled }; }
           const retried = await run(entries, state.through, state.cursor, true);
@@ -243,7 +247,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         results.push(result);
         const done = covered.has(result.disposition);
         return { status: done ? 'covered' : result.refused ? 'refused' : 'stopped', ...(result.refused ? { code: result.code } : {}),
-          cursor: done ? leafId : cursor, results, reconciled, ...(gate.ungated ? { ungated: true } : {}) };
+          cursor: done ? leafId : cursor, results, reconciled };
       } finally { busy = false; }
   }
 }

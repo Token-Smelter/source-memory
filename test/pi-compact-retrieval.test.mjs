@@ -274,6 +274,22 @@ test('link offers admit only selected handles from the same trigger', async () =
   } finally { handlers.close(); }
 });
 
+test('uncited current-turn context omitted from a link offer is disclosed, while omitted prior memory stays incomplete', async () => {
+  const offerWith = async retrieval => {
+    const memory = { async searchCompact() { return compactResult({ records: [{ id: 'one', kind: 'decision', text: 'one' }] }); },
+      async enrich() { return {}; }, async beginLinks() { return { token: 'offer', packet: { records: [], sources: [], retrieval } }; } };
+    const tools = createTurnTools({ scope: 'fiction', turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'fiction' }] }, receipt: { id: 'turn' }, memory });
+    const found = await tools.search('fiction', []);
+    await tools.record('decision', 'fiction', ['ref-000001']);
+    await tools.offer([found.records[0].id]);
+    return tools.stats();
+  };
+  const base = { status: 'selected', relationship_context_complete: false, completeness_guaranteed: false, budget_omitted: 0, omitted_prior_records: 0, omitted_prior_spans: 0 };
+  const context = await offerWith({ ...base, trigger_omissions: [{ entry_id: 'u', start: 0, end: 4, reason: 'packet_budget' }] });
+  const prior = await offerWith({ ...base, omitted_prior_records: 1, omitted_prior_spans: 1, trigger_omissions: [] });
+  assert.deepEqual([context.incomplete_search, context.search_statuses.at(-1).trigger_context_omitted, prior.incomplete_search], [false, 1, true]);
+});
+
 test('search trace distinguishes previewed, fetched and link-selected identities', async () => {
   const retrieval = { status: 'selected', relationship_context_complete: false, completeness_guaranteed: false,
     budget_omitted: 0, omitted_prior_records: 0, omitted_prior_spans: 0, trigger_omissions: [] };

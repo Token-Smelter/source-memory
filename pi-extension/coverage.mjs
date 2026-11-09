@@ -49,6 +49,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
   let gapEffects = new Map();
   const finished = new Map();
   const attempts = new Map();
+  const failures = new Map();
   function apply(row) {
     if (row.type === 'begin') {
       if (active || (gap && (gap.reconciliation_required || !['failed', 'unresolved_scope'].includes(gap.disposition) || row.id !== gap.id || !row.retry)) || finished.has(row.id)) throw fail('journal_invalid');
@@ -74,6 +75,8 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
         gap = { id: row.id, disposition: row.disposition, through: active.through, cursor: active.cursor,
           ...(row.reconciliation_required ? { reconciliation_required: true } : {}) };
         gapEffects = active.effects;
+        // A shutdown or crash interrupting the run is not evidence that the interval fails; only real failures count.
+        if (row.code !== 'interrupted') failures.set(row.id, (failures.get(row.id) ?? 0) + 1);
       }
       active = null;
     } else if (row.type === 'reconcile') {
@@ -223,6 +226,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
       return [...rows].map(([effect, row]) => ({ effect, ...structuredClone(row) }));
     },
     attempts: id => attempts.get(id) ?? 0,
+    failures: id => failures.get(id) ?? 0,
     state() {
       if (active) return { status: 'uncertain', id: active.id, cursor: active.cursor, through: active.through, reason: 'unfinished_interval' };
       return gap ? { status: gap.disposition, ...gap } : { status: 'ready' };
@@ -237,7 +241,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
 }
 
 /** The session's distiller and ingest path must both use the same journal-tracked memory facade. */
-export async function runCoveredInterval({ journal, session, through, cursor, allowInterrupted = false, retry = false, summaryPolicy }) {
+export async function runCoveredInterval({ journal, session, through, cursor, allowInterrupted = false, retry = false, summaryPolicy, interrupted }) {
   if (session?.memory?.[tracking] !== journal || session?.distiller?.memory !== session.memory) throw fail('tracking_required');
   if (summaryPolicy !== undefined && summaryPolicy !== 'dependency_closure') throw fail('invalid_input');
   const id = journal.begin({ through, cursor, retry });
@@ -252,7 +256,8 @@ export async function runCoveredInterval({ journal, session, through, cursor, al
     if (!covered.has(actual)) return { id, through, cursor, disposition: actual, code: 'write_uncertain' };
     return { ...result, id, disposition: actual, ...(search ? { search_incomplete: search.incomplete, search_statuses: search.statuses } : {}) };
   } catch (error) {
-    const disposition = journal.finish(error?.code === 'scope_unresolved' ? 'unresolved_scope' : 'failed', safeCode(error));
-    return { id, through, cursor, disposition, code: safeCode(error) };
+    const code = typeof interrupted === 'function' && interrupted() ? 'interrupted' : safeCode(error);
+    const disposition = journal.finish(error?.code === 'scope_unresolved' ? 'unresolved_scope' : 'failed', code);
+    return { id, through, cursor, disposition, code };
   }
 }

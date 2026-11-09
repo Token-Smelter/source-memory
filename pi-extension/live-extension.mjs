@@ -26,6 +26,7 @@ const serveFile = fileURLToPath(new URL('./serve.mjs', import.meta.url));
 export const DEFAULT_CONFIG_PATH = join(homedir(), '.config', 'source-memory', 'pi-live.json');
 
 const MODES = ['tui', 'rpc', 'json', 'print'];
+const WRITES = new Set(['ingest', 'enrich', 'beginLinks', 'applyLinks', 'beginOutcome', 'applyOutcome', 'index']);
 const THINKING = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 const KEYS = {
   root: ['version', 'enabled', 'scope', 'state_dir', 'memory', 'distiller', 'budget', 'max_retries', 'shutdown_grace_ms', 'pi_sdk', 'modes', 'backfill'],
@@ -43,7 +44,8 @@ const route = value => typeof value === 'string' && /^[^/\s]+\/[^\s]+$/.test(val
 export function parseLiveConfig(value) {
   if (!only(value, KEYS.root) || value.version !== 1) throw fail('live_config_invalid');
   const { memory = {}, distiller = {}, budget = {} } = value;
-  if (!only(memory, KEYS.memory) || !only(distiller, KEYS.distiller) || !only(budget, KEYS.budget)) throw fail('live_config_invalid');
+  if (!only(memory, KEYS.memory) || !only(distiller, KEYS.distiller) || !only(budget, KEYS.budget)
+    || [value, memory, distiller, budget].some(section => Object.values(section).includes(null))) throw fail('live_config_invalid');
   const config = {
     enabled: value.enabled ?? true,
     scope: value.scope,
@@ -75,13 +77,18 @@ export function parseLiveConfig(value) {
 
 /** The configuration names an executable and a module, so it must be the user's own file and not writable by others. */
 export function readLiveConfig(path) {
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  return parseLiveConfig(readOwnJson(path, 'live_config'));
+}
+
+/** A JSON file that steers execution or where source text goes must be the user's own and not writable by others. */
+function readOwnJson(path, label) {
+  let fd;
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
+  catch { throw fail(`${label}_unsafe`); }
   try {
     const st = fstatSync(fd);
-    if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o022) !== 0) throw fail('live_config_unsafe');
-    let value;
-    try { value = JSON.parse(readFileSync(fd, 'utf8')); } catch { throw fail('live_config_invalid'); }
-    return parseLiveConfig(value);
+    if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o022) !== 0) throw fail(`${label}_unsafe`);
+    try { return JSON.parse(readFileSync(fd, 'utf8')); } catch { throw fail(`${label}_invalid`); }
   } finally { closeSync(fd); }
 }
 
@@ -116,12 +123,12 @@ export function spawnMemoryProcess({ node, configPath, scope, intentDir, timeout
   const child = spawn(program, [serveFile, '--config', configPath, '--scope', scope, '--intent-dir', intentDir], { stdio: ['pipe', 'pipe', 'pipe'] });
   // A dead child must never surface as an unhandled stream or process error in the host.
   for (const stream of [child.stdin, child.stdout, child.stderr]) stream.on('error', () => {});
-  child.on('error', () => {});
   let lastCode = null, stderrTail = '';
+  child.on('error', error => { lastCode = safeCode(error); });
   child.stderr.on('data', chunk => {
     stderrTail = (stderrTail + chunk.toString('utf8')).slice(-4096);
-    const match = stderrTail.match(/"code":"([a-z_]{1,80})"/g);
-    if (match) lastCode = match.at(-1).slice(8, -1);
+    const match = stderrTail.match(/"code":"([a-zA-Z_]{1,80})"/g);
+    if (match) lastCode = safeCode({ code: match.at(-1).slice(8, -1) });
   });
   const exited = new Promise(resolve => { child.once('exit', resolve); child.once('error', resolve); });
   const memory = createMemoryClient({ input: child.stdout, output: child.stdin, timeoutMs, indexTimeoutMs });
@@ -138,7 +145,7 @@ export function spawnMemoryProcess({ node, configPath, scope, intentDir, timeout
 /** Assemble per-session controllers for one extension instance from a parsed configuration. */
 export async function createLiveRuntime({ config, sdk, resolveModels = resolvePiModels, spawnMemory = spawnMemoryProcess, now } = {}) {
   const stateDir = privateDir(config.stateDir);
-  const memoryConfig = JSON.parse(readFileSync(config.memory.config, 'utf8'));
+  const memoryConfig = readOwnJson(config.memory.config, 'memory_config');
   const models = await resolveModels({ pi: sdk, modelId: config.distiller.model, reviewerId: config.distiller.reviewer });
   const ledger = createUsageLedger({ directory: stateDir, ...(now ? { now } : {}) });
   let budget, gate;
@@ -157,20 +164,28 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
     for (const name of readdirSync(workDir)) if (/^(pi-memory-.*\.jsonl|\.pi-memory-.*\.tmp)$/.test(name)) { try { unlinkSync(join(workDir, name)); } catch {} }
     const child = spawnMemory({ node: config.memory.node, configPath: config.memory.config, scope: config.scope, intentDir,
       timeoutMs: config.memory.timeoutMs, indexTimeoutMs: config.memory.indexTimeoutMs });
-    let incremental;
+    let incremental, stopped = false;
     const close = async () => {
       await child.close();
       try { if (incremental) unlinkSync(incremental.file); } catch {}
     };
     try {
       await child.memory.init(config.scope);
-      const memory = journal.track(child.memory);
+      // Once stopped, a write is refused before it is sent, so the journal records it as refused rather than unknown.
+      const guarded = new Proxy(child.memory, { get(target, key) {
+        const value = Reflect.get(target, key, target);
+        if (typeof value !== 'function') return value;
+        if (stopped && WRITES.has(key)) return async () => { throw Object.assign(fail('controller_closed'), { effect: 'refused' }); };
+        return value.bind(target);
+      } });
+      const memory = journal.track(guarded);
       incremental = await createIncrementalSession({ source: sessionFile, workDir });
       const runtime = boundPiRuntime(models.runtime, budget);
       const reviewer = createPiReviewer({ pi: sdk, workDir, model: models.reviewerModel, modelRuntime: runtime, budget, thinkingLevel: config.distiller.reviewerThinking });
       const distiller = await createPiDistiller({ pi: sdk, incremental, workDir, model: models.model, modelRuntime: runtime, memory, scope: config.scope,
         reviewer, budget, ensureIndexed: readiness, createOptions: { thinkingLevel: config.distiller.thinking } });
-      return { conversation_id: sessionId, scopes: [config.scope], memory, distiller, budget, ensureIndexed: readiness, close };
+      return { conversation_id: sessionId, scopes: [config.scope], memory, distiller, budget, ensureIndexed: readiness, close,
+        stop() { stopped = true; budget.stop(); } };
     } catch (error) {
       const code = error?.code === 'transport_closed' ? child.exitCode?.() : null;
       await close();
@@ -186,10 +201,12 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
       let entry = controllers.get(sessionId);
       if (!entry) {
         const dir = join(stateDir, 'sessions', digest(['pi-live-session/v1', sessionId]).slice(0, 32));
-        const fresh = !existsSync(dir);
         privateDir(dir);
         const journal = createCoverageJournal({ directory: dir, sessionKey: sessionId, effectIds: true, pidLock: true });
-        const controller = createLiveController({ journal, cursorStore: createCursorStore({ directory: dir, sessionKey: sessionId }),
+        const cursorStore = createCursorStore({ directory: dir, sessionKey: sessionId });
+        // First seen means no durable coverage state yet, not merely a missing directory.
+        const fresh = !journal.intervals().length && journal.state().status === 'ready' && cursorStore.load() === null;
+        const controller = createLiveController({ journal, cursorStore,
           conversationId: sessionId, maxRetries: config.maxRetries, gate, baseline: fresh && !config.backfill ? baseline : null,
           open: () => openSession(journal, sessionId, sessionFile, dir) });
         entry = { controller, journal, sessionFile };
@@ -201,6 +218,7 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
     /** Stop every controller within the grace, then close journals (releasing their locks) and the ledger last. */
     async close() {
       closed = true;
+      budget.stop();
       await Promise.all([...controllers.values()].map(async ({ controller, journal }) => {
         try { await controller.close({ graceMs: config.shutdownGraceMs }); } catch {}
         try { journal.close(); } catch {}
@@ -221,7 +239,8 @@ export function createLiveExtension({ configPath = process.env.SOURCE_MEMORY_PI_
   return function sourceMemoryLive(pi) {
     let config = null, logDir = null, runtime = null, starting = null, disabled = null, closed = false;
     let ui = null, mode = null, baseline = null;
-    const status = text => { try { ui?.setStatus?.('source-memory', text); } catch {} };
+    // After shutdown the footer and host callbacks belong to the next session; late results are only logged.
+    const status = text => { if (closed) return; try { ui?.setStatus?.('source-memory', text); } catch {} };
     const log = event => {
       if (!logDir) return;
       try { appendFileSync(join(logDir, 'live.log'), `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, { mode: 0o600 }); } catch {}
@@ -230,6 +249,7 @@ export function createLiveExtension({ configPath = process.env.SOURCE_MEMORY_PI_
       const code = safeCode(error);
       log({ event: 'error', code });
       status(`memory: ${code}`);
+      if (closed) return;
       try { onError(Object.assign(error ?? fail(code), { code })); } catch {}
     };
     const ensure = async () => {
@@ -260,6 +280,7 @@ export function createLiveExtension({ configPath = process.env.SOURCE_MEMORY_PI_
         } catch {}
       });
       const hook = registerLiveMemory(pi, {
+        active: ctx => !closed && !disabled && Boolean(ctx?.sessionManager?.getSessionFile?.()) && (runtime !== null || starting !== null || existsSync(configPath)),
         controllerFor: async snapshot => {
           if (closed || !snapshot.sessionFile) return null;
           return (await ensure())?.controllerFor(snapshot, { baseline }) ?? null;
@@ -268,7 +289,7 @@ export function createLiveExtension({ configPath = process.env.SOURCE_MEMORY_PI_
           log({ event: 'settle', status: result.status, code: result.code ?? result.results?.at(-1)?.code ?? null,
             dispositions: result.results?.map(row => row.disposition ?? (row.refused ? 'refused' : null)) ?? [] });
           status(`memory: ${result.status}`);
-          try { onResult(result, snapshot); } catch {}
+          if (!closed) { try { onResult(result, snapshot); } catch {} }
         },
         onError: report,
       });

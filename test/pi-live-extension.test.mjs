@@ -39,6 +39,7 @@ function fakeMemory() {
   const memory = {
     async init() { return { initialized: true }; },
     async ingest(_scope, turn) {
+      if (store.holdIngest) { store.ingestEntered?.(); await store.holdIngest; }
       store.ingests.push(turn.entries.map(row => row.id));
       const replayed = store.turns.has(turn.turn_id);
       if (!replayed) store.turns.set(turn.turn_id, turn);
@@ -63,13 +64,81 @@ test('a strict configuration refuses relative paths, unknown thinking levels and
     { ...base, scope: 'two scopes' }, { ...base, version: 2 }, { ...base, enabled: 'false' }, { ...base, shutdown_grace: 10 },
     { ...base, budget: { input_tokens_per_day: 10, max_interval_per_day: 1 } }, { ...base, memory: null }, { ...base, shutdown_grace_ms: 60000 },
     { ...base, memory: { config: '/fiction/memory.json', timeout_ms: 4_000_000 } }, { ...base, distiller: { model: 'fiction/model', reviewer: 'model' } },
-    { ...base, modes: ['web'] }, { ...base, modes: [] }]) assert.throws(() => parseLiveConfig(broken), /live_config_invalid/, JSON.stringify(broken));
+    { ...base, modes: ['web'] }, { ...base, modes: [] }, { ...base, enabled: null }, { ...base, pi_sdk: null }, { ...base, backfill: null }]) assert.throws(() => parseLiveConfig(broken), /live_config_invalid/, JSON.stringify(broken));
 });
 
 test('a configuration file others can write is refused', () => {
   const paths = layout('unsafe');
   chmodSync(paths.configPath, 0o666);
   assert.throws(() => readLiveConfig(paths.configPath), /live_config_unsafe/);
+});
+
+test('a Memory configuration others can write is refused before any process starts', { skip: !sdkPath }, async () => {
+  const pi = await loadPi();
+  const paths = layout('unsafe-memory');
+  chmodSync(paths.config.memory.config, 0o666);
+  const { store, spawnMemory } = fakeMemory();
+  const errors = [];
+  const factory = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory, resolveModels: fakeModels(distillerRuntime()),
+    onError: error => errors.push(error.code) });
+  const { session } = await hostSession(pi, { ...paths, factories: [factory] });
+  await session.prompt('Fictional prompt.');
+  await waitFor(() => errors.length === 1);
+  assert.deepEqual([errors, store.spawned], [['memory_config_unsafe'], 0]);
+  await shutdown(session);
+});
+
+test('shutdown during a held ingest starts no model call afterwards and leaves no call without usage', { skip: !sdkPath }, async () => {
+  const pi = await loadPi();
+  const paths = layout('held-ingest');
+  writeFileSync(paths.configPath, JSON.stringify({ ...paths.config, shutdown_grace_ms: 100 }), { mode: 0o600 });
+  const { store, spawnMemory } = fakeMemory();
+  let release;
+  store.holdIngest = new Promise(resolve => { release = resolve; });
+  const entered = new Promise(resolve => { store.ingestEntered = resolve; });
+  const calls = [];
+  let shutdownAt = Infinity;
+  const runtime = distillerRuntime();
+  const counted = { hasConfiguredAuth: () => true, streamSimple(...args) { calls.push(Date.now()); return runtime.streamSimple(...args); } };
+  const factory = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory, resolveModels: fakeModels(counted), onError() {} });
+  const { session } = await hostSession(pi, { ...paths, factories: [factory] });
+  await session.prompt('Fictional: held ingest.');
+  await entered;
+  shutdownAt = Date.now();
+  const closing = shutdown(session);
+  release();
+  await closing;
+  await new Promise(resolve => setTimeout(resolve, 200));
+  const ledger = readFileSync(join(paths.config.state_dir, 'usage.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  const unanswered = ledger.filter(row => row.kind === 'call' && !ledger.some(other => other.kind === 'usage' && other.call === row.id));
+  assert.deepEqual([calls.filter(at => at >= shutdownAt).length, unanswered.length, store.spawned === store.closed], [0, 0, true]);
+});
+
+test('repeatedly quitting during a distillation never exhausts the retry limit', { skip: !sdkPath }, async () => {
+  const pi = await loadPi();
+  const paths = layout('quit-loop');
+  writeFileSync(paths.configPath, JSON.stringify({ ...paths.config, shutdown_grace_ms: 50, max_retries: 1 }), { mode: 0o600 });
+  const { store, spawnMemory } = fakeMemory();
+  let sessionFile = null;
+  for (let round = 0; round < 3; round++) {
+    let reached;
+    const started = new Promise(resolve => { reached = resolve; });
+    const factory = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory, onError() {},
+      resolveModels: fakeModels(distillerRuntime({ before: () => { reached(); return new Promise(() => {}); } })) });
+    const host = await hostSession(pi, { ...paths, factories: [factory], ...(sessionFile ? { sessionFile } : {}) });
+    sessionFile = host.sessionManager.getSessionFile();
+    await host.session.prompt(`Fictional turn ${round}.`);
+    await started;
+    await shutdown(host.session);
+  }
+  const results = [];
+  const factory = createLiveExtension({ configPath: paths.configPath, loadSdk: async () => pi, spawnMemory, resolveModels: fakeModels(distillerRuntime()),
+    onResult: result => results.push(result) });
+  const host = await hostSession(pi, { ...paths, factories: [factory], sessionFile });
+  await host.session.prompt('Fictional final turn.');
+  await waitFor(() => results.length === 1);
+  assert.deepEqual([results[0].status, results[0].results.map(row => row.disposition)], ['covered', ['committed', 'committed']]);
+  await shutdown(host.session);
 });
 
 test('a real Pi session settles immediately while the extension distills its turns in the background', { skip: !sdkPath }, async () => {
