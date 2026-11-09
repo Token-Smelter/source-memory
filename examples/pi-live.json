@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "scope": "personal",
+  "state_dir": "/home/example/.local/state/source-memory/pi-live",
+  "memory": {
+    "config": "/home/example/.config/source-memory/memory.json",
+    "timeout_ms": 120000,
+    "index_timeout_ms": 300000
+  },
+  "distiller": {
+    "model": "anthropic/claude-haiku-5-5",
+    "reviewer": "anthropic/claude-haiku-5-5",
+    "thinking": "low"
+  },
+  "budget": {
+    "input_tokens_per_day": 5000000,
+    "max_intervals_per_day": 200,
+    "min_remaining_tokens": 200000
+  },
+  "max_retries": 3,
+  "shutdown_grace_ms": 5000
+}

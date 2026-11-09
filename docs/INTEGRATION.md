@@ -1,6 +1,42 @@
 # Integrating Pi Memory with a host
 
-**Status: experimental scaffolding, not a drop-in production integration.** The repository implements a host-injected Pi hook, a cursor-bounded distiller and Memory-process adapters; the host must supply configuration, authorization, cursor persistence, lifecycle management and recovery. An external development pilot was declared **invalid: search truncation fault** after whole recall bundles were omitted under a budget. Compact record search replaces those distiller bundles, but does not retroactively validate that pilot.
+**Status: a configurable live Pi extension (`pi-extension/live-extension.mjs`) with durable cursor custody, restart recovery, compaction handling and a pre-ingest budget and permission gate; still experimental, and not a qualified production deployment.** The lower-level `registerPiMemory` hook remains for host-owned adapters. The operator still owns the Memory database, credentials, model routes and spend. An external development pilot was declared **invalid: search truncation fault** after whole recall bundles were omitted under a budget. Compact record search replaces those distiller bundles, but does not retroactively validate that pilot.
+
+## Live bootstrap (implemented)
+
+```mermaid
+flowchart LR
+    Pi["Host Pi session"] -->|"agent_settled: snapshot and enqueue"| Ext["live-extension.mjs default export"]
+    Ext -->|"background queue"| Ctl["createLiveController"]
+    Ctl -->|"gate: grants and daily budget"| Gate["live-gate.mjs"]
+    Ctl -->|"journal and cursor"| State["private state_dir"]
+    Ctl -->|"spawn on first interval"| Proc["serve.mjs Memory process"]
+    Ctl --> Dist["Private Pi distiller (no host extensions)"]
+    Dist --> Proc
+    Proc --> Store["Scoped Source Memory"]
+```
+
+Load `pi-extension/live-extension.mjs` as a Pi extension, for example with `pi -e /path/to/source-memory/pi-extension/live-extension.mjs` or by placing it in Pi's extension paths. It reads `SOURCE_MEMORY_PI_LIVE_CONFIG` or `~/.config/source-memory/pi-live.json`. **Without that file it does nothing.** `examples/pi-live.json` shows the shape:
+
+| Key | Meaning |
+|---|---|
+| `scope` | The one Memory scope written; the Memory configuration must grant both read and write on it, or the gate refuses. |
+| `state_dir` | Absolute private directory (created `0700`) for per-session journals, cursors, intents, private session copies, `usage.jsonl` and `live.log`. |
+| `memory.config` | Absolute path to the Memory configuration that `serve.mjs` uses (Neo4j, scopes, embedding). `memory.node`, `timeout_ms` and `index_timeout_ms` are optional. |
+| `distiller.model`, `distiller.reviewer`, `thinking` | Pi `provider/model` routes resolved through Pi's own `ModelRuntime` and auth; the reviewer defaults to the distiller model. |
+| `budget.input_tokens_per_day`, `max_intervals_per_day`, `min_remaining_tokens` | Daily gate before ingest. The token budget is required. |
+| `max_retries`, `shutdown_grace_ms`, `pi_sdk`, `enabled` | Retry cap per interval, drain time at `session_shutdown`, an explicit Pi SDK path (otherwise `PI_SDK_MODULE` or the running Pi package), and an off switch. |
+
+Runtime contract:
+
+- **Never blocks the session.** The `agent_settled` handler only snapshots and enqueues. Distillation runs after the handler returns, and the next prompt does not wait for it.
+- **Fails safe.** A missing, disabled or invalid configuration, an unavailable SDK, a failed Memory process or any interval error is written to `live.log` (codes only, no source text) and the `source-memory` footer status, and passed to `onError`. Nothing is thrown into Pi. A startup failure disables the extension for that Pi session.
+- **Lifecycle.** Nothing starts in the factory. The Memory process is spawned on the first admitted interval. `session_shutdown` drains for `shutdown_grace_ms`, then stops the process and closes the journals. Work cut off by shutdown is reconciled on the next start.
+- **Isolation.** Distiller and reviewer sub-sessions load no host extensions, skills or context files, and private session copies are removed when the Memory session closes. Ephemeral sessions without a session file are not processed.
+
+The extension holds one Memory process and one controller per Pi session. Two Pi processes on the same session are refused by the journal lock. Two Pi processes on different sessions share `usage.jsonl`, but each holds its own in-memory view of the day's spend.
+
+## Host-owned hook (`registerPiMemory`)
 
 ```mermaid
 flowchart LR
@@ -18,9 +54,9 @@ flowchart LR
 | Surface | Current behavior |
 |---|---|
 | Package | `source-memory`, private package, Node.js 22 or later, ES modules. The root `exports` entry is `src/memory.mjs`; it does **not** export the Pi integration as a package subpath. |
-| Host entry | Import the named `registerPiMemory` export from the checked-out `pi-extension/index.mjs` using a host-controlled file path. It is not a default-export Pi extension and this repository does not install or automatically register it in a host. |
+| Host entry | `pi-extension/live-extension.mjs` is a default-export Pi extension (above). For a custom host adapter, import the named `registerPiMemory` export from `pi-extension/index.mjs`, or `registerLiveMemory` and `createLiveController` from `pi-extension/live.mjs`. This repository installs nothing into a host automatically. |
 | Registration | Call `registerPiMemory(pi, { prepare, onError })` from a host-owned adapter. The host must verify that its Pi runtime emits the expected `agent_settled` event with the `sessionManager` methods described below. |
-| Status | The hook and injected adapters have fictional tests. A complete live bootstrap, supported installation contract and production lifecycle have not been established. |
+| Status | The live extension is exercised by fictional tests in a real Pi SDK session, and by an end-to-end check against the disposable Neo4j of `npm run test:integration` when `PI_SDK_MODULE` is set. Model routes, providers and spend in a production deployment have not been qualified. |
 
 Illustrative wiring, **not a complete or production-ready bootstrap**:
 
@@ -166,7 +202,7 @@ Turns created by this adapter use source `pi-memory`. Their `turn_id` is derived
 | Area | Implemented and exercised | Still required or planned |
 |---|---|---|
 | Event adapter | Injectable `agent_settled` hook and per-session in-memory queue; nonblocking registration has a fictional test | Real host bootstrap, queue ordering/error/cursor-save tests, lifecycle and operational authorization |
-| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries, and a durable budget and permission gate before ingest** | Operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
+| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries, a durable budget and permission gate before ingest, and a default-export live extension with configuration, background distillation and fail-safe lifecycle** | Operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
 | Retrieval | Scoped Memory search and proposal handles; bounded-state disclosure | Compact per-record results and chosen-handle evidence fetch; eliminate the observed truncation fault |
 | Distiller | Private incremental Pi copy, sequential memory tools, metering interfaces and fictional/offline SDK tests | Production route qualification, bounded provider costs and host-level access controls |
 | Evidence and identity | Current-turn evidence labels, private image blobs, explicit `pi-memory` source | Cross-source deduplication and visual-content citation |
