@@ -360,11 +360,13 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       const retrieval = result.packet.retrieval ?? null;
       if (retrieval?.status !== 'selected' || retrieval?.relationship_context_complete !== false || retrieval?.completeness_guaranteed !== false
         || !Number.isSafeInteger(retrieval?.omitted_prior_records) || !Number.isSafeInteger(retrieval?.omitted_prior_spans)
-        || !Array.isArray(retrieval?.trigger_omissions) || retrieval.omitted_prior_records > 0 || retrieval.omitted_prior_spans > 0
-        || retrieval.trigger_omissions.some(row => row.reason === 'packet_budget')) incompleteSearch = true;
+        || !Array.isArray(retrieval?.trigger_omissions) || retrieval.omitted_prior_records > 0 || retrieval.omitted_prior_spans > 0) incompleteSearch = true;
+      // Evidence cited by new records must fit, and omitted prior memory stays fail-closed. Uncited spans of the
+      // current turn are optional context the distiller already read, so their omission is disclosed, not a retrieval gap.
       searchStatuses.push({ surface: 'selected-link-offer', status: retrieval?.status ?? 'offer',
         budget_omitted: retrieval?.budget_omitted ?? 0, omitted_prior_records: retrieval?.omitted_prior_records ?? 0,
-        trigger_omitted: retrieval?.trigger_omissions?.length ?? 0, candidate_ids: handles.map(handle => compactHandles.get(handle)) });
+        trigger_omitted: retrieval?.trigger_omissions?.length ?? 0,
+        trigger_context_omitted: retrieval?.trigger_omissions?.filter(row => row.reason === 'packet_budget').length ?? 0, candidate_ids: handles.map(handle => compactHandles.get(handle)) });
       for (const handle of handles) linkCandidateIds.add(compactHandles.get(handle));
       offer = result;
       offerHandles = [...handles];
