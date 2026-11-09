@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createAnswerer, CITATION_PROTOCOL, UNKNOWN_ANSWER, citationId, textSha256 } from '../pi-extension/evaluation/answerer.mjs';
+import { createAnswerer, CITATION_PROTOCOL, UNKNOWN_ANSWER, citationId, rawEvidenceId, textSha256 } from '../pi-extension/evaluation/answerer.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_CITED_TOOLS_SHA256, ANSWERER_CITED_REPAIR,
   SCORER_GROUNDED_TOOLS_SHA256, SCORER_GROUNDED_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
 import { hash, sealComparison } from '../pi-extension/evaluation/seal.mjs';
@@ -122,9 +122,10 @@ test('raw-only diagnostics cite a directly returned source using its returned id
   const answerer = createAnswerer({ seal, expectedDigest: seal.digest,
     memory: { async search() { throw new Error('derived_forbidden'); }, async resolve() { throw new Error('resolve_forbidden'); } },
     archive: { async search() { return [{ id: 'raw', scope: 'fiction', text: 'Fictional source.' }]; } },
-    async respond({ tools }) { await tools.search('fiction'); return { text: 'Fiction.', citations: [{ item_id: 'raw', evidence_id: 'raw' }] }; } });
+    async respond({ tools }) { const [row] = await tools.search('fiction');
+      return { text: 'Fiction.', citations: [{ item_id: 'raw', evidence_id: row.evidence[0].id }] }; } });
   const result = await answerer.run({ arm: 'raw-only', case: fictionalCase() });
-  assert.deepEqual([result.answer.citations, result.diagnostic], [[{ item_id: 'raw', evidence_id: 'raw' }], true]);
+  assert.deepEqual([result.answer.citations, result.diagnostic], [[{ item_id: 'raw', evidence_id: rawEvidenceId('raw', 'Fictional source.') }], true]);
 });
 
 test('scoring refuses citations or unknown text altered after answer generation', async () => {
@@ -147,13 +148,33 @@ test('scoring refuses citations or unknown text altered after answer generation'
   await assert.rejects(scorer.score({ packet: scoringPacket(), answer: { text: 'Forged claim.', citations: [] }, trace: empty.trace }), /citation_trace_invalid/);
 });
 
-test('raw-only repeated ids are rejected before citation identity becomes ambiguous', async () => {
+test('a raw source returned again with query-dependent excerpts keeps each excerpt citable', async () => {
   const seal = sealComparison(settings());
-  const answerer = createAnswerer({ seal, expectedDigest: seal.digest,
+  const run = second => createAnswerer({ seal, expectedDigest: seal.digest,
     memory: { async search() { return []; }, async resolve() {} },
-    archive: { async search() { return [{ id: 'raw', scope: 'fiction', text: 'Fiction.' }]; } },
-    async respond({ tools }) { await tools.search('one'); await tools.search('two'); return { text: 'Fiction.', citations: [] }; } });
-  await assert.rejects(answerer.run({ arm: 'raw-only', case: fictionalCase() }), /duplicate_item/);
+    archive: { async search({ query }) { return [{ id: 'raw', scope: 'fiction', text: query === 'one' ? 'First excerpt.' : second }]; } },
+    async respond({ tools }) { const [a] = await tools.search('one'); const [b] = await tools.search('two');
+      assert.deepEqual([a.kind, b.kind], ['source_excerpt', 'source_excerpt']);
+      return { text: 'Fiction.', citations: [...new Set([a.evidence[0].id, b.evidence[0].id])].map(evidence_id => ({ item_id: 'raw', evidence_id })) }; } })
+    .run({ arm: 'raw-only', case: fictionalCase() });
+  const same = await run('First excerpt.');
+  assert.deepEqual([same.trace.returnedItemIds, same.trace.returnedEvidence.length, same.trace.returnedItems, same.answer.citations.length], [['raw'], 1, 2, 1]);
+  const different = await run('Second excerpt.');
+  assert.deepEqual([different.trace.returnedItemIds, different.trace.citedEvidence.map(row => row.text)], [['raw'], ['First excerpt.', 'Second excerpt.']]);
+});
+
+test('a derived item returned by a later search is accepted unless its evidence changed or it repeats in one response', async () => {
+  const seal = sealComparison(settings());
+  const run = rowsFor => createAnswerer({ seal, expectedDigest: seal.digest,
+    memory: { async search({ query }) { return rowsFor(query); }, async resolve(request) { return { id: request.evidenceId, scope: 'fiction', text: 'Fictional source.' }; } },
+    archive: { async search() { return []; } },
+    async respond({ tools }) { await tools.search('one'); await tools.search('two'); await tools.resolve('item', 'source');
+      return { text: 'Fiction.', citations: [citation] }; } }).run({ arm: 'candidate', case: fictionalCase() });
+  const repeated = await run(() => [item]);
+  assert.deepEqual([repeated.trace.returnedItemIds, repeated.answer.citations], [['item'], [citation]]);
+  const changed = { ...item, evidence: [{ id: 'other', scope: 'fiction' }] };
+  await assert.rejects(run(query => [query === 'one' ? item : changed]), /retrieval_failed|duplicate_item/);
+  await assert.rejects(run(() => [item, item]), /retrieval_failed|duplicate_item/);
 });
 
 test('legacy uncited answerers cannot execute through the fixed answerer', () => {

@@ -9,6 +9,8 @@ export const UNKNOWN_ANSWER = 'I do not know based on the available memory.';
 const pair = (item, evidence) => JSON.stringify([item, evidence]);
 export const citationId = (item, evidence) => `citation-${hash([item, evidence])}`;
 export const textSha256 = value => createHash('sha256').update(value, 'utf8').digest('hex');
+export const rawEvidenceId = (id, text) => `${id}:${textSha256(text).slice(0, 16)}`;
+const sameRefs = (a, b) => a.size === b.size && [...a].every(([id, scope]) => b.get(id) === scope);
 const budgetCodes = new Set(['search_limit', 'item_limit', 'retrieval_bytes_limit', 'resolve_limit', 'evidence_limit']);
 
 export function createAnswerer({ seal, expectedDigest, memory, archive, respond }) {
@@ -74,14 +76,18 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
               if (!nonempty(row?.id) || !nonempty(row?.text) || !access.readScopes.includes(row.scope)) throw fail('retrieval_scope_invalid');
               if (arm === 'raw-only') {
                 if (!access.evidenceScopes.includes(row.scope)) throw fail('evidence_scope_invalid');
-                if (offered.has(row.id) || next.has(row.id)) throw fail('duplicate_item');
-                next.set(row.id, new Map([[row.id, row.scope]]));
-                return { id: row.id, scope: row.scope, text: row.text };
+                // Raw excerpts depend on the query, so each distinct text is its own citable evidence.
+                const evidenceId = rawEvidenceId(row.id, row.text);
+                if (next.has(row.id)) throw fail('duplicate_item');
+                next.set(row.id, new Map([...(offered.get(row.id) ?? []), [evidenceId, row.scope]]));
+                return { id: row.id, kind: 'source_excerpt', scope: row.scope, text: row.text, evidence: [{ id: evidenceId, scope: row.scope }] };
               }
               if (!Array.isArray(row.evidence)) throw fail('retrieval_invalid');
               const evidence = row.evidence.filter(e => nonempty(e?.id) && access.evidenceScopes.includes(e.scope)).map(e => ({ id: e.id, scope: e.scope }));
-              if (offered.has(row.id) || next.has(row.id) || new Set(evidence.map(e => e.id)).size !== evidence.length) throw fail('duplicate_item');
-              next.set(row.id, new Map(evidence.map(e => [e.id, e.scope])));
+              const refs = new Map(evidence.map(e => [e.id, e.scope]));
+              // A later search may legitimately return an item again; only a changed identity or an in-response repeat is invalid.
+              if (next.has(row.id) || refs.size !== evidence.length || (offered.has(row.id) && !sameRefs(offered.get(row.id), refs))) throw fail('duplicate_item');
+              next.set(row.id, refs);
               return { id: row.id, scope: row.scope, text: row.text, evidence };
             });
             const bytes = result.reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify(row)), 0);
@@ -90,7 +96,7 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
             returned += rows.length; retrievalBytes += bytes;
             if (arm === 'raw-only') {
               evidenceBytes += bytes;
-              for (const row of result) remember(row.id, row.id, row.scope, row.text);
+              for (const row of result) remember(row.id, row.evidence[0].id, row.scope, row.text);
             }
             for (const [id, refs] of next) offered.set(id, refs);
             return result;
