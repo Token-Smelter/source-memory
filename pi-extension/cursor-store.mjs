@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, fstatSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { digest } from '../src/core.mjs';
 
@@ -9,6 +9,18 @@ const owned = st => st.uid === process.getuid() && (st.mode & 0o077) === 0;
 function syncDirectory(dir) {
   const fd = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY);
   try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+/** Write a new private file durably: exclusive create, fsync, directory fsync. An existing file is left unchanged. */
+export function writeDurableFile(directory, name, bytes) {
+  const path = join(directory, name);
+  const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  try {
+    for (let offset = 0; offset < bytes.length;) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  syncDirectory(directory);
+  return path;
 }
 
 /**
@@ -22,6 +34,8 @@ export function createCursorStore({ directory, sessionKey, hooks = {} }) {
   if (!st.isDirectory() || !owned(st)) throw fail('work_dir_invalid');
   const key = digest(['live-cursor/v1', sessionKey]);
   const path = join(dir, `cursor-${key}.json`);
+  // A temp file left by a crash before its rename was never the cursor.
+  for (const name of readdirSync(dir)) if (name.startsWith(`.cursor-${key}-`) && name.endsWith('.tmp')) { try { unlinkSync(join(dir, name)); } catch {} }
   return {
     path,
     load() {

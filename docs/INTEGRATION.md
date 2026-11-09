@@ -1,6 +1,6 @@
 # Integrating Pi Memory with a host
 
-**Status: experimental scaffolding, not a drop-in production integration.** The repository implements a host-injected Pi hook, a cursor-bounded distiller and Memory-process adapters; the host must supply configuration, authorization, cursor persistence, lifecycle management and recovery. An external development pilot was declared **invalid: search truncation fault** after whole recall bundles were omitted under a budget. Compact record search replaces those distiller bundles, but does not retroactively validate that pilot.
+**Status: experimental scaffolding, not a drop-in production integration.** The repository implements a host-injected Pi hook, a cursor-bounded distiller and Memory-process adapters; the host must supply configuration, authorization and lifecycle management. `pi-extension/live.mjs` provides journal-backed cursor persistence and restart recovery; with the lower-level `registerPiMemory` hook below, the host supplies them itself. An external development pilot was declared **invalid: search truncation fault** after whole recall bundles were omitted under a budget. Compact record search replaces those distiller bundles, but does not retroactively validate that pilot.
 
 ```mermaid
 flowchart LR
@@ -66,34 +66,50 @@ The cursor is the last covered **source entry ID**, not a message count. Process
 
 ### Live controller: durable cursor and restart recovery (implemented)
 
-`pi-extension/live.mjs` adds a restart-safe alternative to `registerPiMemory`: `registerLiveMemory(pi, { controllerFor, onResult, onError })` snapshots each `agent_settled` event and queues it for a per-session `createLiveController`. That controller uses the same coverage journal as the replay harness (`createCoverageJournal` with `effectIds` and `pidLock`) plus a durable cursor file (`pi-extension/cursor-store.mjs`).
+`pi-extension/live.mjs` adds a journal-backed alternative to `registerPiMemory`: `registerLiveMemory(pi, { controllerFor, onResult, onError })` snapshots each `agent_settled` event and queues it for a per-session `createLiveController`. That controller uses the same coverage journal as the replay harness (`createCoverageJournal` with `effectIds` and `pidLock`) plus a durable cursor file (`pi-extension/cursor-store.mjs`).
 
 ```mermaid
 flowchart TD
     Settle["settle(leaf, entries)"] --> Rec{"journal uncertain or reconciliation required?"}
     Rec -->|"yes"| Ids["Fresh Memory process: ingest is an idempotent replay; enrich and outcome IDs are checked with recordPresence"]
-    Ids --> Gap["reconcile as failed with evidence ref"]
-    Rec -->|"no"| Resolve
-    Gap --> Resolve["cursor = saved pointer, walked back off a foreign branch, forward over covered intervals"]
-    Resolve --> Retry{"failed gap?"}
-    Retry -->|"yes, within maxRetries"| Same["retry the same cursor and through: same turn ID"]
-    Retry -->|"no"| Check["pure sourceInterval check: skip without a journal row"]
-    Same --> Check
+    Ids --> Gap["persist evidence file, reconcile as failed"]
+    Rec -->|"no"| Retry
+    Gap --> Retry{"failed gap?"}
+    Retry -->|"yes, still valid and within maxRetries"| Same["retry the same cursor and through: same turn ID"]
+    Retry -->|"no"| Resolve
+    Same --> Resolve["cursor = end of the covered prefix of the active branch"]
+    Resolve --> Check["pure sourceInterval check: skip without a journal row"]
     Check --> Run["runCoveredInterval, then atomic cursor save"]
 ```
 
+Wiring for a custom host, with one journal and cursor per Pi session:
+
+```js
+const journal = createCoverageJournal({ directory, sessionKey: sessionId, effectIds: true, pidLock: true });
+const controller = createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: sessionId }),
+  conversationId: sessionId, open: openTrackedSession, gate });
+registerLiveMemory(pi, { controllerFor: () => controller, onError });
+// At shutdown: await controller.close(); journal.close();  (releases the lock)
+```
+
+`open()` must return `{ conversation_id, scopes: [scope], memory: journal.track(client), distiller, close }`, with the distiller using that same tracked `memory`, and must start a new Memory process each time it is called. The controller closes its own session before reconciling, but it cannot stop a process another host left running.
+
 | Behavior | Contract |
 |---|---|
-| Cursor file | One private `cursor-<sha>.json` per session key, hash-bound to that key. Each save writes a private temp file, fsyncs it, renames it and fsyncs the directory. A crash leaves the old or the new cursor. A tampered or foreign file is refused with `cursor_store_invalid`. |
-| Authority | The journal decides what is covered; the cursor file is a pointer into it. A saved cursor that the journal never covered is refused with `cursor_journal_mismatch`. |
-| Failed cursor save | The journal already holds the covered interval, so the next settle advances past it. The interval is never widened over covered source, and the file is repaired. |
-| Crash or unknown write | An unfinished or uncertain interval is reconciled before any new work. Unknown `ingest` is settled by an idempotent replay under the same deterministic turn ID. Unknown `enrich` and `applyOutcome` are settled by reading their content-addressed record IDs (`recordPresence`) through a newly opened Memory session. Unknown `applyLinks`, or an effect without recorded IDs, raises `reconciliation_required` and needs an operator. |
-| Retry | A failed interval is retried with the same cursor and through, so `ingest` replays the stored turn (`replayed: true`), up to `maxRetries` (default 3, counted from journal `begin` rows). The result after that is `blocked: retry_limit`. |
-| Validation | A leaf that fails the pure `sourceInterval` check, such as `turn_incomplete` or a no-op re-settle, is skipped without a journal row. |
-| Branch switch | When the saved cursor is not on the new branch, it walks back through covered intervals to the shared ancestor, and only the new branch's suffix is covered. A failed gap on an abandoned branch stays `blocked: coverage_gap_unreachable` and needs an operator. |
-| Lock | `pidLock` records the owner PID and breaks a lock only when that PID no longer exists on this host. An empty lock, a live owner, or a lock written by the harness's default journal still refuses with `journal_locked`. |
+| Behavior | Contract |
+|---|---|
+| Cursor file | One private `cursor-<sha>.json` per session key. Each save writes a private temp file, fsyncs it, renames it and fsyncs the directory, so a crash leaves the old or the new cursor. Temp files left by a crash are removed when the store opens. The embedded unkeyed SHA-256 detects corruption, not deliberate tampering; a mismatch is refused with `cursor_store_invalid`. |
+| Authority | The journal decides what is covered. Each settle computes the cursor as the end of the active branch's covered prefix, counting every entry on a covered interval's chain, not only its endpoints. A saved cursor that is not the end of a covered interval is refused with `cursor_journal_mismatch`. |
+| Failed cursor save | The journal already holds the covered interval, so the next settle starts after it. The interval is never widened over covered source; the next successful save rewrites the file. |
+| Crash or unknown write | An unfinished or uncertain interval is reconciled before any new work. Unknown `ingest` is settled by replaying it under the same deterministic turn ID: `replayed: true` if the first attempt landed, a first write otherwise. Unknown `enrich` and `applyOutcome` are settled by reading their content-addressed record IDs (`recordPresence`, read grant required) through a newly opened Memory session. A split outcome, any non-refused `applyLinks`, or an effect without recorded IDs returns `blocked: reconciliation_required` and needs an operator. |
+| Confirmed partial writes | A failed interval with confirmed `enrich` or `applyOutcome` writes is also reconciled automatically and retried. The retry may add further proposed records for the same turn; identical records deduplicate by ID. |
+| Evidence | Every automatic reconciliation writes `reconcile-<sha>.json` (canonical JSON: interval, confirmed IDs, present and absent IDs, ingest settlement) durably next to the journal before the journal `reconcile` row, whose `evidence_ref` names that SHA-256. Presence never changes the decision: the interval is always reconciled as `failed` and then retried. |
+| Retry | A failed gap is retried with the same cursor and through wherever it still validates in the session's entries, including on an abandoned branch, up to `maxRetries` (default 3, counted from journal `begin` rows). After that it is `blocked: retry_limit`. A gap whose source no longer validates is `blocked: coverage_gap_unreachable`. Nothing new begins while a gap is open. |
+| Validation | A leaf inside the covered prefix returns `current`. A leaf that fails the pure `sourceInterval` check (for example `turn_incomplete`, or an unknown leaf) is `skipped` without a journal row, and is skipped again on each later settle while that condition holds. |
+| Branches | A fork anywhere, including inside one covered interval, starts at the last covered entry it shares with the covered prefix, so only its own suffix is ingested. |
+| Lock | `pidLock` writes an owner record (host, boot ID, PID namespace, PID, process start time) atomically with a hard link. A lock is taken over only when it names this host and PID namespace and its owner's PID is gone, has a different start time, or belongs to an earlier boot. Takeover runs under an `O_EXCL` break guard and re-checks the owner, so concurrent openers end with one holder. An empty, foreign or live-owner lock refuses with `journal_locked`, as does a lock written by the harness's default journal. A guard left by a crash during takeover needs an operator. |
 
-Presence is read after the writing session is closed. It cannot cover a Neo4j commit that the server accepted but had not applied at read time. The default `createCoverageJournal` options leave harness journal rows and locks unchanged.
+Presence is read after the writing session is closed. It cannot cover a Neo4j commit that the server accepted but had not applied at read time. The default `createCoverageJournal` options leave harness journal rows and locks byte-identical (pinned by a golden test).
 
 ### Legacy `registerPiMemory` boundary
 
