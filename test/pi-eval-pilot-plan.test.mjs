@@ -30,5 +30,6 @@ test('fresh cited plan seals grounded scorer and leaves candidate and model rout
   const d0 = createCitedPilotPlan({ ...options, treatment: TREATMENTS.D0 }).spec;
   assert.deepEqual([Object.hasOwn(cited, 'treatment'), d0.treatment.retrieval], [false, 'oracle-catalog']);
   assert.throws(() => createCitedPilotPlan({ ...options, treatment: { ...TREATMENTS.D0, retrieval: 'search' } }), /pilot_plan_invalid/);
+  assert.deepEqual(createCitedPilotPlan({ ...options, treatment: TREATMENTS.T1 }).spec.treatment, TREATMENTS.T1);
   assert.throws(() => createCitedPilotPlan({ ...options, toolCallReviewSha256: undefined }), /pilot_plan_invalid/);
 });
