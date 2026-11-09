@@ -1,6 +1,6 @@
 # Integrating Pi Memory with a host
 
-**Status: experimental scaffolding, not a drop-in production integration.** The repository implements a host-injected Pi hook, a cursor-bounded distiller and Memory-process adapters; the host must supply configuration, authorization, cursor persistence, lifecycle management and recovery. An external development pilot was declared **invalid: search truncation fault** after whole recall bundles were omitted under a budget. Compact record search replaces those distiller bundles, but does not retroactively validate that pilot.
+**Status: experimental scaffolding, not a drop-in production integration.** The repository implements a host-injected Pi hook, a cursor-bounded distiller and Memory-process adapters; the host must supply configuration, authorization and lifecycle management. `pi-extension/live.mjs` provides journal-backed cursor persistence and restart recovery; with the lower-level `registerPiMemory` hook below, the host supplies them itself. An external development pilot was declared **invalid: search truncation fault** after whole recall bundles were omitted under a budget. Compact record search replaces those distiller bundles, but does not retroactively validate that pilot.
 
 ```mermaid
 flowchart LR
@@ -64,7 +64,56 @@ export default function attachMemory(pi) {
 
 The cursor is the last covered **source entry ID**, not a message count. Processing walks the active ancestry and consumes the suffix after that cursor through the settled assistant leaf. Missing or mismatched ancestry, unsupported content and incomplete turns must not be treated as successful coverage. `incremental.mjs` creates a private Pi session copy and preserves source IDs in a work directory with no group/other permissions; `pi-runtime.mjs` branches the distiller at each source leaf.
 
-**The live hook is not restart-safe.** The repository does not provide a durable live cursor store or automatic restart recovery. The host must implement `saveCursor` and durable cursor loading and bind them to the correct session and branch. A `createSliceSession` result built with `coverageJournal` cannot be used directly with `registerPiMemory`: the hook does not begin an interval and tracked ingest fails with `interval_not_started`. Use the journal through `runCoveredInterval` or `replay`, not by passing it to the live hook. The cursor save is not atomic with the journal.
+### Live controller: durable cursor and restart recovery (implemented)
+
+`pi-extension/live.mjs` adds a journal-backed alternative to `registerPiMemory`: `registerLiveMemory(pi, { controllerFor, onResult, onError })` snapshots each `agent_settled` event and queues it for a per-session `createLiveController`. That controller uses the same coverage journal as the replay harness (`createCoverageJournal` with `effectIds` and `pidLock`) plus a durable cursor file (`pi-extension/cursor-store.mjs`).
+
+```mermaid
+flowchart TD
+    Settle["settle(leaf, entries)"] --> Rec{"journal uncertain or reconciliation required?"}
+    Rec -->|"yes"| Ids["Fresh Memory process: ingest is an idempotent replay; enrich and outcome IDs are checked with recordPresence"]
+    Ids --> Gap["persist evidence file, reconcile as failed"]
+    Rec -->|"no"| Retry
+    Gap --> Retry{"failed gap?"}
+    Retry -->|"yes, still valid and within maxRetries"| Same["retry the same cursor and through: same turn ID"]
+    Retry -->|"no"| Resolve
+    Same --> Resolve["cursor = end of the covered prefix of the active branch"]
+    Resolve --> Check["pure sourceInterval check: skip without a journal row"]
+    Check --> Run["runCoveredInterval, then atomic cursor save"]
+```
+
+Wiring for a custom host, with one journal and cursor per Pi session:
+
+```js
+const journal = createCoverageJournal({ directory, sessionKey: sessionId, effectIds: true, pidLock: true });
+const controller = createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: sessionId }),
+  conversationId: sessionId, open: openTrackedSession, gate });
+registerLiveMemory(pi, { controllerFor: () => controller, onError });
+// At shutdown: await controller.close(); journal.close();  (releases the lock)
+```
+
+`open()` must return `{ conversation_id, scopes: [scope], memory: journal.track(client), distiller, close }`, with the distiller using that same tracked `memory`, and must start a new Memory process each time it is called. The controller closes its own session before reconciling, but it cannot stop a process another host left running.
+
+| Behavior | Contract |
+|---|---|
+| Behavior | Contract |
+|---|---|
+| Cursor file | One private `cursor-<sha>.json` per session key. Each save writes a private temp file, fsyncs it, renames it and fsyncs the directory, so a crash leaves the old or the new cursor. Temp files left by a crash are removed when the store opens. The embedded unkeyed SHA-256 detects corruption, not deliberate tampering; a mismatch is refused with `cursor_store_invalid`. |
+| Authority | The journal decides what is covered. Each settle computes the cursor as the end of the active branch's covered prefix, counting every entry on a covered interval's chain, not only its endpoints. A saved cursor that is not the end of a covered interval is refused with `cursor_journal_mismatch`. |
+| Failed cursor save | The journal already holds the covered interval, so the next settle starts after it. The interval is never widened over covered source; the next successful save rewrites the file. |
+| Crash or unknown write | An unfinished or uncertain interval is reconciled before any new work. Unknown `ingest` is settled by replaying it under the same deterministic turn ID: `replayed: true` if the first attempt landed, a first write otherwise. Unknown `enrich` and `applyOutcome` are settled by reading their content-addressed record IDs (`recordPresence`, read grant required) through a newly opened Memory session. A split outcome, any non-refused `applyLinks`, or an effect without recorded IDs returns `blocked: reconciliation_required` and needs an operator. |
+| Confirmed partial writes | A failed interval with confirmed `enrich` or `applyOutcome` writes is also reconciled automatically and retried. The retry may add further proposed records for the same turn; identical records deduplicate by ID. |
+| Evidence | Every automatic reconciliation writes `reconcile-<sha>.json` (canonical JSON: interval, confirmed IDs, present and absent IDs, ingest settlement) durably next to the journal before the journal `reconcile` row, whose `evidence_ref` names that SHA-256. Presence never changes the decision: the interval is always reconciled as `failed` and then retried. |
+| Retry | A failed gap is retried with the same cursor and through wherever it still validates in the session's entries, including on an abandoned branch, up to `maxRetries` (default 3, counted from journal `begin` rows). After that it is `blocked: retry_limit`. A gap whose source no longer validates is `blocked: coverage_gap_unreachable`. Nothing new begins while a gap is open. |
+| Validation | A leaf inside the covered prefix returns `current`. A leaf that fails the pure `sourceInterval` check (for example `turn_incomplete`, or an unknown leaf) is `skipped` without a journal row, and is skipped again on each later settle while that condition holds. |
+| Branches | A fork anywhere, including inside one covered interval, starts at the last covered entry it shares with the covered prefix, so only its own suffix is ingested. |
+| Lock | `pidLock` writes an owner record (host, boot ID, PID namespace, PID, process start time) atomically with a hard link. A lock is taken over only when it names this host and PID namespace and its owner's PID is gone, has a different start time, or belongs to an earlier boot. Takeover runs under an `O_EXCL` break guard and re-checks the owner, so concurrent openers end with one holder. An empty, foreign or live-owner lock refuses with `journal_locked`, as does a lock written by the harness's default journal. A guard left by a crash during takeover needs an operator. |
+
+Presence is read after the writing session is closed. It cannot cover a Neo4j commit that the server accepted but had not applied at read time. The default `createCoverageJournal` options leave harness journal rows and locks byte-identical (pinned by a golden test).
+
+### Legacy `registerPiMemory` boundary
+
+**`registerPiMemory` is not restart-safe.** Use the live controller instead. The host must implement `saveCursor` and durable cursor loading and bind them to the correct session and branch. A `createSliceSession` result built with `coverageJournal` cannot be used directly with `registerPiMemory`: the hook does not begin an interval and tracked ingest fails with `interval_not_started`. Use the journal through `runCoveredInterval` or `replay`, not by passing it to the live hook. The cursor save is not atomic with the journal.
 
 **Failure may duplicate source.** Ingest and derived writes happen before cursor saving. If the distiller or `saveCursor` fails, the next settle can ingest a wider interval under a different turn ID, overlapping earlier source and records. The live hook has no same-interval retry or reconciliation. It also does not check budget before ingestion; the host must check in `prepare` and refuse before returning when budget or usage is unavailable.
 
@@ -108,7 +157,7 @@ Turns created by this adapter use source `pi-memory`. Their `turn_id` is derived
 | Area | Implemented and exercised | Still required or planned |
 |---|---|---|
 | Event adapter | Injectable `agent_settled` hook and per-session in-memory queue; nonblocking registration has a fictional test | Real host bootstrap, queue ordering/error/cursor-save tests, lifecycle and operational authorization |
-| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation | Durable host cursor, atomic journal/cursor handoff, non-overlapping failure recovery, budget-before-ingest and compacted-session handling |
+| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save** | Budget-before-ingest and compacted-session handling; operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
 | Retrieval | Scoped Memory search and proposal handles; bounded-state disclosure | Compact per-record results and chosen-handle evidence fetch; eliminate the observed truncation fault |
 | Distiller | Private incremental Pi copy, sequential memory tools, metering interfaces and fictional/offline SDK tests | Production route qualification, bounded provider costs and host-level access controls |
 | Evidence and identity | Current-turn evidence labels, private image blobs, explicit `pi-memory` source | Cross-source deduplication and visual-content citation |
