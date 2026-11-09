@@ -6,7 +6,7 @@ Scope: Agency design `DESIGN-AGENCY-CUSTODY-EVENTSOURCED-FINAL.md` §9.4 (no_wri
 
 ## Results
 
-Run of 2026-11-09 on `feat/qualification-q-sm`: the full integration run passed 96 checks including Q-SM-1…6 (container `source-memory-test-0310e434…`), and the qualification-only run passed 6 (container `source-memory-test-1178b2e8…`). `npm test`: 625 pass, 0 fail.
+Run of 2026-11-09 on `feat/qualification-q-sm`: the full integration run passed 96 checks including Q-SM-1…6 (container `source-memory-test-0310e434…`), and the qualification-only run passed 6 (container `source-memory-test-1178b2e8…`). `npm test`: 625 pass, 0 fail. A later qualification run (#49) adds a seventh check, a refusal after a real driver retry: attempt 1 lost its connection (`ServiceUnavailable`, retryable), and the retry's `record_identity_conflict` replied `stage:unknown`.
 
 | Q | Requirement | Result | Evidence (CLI replies) |
 |---|---|---|---|
@@ -36,11 +36,11 @@ flowchart LR
 |---|---|---|
 | `{"ok":true,...}` on stdout, exit 0 | Committed. `indexing.status: unavailable` with `reason` means indexing failed after the commit; the write stands | `receipt` |
 | `{"ok":false,"error":C,"stage":"before_write"}` on stderr, exit 1 | Refused before the write transaction began; nothing was written | `no_write` |
-| `{"ok":false,"error":C,"stage":"rolled_back"}`, exit 1 | Raised inside the write transaction on its first attempt; the transaction rolled back, so nothing was written | `no_write` (`record_identity_conflict`: T5 `conflict`) |
+| `{"ok":false,"error":C,"stage":"rolled_back"}`, exit 1 | Raised inside the write transaction on its first attempt; the transaction rolled back, so nothing was written | `no_write` (`record_identity_conflict`, `relation_identity_conflict`, `source_identity_conflict`: T5 `conflict`) |
 | `{"ok":false,"error":C,"stage":"unknown"}`, exit 1 | The write may have committed (driver or database error, or a refusal after the driver retried a transaction whose commit reply may have been lost) | `unknown` → exact read |
 | No parseable reply, signal or other exit | The process may have died after the commit | `unknown` → exact read |
 
-`stage` is set only on `ingest` and `enrich` failure replies; other commands keep `{"ok":false,"error":C}`. A stage is set only by an explicit marker at the raise site (`markStage` in `src/core.mjs`). An unmarked error is `unknown`, so a new raise site can never be misreported as no_write.
+`stage` is set only on `ingest` and `enrich` failure replies, on the CLI and on the extension's NDJSON transport; other commands keep `{"ok":false,"error":C}`. A stage is set only by an explicit marker at the raise site (`markStage` in `src/core.mjs`). An unmarked error is `unknown`, so a new raise site can never be misreported as no_write.
 
 Exact read: `show {"kind":"record","id":ID}` returns the stored record; its body minus `uid` and `scope` has the same canonical digest as the normalized submitted record (`match`), or a different one (`differs`). Turns: `show {"kind":"turn_by_key",...}`.
 
@@ -157,5 +157,6 @@ The §9.4 table for `memory.remember@2` was written against the defect. With thi
 | `scope_denied` → `unknown` | `scope_denied` is raised only before the write (`stage: before_write`); no post-commit site remains (Q-SM-6) |
 | `evidence_unavailable` … `outcome_referent_required` → `unknown` until Q-SM-3 | Raised before the first `MERGE` and rolled back (Q-SM-3), `stage: rolled_back` |
 | Classification by code | A codec can classify by `stage` alone: `before_write`/`rolled_back` → `no_write`, anything else → `unknown`. That is a new codec version, as §9.4 requires for a reclassification |
+| `record_identity_conflict`, `relation_identity_conflict`, `source_identity_conflict` | Not covered by that shorthand. With `stage: rolled_back` they are conflicts (the stored record, relation or turn differs), not no-write retries. With `stage: unknown` they are `unknown`, as is every `stage: unknown` reply |
 
 Not covered here: the Agency codec, registry and consumer adapter (§18.1, Memory owner), concurrent original and redispatch deliveries (§9.3, class I only), and the class-I ruling.
