@@ -61,9 +61,12 @@ for (const fixture of fictionalCoverage().value.cases.filter(row => row.entries 
   });
 }
 
-test('an oversized retained chunk cannot be cited by inventing smaller offsets', () => {
-  const text = `${'x'.repeat(7999)}😀${'y'.repeat(8100)}`;
+test('an oversized retained chunk is disclosed as uncitable instead of cut at invented offsets', () => {
+  const text = `${'x'.repeat(7999)}😀${'y'.repeat(8100)} tail`;
+  const tools = createTurnTools({ scope: 'fiction', turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text }] },
+    receipt: { id: 'turn' }, sourceChunks: [{ entry_id: 'u', start: 0, end: text.length - 5, ordinal: 0 }, { entry_id: 'u', start: text.length - 4, end: text.length, ordinal: 1 }],
+    memory: { async enrich() {} } });
+  assert.deepEqual([tools.labels().length, tools.imageNotes()], [1, [{ entry_id: 'u', reason: 'chunk_over_citable_limit', ordinal: 0 }]]);
   assert.throws(() => createTurnTools({ scope: 'fiction', turn: { turn_id: 't', entries: [{ id: 'u', role: 'user', text }] },
-    receipt: { id: 'turn' }, sourceChunks: [{ entry_id: 'u', start: 0, end: text.length, ordinal: 0 }],
-    memory: { async enrich() {} } }), /evidence_chunk_invalid/);
+    receipt: { id: 'turn' }, sourceChunks: [{ entry_id: 'u', start: 0, end: text.length + 1, ordinal: 0 }], memory: { async enrich() {} } }), /evidence_chunk_invalid/);
 });
