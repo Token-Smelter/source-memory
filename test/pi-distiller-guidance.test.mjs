@@ -22,8 +22,8 @@ async function promptFor(guidance) {
 }
 
 test('T1 guidance is appended to the checkpoint instructions only when sealed; the default prompt is unchanged', async () => {
-  const base = await promptFor(null), guided = await promptFor('typed-records-and-links-v1');
-  const text = DISTILLER_GUIDANCE['typed-records-and-links-v1'];
+  const base = await promptFor(null), guided = await promptFor('typed-records-and-links-v2');
+  const text = DISTILLER_GUIDANCE['typed-records-and-links-v2'];
   const split = guided.indexOf(`\n${text}\n`);
   assert.deepEqual([base.includes(text), split > 0, guided.slice(0, split) + guided.slice(split + text.length + 2)], [false, true, base]);
   await assert.rejects(promptFor('unknown'), /runtime_invalid/);

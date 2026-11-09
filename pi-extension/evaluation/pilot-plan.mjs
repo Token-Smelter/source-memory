@@ -9,7 +9,8 @@ import { BLOCK_EVIDENCE_CONTRACT } from './dev-dataset.mjs';
 import { WORKER_SHARE_NANO } from './prior-spend.mjs';
 import { DISTILLER_GUIDANCE } from '../pi-runtime.mjs';
 import { createHash } from 'node:crypto';
-const GUIDANCE_SHA256 = createHash('sha256').update(DISTILLER_GUIDANCE['typed-records-and-links-v1']).digest('hex');
+// T1 v1 (action-only outcomes) is historical; T1 now seals v2, written for outcome_of targets widened to decisions and intentions.
+const GUIDANCE_SHA256 = createHash('sha256').update(DISTILLER_GUIDANCE['typed-records-and-links-v2']).digest('hex');
 
 const fail = code => Object.assign(new Error(code), { code });
 export const INTERPRETATION_02_SHA256 = 'a55c16e3ccba00a60892db5c9b7604d96ca1e8d6998bf89b667cd1fdff42313c';
@@ -27,7 +28,7 @@ export const DISTILLER_MAX_OUTPUT_TOKENS = 16384, EVALUATOR_MAX_OUTPUT_TOKENS = 
 export const TREATMENTS = Object.freeze({
   // D0's oracle is the candidate's own earlier store in the run's scope, not the reference catalog.
   D0: Object.freeze({ id: 'D0', surface: 'distiller retrieval', retrieval: 'oracle-catalog', catalog: 'candidate-store-in-scope', product: false }),
-  T1: Object.freeze({ id: 'T1', surface: 'distiller instructions', guidance: 'typed-records-and-links-v1', guidanceSha256: GUIDANCE_SHA256, product: true }),
+  T1: Object.freeze({ id: 'T1', surface: 'distiller instructions', guidance: 'typed-records-and-links-v2', guidanceSha256: GUIDANCE_SHA256, product: true }),
 });
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
 /** Runtime paths whose change can alter candidate behavior; each changed one must be named as reviewed. */
