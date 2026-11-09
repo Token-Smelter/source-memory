@@ -1,22 +1,26 @@
 import { createHash } from 'node:crypto';
 import { constants, closeSync, fstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { digest } from '../../src/core.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const sha = value => createHash('sha256').update(value).digest('hex');
 export const CLIMB_RUN_SCHEMA = 'climb-run-graph/v1';
 export const CLIMB_ALIGNMENT_SCHEMA = 'climb-alignment/v1';
-export const MATCH_BUCKETS = ['stored_and_returned_provisional', 'stored_not_returned_provisional', 'not_stored_provisional', 'alignment_uncertain'];
+export const MATCH_BUCKETS = ['stored_and_returned_provisional', 'stored_not_returned_provisional', 'not_stored_provisional',
+  'no_match_provisional', 'alignment_uncertain'];
 
 /** Development sessions only. Holdout references and results have no entry here and are refused everywhere. */
 export const DEV_REFERENCES = Object.freeze({
   '01a083db-bf9a': { panel: 'panel v1', format: 'cut', root: '/var/tmp/source-memory-real-eval-r2-20261107T171141Z',
     manifest: 'development/CASE-MANIFEST.json', sha256: 'eb84b3f2c668cb6584994855415e438f1144faa77d3d58e771230a27a6f81625',
-    cut: 'development/reference/reference-cut-044.json' },
+    cut: 'development/reference/reference-cut-044.json', source_sha256: 'eb36913d3ea58902ac99cb9050d706205e35de89cfe54b17a4ad3e86baf963de' },
   'doxagon-vault-software-presentations': { panel: 'panel v2', format: 'checkpoints', root: '/var/tmp/source-memory-real-eval-r2-20261108T194931Z',
-    manifest: 'MANIFEST.json', sha256: 'fbee3eadeaa3205900133b6d9340555b8605cffc41bec1b787575aeaa8bf4ea2' },
+    manifest: 'MANIFEST.json', sha256: 'fbee3eadeaa3205900133b6d9340555b8605cffc41bec1b787575aeaa8bf4ea2',
+    source_sha256: 'a5500fe97b3aab256b45ba50030f1a1aaef6e7fde58f1bcc169b638aea55a74e' },
   'nes-launch-rpc-9de6d24c': { panel: 'panel v2', format: 'checkpoints', root: '/var/tmp/source-memory-real-eval-r2-20261109T000000Z-recovery',
-    manifest: 'MANIFEST.json', sha256: '36137797d8ae8f41c3e5e8e2e9785253a49d1cf988249ceb5fe40f573aa3cb3e' },
+    manifest: 'MANIFEST.json', sha256: '36137797d8ae8f41c3e5e8e2e9785253a49d1cf988249ceb5fe40f573aa3cb3e',
+    source_sha256: 'ff6bfb477be6ea64b44bf31757824b04a227331e34286c4a513bb9fff566b88e' },
 });
 export const referenceCaption = panel => `model-adjudicated reference, ${panel}; not semantically reviewed`;
 
@@ -27,46 +31,92 @@ export function assertDevelopment(sourceKey, paths = []) {
   if (!Object.hasOwn(DEV_REFERENCES, sourceKey)) throw fail('source_not_development');
   refuseHoldoutPaths(paths);
 }
+/** A run belongs to a development session only if its sealed source hash is that session's pinned source. */
+export function assertDevelopmentSource(sourceKey, sourceSha256) {
+  assertDevelopment(sourceKey);
+  if (DEV_REFERENCES[sourceKey].source_sha256 !== sourceSha256) throw fail('source_binding_mismatch');
+}
 
 const bodies = (snapshot, label) => {
   if (!Array.isArray(snapshot?.nodes)) throw fail('snapshot_invalid');
   return snapshot.nodes.filter(node => node.labels?.includes(label)).map(node => JSON.parse(node.properties.body));
 };
 
-/** Records carry the first checkpoint snapshot that contains them; relations come from the final snapshot. */
-export function storeGraph(snapshots) {
-  if (!Array.isArray(snapshots) || !snapshots.length) throw fail('snapshot_invalid');
+/**
+ * Each record is dated by the checkpoint whose confirmed enrich effect created it: the memory receipt's value must
+ * hash to a confirmed coverage-journal effect inside the interval ending at that checkpoint. Records without such a
+ * receipt fall back to the first per-checkpoint snapshot containing them, never the final export.
+ */
+export function storeGraph({ schedule, snapshots, journal, receipts }) {
+  if (!Array.isArray(schedule) || !schedule.length || new Set(schedule).size !== schedule.length
+    || !Array.isArray(snapshots) || snapshots.length !== schedule.length || !Array.isArray(journal) || !Array.isArray(receipts)) throw fail('snapshot_invalid');
+  const byThrough = new Map(snapshots.map(row => [row.through, row.snapshot]));
+  if (byThrough.size !== schedule.length || schedule.some(through => !byThrough.has(through))) throw fail('checkpoint_schedule_mismatch');
+  const ordered = schedule.map(through => byThrough.get(through)), index = new Map(schedule.map((through, i) => [through, i + 1]));
+  const intervals = new Map(journal.filter(row => row.type === 'begin').map(row => [row.id, row.through]));
+  const enrichEffects = new Set(journal.filter(row => row.type === 'effect_begin' && row.method === 'enrich').map(row => row.effect));
+  const confirmed = new Map(journal.filter(row => row.type === 'effect_end' && row.outcome === 'confirmed' && enrichEffects.has(row.effect))
+    .map(row => [row.receipt_sha256, intervals.get(row.id)]));
+  const created = new Map();
+  for (const receipt of receipts.filter(row => row.method === 'enrich' && row.ok === true)) {
+    const through = confirmed.get(digest(receipt.value));
+    if (!through || through !== receipt.checkpoint || !index.has(through)) continue;
+    for (const id of receipt.value.records ?? []) if (!created.has(id)) created.set(id, index.get(through));
+  }
   const firstSeen = new Map();
-  snapshots.forEach((snapshot, index) => {
-    for (const record of bodies(snapshot, 'SMRecord')) if (!firstSeen.has(record.id)) firstSeen.set(record.id, index + 1);
-  });
-  const final = snapshots.at(-1);
-  const records = bodies(final, 'SMRecord').map(row => ({ id: row.id, kind: row.kind, text: row.text, checkpoint_index: firstSeen.get(row.id) }))
+  ordered.forEach((snapshot, i) => { for (const record of bodies(snapshot, 'SMRecord')) if (!firstSeen.has(record.id)) firstSeen.set(record.id, i + 1); });
+  const final = ordered.at(-1);
+  const records = bodies(final, 'SMRecord').map(row => ({ id: row.id, kind: row.kind, text: row.text,
+    checkpoint_index: created.get(row.id) ?? firstSeen.get(row.id), dated_by: created.has(row.id) ? 'write_receipt' : 'first_snapshot' }))
     .sort((a, b) => a.checkpoint_index - b.checkpoint_index || a.id.localeCompare(b.id));
   const relations = bodies(final, 'SMRelation').map(row => ({ from: row.from, to: row.to, type: row.type }))
     .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-  return { checkpoints: snapshots.length, records, relations };
+  return { checkpoints: schedule.length, schedule: [...schedule], records, relations };
 }
 
-/** Normalizes a pinned as-labeled reference: a cumulative cut (panel v1) or per-checkpoint deltas (panel v2). */
+/**
+ * Normalizes a pinned as-labeled reference: a cumulative cut (panel v1) or per-checkpoint additions (panel v2).
+ * Each ordinal is bound to its checkpoint entry so it can be compared with a run schedule.
+ */
 export function referenceGraph({ format, cut, checkpoints }) {
   if (format === 'cut') {
     if (!Array.isArray(cut?.records) || !Array.isArray(cut?.edges) || !Number.isSafeInteger(cut.through_ordinal)) throw fail('reference_invalid');
-    return { checkpoints: cut.through_ordinal,
+    const schedule = new Array(cut.through_ordinal).fill(null);
+    schedule[cut.through_ordinal - 1] = cut.through_entry_id;
+    for (const row of [...cut.records, ...cut.edges]) {
+      const at = row.created_at_checkpoint_ordinal - 1;
+      if (!Number.isSafeInteger(at) || at < 0 || at >= schedule.length || (schedule[at] && schedule[at] !== row.created_at_entry_id)) throw fail('reference_invalid');
+      schedule[at] = row.created_at_entry_id;
+    }
+    return checked({ checkpoints: cut.through_ordinal, schedule,
       records: cut.records.map(row => ({ id: row.id, kind: row.kind, text: row.text, checkpoint_index: row.created_at_checkpoint_ordinal })),
-      relations: cut.edges.map(row => ({ from: row.from, to: row.to, type: row.type })) };
+      relations: cut.edges.map(row => ({ from: row.from, to: row.to, type: row.type })) });
   }
   if (format !== 'checkpoints' || !Array.isArray(checkpoints) || !checkpoints.length) throw fail('reference_invalid');
   const ordered = [...checkpoints].sort((a, b) => a.ordinal - b.ordinal);
-  if (ordered.some((row, index) => row.ordinal !== index + 1 || !Array.isArray(row.records) || !Array.isArray(row.edges))) throw fail('reference_invalid');
-  return { checkpoints: ordered.length,
+  if (ordered.some((row, index) => row.ordinal !== index + 1 || typeof row.checkpoint_entry_id !== 'string'
+    || !Array.isArray(row.records) || !Array.isArray(row.edges))) throw fail('reference_invalid');
+  return checked({ checkpoints: ordered.length, schedule: ordered.map(row => row.checkpoint_entry_id),
     records: ordered.flatMap(row => row.records.map(record => ({ id: record.id, kind: record.kind, text: record.text, checkpoint_index: row.ordinal }))),
-    relations: ordered.flatMap(row => row.edges.map(edge => ({ from: edge.from, to: edge.to, type: edge.type }))) };
+    relations: ordered.flatMap(row => row.edges.map(edge => ({ from: edge.from, to: edge.to, type: edge.type }))) });
+}
+// Panel deltas only add: a repeated record ID or a dangling relation would mean the layout is not additions-only.
+function checked(graph) {
+  const ids = new Set(graph.records.map(row => row.id));
+  if (ids.size !== graph.records.length || graph.relations.some(edge => !ids.has(edge.from) || !ids.has(edge.to))) throw fail('reference_invalid');
+  return graph;
+}
+
+/** Reference ordinals must name the run's own checkpoints; unknown cut ordinals (no labels there) are not compared. */
+export function assertSameSchedule(reference, schedule) {
+  if (!Array.isArray(schedule) || reference.schedule.length !== schedule.length
+    || reference.schedule.some((through, i) => through !== null && through !== schedule[i])) throw fail('reference_schedule_mismatch');
 }
 
 /** Reads a regular, non-symlinked file whose bytes must match the expected SHA-256. */
 export function readPinned(path, expected, max = 256_000_000) {
   if (!isAbsolute(path ?? '') || realpathSync(path) !== path || !/^[a-f0-9]{64}$/.test(expected ?? '')) throw fail('path_invalid');
+  refuseHoldoutPaths([path]);
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = fstatSync(fd);
@@ -80,7 +130,7 @@ export function readPinned(path, expected, max = 256_000_000) {
 export function readDevReference(sourceKey) {
   assertDevelopment(sourceKey);
   const ref = DEV_REFERENCES[sourceKey], manifest = JSON.parse(readPinned(join(ref.root, ref.manifest), ref.sha256, 20_000_000));
-  if (manifest.source_key !== sourceKey) throw fail('reference_source_mismatch');
+  if (manifest.source_key !== sourceKey || manifest.source_sha256 !== ref.source_sha256) throw fail('reference_source_mismatch');
   const file = key => {
     if (!manifest.files?.[key]?.sha256) throw fail('reference_file_unpinned');
     return JSON.parse(readPinned(join(ref.root, key), manifest.files[key].sha256));
@@ -94,25 +144,29 @@ export function readDevReference(sourceKey) {
 const tally = values => Object.fromEntries([...new Set(values)].sort().map(value => [value, values.filter(item => item === value).length]));
 
 /** One completed run's candidate graph plus the metadata the climb dashboard compares across runs. */
-export function runExport({ treatment, ready, report, reportSha256, graph, answers }) {
+export function runExport({ treatment, seal, report, reportSha256, graph, answers }) {
   if (typeof treatment !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(treatment)) throw fail('treatment_invalid');
-  assertDevelopment(ready?.source_key);
-  if (report?.run_id !== ready.run_id || report.seal_sha256 !== ready.seal_sha256 || report.coverage?.status !== 'complete'
-    || !report.scorecard?.deltas || !/^[a-f0-9]{64}$/.test(reportSha256 ?? '')) throw fail('run_unqualified');
+  if (seal?.digest !== report?.seal_sha256 || report.coverage?.status !== 'complete' || !report.scorecard?.deltas
+    || !/^[a-f0-9]{64}$/.test(reportSha256 ?? '')) throw fail('run_unqualified');
+  const sourceKey = Object.keys(DEV_REFERENCES).find(key => DEV_REFERENCES[key].source_sha256 === seal.spec.sourceSha256);
+  assertDevelopmentSource(sourceKey, seal.spec.sourceSha256);
   const dispositions = report.coverage.dispositions;
+  if (JSON.stringify(dispositions.map(row => row.through)) !== JSON.stringify(graph.schedule)) throw fail('checkpoint_schedule_mismatch');
   const byArm = arm => answers.filter(row => row.arm === arm).map(row => row.answer.trace);
   const arms = [...new Set(answers.map(row => row.arm))].sort();
-  return { schema: CLIMB_RUN_SCHEMA, treatment, source_key: ready.source_key, run_id: report.run_id, run_dir: report.run_dir,
-    code_sha: ready.code_sha, seal_sha256: report.seal_sha256, report_sha256: reportSha256, dataset_sha256: ready.dataset_sha256,
-    models: ready.models, completed_at: report.completed_at ?? null,
+  return { schema: CLIMB_RUN_SCHEMA, treatment, source_key: sourceKey, source_sha256: seal.spec.sourceSha256, run_id: report.run_id, run_dir: report.run_dir,
+    code_sha: seal.spec.codeSha, seal_sha256: report.seal_sha256, report_sha256: reportSha256, dataset_sha256: seal.spec.datasetSha256,
+    models: Object.fromEntries(Object.entries(seal.spec.budget?.purposes ?? {}).map(([purpose, row]) => [purpose, row.route])),
     primary: { metric: 'candidate usefulness delta vs no-memory baseline', value: report.scorecard.deltas.candidate,
       sensitivity: report.scorecard.sensitivity, confidence: report.scorecard.confidence, cases: answers.filter(row => row.arm === 'candidate').length,
       status: 'provisional pending owner semantic review' },
     diagnostics: { deltas: report.scorecard.deltas, safety: report.scorecard.safety,
       coverage: { scheduled: report.coverage.scheduled, dispositions: tally(dispositions.map(row => row.disposition)),
         search_incomplete: dispositions.filter(row => row.search_incomplete).length,
-        budget_limited: dispositions.filter(row => (row.search_statuses ?? []).some(status => status.status === 'budget_limited')).length },
-      abstention: Object.fromEntries(arms.map(arm => [arm, tally(byArm(arm).map(trace => trace.abstention))])) },
+        budget_limited: dispositions.filter(row => (row.search_statuses ?? []).some(status => status.status === 'budget_limited')).length,
+        trigger_context_omitted: dispositions.map(row => (row.search_statuses ?? []).reduce((sum, status) => sum + (status.trigger_context_omitted ?? 0), 0)) },
+      abstention: Object.fromEntries(arms.map(arm => [arm, tally(byArm(arm).map(trace => trace.abstention))])),
+      record_dating: tally(graph.records.map(row => row.dated_by)) },
     cost: { spent_nano: report.budget.spent_nano, calls: report.budget.calls_started, basis: 'SDK-rate API-equivalent; not a provider charge' },
     returned_item_ids: [...new Set(byArm('candidate').flatMap(trace => trace.returnedItemIds))].sort(),
     graph };
@@ -154,7 +208,7 @@ const SCRIPT = `
 const D=JSON.parse(document.getElementById('data').textContent);
 const KIND={observation:'#3b6ea5',decision:'#c2562f',intention:'#7a8f3a',action:'#8a4f9e',outcome:'#c79a2b',question:'#2f8f86'};
 const TYPE={supersedes:'#b3261e',qualifies:'#5b7fa6',depends_on:'#6b665c',outcome_of:'#c79a2b',contradicts:'#8a4f9e'};
-const BUCKET={stored_and_returned_provisional:'#3f7d4f',stored_not_returned_provisional:'#c79a2b',not_stored_provisional:'#b3261e',alignment_uncertain:'#a39e93'};
+const BUCKET={stored_and_returned_provisional:'#3f7d4f',stored_not_returned_provisional:'#c79a2b',not_stored_provisional:'#8c2a1f',no_match_provisional:'#b3261e',alignment_uncertain:'#a39e93'};
 const NS='http://www.w3.org/2000/svg',tip=document.getElementById('tip');
 const el=(tag,attrs={},parent)=>{const n=tag.includes(':')?document.createElementNS(NS,tag.slice(4)):document.createElement(tag);for(const[k,v]of Object.entries(attrs))k==='text'?n.textContent=v:n.setAttribute(k,v);parent&&parent.appendChild(n);return n};
 const hover=(node,text)=>{node.addEventListener('mousemove',e=>{tip.textContent=text;tip.style.display='block';tip.style.left=Math.min(e.clientX+14,innerWidth-480)+'px';tip.style.top=(e.clientY+14)+'px'});node.addEventListener('mouseleave',()=>tip.style.display='none')};
@@ -181,12 +235,12 @@ function render(){
   const host=document.getElementById('sessions');host.replaceChildren();
   for(const s of D.sessions){
     const box=el('div',{class:'session'},host);el('h3',{text:s.source_key},box);const pair=el('div',{class:'pair'},box);
-    const run=s.runs.find(r=>r.treatment===sel.value),maxCp=Math.max(s.reference?.checkpoints??1,run?.graph.checkpoints??1);
+    const run=s.runs.find(r=>r.treatment===sel.value&&r.graph&&r.primary&&r.cost),maxCp=Math.max(s.reference?.checkpoints??1,run?.graph.checkpoints??1);
     const left=el('div',{},pair);el('div',{class:'cap',text:'Reference as labeled — '+s.reference_caption},left);
     if(s.reference){el('div',{class:'stats',text:stats(s.reference)},left);graph(left,s.reference,maxCp)}else el('div',{class:'none',text:'reference unavailable'},left);
     const right=el('div',{},pair);
     if(run){const a=run.alignment;el('div',{class:'cap',text:'Candidate · '+run.treatment+' · code '+run.code_sha.slice(0,7)+' · seal '+run.seal_sha256.slice(0,8)+' · Δ '+run.primary.value.toFixed(3)+' · '+usd(run.cost.spent_nano)},right);
-      el('div',{class:'stats',text:stats(run.graph)+(a?' · match: '+D.buckets.map(b=>b.replace('_provisional','')+' '+(a.item_counts[b]??0)).join(', '):' · alignment not run')},right);graph(right,run.graph,maxCp)}
+      el('div',{class:'stats',text:stats(run.graph)+(a?' · match: '+D.buckets.map(b=>b.replace('_provisional','')+' '+(a.item_counts?.[b]??0)).join(', ')+' (returned = returned to the candidate answerer in any case)':' · alignment not run')},right);graph(right,run.graph,maxCp)}
     else el('div',{class:'none',text:'no completed run for this treatment'},right);
   }
 }
@@ -204,12 +258,12 @@ function chart(title,series,stacks,colors,opts={}){
 }
 function charts(){
   for(const s of D.sessions){
-    const runs=s.runs,lab=r=>r.treatment,sum=(o,k)=>o[k]??0;
+    const runs=s.runs.filter(r=>r.graph&&r.primary&&r.cost),lab=r=>r.treatment,sum=(o,k)=>o[k]??0;
     const kinds=r=>{const o={};for(const x of r.graph.records)o[x.kind]=(o[x.kind]||0)+1;return o},types=r=>{const o={};for(const x of r.graph.relations)o[x.type]=(o[x.type]||0)+1;return o};
     chart(s.source_key+' · records per kind',runs.map(r=>({label:lab(r),v:kinds(r)})),Object.keys(KIND),KIND);
     chart(s.source_key+' · relations per type',runs.map(r=>({label:lab(r),v:types(r)})),Object.keys(TYPE),TYPE);
     chart(s.source_key+' · supersedes',runs.map(r=>({label:lab(r),v:{supersedes:sum(types(r),'supersedes')}})),['supersedes'],TYPE);
-    chart(s.source_key+' · reference match (provisional)',runs.map(r=>({label:lab(r),v:r.alignment?.item_counts??{}})),D.buckets,BUCKET);
+    chart(s.source_key+' · reference match (provisional; returned = any case)',runs.map(r=>({label:lab(r),v:r.alignment?.item_counts??{}})),D.buckets,BUCKET);
     chart(s.source_key+' · primary score Δ',runs.map(r=>{const v=r.primary.value,sv=r.primary.sensitivity??{},xs=[v,sv.conservative,sv.excluded,sv.inclusive].filter(Number.isFinite);
       return{label:lab(r),v,lo:Math.min(...xs),hi:Math.max(...xs),note:r.primary.confidence?.kind??'unknown'}}),[],{},{range:true});
     chart(s.source_key+' · cost',runs.map(r=>({label:lab(r),v:{run:Number(BigInt(r.cost.spent_nano))/1e9,alignment:r.alignment?Number(BigInt(r.alignment.spent_nano))/1e9:0}})),['run','alignment'],{run:'#3b6ea5',alignment:'#a39e93'},{fmt:v=>'$'+v.toFixed(2)});

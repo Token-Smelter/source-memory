@@ -11,8 +11,8 @@ import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
 import { attestedPriorSpend } from '../pi-extension/evaluation/prior-spend.mjs';
 import { hash } from '../pi-extension/evaluation/seal.mjs';
 import { summarizeStage } from '../pi-extension/evaluation/stage-alignment.mjs';
-import { CLIMB_ALIGNMENT_SCHEMA, CLIMB_RUN_SCHEMA, assertDevelopment, readDevReference, readPinned } from '../pi-extension/evaluation/climb.mjs';
-import { privateDir, writeNew } from './export-climb-run.mjs';
+import { CLIMB_ALIGNMENT_SCHEMA, CLIMB_RUN_SCHEMA, assertDevelopmentSource, assertSameSchedule, readDevReference, readPinned, refuseHoldoutPaths } from '../pi-extension/evaluation/climb.mjs';
+import { loadRun, privateDir, writeNew } from './export-climb-run.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -43,10 +43,12 @@ async function main() {
   privateDir(climbDir);
   const exportBytes = readPinned(exportPath, exportSha, 50_000_000), run = JSON.parse(exportBytes);
   if (run.schema !== CLIMB_RUN_SCHEMA) throw fail('run_export_invalid');
-  assertDevelopment(run.source_key, [exportPath, climbDir, run.run_dir]);
-  const report = JSON.parse(readPinned(join(run.run_dir, 'REPORT.json'), run.report_sha256, 50_000_000));
-  const ready = JSON.parse(readFileSync(join(run.run_dir, 'READY.json')));
-  if (ready.seal_sha256 !== run.seal_sha256 || report.run_id !== run.run_id) throw fail('run_export_mismatch');
+  assertDevelopmentSource(run.source_key, run.source_sha256);
+  refuseHoldoutPaths([exportPath, climbDir, run.run_dir]);
+  const { report, seal, graph } = loadRun(join(run.run_dir, 'REPORT.json'), run.report_sha256);
+  if (seal.digest !== run.seal_sha256 || seal.spec.sourceSha256 !== run.source_sha256 || report.run_id !== run.run_id
+    || JSON.stringify(graph) !== JSON.stringify(run.graph)) throw fail('run_export_mismatch');
+  const rateCard = seal.spec.budget?.routes?.[ROUTE];
 
   const attestationBytes = readPinned(process.env.PILOT_PRIOR_ATTESTATION, process.env.PILOT_PRIOR_ATTESTATION_SHA256, 1_000_000);
   const attestation = JSON.parse(attestationBytes);
@@ -55,6 +57,7 @@ async function main() {
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
 
   const cutoff = run.graph.checkpoints, reference = readDevReference(run.source_key);
+  assertSameSchedule(reference, run.graph.schedule);
   const refs = reference.records.filter(row => row.checkpoint_index <= cutoff).map(row => ({ id: row.id, kind: row.kind, text: row.text }));
   const candidates = run.graph.records.map(row => ({ id: row.id, kind: row.kind, text: row.text }));
   readPinned(sdkIndex, sdkSha, 5_000_000);
@@ -74,7 +77,7 @@ async function main() {
   writeNew(join(dir, 'seal.json'), JSON.stringify({ spec, digest }));
   const outputs = [];
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `climb-align-${runId}`, sealSha256: digest,
-    routes: { [route]: ready.budget.rate_card.reviewer }, onRaw: row => outputs.push(row) });
+    routes: { [route]: rateCard }, onRaw: row => outputs.push(row) });
   const gate = { status: 'awaiting_go', run_dir: dir, seal_sha256: digest, source_key: run.source_key, treatment: run.treatment,
     reference_items: refs.length, candidate_items: candidates.length, batches: Math.ceil(refs.length / BATCH), model: route,
     prior_spend_nano: prior.totalNano, remaining_cap_nano: remaining.toString(), one_call_in_flight: true };
@@ -89,6 +92,7 @@ async function main() {
 
   let meta = { purpose: 'climb-alignment', arm: 'diagnostic', checkpoint: 'batch-1', task_version: 'climb-alignment-v1', policy_version: 'memory-retention/r2-v1' };
   const metered = budget.wrap(runtime, () => meta), alignments = [], failures = [];
+  try {
   for (let offset = 0; offset < refs.length; offset += BATCH) {
     const batchNo = offset / BATCH + 1, batch = refs.slice(offset, offset + BATCH);
     if (budget.state().stopped) { failures.push({ batch: batchNo, reason: budget.state().stopped }); break; }
@@ -98,7 +102,7 @@ async function main() {
     for (let attempt = 0; attempt < 2 && !accepted; attempt++) {
       let message;
       try { message = await metered.streamSimple(reviewerModel, context, { maxTokens: 4096, reasoning: 'low', maxRetries: 0, sessionId: `climb-align-${runId}` }).result(); }
-      catch (error) { if (!budget.state().stopped) throw error; failures.push({ batch: batchNo, reason: budget.state().stopped }); break; }
+      catch (error) { failures.push({ batch: batchNo, reason: budget.state().stopped ?? error?.code ?? 'model_call_failed' }); break; }
       context.messages.push(message);
       const calls = (message.content ?? []).filter(row => row.type === 'toolCall');
       const call = message.stopReason === 'toolUse' && calls.length === 1 && calls[0].name === 'submit_alignment' ? calls[0] : null;
@@ -112,9 +116,11 @@ async function main() {
       accepted = batch.map(row => ({ reference_id: row.id, verdict: 'uncertain', candidate_ids: [], reason: 'alignment unavailable' }));
     }
     alignments.push(...accepted);
+    // Any failed call leaves the remaining batches unaligned rather than retrying in an unknown state.
+    if (failures.some(row => row.batch === batchNo && row.reason !== 'invalid_after_one_repair')) break;
   }
+  } finally { budget.close(); }
   for (const row of refs.slice(alignments.length)) alignments.push({ reference_id: row.id, verdict: 'uncertain', candidate_ids: [], reason: 'alignment not run' });
-  budget.close();
   writeNew(join(dir, 'model-outputs.jsonl'), outputs.map(row => `${JSON.stringify(row)}\n`).join(''));
   const summary = summarizeStage({ coverage: report.coverage, cutoff,
     reference: { records: reference.records, relations: reference.relations },
