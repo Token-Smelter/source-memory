@@ -1,4 +1,4 @@
-import { digest, identity, namespace, normalizeEnrichment, RELATIONS } from '../../src/core.mjs';
+import { digest, identity, namespace, normalizeEnrichment, OUTCOME_REFERENT_KINDS, RELATIONS } from '../../src/core.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const image = /\[image sha256=[a-f0-9]{64} mime=[^\]]+\]/i;
@@ -63,8 +63,8 @@ export function prepareReferenceSnapshot({ snapshot, reference, sourceKey, throu
   const admitted = new Set(records.map(row => row.id)), relations = [];
   for (const [index, row] of reference.edges.entries()) {
     const key = `reference-edge-${digest(['reference-edge/v1', sourceKey, through, index, row.type, row.from, row.to])}`;
-    if (row.type === 'outcome_of' && (original.get(row.from)?.kind !== 'outcome' || original.get(row.to)?.kind !== 'action')) {
-      audit.omitted_edges.push({ index, reason: 'outcome_of_non_action_or_non_outcome' }); continue;
+    if (row.type === 'outcome_of' && (original.get(row.from)?.kind !== 'outcome' || !OUTCOME_REFERENT_KINDS.includes(original.get(row.to)?.kind))) {
+      audit.omitted_edges.push({ index, reason: 'outcome_of_invalid_endpoint_kind' }); continue;
     }
     if (!RELATIONS.includes(row.type) || row.from === row.to) { audit.omitted_edges.push({ index, reason: 'invalid_relation' }); continue; }
     if (!admitted.has(row.from) || !admitted.has(row.to)) { audit.omitted_edges.push({ index, reason: 'endpoint_item_omitted' }); continue; }

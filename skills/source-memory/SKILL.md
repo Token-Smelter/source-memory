@@ -36,7 +36,7 @@ The host/caller supplies original source bytes. **Do not transcribe a conversati
 - `ingest` receives `source`, `conversation_id`, `turn_id`, optional parent/time, and ordered `entries` with original `id`, `role`, and exact `text`. Keep stable identity on retries. Save the returned source ID.
 - Source is retained even if no structured memory is extracted or embeddings are unavailable. Report the actual `indexing.status`. Use `index` to retry unavailable/pending embeddings, not a fabricated new turn ID.
 - `enrich` receives `records` and `relations`. Each has a stable caller ID, attribution, and evidence spans referencing an ingested source ID plus original entry ID and half-open UTF-16 offsets. Let the runtime/caller provide offsets, or locate exact spans in the retained source; do not guess.
-- Keep proposals distinct from accepted decisions and observations. Attach an outcome to its concrete action/attempt through `outcome_of`; otherwise retain an attributed observation.
+- Keep proposals distinct from accepted decisions and observations. Attach an outcome to the concrete action, decision or intention it resulted from through `outcome_of`; otherwise retain an attributed observation.
 - Add supported corrections as new records and explicit relations. Never overwrite an accepted identity to change its meaning. Identical retries replay; conflicting content refuses.
 
 ## Failure and scope

@@ -29,10 +29,11 @@ test('installed Pi SDK executes an atomic fictional action and outcome through t
       make([{ type: 'toolCall', id: 'submit', name: 'memory_submit', arguments: { result: 'done_with_writes', reason: 'Supported change.' } }], 'toolUse'),
       make([{ type: 'text', text: 'Submitted.' }], 'stop')];
     const offeredTools = [];
-    let offeredKinds;
+    let offeredKinds, recordTool;
     const runtime = { hasConfiguredAuth() { return true; }, streamSimple(_model, context) {
       offeredTools.push((context.tools ?? []).map(tool => tool.name));
       offeredKinds ??= context.tools?.find(tool => tool.name === 'memory_record')?.parameters?.properties?.kind?.enum;
+      recordTool ??= context.tools?.find(tool => tool.name === 'memory_record');
       const message = messages.shift();
       let finish;
       const result = new Promise(resolve => { finish = resolve; });
@@ -59,5 +60,7 @@ test('installed Pi SDK executes an atomic fictional action and outcome through t
     assert.deepEqual([result.disposition, calls, soft.state().calls_started, offeredTools[0], offeredKinds, maxInFlight],
       ['committed', ['search', 'search', 'begin', 'commit'], 5, ['memory_search', 'memory_fetch', 'memory_record', 'memory_link_offer', 'memory_link', 'memory_submit'],
         ['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action'], 1]);
+    assert.deepEqual([/a prior action, decision or intention/.test(recordTool.description),
+      /action, decision or intention/.test(recordTool.parameters.properties.action_handle.description)], [true, true]);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

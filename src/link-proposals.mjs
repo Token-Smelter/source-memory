@@ -1,5 +1,5 @@
 import { authorize, canonical, digest, integer, normalizeEnrichment, normalizeTurn,
-  RELATIONS, requireThat, sourceExcerpt, text } from './core.mjs';
+  OUTCOME_REFERENT_KINDS, RELATIONS, requireThat, sourceExcerpt, text } from './core.mjs';
 import { evidenceSpansForEntry } from './evidence-spans.mjs';
 
 export const LINK_PROPOSAL_CONTRACT = 'source-memory-links/v4';
@@ -50,7 +50,7 @@ export function memoryLinkPrompt(packet) {
     + `Every link must involve a newly retained record and cite supplied evidence from the retained trigger turn.\n`
     + `supersedes goes from replacement to replaced; later time alone is never supersession. qualifies narrows the target; `
     + `contradicts preserves unresolved reports, not a winner. depends_on points from dependent to prerequisite. `
-    + `outcome_of requires an outcome as from and action as to. Questions, intentions and outcomes are not interchangeable.\n`
+    + `outcome_of requires an outcome as from and an action, decision or intention as to. Questions, intentions and outcomes are not interchangeable.\n`
     + `For ambiguous, unsupported or chronology-only connections, label support accordingly; they cannot be written. `
     + `An assistant assertion, a user question, record status, similarity and an explicit model label do not establish authority. `
     + `Even explicit links remain model proposals awaiting host semantic review. Never infer completeness/currentness.\n`
@@ -76,7 +76,7 @@ export function validateLinkProposals(output, packet) {
     requireThat(link.evidence.reduce((sum, ref) => sum + spans.get(ref).text.length, 0) <= 32000, 'evidence_too_large');
     requireThat(link.evidence.some(ref => spans.get(ref).trigger), 'link_trigger_evidence_required');
     requireThat(['explicit', 'ambiguous', 'unsupported', 'chronology_only'].includes(link.support), 'link_support_invalid');
-    requireThat(link.type !== 'outcome_of' || (from.kind === 'outcome' && to.kind === 'action'), 'invalid_outcome_relation');
+    requireThat(link.type !== 'outcome_of' || (from.kind === 'outcome' && OUTCOME_REFERENT_KINDS.includes(to.kind)), 'invalid_outcome_relation');
     const key = canonical([link.type, link.from, link.to]);
     requireThat(!seen.has(key), 'duplicate_link_proposal');
     seen.add(key);

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { digest, normalizeEnrichment } from '../src/core.mjs';
+import { digest, normalizeEnrichment, OUTCOME_REFERENT_KINDS } from '../src/core.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 
@@ -15,7 +15,7 @@ export function createAtomicOutcomes({ memory, beforeAppend }) {
       if (typeof trigger !== 'string' || !trigger) return recalled;
       const copy = structuredClone(recalled);
       for (const bundle of copy.bundles ?? []) for (const record of bundle.records ?? []) {
-        if (record.kind !== 'action' || typeof record.id !== 'string') continue;
+        if (!OUTCOME_REFERENT_KINDS.includes(record.kind) || typeof record.id !== 'string') continue;
         const key = JSON.stringify([scope, trigger, record.id]);
         let handle = offerByIdentity.get(key);
         if (!handle) {
@@ -41,7 +41,7 @@ export function createAtomicOutcomes({ memory, beforeAppend }) {
         const offer = offers.get(actionHandle);
         if (!offer || offer.scope !== scope || offer.trigger !== trigger) throw fail('action_handle_not_offered');
         action = await show(scope, 'record', offer.id);
-        if (!action || action.kind !== 'action') throw fail('invalid_outcome_relation');
+        if (!action || !OUTCOME_REFERENT_KINDS.includes(action.kind)) throw fail('invalid_outcome_relation');
         prior = true;
       }
       if (outcome.kind !== 'outcome' || !Array.isArray(outcome.evidence)
@@ -53,10 +53,10 @@ export function createAtomicOutcomes({ memory, beforeAppend }) {
       const evidence = await memory.evidence(scope, [...outcome.evidence, ...action.evidence]);
       if (!Array.isArray(evidence) || evidence.some(row => /\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? ''))) throw fail('image_not_citable');
       const packet = { records: [{ ref: 'outcome', kind: 'outcome', text: outcome.text, newly_retained: true },
-        { ref: 'action', kind: 'action', text: action.text, newly_retained: !prior }],
+        { ref: 'referent', kind: action.kind, text: action.text, newly_retained: !prior }],
       sources: evidence.map((row, index) => ({ ref: `s${index}`, role: row.role, text: row.text })) };
-      const proposal = { contract: 'pi-memory-atomic-outcome/v1', scope, trigger, requires_review: prior, packet,
-        proposals: [{ from: 'outcome', to: 'action', type: 'outcome_of', evidence: outcome.evidence.map((_, i) => `s${i}`) }] };
+      const proposal = { contract: 'pi-memory-atomic-outcome/v2', scope, trigger, requires_review: prior, packet,
+        proposals: [{ from: 'outcome', to: 'referent', type: 'outcome_of', evidence: outcome.evidence.map((_, i) => `s${i}`) }] };
       const contextSha = digest({ scope, trigger, source, action, payload });
       const proposalSha = digest({ proposal, contextSha });
       const operationId = `pi-memory-atomic-outcome-${digest([scope, trigger, payload])}`;

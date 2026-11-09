@@ -1141,11 +1141,22 @@ export async function runIntegration(database, scratch) {
       const replay = await memory.enrich('demo', { records: [outcome], relations: [] });
       assert.deepEqual(replay.records, ['good-outcome']);
     });
+    await check('outcome can refer to a new intention or an existing decision and replay against its stored referent', async () => {
+      const intentionOutcome = typedRecord('intention-outcome', 'outcome');
+      await memory.enrich('demo', { records: [intentionOutcome, typedRecord('new-intention', 'intention')],
+        relations: [outcomeEdge('intention-new', 'intention-outcome', 'new-intention')] });
+      await memory.enrich('demo', { records: [typedRecord('skip-staging', 'decision')], relations: [] });
+      const decisionOutcome = typedRecord('deploy-failed', 'outcome');
+      await memory.enrich('demo', { records: [decisionOutcome], relations: [outcomeEdge('deploy-failed-of', 'deploy-failed', 'skip-staging')] });
+      const replays = [await memory.enrich('demo', { records: [intentionOutcome], relations: [] }),
+        await memory.enrich('demo', { records: [decisionOutcome], relations: [] })];
+      assert.deepEqual(replays.map(row => row.records), [['intention-outcome'], ['deploy-failed']]);
+    });
     await check('new outcome cannot use an existing question as its referent', async () => {
       await assert.rejects(memory.enrich('demo', { records: [typedRecord('bad-existing-outcome', 'outcome')],
         relations: [outcomeEdge('bad-existing', 'bad-existing-outcome', 'existing-question')] }), { code: 'invalid_outcome_relation' });
     });
-    await check('relation-only enrichment enforces an action target', async () => {
+    await check('relation-only enrichment refuses a question target', async () => {
       await assert.rejects(memory.enrich('demo', { records: [],
         relations: [outcomeEdge('bad-target', 'good-outcome', 'existing-question')] }), { code: 'invalid_outcome_relation' });
     });

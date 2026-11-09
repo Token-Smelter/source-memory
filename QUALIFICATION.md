@@ -119,8 +119,8 @@ Classes, for `ingest` and `enrich`:
 | `invalid_evidence_span` | in-transaction-rolled-back | † `sourceExcerpt` inside `Neo4jStore.enrich` |
 | `derived_is_not_original_evidence` | in-transaction-rolled-back | † `sourceExcerpt` inside `Neo4jStore.enrich` |
 | `relation_endpoint_unavailable` | in-transaction-rolled-back | † `Neo4jStore.enrich` endpoint lookup |
-| `invalid_outcome_relation` | in-transaction-rolled-back | † `Neo4jStore.enrich` |
-| `outcome_referent_required` | in-transaction-rolled-back | † `Neo4jStore.enrich` |
+| `invalid_outcome_relation` | in-transaction-rolled-back | † `Neo4jStore.enrich`: an `outcome_of` edge whose source is not an `outcome` or whose target is not an `action`, `decision` or `intention` |
+| `outcome_referent_required` | in-transaction-rolled-back | † `Neo4jStore.enrich`: an `outcome` in the bundle with no `outcome_of` edge in the bundle and either no stored `outcome_of` edge or a stored one whose target is not an `action`, `decision` or `intention` |
 | `record_identity_conflict` | in-transaction-rolled-back | `Neo4jStore.enrich`, after the record `MERGE` (IR3) |
 | `relation_identity_conflict` | in-transaction-rolled-back | `Neo4jStore.enrich`, after the relation `MERGE` |
 | `source_identity_conflict` | in-transaction-rolled-back | `Neo4jStore.ingest`, after the turn `MERGE` |

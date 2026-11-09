@@ -165,9 +165,9 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           sources: sources.map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text })),
           image_sources_omitted: packet.sources.length - sources.length, retrieval: packet.retrieval };
       });
-    register('memory_record', 'Record a proposed memory supported by current-turn reference labels. An outcome requires exactly one action referent: an action_handle offered by memory_search, or new_action with its own current evidence. A prior action requires separate review before the atomic outcome_of commit.',
+    register('memory_record', 'Record a proposed memory supported by current-turn reference labels. An outcome requires exactly one referent: an action_handle that memory_search offered on a prior action, decision or intention, or new_action with its own current evidence. A prior referent requires separate review before the atomic outcome_of commit.',
       { kind, text: { type: 'string', minLength: 1, maxLength: 16000 }, evidence_labels: evidenceLabels,
-        action_handle: string, new_action: object({ text: { type: 'string', minLength: 1, maxLength: 16000 }, evidence_labels: evidenceLabels }) },
+        action_handle: { type: 'string', description: 'Outcome referent offered by memory_search on a prior action, decision or intention record.' }, new_action: object({ text: { type: 'string', minLength: 1, maxLength: 16000 }, evidence_labels: evidenceLabels }) },
       (tools, args) => tools.record(args.kind, args.text, args.evidence_labels, { action_handle: args.action_handle, new_action: args.new_action }),
       ['kind', 'text', 'evidence_labels']);
     register('memory_link', 'Propose a link using handles from the current offer; this does not approve it.',

@@ -1,6 +1,6 @@
 import neo4j from 'neo4j-driver';
 import { passthrough } from './phase-diagnostic.mjs';
-import { digest, identity, indexNames, integer, markStage, MemoryError, namespace, requireThat, sourceExcerpt, lexicalQuery } from './core.mjs';
+import { digest, identity, indexNames, integer, markStage, MemoryError, namespace, OUTCOME_REFERENT_KINDS, requireThat, sourceExcerpt, lexicalQuery } from './core.mjs';
 
 const unwrap = node => node?.properties ?? null;
 const decodeTurn = props => props ? { id: props.uid, scope: props.scope, ...JSON.parse(props.body) } : null;
@@ -203,14 +203,14 @@ export class Neo4jStore {
         endpoints.set(id, record);
       }
       for (const edge of payload.relations.filter(row => row.type === 'outcome_of')) {
-        requireThat(endpoints.get(edge.from).kind === 'outcome' && endpoints.get(edge.to).kind === 'action', 'invalid_outcome_relation');
+        requireThat(endpoints.get(edge.from).kind === 'outcome' && OUTCOME_REFERENT_KINDS.includes(endpoints.get(edge.to).kind), 'invalid_outcome_relation');
       }
       for (const record of payload.records.filter(row => row.kind === 'outcome')) {
         const supplied = payload.relations.some(edge => edge.from === record.id && edge.type === 'outcome_of');
         if (!supplied) {
           const result = await tx.run(`MATCH (e:SMRelation {scope:$scope, from_uid:$uid, type:"outcome_of"})
             MATCH (target:SMRecord {uid:e.to_uid, scope:$scope}) RETURN target`, { scope, uid: identity('record', scope, record.id) });
-          requireThat(result.records.length > 0 && result.records.every(row => decodeRecord(unwrap(row.get('target'))).kind === 'action'), 'outcome_referent_required');
+          requireThat(result.records.length > 0 && result.records.every(row => OUTCOME_REFERENT_KINDS.includes(decodeRecord(unwrap(row.get('target'))).kind)), 'outcome_referent_required');
         }
       }
       const ns = namespace(scope);

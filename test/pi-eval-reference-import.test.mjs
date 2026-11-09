@@ -22,22 +22,23 @@ function fixture() {
       { id: 'uncitable', kind: 'question', text: 'Fictional question.', evidence: [ev('huge'), ev('image')] }],
     edges: [{ from: 'outcome', to: 'action', type: 'outcome_of', evidence: [ev('short-a')] },
       { from: 'outcome', to: 'decision', type: 'outcome_of', evidence: [ev('short-b')] },
-      { from: 'decision', to: 'uncitable', type: 'depends_on', evidence: [ev('short-b')] }] };
+      { from: 'decision', to: 'uncitable', type: 'depends_on', evidence: [ev('short-b')] },
+      { from: 'outcome', to: 'uncitable', type: 'outcome_of', evidence: [ev('short-b')] }] };
   return { snapshot, reference, sourceKey: 'fiction-source', through: 'checkpoint' };
 }
 
 test('evaluation import preserves whole fitting citations, omits invalid edges and retains unlinked outcomes', () => {
-  const f = fixture(); f.reference.edges.shift();
+  const f = fixture(); f.reference.edges.splice(0, 2);
   const result = prepareReferenceSnapshot(f);
   const recordNode = result.snapshot.nodes.find(row => row.uid === identity('record', 'fiction', 'outcome'));
   const record = JSON.parse(recordNode.properties.body);
   assert.deepEqual([record.evidence.map(row => row.entry_id), result.audit.imported_records, result.audit.imported_edges,
     result.audit.omitted_items.length, result.audit.omitted_edges.map(row => row.reason)],
-  [['short-a', 'short-b'], 3, 0, 1, ['outcome_of_non_action_or_non_outcome', 'endpoint_item_omitted']]);
+  [['short-a', 'short-b'], 3, 0, 1, ['endpoint_item_omitted', 'outcome_of_invalid_endpoint_kind']]);
 });
 
 test('evaluation import removes candidate records, retains raw turns and imports valid outcome relations', () => {
   const result = prepareReferenceSnapshot(fixture());
   assert.deepEqual([result.snapshot.nodes.some(row => row.uid === 'candidate'), result.audit.imported_records,
-    result.audit.imported_edges, result.snapshot.relationships.filter(row => row.type === 'SM_HAS_CHUNK').length], [false, 3, 1, 1]);
+    result.audit.imported_edges, result.snapshot.relationships.filter(row => row.type === 'SM_HAS_CHUNK').length], [false, 3, 2, 1]);
 });
