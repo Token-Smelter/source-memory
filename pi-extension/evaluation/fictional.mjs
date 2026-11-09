@@ -34,7 +34,7 @@ export function fictionalTrace() {
   return { caseId: c.id, caseDigest: hash(c), sealDigest: sealComparison(fictionalSettings()).digest,
     context: { request: c.request, actor: c.actor, queryTime: c.queryTime, readScopes: c.readScopes, evidenceScopes: c.evidenceScopes },
     returnedItemIds: [], returnedEvidence: [], citedEvidence: [], citations: [], budgetRefusals: [],
-    model_text_sha256: textSha256(UNKNOWN_ANSWER), host_replaced_text: false, abstention: 'host_enforced_no_citations' };
+    model_text_sha256: textSha256(UNKNOWN_ANSWER), host_replaced_text: false, citation_repair_failed: false, abstention: 'host_enforced_no_citations' };
 }
 export function clause(id, requirementIds, overrides = {}) {
   const { alternative = null, relation = null, action = false, ...grades } = overrides;

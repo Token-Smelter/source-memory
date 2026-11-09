@@ -10,6 +10,8 @@ const pair = (item, evidence) => JSON.stringify([item, evidence]);
 export const citationId = (item, evidence) => `citation-${hash([item, evidence])}`;
 export const textSha256 = value => createHash('sha256').update(value, 'utf8').digest('hex');
 export const rawEvidenceId = (id, text) => `${id}:${textSha256(text).slice(0, 16)}`;
+export const abstentionMarker = (citations, citationRepairFailed, refusals) => citations ? 'not_enforced'
+  : citationRepairFailed ? 'host_enforced_invalid_citations' : refusals ? 'host_enforced_after_budget_refusal' : 'host_enforced_no_citations';
 const sameRefs = (a, b) => a.size === b.size && [...a].every(([id, scope]) => b.get(id) === scope);
 const budgetCodes = new Set(['search_limit', 'item_limit', 'retrieval_bytes_limit', 'resolve_limit', 'evidence_limit']);
 
@@ -52,7 +54,8 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
           if (!citation || Object.keys(citation).sort().join(',') !== 'evidence_id,item_id'
             || !nonempty(citation.item_id) || !nonempty(citation.evidence_id)) throw fail('citation_invalid');
           const key = pair(citation.item_id, citation.evidence_id);
-          if (seen.has(key) || !returnedEvidence.has(key)) throw fail('citation_not_returned');
+          if (seen.has(key) || !returnedEvidence.has(key)) throw Object.assign(fail('citation_not_returned'),
+            { citable: [...returnedEvidence.values()].map(row => ({ item_id: row.item_id, evidence_id: row.evidence_id })) });
           seen.add(key);
         }
         return true;
@@ -140,6 +143,9 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
       } finally { closed = true; }
       if (!answer || typeof answer.text !== 'string' || Buffer.byteLength(answer.text) > limits.responseBytes) throw fail('answer_invalid');
       try { answer = structuredClone(answer); } catch { throw fail('answer_invalid'); }
+      const citationRepairFailed = answer.citationRepairFailed === true;
+      if (citationRepairFailed && answer.citations?.length !== 0) throw fail('answer_invalid');
+      delete answer.citationRepairFailed;
       validateAnswer(answer);
       const abstained = answer.citations.length === 0;
       const citedEvidence = answer.citations.map(row => {
@@ -153,7 +159,7 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
           searchCalls: searches, resolveCalls: resolves, returnedItems: returned, returnedItemIds: [...offered.keys()], evidenceBytes, retrievalBytes,
           citations: structuredClone(answer.citations), returnedEvidence: [...returnedEvidence.values()].map(({ text: _text, ...row }) => row),
           citedEvidence, budgetRefusals: refusals, model_text_sha256: textSha256(answer.text), host_replaced_text: abstained && answer.text !== UNKNOWN_ANSWER,
-          abstention: abstained ? (refusals.length ? 'host_enforced_after_budget_refusal' : 'host_enforced_no_citations') : 'not_enforced' }, sealDigest: seal.digest };
+          citation_repair_failed: citationRepairFailed, abstention: abstentionMarker(answer.citations.length, citationRepairFailed, refusals.length) }, sealDigest: seal.digest };
     },
   };
 }
