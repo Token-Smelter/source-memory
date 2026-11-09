@@ -130,11 +130,6 @@ export function sourceInterval(entries, throughEntryId, cursor, conversation, op
   return turnAt(entries, throughEntryId, cursor, conversation, options);
 }
 
-/** Pure check of one cursor interval; it throws the same codes distillThrough would before any side effect. */
-export function sourceInterval(entries, throughEntryId, cursor, conversation, options = {}) {
-  return turnAt(entries, throughEntryId, cursor, conversation, options);
-}
-
 /** The same cursor-bounded source turn is retained before either live or replay distillation. */
 export async function distillThrough(session, throughEntryId, cursor, { allowInterrupted = false, summaryPolicy } = {}) {
   if (!session || !Array.isArray(session.scopes) || session.scopes.length !== 1
