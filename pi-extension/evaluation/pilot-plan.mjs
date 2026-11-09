@@ -17,7 +17,7 @@ const groundedScorerInstructions = 'Judge each asserted answer or action clause 
 
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
 /** Runtime paths whose change can alter candidate behavior; each changed one must be named as reviewed. */
-export const RUNTIME_PATH = /^(src|pi-extension|config)\//;
+export const RUNTIME_PATH = /^(?:(?:src|pi-extension|config|scripts)\/|package(?:-lock)?\.json$)/;
 /**
  * A code change may resume a run only when it is declared to leave every completed interval unchanged: the prior run must
  * have stopped at the first interval after the cursor with the named failure the change addresses, and every changed
