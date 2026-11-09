@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { closeSync, constants, fsyncSync, linkSync, openSync, readdirSync, readFileSync, readlinkSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -7,7 +7,11 @@ const fail = code => Object.assign(new Error(code), { code });
 const read = (load, fallback = null) => { try { return load(); } catch { return fallback; } };
 // A boot ID proves the same kernel only within one boot. Across boots, the hostname alone can repeat on machines sharing a
 // directory (NFS, containers); the machine ID narrows that, though cloned VMs and baked images can share it too.
-const machineId = () => read(() => readFileSync('/etc/machine-id', 'utf8').trim()) || read(() => readFileSync('/var/lib/dbus/machine-id', 'utf8').trim());
+// machine-id(5) is confidential: records carry only a keyed, application-specific hash of it.
+const machineId = () => {
+  const raw = read(() => readFileSync('/etc/machine-id', 'utf8').trim()) || read(() => readFileSync('/var/lib/dbus/machine-id', 'utf8').trim());
+  return raw ? createHmac('sha256', raw).update('source-memory/owner/v1').digest('hex') : null;
+};
 const bootId = () => read(() => readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim());
 const pidNamespace = () => read(() => readlinkSync('/proc/self/ns/pid'));
 // Field 22 of /proc/<pid>/stat (after the parenthesised command) is the start time in clock ticks since boot.
@@ -20,8 +24,9 @@ export function ownerRecord(pid = process.pid) {
 }
 
 /**
- * A lock owner is gone only when its record names this host and PID namespace and either this boot has changed, or its PID
- * no longer exists or now has a different start time. Anything unreadable, foreign or ambiguous is treated as alive.
+ * A lock owner is gone only when its record names this host and either an earlier boot of this machine (matching machine
+ * hash), or this boot and PID namespace with a PID that no longer exists or now has a different start time. Anything
+ * unreadable, foreign or ambiguous is treated as alive.
  */
 export function ownerGone(owner, self = ownerRecord()) {
   if (!owner || owner.v !== 1 || owner.host !== self.host || !Number.isSafeInteger(owner.pid) || owner.pid < 1) return false;

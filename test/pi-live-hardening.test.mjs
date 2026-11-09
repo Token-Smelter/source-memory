@@ -110,8 +110,10 @@ test('a reconcile the journal would reject is refused without writing, and the j
 
 test('a corrupt content-addressed file is moved aside, and stale temp files are swept', () => privateDir(async directory => {
   writeFileSync(join(directory, 'evidence.json'), 'partial', { mode: 0o600 });
-  writeFileSync(join(directory, '.evidence.json.stale.tmp'), 'old', { mode: 0o600 });
-  utimesSync(join(directory, '.evidence.json.stale.tmp'), new Date(Date.now() - 120000), new Date(Date.now() - 120000));
+  for (const stale of ['.evidence.json.00000000-0000-4000-8000-000000000000.tmp', '.reconcile-other.json.00000000-0000-4000-8000-000000000001.tmp']) {
+    writeFileSync(join(directory, stale), 'old', { mode: 0o600 });
+    utimesSync(join(directory, stale), new Date(Date.now() - 120000), new Date(Date.now() - 120000));
+  }
   writeDurableFile(directory, 'evidence.json', Buffer.from('whole'), { valid: bytes => bytes.toString() === 'whole' });
   assert.deepEqual([readFileSync(join(directory, 'evidence.json'), 'utf8'), readdirSync(directory).filter(name => name.includes('corrupt')).length,
     readdirSync(directory).filter(name => name.endsWith('.tmp'))], ['whole', 1, []]);
@@ -156,15 +158,38 @@ test('this process\'s own in-flight call is recognized even where /proc proves n
 test('a reviewer call nested in the distiller\'s tool call is admitted and each report settles its own call', () => privateDir(async directory => {
   const ledger = createUsageLedger({ directory });
   const budget = createDailyInputBudget({ ledger, limit: 1000 });
+  const reviewer = budget.nested();
   budget.beforeCall();
+  // Only the reviewer's view tolerates the open distiller call, and only that one.
+  assert.throws(() => budget.beforeCall(), /input_budget_unknown/);
+  budget.record({ input: 0, cacheRead: 0, cacheWrite: 0 }); // Pi's empty report for the prevented dispatch
+  budget.record({ input: 0, cacheRead: 0, cacheWrite: 0 }); // the open call's own report
   budget.beforeCall();
-  budget.record({ input: 5, cacheRead: 0, cacheWrite: 0 });
+  reviewer.beforeCall();
+  assert.throws(() => reviewer.beforeCall(), /input_budget_unknown/);
+  reviewer.record({ input: 0, cacheRead: 0, cacheWrite: 0 });
+  reviewer.record({ input: 5, cacheRead: 0, cacheWrite: 0 });
   budget.record({ input: 10, cacheRead: 0, cacheWrite: 0 });
   const rows = readFileSync(ledger.path, 'utf8').trim().split('\n').map(JSON.parse);
   const calls = rows.filter(row => row.kind === 'call').map(row => row.id);
-  assert.deepEqual([budget.reason(), rows.filter(row => row.kind === 'usage').map(row => [calls.indexOf(row.call), row.input])], [null, [[1, 5], [0, 10]]]);
+  assert.deepEqual([budget.reason(), rows.filter(row => row.kind === 'usage' && row.call).map(row => [calls.indexOf(row.call), row.input])],
+    [null, [[0, 0], [2, 5], [1, 10]]]);
   ledger.close();
 }));
+
+test('a dropped entry inside a covered interval blocks rather than re-ingesting shared source', () => privateDir(async directory => {
+  const live = harness(directory);
+  await live.controller.settle({ leafId: 'x', entries: tree });
+  const gap = await live.controller.settle({ leafId: 'y', entries: tree.filter(row => row.id !== 'ux') });
+  assert.deepEqual([gap.status, gap.code, live.seen.ingests.length], ['blocked', 'source_incomplete', 1]);
+  live.journal.close();
+}));
+
+test('the machine identity in owner records is a keyed hash, never the raw machine ID', { skip: !ownerRecord().machine }, () => {
+  const raw = (() => { try { return readFileSync('/etc/machine-id', 'utf8').trim(); } catch { return readFileSync('/var/lib/dbus/machine-id', 'utf8').trim(); } })();
+  const { machine } = ownerRecord();
+  assert.deepEqual([/^[0-9a-f]{64}$/.test(machine), machine.includes(raw)], [true, false]);
+});
 
 test('a contended admission waits without blocking the host and then refuses ledger_busy', () => privateDir(async directory => {
   const ledger = createUsageLedger({ directory });
@@ -188,7 +213,7 @@ test('an ungated controller marks every result as ungated', () => privateDir(asy
   live.journal.close();
 }));
 
-test('a second opener arriving inside the takeover window never also holds the lock', { skip: !ownerRecord().machine }, () => privateDir(async directory => {
+test('a second opener arriving inside the takeover window never also holds the lock', { skip: !ownerRecord().start }, () => privateDir(async directory => {
   const lockPath = join(directory, 'fiction.lock');
   writeFileSync(lockPath, JSON.stringify({ ...ownerRecord(), pid: 999999999 }), { mode: 0o600 });
   const contender = new URL('./helpers/lock-contender.mjs', import.meta.url).pathname;

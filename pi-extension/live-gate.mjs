@@ -152,23 +152,27 @@ export function createDailyInputBudget({ ledger, limit }) {
   if (!Number.isSafeInteger(limit) || limit <= 0 || typeof ledger?.callStart !== 'function') throw fail('input_budget_invalid');
   const own = [];
   let unknownDay = null, prevented = 0, stopped = false;
-  // A reviewer call nests inside the distiller's tool call, before Pi reports the distiller's usage; this process's own
-  // open calls are provably in flight, so they block only the external reason(), not a nested dispatch.
+  // A reviewer call nests inside the distiller's tool call, before Pi reports the distiller's usage. Only the reviewer's view
+  // tolerates that one open distiller call; the distiller's own dispatches still refuse after a lost report.
   const check = ({ nested = false } = {}) => {
-    if (unknownDay === ledger.day() || (!nested && own.some(call => !call.receipt)) || ledger.unknown()) return 'input_budget_unknown';
+    const open = own.filter(call => !call.receipt).length;
+    if (unknownDay === ledger.day() || open > (nested ? 1 : 0) || ledger.unknown()) return 'input_budget_unknown';
     return ledger.used() >= limit ? 'input_budget_exhausted' : null;
   };
-  return {
+  const dispatch = nested => {
+    if (stopped) { prevented++; throw fail('dispatch_prevented'); }
+    const reason = check({ nested });
+    // Pi reports a dispatch it never made with empty usage; that report must not read as lost spend.
+    if (reason) { prevented++; throw fail(reason); }
+    own.push({ id: ledger.callStart(), receipt: null });
+  };
+  const budget = {
     ledger,
     /** Sticky: every later dispatch is refused before it is sent, so shutdown cannot start a model call. */
     stop() { stopped = true; },
-    beforeCall() {
-      if (stopped) { prevented++; throw fail('dispatch_prevented'); }
-      const reason = check({ nested: true });
-      // Pi reports a dispatch it never made with empty usage; that report must not read as lost spend.
-      if (reason) { prevented++; throw fail(reason); }
-      own.push({ id: ledger.callStart(), receipt: null });
-    },
+    beforeCall: () => dispatch(false),
+    /** The reviewer's view: its dispatch and reason tolerate the one distiller call it is nested in. */
+    nested: () => ({ ...budget, beforeCall: () => dispatch(true), reason: () => check({ nested: true }) }),
     record(usage) {
       // Nested calls report innermost first, so a report settles the most recent open call.
       const call = own.findLast(row => !row.receipt);
@@ -190,6 +194,7 @@ export function createDailyInputBudget({ ledger, limit }) {
     reason: () => check(),
     limit,
   };
+  return budget;
 }
 
 /**

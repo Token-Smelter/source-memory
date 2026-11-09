@@ -181,7 +181,10 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
       const memory = journal.track(guarded);
       incremental = await createIncrementalSession({ source: sessionFile, workDir });
       const runtime = boundPiRuntime(models.runtime, budget);
-      const reviewer = createPiReviewer({ pi: sdk, workDir, model: models.reviewerModel, modelRuntime: runtime, budget, thinkingLevel: config.distiller.reviewerThinking });
+      // The reviewer runs inside the distiller's tool call, so it dispatches through the budget's nested view.
+      const reviewerBudget = budget.nested();
+      const reviewer = createPiReviewer({ pi: sdk, workDir, model: models.reviewerModel, modelRuntime: boundPiRuntime(models.runtime, reviewerBudget),
+        budget: reviewerBudget, thinkingLevel: config.distiller.reviewerThinking });
       const distiller = await createPiDistiller({ pi: sdk, incremental, workDir, model: models.model, modelRuntime: runtime, memory, scope: config.scope,
         reviewer, budget, ensureIndexed: readiness, createOptions: { thinkingLevel: config.distiller.thinking } });
       return { conversation_id: sessionId, scopes: [config.scope], memory, distiller, budget, ensureIndexed: readiness, close,
@@ -203,16 +206,19 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
         const dir = join(stateDir, 'sessions', digest(['pi-live-session/v1', sessionId]).slice(0, 32));
         privateDir(dir);
         const journal = createCoverageJournal({ directory: dir, sessionKey: sessionId, effectIds: true, pidLock: true });
-        const cursorStore = createCursorStore({ directory: dir, sessionKey: sessionId });
-        // First seen means no durable coverage state yet, not merely a missing directory.
-        const fresh = !journal.intervals().length && journal.state().status === 'ready' && cursorStore.load() === null;
-        const controller = createLiveController({ journal, cursorStore,
-          conversationId: sessionId, sessionId, maxRetries: config.maxRetries, gate, baseline: fresh && !config.backfill ? baseline : null,
-          open: () => openSession(journal, sessionId, sessionFile, dir) });
-        // Mark the session seen now (a null cursor), so turns that fail before their first interval are not baselined away on
-        // a later resume; this instance still records its own baseline, if any, at the first settle.
-        if (fresh) cursorStore.save(null);
-        entry = { controller, journal, sessionFile };
+        // Anything failing after the journal opens must release its lock, or every later settle reports journal_locked.
+        try {
+          const cursorStore = createCursorStore({ directory: dir, sessionKey: sessionId });
+          // First seen means no durable coverage state yet, not merely a missing directory.
+          const fresh = !journal.intervals().length && journal.state().status === 'ready' && cursorStore.load() === null;
+          const controller = createLiveController({ journal, cursorStore,
+            conversationId: sessionId, sessionId, maxRetries: config.maxRetries, gate, baseline: fresh && !config.backfill ? baseline : null,
+            open: () => openSession(journal, sessionId, sessionFile, dir) });
+          // Mark the session seen now (a null cursor), so turns that fail before their first interval are not baselined away on
+          // a later resume; this instance still records its own baseline, if any, at the first settle.
+          if (fresh) cursorStore.save(null);
+          entry = { controller, journal, sessionFile };
+        } catch (error) { journal.close(); throw error; }
         controllers.set(sessionId, entry);
       }
       if (entry.sessionFile !== sessionFile) throw fail('session_file_changed');
