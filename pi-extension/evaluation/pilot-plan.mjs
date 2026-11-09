@@ -34,6 +34,8 @@ export const TREATMENTS = Object.freeze({
   // provider's published peak tier (off-peak is half), so API-equivalent spend is conservative.
   'M-DS': Object.freeze({ id: 'M-DS', surface: 'candidate distiller model', candidateRoute: 'deepseek/deepseek-v4-flash', candidateOrigin: 'https://api.deepseek.com',
     servedVersion: 'DeepSeek-V4.1-Flash-1017 (provider docs: the legacy deepseek-v4-flash name is served by it)', imageInput: false,
+    // Declared arm differences from the Haiku baseline beyond the model itself.
+    armDifferences: Object.freeze(['candidate route and provider origin', 'sealed provider rate card', 'images reach the candidate as Pi text placeholders (text-only route)']),
     rateCard: Object.freeze({ source: 'https://api-docs.deepseek.com/quick_start/pricing (read 2026-11-09)', tier: 'peak',
       usdPerMillion: Object.freeze({ cacheHit: 0.006, cacheMiss: 0.3, output: 1.2 }), offPeakUsdPerMillion: Object.freeze({ cacheHit: 0.003, cacheMiss: 0.15, output: 0.6 }) }),
     product: true }),

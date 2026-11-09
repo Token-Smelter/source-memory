@@ -393,13 +393,18 @@ async function main() {
     chunking: { words: 256, overlap: 32 }, embedding: { url: 'http://127.0.0.1:18080/v1/embeddings', model: 'embeddinggemma', dimensions: 768, timeout_ms: 120000 }, index_on_write: false });
   const resources = privateWriter(join(dir, 'resources.jsonl')), progress = privateWriter(join(dir, 'progress.jsonl'));
   const memoryLog = privateWriter(join(dir, 'memory-receipts.jsonl')), results = privateWriter(join(dir, 'case-results.jsonl'));
+  const candidateResponseModels = new Set();
   const relayLog = privateWriter(join(dir, 'embedding-relay.jsonl')), rawOutputs = privateWriter(join(dir, 'model-outputs.jsonl')),
     snapshotChecks = privateWriter(join(dir, 'snapshot-verifications.jsonl'));
   const image = name => execFileSync('/usr/bin/docker', ['image', 'inspect', name, '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
   const docker = createNamespaceDocker({ databaseImage: image('neo4j:5.26.14-community'), driverImage: image('node:22-bookworm-slim'),
     mounts: { memory: runtimeDir, scratch: driverDir }, runId, onResource: row => resources.append(row) });
   const budget = createSoftBudget({ path: join(dir, 'ledger.jsonl'), capNano: remaining.toString(), sessionKey: `pilot-${runId}`, sealSha256: seal.digest,
-    routes: { [exactRoute(model, candidateOrigin)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => rawOutputs.append(row) });
+    routes: { [exactRoute(model, candidateOrigin)]: routeRates.candidate, [exactRoute(reviewerModel)]: routeRates.reviewer }, onRaw: row => {
+      // The provider may serve a route under a different model; each distinct reported model is kept for the report.
+      if (row?.purpose === 'candidate') candidateResponseModels.add(row.message?.responseModel ?? row.message?.model ?? 'unreported');
+      rawOutputs.append(row);
+    } });
   const onInterrupt = signal => { try { budget.requestStop(signal); } catch {} };
   const onSigint = () => onInterrupt('SIGINT'), onSigterm = () => onInterrupt('SIGTERM');
   process.on('SIGINT', onSigint); process.on('SIGTERM', onSigterm);
@@ -711,6 +716,9 @@ async function main() {
     ledger_completeness: 'partial: gateway-internal failover/retry attempts not correlatable',
     image_limitation: 'Original image blobs are archived by SHA-256; image content is not text-citable.',
     latency_limitation: 'Local embedding latency is environment-sensitive; a later sample showed 100% GPU and elevated host load, not proof of contention during any call.', artifacts,
+    candidate_model: { route: exactRoute(model, candidateOrigin), origin: candidateOrigin, image_input: model.input?.includes('image') === true,
+      response_models: [...candidateResponseModels].sort(), response_model_changed: candidateResponseModels.size > 1,
+      ...(treatment?.candidateOrigin ? { privacy: 'Operator-approved direct provider route: the replayed source context, including tool outputs and the source assistant\'s thinking converted to plain text (as for every arm), and each checkpoint task prompt were sent to this provider for distillation.' } : {}) },
     mixed_code: seal.spec.resume?.codeTransition ? { from: seal.spec.resume.codeTransition.from, to: seal.spec.resume.codeTransition.to,
       cursor: seal.spec.resume.cursor, changed_paths: seal.spec.resume.codeTransition.changedPaths.length } : null,
     run_dir: dir, run_id: runId, seal_sha256: seal.digest };
