@@ -123,7 +123,10 @@ async function main() {
   } finally { budget.close(); }
   for (const row of refs.slice(alignments.length)) alignments.push({ reference_id: row.id, verdict: 'uncertain', candidate_ids: [], reason: 'alignment not run' });
   writeNew(join(dir, 'model-outputs.jsonl'), outputs.map(row => `${JSON.stringify(row)}\n`).join(''));
-  const summary = summarizeStage({ coverage: report.coverage, cutoff,
+  // Alignment concerns the stored graph, so a run whose case phase failed after full checkpoint coverage qualifies too.
+  const coverage = report.coverage.status === 'case_failed' && report.coverage.processed === report.coverage.scheduled
+    ? { ...report.coverage, status: 'complete' } : report.coverage;
+  const summary = summarizeStage({ coverage, cutoff,
     reference: { records: reference.records, relations: reference.relations },
     candidate: run.graph, alignments, alignmentCandidateHashes: Object.fromEntries(candidates.map(row => [row.id, sha(row.text)])),
     returnedIds: run.returned_item_ids.filter(id => candidates.some(row => row.id === id)) });

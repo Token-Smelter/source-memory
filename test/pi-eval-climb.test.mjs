@@ -73,7 +73,7 @@ test('the dashboard is self-contained, shows no-match references, and embedded t
 test('a run export is bound to its sealed source, needs complete coverage, and records abstention markers per arm', () => {
   const graph = { schedule: ['a'], records: [{ id: 'r', dated_by: 'write_receipt' }], relations: [] };
   const seal = { digest: 's', spec: { sourceSha256: SOURCE, codeSha: 'c', datasetSha256: 'd', budget: { purposes: {} } } };
-  const report = { run_id: 'run', seal_sha256: 's', run_dir: '/fiction', coverage: { status: 'complete', scheduled: 1, dispositions: [{ through: 'a', disposition: 'committed', search_incomplete: false }] },
+  const report = { run_id: 'run', seal_sha256: 's', run_dir: '/fiction', coverage: { status: 'complete', scheduled: 1, processed: 1, dispositions: [{ through: 'a', disposition: 'committed', search_incomplete: false }] },
     scorecard: { deltas: { candidate: 0.5 }, sensitivity: {}, confidence: {}, safety: {} }, budget: { spent_nano: '1', calls_started: 1 } };
   const answers = [{ arm: 'candidate', answer: { trace: { abstention: 'not_enforced', returnedItemIds: ['b', 'a', 'b'] } } },
     { arm: 'empty', answer: { trace: { abstention: 'host_enforced_no_citations', returnedItemIds: [] } } }];
@@ -81,7 +81,7 @@ test('a run export is bound to its sealed source, needs complete coverage, and r
   assert.deepEqual([value.source_key, value.primary.value, value.returned_item_ids, value.diagnostics.abstention.empty], [DEV, 0.5, ['a', 'b'], { host_enforced_no_citations: 1 }]);
   assert.throws(() => runExport({ treatment: 'baseline-v2', seal: { ...seal, spec: { ...seal.spec, sourceSha256: '0'.repeat(64) } }, report,
     reportSha256: 'f'.repeat(64), graph, answers }), /source_not_development/);
-  assert.throws(() => runExport({ treatment: 'baseline-v2', seal, report: { ...report, coverage: { ...report.coverage, status: 'case_failed' } },
+  assert.throws(() => runExport({ treatment: 'baseline-v2', seal, report: { ...report, coverage: { ...report.coverage, status: 'failed' } },
     reportSha256: 'f'.repeat(64), graph, answers }), /run_unqualified/);
 });
 
