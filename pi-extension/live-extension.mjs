@@ -207,7 +207,7 @@ export async function createLiveRuntime({ config, sdk, resolveModels = resolvePi
         // First seen means no durable coverage state yet, not merely a missing directory.
         const fresh = !journal.intervals().length && journal.state().status === 'ready' && cursorStore.load() === null;
         const controller = createLiveController({ journal, cursorStore,
-          conversationId: sessionId, maxRetries: config.maxRetries, gate, baseline: fresh && !config.backfill ? baseline : null,
+          conversationId: sessionId, sessionId, maxRetries: config.maxRetries, gate, baseline: fresh && !config.backfill ? baseline : null,
           open: () => openSession(journal, sessionId, sessionFile, dir) });
         entry = { controller, journal, sessionFile };
         controllers.set(sessionId, entry);

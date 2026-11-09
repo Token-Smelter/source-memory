@@ -51,10 +51,11 @@ export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onE
  * pointer that must agree with it. Each settle derives its cursor as the end of the covered prefix of the active branch,
  * so a failed cursor save, a crash, a fork inside a covered interval or a branch switch never ingests a covered entry again.
  */
-export function createLiveController({ journal, cursorStore, conversationId, open, gate, maxRetries = 3, baseline = null }) {
+export function createLiveController({ journal, cursorStore, conversationId, open, gate, maxRetries = 3, baseline = null, sessionId = null }) {
   if (!journal || !journal.options?.effectIds || !journal.options?.pidLock || !cursorStore || typeof open !== 'function' || typeof gate !== 'function'
     || typeof conversationId !== 'string' || !conversationId || !Number.isSafeInteger(maxRetries) || maxRetries < 0
-    || (baseline !== null && (typeof baseline !== 'string' || !baseline))) throw fail('controller_invalid');
+    || (baseline !== null && (typeof baseline !== 'string' || !baseline))
+    || (sessionId !== null && (typeof sessionId !== 'string' || !sessionId))) throw fail('controller_invalid');
   // Live sessions compact; summaries follow the dependency-closure rule instead of blocking every later interval.
   const summaryPolicy = 'dependency_closure';
   let session = null;
@@ -131,11 +132,13 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
       present.push(...found.present);
       absent.push(...found.absent);
     }
+    const ingestEffect = effects.find(effect => effect.method === 'ingest');
+    const ingest = replayedIngest ? 'idempotent_replay_by_turn_id' : ingestEffect?.state === 'confirmed' ? 'confirmed'
+      : ingestEffect?.state === 'refused' ? 'refused' : 'not_started';
     const evidence = { kind: 'live-reconcile/v1', interval: state.id, cursor: state.cursor, through: state.through,
-      ingest: replayedIngest ? 'idempotent_replay_by_turn_id' : 'confirmed', confirmed, present: present.sort(), absent: absent.sort() };
+      ingest, confirmed, present: present.sort(), absent: absent.sort() };
     const sha = digest(evidence);
-    try { writeDurableFile(dirname(journal.path), `reconcile-${sha}.json`, Buffer.from(canonical(evidence))); }
-    catch (problem) { if (problem.code !== 'EEXIST') throw problem; }
+    writeDurableFile(dirname(journal.path), `reconcile-${sha}.json`, Buffer.from(canonical(evidence)));
     journal.reconcile({ id: state.id, disposition: 'failed', evidenceRef: `${evidence.kind}:${sha}` });
     return evidence;
   }
@@ -206,12 +209,17 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
     },
   };
 
-  async function settleOnce({ leafId, entries }) {
+  async function settleOnce({ leafId, entries, sessionId: snapshotSession }) {
       busy = true;
       const results = [];
       let reconciled = null;
       try {
+        // One controller, one journal, one Pi session: another session's entries never enter this conversation.
+        if (sessionId !== null && snapshotSession !== sessionId) return { status: 'skipped', code: 'session_mismatch', results, reconciled };
         if (!Array.isArray(entries) || !entries.some(row => row?.id === leafId)) return { status: 'skipped', code: 'source_unavailable', results, reconciled };
+        // Covered prefixes are computed from the whole append-only tree; a branch-only view would re-ingest shared source.
+        const present = new Set(entries.map(row => row?.id));
+        if (journal.intervals().some(row => !present.has(row.through))) return { status: 'skipped', code: 'source_incomplete', results, reconciled };
         const pending = journal.state();
         if (pending.status === 'uncertain' || pending.reconciliation_required) {
           // Reconciliation reads Memory, so the scope grants are checked first; it spends no model budget.

@@ -168,6 +168,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
             if (active.effects.has(effect)) throw fail('effect_already_attempted');
             const ids = !effectIds ? null : key === 'enrich' ? args[1]?.records?.map(row => row?.id) ?? []
               : key === 'applyOutcome' ? outcomeIds.get(args[1]) ?? null : null;
+            if (key === 'applyOutcome') outcomeIds.delete(args[1]);
             append({ type: 'effect_begin', id, method: key, effect, ...(ids && idList(ids) ? { ids } : {}) });
             try {
               const result = await value.apply(target, args);

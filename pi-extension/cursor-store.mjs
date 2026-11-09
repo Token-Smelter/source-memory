@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, fstatSync, fsyncSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, linkSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { digest } from '../src/core.mjs';
 
@@ -11,14 +11,23 @@ function syncDirectory(dir) {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-/** Write a new private file durably: exclusive create, fsync, directory fsync. An existing file is left unchanged. */
+/**
+ * Write a new private file durably and whole: a fsynced temp file is hard-linked into place, so the name never shows a partial
+ * file. An existing file with the same bytes is accepted; different bytes refuse with durable_file_conflict.
+ */
 export function writeDurableFile(directory, name, bytes) {
   const path = join(directory, name);
-  const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  const temporary = join(directory, `.${name}.${randomUUID()}.tmp`);
+  const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
   try {
     for (let offset = 0; offset < bytes.length;) offset += writeSync(fd, bytes, offset, bytes.length - offset);
     fsyncSync(fd);
   } finally { closeSync(fd); }
+  try { linkSync(temporary, path); }
+  catch (problem) {
+    if (problem.code !== 'EEXIST') throw problem;
+    if (!readFileSync(path).equals(bytes)) throw fail('durable_file_conflict');
+  } finally { try { unlinkSync(temporary); } catch {} }
   syncDirectory(directory);
   return path;
 }

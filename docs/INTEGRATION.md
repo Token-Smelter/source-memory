@@ -126,20 +126,28 @@ flowchart TD
     Gate -->|"yes"| Run["runCoveredInterval, then atomic cursor save"]
 ```
 
-Wiring for a custom host, with one journal and cursor per Pi session:
+Wiring for a custom host, with one journal, cursor and controller per Pi session (`live-extension.mjs` does exactly this):
 
 ```js
-const journal = createCoverageJournal({ directory, sessionKey: sessionId, effectIds: true, pidLock: true });
-const controller = createLiveController({ journal, cursorStore: createCursorStore({ directory, sessionKey: sessionId }),
-  conversationId: sessionId, open: openTrackedSession, gate });
-registerLiveMemory(pi, { controllerFor: () => controller, onError });
-// At shutdown: await controller.close(); journal.close();  (releases the lock)
+const controllers = new Map();
+const hook = registerLiveMemory(pi, { onError, controllerFor: snapshot => {
+  if (!controllers.has(snapshot.sessionId)) {
+    const journal = createCoverageJournal({ directory, sessionKey: snapshot.sessionId, effectIds: true, pidLock: true });
+    controllers.set(snapshot.sessionId, { journal, controller: createLiveController({ journal, gate, open: openTrackedSession,
+      cursorStore: createCursorStore({ directory, sessionKey: snapshot.sessionId }), conversationId: snapshot.sessionId, sessionId: snapshot.sessionId }) });
+  }
+  return controllers.get(snapshot.sessionId).controller;
+} });
+pi.on('session_shutdown', async () => {
+  await hook.drain();
+  for (const { controller, journal } of controllers.values()) { await controller.close(); journal.close(); } // releases the lock
+});
 ```
+
+`entries` must be the whole session tree (`sessionManager.getEntries()`), never one branch; a view missing a covered interval's end is skipped with `source_incomplete`. A controller given `sessionId` skips other sessions' snapshots with `session_mismatch`.
 
 `open()` must return `{ conversation_id, scopes: [scope], memory: journal.track(client), distiller, budget, close }` (`budget` is required when the gate exposes one), with the distiller using that same tracked `memory`, and must start a new Memory process each time it is called. The controller closes its own session before reconciling, but it cannot stop a process another host left running.
 
-| Behavior | Contract |
-|---|---|
 | Behavior | Contract |
 |---|---|
 | Cursor file | One private `cursor-<sha>.json` per session key. Each save writes a private temp file, fsyncs it, renames it and fsyncs the directory, so a crash leaves the old or the new cursor. Temp files left by a crash are removed when the store opens. The embedded unkeyed SHA-256 detects corruption, not deliberate tampering; a mismatch is refused with `cursor_store_invalid`. |
@@ -147,13 +155,13 @@ registerLiveMemory(pi, { controllerFor: () => controller, onError });
 | Failed cursor save | The journal already holds the covered interval, so the next settle starts after it. The interval is never widened over covered source; the next successful save rewrites the file. |
 | Crash or unknown write | An unfinished or uncertain interval is reconciled before any new work. Unknown `ingest` is settled by replaying it under the same deterministic turn ID: `replayed: true` if the first attempt landed, a first write otherwise. Unknown `enrich` and `applyOutcome` are settled by reading their content-addressed record IDs (`recordPresence`, read grant required) through a newly opened Memory session. A split outcome, any non-refused `applyLinks`, or an effect without recorded IDs returns `blocked: reconciliation_required` and needs an operator. |
 | Confirmed partial writes | A failed interval with confirmed `enrich` or `applyOutcome` writes is also reconciled automatically and retried. The retry may add further proposed records for the same turn; identical records deduplicate by ID. |
-| Evidence | Every automatic reconciliation writes `reconcile-<sha>.json` (canonical JSON: interval, confirmed IDs, present and absent IDs, ingest settlement) durably next to the journal before the journal `reconcile` row, whose `evidence_ref` names that SHA-256. Presence never changes the decision: the interval is always reconciled as `failed` and then retried. |
+| Evidence | Every automatic reconciliation writes `reconcile-<sha>.json` (canonical JSON: interval, confirmed IDs, present and absent IDs, ingest settlement) next to the journal before the journal `reconcile` row, whose `evidence_ref` names that SHA-256. The file is written as a fsynced temp file hard-linked into place, so it is never partial; an existing file with different bytes refuses with `durable_file_conflict`. The ingest settlement is `idempotent_replay_by_turn_id`, `confirmed`, `refused` or `not_started`. Presence never changes the decision: the interval is always reconciled as `failed` and then retried. |
 | Retry | A failed gap is retried with the same cursor and through wherever it still validates in the session's entries, including on an abandoned branch, up to `maxRetries` (default 3, counted from journal `begin` rows). After that it is `blocked: retry_limit`. A gap whose source no longer validates is `blocked: coverage_gap_unreachable`. Nothing new begins while a gap is open. |
 | Validation | A leaf inside the covered prefix returns `current`. A leaf that fails the pure `sourceInterval` check (for example `turn_incomplete`, or an unknown leaf) is `skipped` without a journal row, and is skipped again on each later settle while that condition holds. |
 | Branches | A fork anywhere, including inside one covered interval, starts at the last covered entry it shares with the covered prefix, so only its own suffix is ingested. |
-| Lock | `pidLock` writes an owner record (host, boot ID, PID namespace, PID, process start time) atomically with a hard link. A lock is taken over only when it names this host and PID namespace and its owner's PID is gone, has a different start time, or belongs to an earlier boot. Takeover runs under an `O_EXCL` break guard and re-checks the owner, so concurrent openers end with one holder. An empty, foreign or live-owner lock refuses with `journal_locked`, as does a lock written by the harness's default journal. A guard left by a crash during takeover needs an operator. |
+| Lock | `pidLock` writes an owner record (host, machine ID, boot ID, PID namespace, PID, process start time) atomically with a hard link. A lock is taken over only when it names this host, machine ID and PID namespace and its owner's PID is gone, has a different start time, or belongs to an earlier boot. Without `/etc/machine-id` and `/proc` (for example macOS or many containers), nothing is ever taken over and a stale lock needs an operator. Takeover runs under an `O_EXCL` break guard and re-checks the owner, so concurrent openers end with one holder. An empty, foreign or live-owner lock refuses with `journal_locked`, as does a lock written by the harness's default journal. A guard left by a crash during takeover needs an operator. |
 
-Presence is read after the writing session is closed. It cannot cover a Neo4j commit that the server accepted but had not applied at read time. The default `createCoverageJournal` options leave harness journal rows and locks byte-identical (pinned by a golden test).
+Presence is read after the writing session is closed. It cannot cover a Neo4j commit that the server accepted but had not applied at read time. The default `createCoverageJournal` options leave harness journal rows and locks byte-identical to the pre-live format; a golden test pins the SHA-256 that `test/helpers/default-journal-script.mjs` produced at a3d65aa and 16c5a9d. One deliberate difference: a `reconcile()` call that `apply()` would reject is now refused without writing, where it previously wrote a row that made the journal unreadable.
 
 ### Compaction and branch summaries (implemented for the live controller)
 
@@ -230,7 +238,7 @@ Turns created by this adapter use source `pi-memory`. Their `turn_id` is derived
 | Area | Implemented and exercised | Still required or planned |
 |---|---|---|
 | Event adapter | Injectable `agent_settled` hook and per-session in-memory queue; nonblocking registration has a fictional test | Real host bootstrap, queue ordering/error/cursor-save tests, lifecycle and operational authorization |
-| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries, a durable budget and permission gate before ingest, and a default-export live extension with configuration, background distillation and fail-safe lifecycle** | Operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
+| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries, a durable budget and permission gate before ingest, and a default-export live extension with configuration, background distillation and fail-safe lifecycle** | Operator tooling for `applyLinks` reconciliation and for gaps whose source no longer validates (`coverage_gap_unreachable`) |
 | Retrieval | Scoped Memory search and proposal handles; bounded-state disclosure | Compact per-record results and chosen-handle evidence fetch; eliminate the observed truncation fault |
 | Distiller | Private incremental Pi copy, sequential memory tools, metering interfaces and fictional/offline SDK tests | Production route qualification, bounded provider costs and host-level access controls |
 | Evidence and identity | Current-turn evidence labels, private image blobs, explicit `pi-memory` source | Cross-source deduplication and visual-content citation |
