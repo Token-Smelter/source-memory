@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createAnswerer, CITATION_PROTOCOL, UNKNOWN_ANSWER, citationId, rawEvidenceId, textSha256 } from '../pi-extension/evaluation/answerer.mjs';
-import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_CITED_TOOLS_SHA256, ANSWERER_CITED_REPAIR,
+import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_CITED_TOOLS_SHA256, ANSWERER_CITED_REPAIR, CITATION_FEEDBACK,
   SCORER_GROUNDED_TOOLS_SHA256, SCORER_GROUNDED_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
 import { hash, sealComparison } from '../pi-extension/evaluation/seal.mjs';
 import { fictionalCase, fictionalModel, fictionalSettings, scoringPacket } from '../pi-extension/evaluation/fictional.mjs';
@@ -237,6 +237,23 @@ test('a bounded retrieval refusal is distinguished from genuinely empty memory',
     [UNKNOWN_ANSWER, 'host_enforced_after_budget_refusal', [{ tool: 'search', code: 'retrieval_bytes_limit' }]]);
   assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), judgment: { clauses: [] },
     trace: { ...result.trace, budgetRefusals: [] } }), /citation_trace_invalid/);
+});
+
+test('a citation miss lists citable pairs, and a second miss becomes a marked abstention', async () => {
+  const wrong = { item_id: 'source', evidence_id: 'source' };
+  const fake = metered([tool('search', 'memory_search', { query: 'fiction' }), tool('submit', 'submit_answer', { answer: 'Fiction.', citations: [wrong] }),
+    tool('resolve', 'memory_resolve', { item_id: 'item', evidence_id: 'source' }), tool('again', 'submit_answer', { answer: 'Fiction.', citations: [wrong] })]);
+  const value = settings(); value.answerer.limits.modelCalls = 4;
+  const seal = sealComparison(value);
+  const respond = createPiAnswererResponder({ runtime: fake.runtime, model: fictionalModel(), sessionId: 'fiction', expectedToolsSha256: ANSWERER_CITED_TOOLS_SHA256 });
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: { async search() { return [item]; },
+    async resolve(request) { return { id: request.evidenceId, scope: 'fiction', text: 'Fictional source.' }; } }, archive: { async search() { return []; } }, respond });
+  const result = await answerer.run({ arm: 'candidate', case: fictionalCase() });
+  const feedback = JSON.parse(fake.calls[2].messages.at(-2).content[0].text);
+  assert.deepEqual([feedback, result.answer, result.trace.abstention, result.trace.citation_repair_failed],
+    [{ error: 'citation_not_returned', citable: [], instruction: CITATION_FEEDBACK }, { text: UNKNOWN_ANSWER, citations: [] }, 'host_enforced_invalid_citations', true]);
+  assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), judgment: { clauses: [] },
+    trace: { ...result.trace, abstention: 'host_enforced_no_citations' } }), /citation_trace_invalid/);
 });
 
 test('grounded scorer receives exact cited text and rejects support without a cited ID', async () => {

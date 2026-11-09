@@ -33,6 +33,7 @@ export const SCORER_GROUNDED_TOOLS_SHA256 = hash(SCORER_GROUNDED_TOOLS);
 export const ANSWERER_FORMAT_SUFFIX = ' Submit the final answer with the submit_answer tool.';
 export const ANSWERER_BUDGET_SUFFIX = ' If the item budget is exhausted, answer from retrieved items or state uncertainty.';
 export const ANSWERER_CITATION_SUFFIX = ' Search the permitted memory before answering. If no relevant information supports an answer, say you do not know; never guess. Cite only evidence actually returned by memory_resolve using its item_id and evidence_id. Only a memory_search row marked kind "source_excerpt" is itself evidence: cite its id as item_id and its listed evidence id as evidence_id. Every other row must be resolved with memory_resolve before it can be cited. If no evidence supports an answer, submit an empty citations array.';
+export const CITATION_FEEDBACK = 'Cite only pairs listed in citable. To cite another item, first call memory_resolve with that item id and one of its listed evidence ids.';
 export const SCORER_FORMAT_SUFFIX = ' Submit the complete judgment with the submit_score tool.';
 export const ANSWERER_REPAIR = 'The previous output was not a valid final submission. Call submit_answer with the complete answer; do not change its substance merely to fix formatting.';
 export const ANSWERER_CITED_REPAIR = 'The previous submission was invalid. Search before answering and submit the answer with citations only to evidence actually returned by the tools; if none supports an answer, submit no citations and say you do not know.';
@@ -127,7 +128,10 @@ export function createPiAnswererResponder({ runtime, model, sessionId, expectedT
             try { validateAnswer(value); return value; }
             catch (problem) {
               if (!['answer_invalid', 'citation_invalid', 'citation_not_returned'].includes(problem?.code)) throw problem;
-              invalid = true; context.messages.push(toolResult(tool, { error: problem.code }, true)); continue;
+              // A second citation miss is scored as an abstention rather than stopping the whole run.
+              if (repairs && problem.code !== 'answer_invalid') return { text: args.answer, citations: [], citationRepairFailed: true };
+              invalid = true;
+              context.messages.push(toolResult(tool, { error: problem.code, citable: problem.citable ?? [], instruction: CITATION_FEEDBACK }, true)); continue;
             }
           }
         }

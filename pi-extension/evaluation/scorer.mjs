@@ -1,5 +1,5 @@
 import { hash, verifySeal } from './seal.mjs';
-import { CITATION_PROTOCOL, UNKNOWN_ANSWER, citationId, textSha256 } from './answerer.mjs';
+import { CITATION_PROTOCOL, UNKNOWN_ANSWER, abstentionMarker, citationId, textSha256 } from './answerer.mjs';
 import { GROUNDING_PROTOCOL } from './rubric.mjs';
 import { BLOCK_EVIDENCE_CONTRACT } from './dev-dataset.mjs';
 
@@ -68,8 +68,8 @@ function validateCaseTrace({ packet, trace, spec, seal }) {
       || trace.citedEvidence.reduce((sum, row) => sum + Buffer.byteLength(row.text), 0) > spec.answerer.limits.evidenceBytes
       || trace.budgetRefusals.some(row => !validRefusal(row)) || typeof trace.host_replaced_text !== 'boolean'
       || (trace.citations.length > 0 && trace.host_replaced_text) || !/^[a-f0-9]{64}$/.test(trace.model_text_sha256 ?? '')
-      || trace.abstention !== (trace.citations.length ? 'not_enforced' : trace.budgetRefusals.length
-        ? 'host_enforced_after_budget_refusal' : 'host_enforced_no_citations')) throw fail('citation_trace_invalid');
+      || typeof trace.citation_repair_failed !== 'boolean' || (trace.citation_repair_failed && trace.citations.length > 0)
+      || trace.abstention !== abstentionMarker(trace.citations.length, trace.citation_repair_failed, trace.budgetRefusals.length)) throw fail('citation_trace_invalid');
   }
 }
 
