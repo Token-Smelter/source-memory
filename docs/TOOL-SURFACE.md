@@ -44,7 +44,7 @@ A caller concept that needs state transitions (open/closed, assigned, due) stays
 | What's there, in order | `list` | PR 2 | exact scope or `S/**` |
 | Is the store healthy and the same store | `status` | built; subtree in PR 1 | exact scope or `S/**` |
 | Prepare a scope or subtree | `init` | built; subtree in PR 1 | exact scope or `S/**` (write grant) |
-| Keep models resident | `warm`, `warm --db v1` | built | exact scope |
+| Keep the embedding model resident; warm the database read paths | `warm`; `warm --db v1` | built | exact scope |
 
 Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence` on the extension transport, refuses it `scope_denied` inside `authorize`, before any storage call.
 
@@ -61,7 +61,7 @@ Only `recall`, `list`, `status` and `init` accept a selector; every other operat
 
 One membership rule, used everywhere (Cypher selection, JS exactness check, pending counts, migration, `list`): **`T` is in `S/**` iff `T` is a path and (`T = S` or `T` starts with `S/`)**. In Cypher that is a prefix seek on `n.scope` plus a regex post-filter, so an opaque name that merely starts with `S/` (such as `acme/x y`) is never in a subtree, never labelled and never given terms.
 
-The segment charset is the one `pi-extension/live-extension.mjs` already enforces, so every scope that adapter wrote is a depth-1 path. **Compatibility exception (approved by the Memory owner, rpc:f62e1984, 2026-11-09):** before r1 the CLI accepted any name. A stored name that is now nested (contains `/` and parses as a path) would move from its per-scope index to its root's tree, reported `scope_tree_pending` until `init` migrates it and then ranked over the tree; a stored name ending in `/**` becomes a selector and its data becomes unreachable by exact reads. No supported writer produced such names. `init` and `status` of a nested scope report `legacy_flat_index: true` when a pre-r1 per-scope full-text index exists for that name. Evidence for the ruling: the only real store (the pilot) is granted exactly one flat scope, `sourcerer-memory`, in its `scopes.read`/`scopes.write`, and no supported writer emits `/`. The rejected alternative kept any scope with a pre-r1 per-scope index flat, at the cost of a store lookup per nested operation.
+The segment charset is the one `pi-extension/live-extension.mjs` already enforces, so every scope that adapter wrote is a depth-1 path. **Compatibility exception (owner ruling of 2026-11-09):** before r1 the CLI accepted any name. A stored name that is now nested (contains `/` and parses as a path) would move from its per-scope index to its root's tree, reported `scope_tree_pending` until `init` migrates it and then ranked over the tree; a stored name ending in `/**` becomes a selector and its data becomes unreachable by exact reads. No supported writer produced such names. `init` and `status` of a nested scope report `legacy_flat_index: true` when a pre-r1 per-scope full-text index exists for that name. Evidence for the ruling: the only deployed store grants a single depth-1 scope in its `scopes.read`/`scopes.write`, and no supported writer emits `/`. The rejected alternative kept any scope with a pre-r1 per-scope index flat, at the cost of a store lookup per nested operation.
 
 ### Grants
 
@@ -76,7 +76,7 @@ A target `T` is granted when the array contains `T`, or contains `A/**` with `T`
 
 ### Writes: exactly one scope
 
-`ingest`, `enrich` and `index` take one exact scope; a selector is refused `scope_denied` by `authorize` inside `beforeWrite`, so it replies `stage:"before_write"` and adds no write-path code (Q-SM-3/6 unchanged). Evidence spans and relation endpoints must be in the written scope (unchanged `Neo4jStore.enrich` checks). Cross-scope relations do not exist. Identity is unchanged: `identity(kind, scope, ...)` (`src/core.mjs:41`) hashes the full scope string, so the same record id in two scopes is two records.
+`ingest`, `enrich` and `index` take one exact scope; a selector is refused `scope_denied` by `authorize` inside `beforeWrite`, so it replies `stage:"before_write"` and adds no write-path code. The marker read and conditional labelling inside the ingest/enrich transactions raise nothing, so Q-SM-3/6 and the enrich source-order pin hold. Evidence spans and relation endpoints must be in the written scope (unchanged `Neo4jStore.enrich` checks). Cross-scope relations do not exist. Identity is unchanged: `identity(kind, scope, ...)` (`src/core.mjs:41`) hashes the full scope string, so the same record id in two scopes is two records.
 
 ### Reads: one scope or a subtree
 
@@ -110,9 +110,9 @@ flowchart TD
 | `scope_terms` | space-joined `t<sha256(['source-memory.scope/1', A])>` for each ancestor-or-self `A`, plus `x<…>` of the exact scope, computed in JS. Alphanumeric, so the standard analyzer keeps each whole |
 | full-text | per root: `smtree_t_<d>`, `smtree_r_<d>`, `smtree_c_<d>` `ON EACH [n.text, n.scope_terms]`. Query: `text:(<existing literal terms>) AND scope_terms:<term>^0`; the filter runs inside Lucene before top-k, and boost 0 leaves the score unchanged (probed on 5.26.14) |
 | vector | per root: `smtree_vc_<d>`, `smtree_vr_<d>`, cosine, quantization off, the root's own dimension. 5.26 has no pre-filtered ANN, so a read censuses its eligible nodes: at most 4,096 → exact cosine over them (`ready`); more → the root's ANN index with the selection filter inside the existing widening loop (`partial` / `vector_overfetch_cap` when unresolved; survivors ≈ subtree share × 4,096) |
-| range indexes | `SMTurn(scope)`, `SMChunk(scope)`, `SMRecord(scope)`, created by tree `init`, so subtree selection seeks rather than scans |
+| range indexes | `SMTurn(scope)`, `SMChunk(scope)`, `SMRecord(scope)`, `SMRelation(scope)`, created by tree `init`, so subtree selection and counts seek rather than scan |
 | opt-in marker | `(:SMScopeTree {root})`, written by `init 'S/**'` for a depth-1 `S`. A write to `S` reads it inside its transaction and labels and terms its nodes only when present |
-| exactness check | every returned node satisfies the membership rule and every parent has the node's own scope; otherwise `index_scope_mismatch` |
+| exactness check | every returned node satisfies the membership rule for `S/**`, or equals `T` for an exact scope, and every parent has the node's own scope; otherwise `index_scope_mismatch` |
 | visibility checks | `turnVectorStatus`/`recordVectorStatus` of a nested scope query its root's vector index with the same 4,096 window as a flat scope; more than 4,096 identical vectors can keep a node unconfirmed in either layout |
 
 Cost: an opted-in root's own data is indexed twice (per-scope for flat reads, tree for subtree reads). Within a root, nested rankings depend on that root's whole tree, and a reader of `S/**` shares BM25 statistics with the rest of `S`'s root. Roots are isolated from each other.
@@ -121,7 +121,9 @@ Cost: an opted-in root's own data is indexed twice (per-scope for flat reads, tr
 
 A flat exact read uses the same labels, index names, Lucene query text, vector index and widening as today and never reads tree labels or `scope_terms`. Without opt-in, a flat scope's stored nodes are byte-identical too, so `pi-extension/export-scope.mjs` snapshots and `restore-scope.mjs` restores keep working; an opted-in root, and every nested scope, carries extra labels that restore refuses (`snapshot_invalid`), so that tooling stays flat-only. The new range indexes can change planner choice only; every flat query either orders its rows or is consumed order-insensitively (`getRecords` feeds sets and identity checks). The flat `init` reply and side effects are unchanged.
 
-Test (pinned digest): the corpus is written by `589658d` and read by it; then, in the same database, r1 runs `init 'golden/**'` (opt-in, labelling the corpus), writes nested data under `golden/`, and reads the corpus again. Both reads must hash to the pinned value. Reads covered, with embedding and reranker fixtures: ungrouped recall, grouped `evidence_advice` with `follow`, `history_search` with exclusion, `seedsOnly`, `show` (`bundle`, `units`, `record`), and `status` without `store.database_id`. Nested and subtree reads (new) are ranked over their root's tree and are not compared with flat reads.
+Test (pinned digest): the corpus written by r1 into a fresh, non-opted-in flat scope has the same `export-scope` snapshot as `589658d`'s, excluding `created_at`. The corpus is written by `589658d` and read by it; then, in the same database, r1 runs `init 'golden/**'` (opt-in, labelling the corpus), writes nested data under `golden/`, and reads the corpus again. Both reads must hash to the pinned value. Reads covered, with embedding and reranker fixtures: ungrouped recall, grouped `evidence_advice` with `follow`, `history_search` with exclusion, `seedsOnly`, `show` (`bundle`, `units`, `record`), and `status` without `store.database_id`. Nested and subtree reads (new) are ranked over their root's tree and are not compared with flat reads.
+
+Recall fuses its concurrently run channels in completion order, and `589658d` already does so: two identical flat reads can differ in the last bit of a fused score, and fusion keeps the text, match and conversation fields of whichever channel found an item first, which is also the text a reranker scores. The comparison normalizes only that: fused scores to 12 significant digits, the ranking-only reply's key and trace order and first-channel fields, and a fixture reranker that scores the entry sentence every representation shares. This is a property of the base commit, not of r1, and a reranker-configured flat recall is not byte-reproducible across runs on either.
 
 ### Completeness and omission reporting
 
@@ -138,7 +140,7 @@ Test (pinned digest): the corpus is written by `589658d` and read by it; then, i
 | Data | Action |
 |---|---|
 | flat scopes | none |
-| nested scopes written by r1+ | labelled and termed at write |
+| nested scopes written by r1+ | labelled and termed at write. `init T` (nested; write grant on `T`) creates its root's tree and the range indexes without waiting for population, writes no marker, and labels only `T`'s own unlabelled nodes |
 | a depth-1 root's own data, pre-r1 nested names | `init 'S/**'` (write grant on `S/**`): creates the root's tree and the range indexes without waiting for them to populate, writes the marker when `S` is depth 1, and labels and terms the selection's unlabelled path-scope nodes in bounded batches. Reply `{initialized, scope:"S/**", scope_tree:{labelled, pending, indexes}}`; rerun until `pending` is zero. No body, hash or uid changes |
 | writers on a pre-r1 build | their writes are unlabelled and surface as `scope_tree_pending` until the next `init 'S/**'` |
 
@@ -158,10 +160,10 @@ None added by PR 1: selectors refused where they are not accepted reuse `scope_d
 |---|---|
 | order | newest first by `(retained_at, uid)`. `retained_at` is the store's `created_at` on turns and records, written since the first release and compared as a Neo4j `datetime` at full (nanosecond) precision, so the up to 128 records of one `enrich` keep a total order by uid. A node without `created_at` (a direct writer) sorts as the oldest instant and is reported with `retained_at: null` |
 | exactness | keyset paging on that immutable, unique key: a full walk returns every item committed before its first page exactly once; an item committed during the walk appears at most once |
-| selection | from the request, by the membership rule on `n.scope`, not by tree labels, so `list` is exact before migration. Each page sorts the whole selection: O(n log n) per page |
+| selection | from the request, by the membership rule on `n.scope`, not by tree labels, so `list` is exact before migration. Each page sorts the whole selection: O(n log n) per page with the range indexes; a store that never ran a tree `init` has none, and a flat `list` then scans every turn or record in the database (flat `init` stays unchanged) |
 | filters | `kind`: `turn` or a record kind; `status` (records); `source` and `conversation_id` (turns; records by any evidence turn). Memory's own fields only |
 | items | turn: fixed-size header `{kind:"turn", scope, id, source, conversation_id, turn_id, parent_turn_id, occurred_at, retained_at, entry_count, bytes}`; text via `show`. record: `{kind:"record", scope, id, record_kind, status, text, attribution, evidence, retained_at}` with span coordinates, not excerpts |
-| bounds | `limit` 1–64 (default 16); `max_bytes` 1,024–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before the first item that would exceed it. An item that alone exceeds `max_bytes` is returned as a stub `{kind, scope, id, retained_at, bytes, content_omitted:"max_bytes"}` and the walk advances; it is never cut |
+| bounds | `limit` 1–64 (default 16); `max_bytes` 4,096–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before the first item that would exceed it. An item that alone exceeds `max_bytes` is returned as a stub `{kind, scope, id, retained_at, bytes, content_omitted:"max_bytes"}`, admitted alone if need be, and the walk advances; it is never cut |
 | cursor | opaque; binds the selection and filters; a cursor from another request is `invalid_input` |
 | not offered | `since`/`until`: `created_at` follows the statement clock, not commit order, so a time window can miss an earlier-stamped item that commits later; a cursor walk cannot |
 
