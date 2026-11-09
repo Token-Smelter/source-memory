@@ -16,6 +16,9 @@
 | `incremental.mjs` | Copies complete source JSONL entry lines into a private Pi-session file, preserving entry IDs. Prefix rewrites rebuild the private copy if old entry identities remain equal; changed identities and collisions refuse. State is in memory and does not recover after process restart. |
 | `pi-runtime.mjs` | Reopens that private session, branches to the target leaf and runs an injected Pi SDK session. Memory tools run sequentially to avoid competing for the bounded local embedding relay. Anthropic history breakpoint logic is included. |
 | `ndjson.mjs`, `memory-client.mjs`, `memory-process.mjs`, `serve.mjs` | Correlated, cancellable requests to one Memory process; link proposal objects remain in that process for validated reviewed apply. |
+| `live-extension.mjs` | Default-export Pi extension: strict configuration, mode gate, per-session controllers, background distillation and fail-safe shutdown. See `docs/INTEGRATION.md`. |
+| `live.mjs`, `cursor-store.mjs`, `owner-lock.mjs` | Journal-backed live controller and `agent_settled` hook, atomic cursor file, and owner-record locks taken over only from provably gone owners. |
+| `live-gate.mjs` | Shared durable usage ledger, daily input budget and the admission gate checked before any ingest. |
 | `index.mjs`, `replay.mjs` | Injectable nonblocking settled-event registration and replay over the same core. |
 | `namespace-docker.mjs`, `namespace-probe.mjs`, `namespace-harness.mjs` | Disposable Neo4j with `network none`, a driver sharing its namespace, and loopback/no-route and foreign-endpoint checks. Labelled resources are recorded before use and cleaned by exact identity. |
 | `unix-relay.mjs`, `embedding-shim.mjs`, `docker-memory.mjs` | Private Unix-socket embedding relay, loopback shim and long-lived Memory subprocess. `scripts/check-private-namespace.mjs` exercises actual isolated Neo4j using fictional content and a fake embedding response. |

@@ -11,6 +11,8 @@ const bootId = () => read(() => readFileSync('/proc/sys/kernel/random/boot_id', 
 const pidNamespace = () => read(() => readlinkSync('/proc/self/ns/pid'));
 // Field 22 of /proc/<pid>/stat (after the parenthesised command) is the start time in clock ticks since boot.
 const startTime = pid => read(() => readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).split(' ')[19]);
+// Field 3 is the process state; a zombie (Z) or dead (X) process holds its PID but runs nothing.
+const running = pid => !['Z', 'X', null].includes(read(() => readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).split(' ')[0]));
 
 export function ownerRecord(pid = process.pid) {
   return { v: 1, host: hostname(), machine: machineId() || null, boot: bootId(), pidns: pidNamespace(), pid, start: startTime(pid) };
@@ -33,8 +35,9 @@ export function ownerGone(owner, self = ownerRecord()) {
 }
 
 /**
- * The opposite proof, for spend: an owner is alive only when it is this process, or it names this host, boot and PID namespace
- * and its PID exists with the recorded start time. Anything unprovable (no /proc, another namespace or host) is not alive.
+ * The opposite proof, for spend: an owner is alive only when it names this host, machine, boot and PID namespace and its PID
+ * runs with the recorded start time. Anything unprovable (no /proc, another namespace or host) is not alive; callers that
+ * need to recognize their own process tag their records instead (live-gate instance IDs).
  */
 export function ownerAlive(owner, self = ownerRecord()) {
   if (!owner || owner.v !== 1 || owner.host !== self.host || !Number.isSafeInteger(owner.pid) || owner.pid < 1) return false;
@@ -42,7 +45,7 @@ export function ownerAlive(owner, self = ownerRecord()) {
   if (!owner.boot || owner.boot !== self.boot || !owner.pidns || owner.pidns !== self.pidns || owner.start === null) return false;
   if (owner.pid === self.pid) return owner.start === self.start;
   try { process.kill(owner.pid, 0); } catch (problem) { if (problem.code !== 'EPERM') return false; }
-  return startTime(owner.pid) === owner.start;
+  return startTime(owner.pid) === owner.start && running(owner.pid);
 }
 
 /** Create the lock with its owner record in one step: write a private temp file, then hard-link it into place. */

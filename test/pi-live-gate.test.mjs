@@ -131,7 +131,7 @@ test('a call that started but never reported usage is unknown after a restart, a
   reopened.ledger.close();
 }));
 
-test('a call in flight in another live process is neither unknown nor spend', () => privateDir(async directory => {
+test('a call in flight in another live process is neither unknown nor spend', { skip: !ownerRecord().start || !ownerRecord().machine }, () => privateDir(async directory => {
   const now = clock('2026-03-01T10:00:00Z');
   const ledger = createUsageLedger({ directory, now });
   ledger.append({ kind: 'call', id: 'parent', owner: ownerRecord(process.ppid) });

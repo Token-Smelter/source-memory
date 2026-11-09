@@ -81,7 +81,7 @@ test('branch, extension and dependent summaries are gaps while a clean later com
   assert.deepEqual(sourceInterval(clean, 'a5', 'a3', 'fiction', policy).omissions.summaries.map(row => row.disposition), ['admissible']);
 });
 
-test('the distiller receives exclusions and its context drops only inadmissible summaries', async () => {
+test('the distiller receives exclusions and its context replaces only inadmissible summaries with a placeholder', async () => {
   const inputs = [];
   const entries = [user('u', null, 'Fiction.'), { type: 'branch_summary', id: 'b', parentId: 'u', summary: 'Elsewhere.', fromId: 'gone' }, reply('a', 'b', 'Done.')];
   await distillThrough({ entries, conversation_id: 'fiction', scopes: ['private'], memory: { async ingest() { return { id: 'turn' }; } },

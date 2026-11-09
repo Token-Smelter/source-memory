@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createCursorStore, writeDurableFile } from '../pi-extension/cursor-store.mjs';
 import { admitAll, createLiveController } from '../pi-extension/live.mjs';
-import { ownerGone, ownerRecord } from '../pi-extension/owner-lock.mjs';
+import { acquireOwnerLock, ownerGone, ownerRecord } from '../pi-extension/owner-lock.mjs';
+import { createDailyInputBudget, createLiveGate, createUsageLedger } from '../pi-extension/live-gate.mjs';
 
 const message = (id, parentId, role, content) => ({ type: 'message', id, parentId, message: { role, content, ...(role === 'assistant' ? { stopReason: 'stop' } : {}) } });
 const tree = [message('u', null, 'user', 'Shared fictional root.'), message('a', 'u', 'assistant', 'Shared reply.'),
@@ -108,6 +109,41 @@ test('an owner on another machine with the same hostname is never taken over', (
   assert.deepEqual([ownerGone({ ...self, pid: 999999999 }, self), ownerGone({ ...self, pid: 999999999, machine: 'another-machine' }, self),
     ownerGone({ ...self, pid: process.ppid, machine: 'another-machine', boot: 'another-boot' }, self)], [Boolean(self.machine), false, false]);
 });
+
+test('this process\'s own in-flight call is recognized even where /proc proves nothing', () => privateDir(async directory => {
+  const ledger = createUsageLedger({ directory });
+  ledger.callStart();
+  const own = readFileSync(ledger.path, 'utf8').trim().split('\n').map(JSON.parse).at(-1).owner;
+  const bare = { v: 1, host: own.host, machine: null, boot: null, pidns: null, pid: process.pid, start: null };
+  ledger.append({ kind: 'usage', call: readFileSync(ledger.path, 'utf8').trim().split('\n').map(JSON.parse).at(-1).id, input: 0, cacheRead: 0, cacheWrite: 0 });
+  ledger.append({ kind: 'call', id: 'own-macos', owner: { ...bare, instance: own.instance } });
+  const ownInFlight = ledger.unknown();
+  ledger.append({ kind: 'call', id: 'foreign-macos', owner: { ...bare, instance: 'another-process' } });
+  assert.deepEqual([ownInFlight, ledger.unknown()], [false, true]);
+  ledger.close();
+}));
+
+test('a contended admission waits without blocking the host and then refuses ledger_busy', () => privateDir(async directory => {
+  const ledger = createUsageLedger({ directory });
+  const budget = createDailyInputBudget({ ledger, limit: 1000 });
+  const gate = createLiveGate({ scope: 'private', grants: { read: ['private'], write: ['private'] }, budget, ledger });
+  const held = acquireOwnerLock(join(directory, 'usage.lock'));
+  let ticks = 0;
+  const timer = setInterval(() => ticks++, 20);
+  await assert.rejects(gate({}), { code: 'ledger_busy', refused: true });
+  clearInterval(timer);
+  held.release();
+  assert.deepEqual([ticks > 20, await gate({})], [true, { admitted: true }]);
+  ledger.close();
+}));
+
+test('an ungated controller marks every result as ungated', () => privateDir(async directory => {
+  const live = harness(directory);
+  const results = [await live.controller.settle({ leafId: 'missing', entries: tree }), await live.controller.settle({ leafId: 'x', entries: tree }),
+    await live.controller.settle({ leafId: 'x', entries: tree })];
+  assert.deepEqual(results.map(row => [row.status, row.ungated]), [['skipped', true], ['covered', true], ['current', true]]);
+  live.journal.close();
+}));
 
 test('a second opener arriving inside the takeover window never also holds the lock', { skip: !ownerRecord().machine }, () => privateDir(async directory => {
   const lockPath = join(directory, 'fiction.lock');
