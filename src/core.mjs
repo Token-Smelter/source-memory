@@ -195,6 +195,9 @@ export function sourceExcerpt(turn, span) {
 // that alters a stored uid, body or hash for the same input is a new version; test/qualification.test.mjs pins version 1.
 export const RECORD_CONTRACT = 'source-memory.record/1';
 
+export const RECORD_KINDS = ['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action'];
+export const RECORD_STATUSES = ['proposed', 'accepted', 'observed'];
+
 export const RELATIONS = ['supersedes', 'qualifies', 'contradicts', 'depends_on', 'outcome_of'];
 
 // An outcome may result from something done, something decided or something intended; any other target is refused.
@@ -209,9 +212,9 @@ export function normalizeEnrichment(input) {
     requireThat(!recordIds.has(id), 'duplicate_record');
     recordIds.add(id);
     const kind = text(record.kind, 32);
-    requireThat(['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action'].includes(kind), 'invalid_kind');
+    requireThat(RECORD_KINDS.includes(kind), 'invalid_kind');
     const status = record.status ?? 'proposed';
-    requireThat(['proposed', 'accepted', 'observed'].includes(status), 'invalid_status');
+    requireThat(RECORD_STATUSES.includes(status), 'invalid_status');
     return { id, kind, text: text(record.text, 16000), status, attribution: text(record.attribution, 512), evidence: evidenceSpans(record.evidence) };
   });
   const edgeIds = new Set();

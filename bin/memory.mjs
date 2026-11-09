@@ -8,13 +8,14 @@ import { warmDb } from '../src/warm-db.mjs';
 import { isPoolRequest, serializePoolReply } from '../src/envelope.mjs';
 import { createStreamSink } from '../src/phase-diagnostic.mjs';
 
-const HELP = `source-memory <init|ingest|enrich|index|recall|show|status|warm> [--config FILE] --scope SCOPE [--input FILE]
+const HELP = `source-memory <init|ingest|enrich|index|recall|show|list|status|warm> [--config FILE] --scope SCOPE [--input FILE]
 
 --config defaults to $SOURCE_MEMORY_CONFIG.
---scope S/** names the subtree under path scope S for recall, status and init; every other command takes one exact scope.
+--scope 'S/**' names the subtree under path scope S for recall, list, status and init; every other command takes one exact scope.
 
 JSON input is read from --input or stdin for ingest/enrich/recall/show.
-index accepts optional --input {"limit":256}; init/status/warm need no input.
+index and list accept optional --input only; they never read stdin.
+index takes {"limit":256}; list takes {"kind","status","source","conversation_id","limit","max_bytes","cursor"}; init/status/warm need no input.
 recall accepts --diagnostic-phases v1: bounded start/end phase markers and one footer line on stderr; stdout is unchanged.
 warm sends one fixed embedding request and never touches the database.
 warm --db v1 instead runs the read-only recall query paths once against Neo4j, makes no model call, and reports ready or unavailable.
@@ -68,7 +69,7 @@ export async function main(argv = process.argv.slice(2), io = {}) {
   let config;
   let input = {};
   try {
-    requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'status', 'warm'].includes(command), 'unknown_command');
+    requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'list', 'status', 'warm'].includes(command), 'unknown_command');
     for (let i = 0; i < rest.length; i += 2) {
       requireThat(['--config', '--scope', '--input', '--diagnostic-phases', '--db'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
       options[rest[i]] = rest[i + 1];

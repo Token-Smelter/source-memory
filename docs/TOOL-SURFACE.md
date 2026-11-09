@@ -27,7 +27,7 @@ flowchart LR
 | chunk | a word window inside one entry of a turn; a search handle that resolves to its turn | a separate memory |
 | record | one derived claim of a fixed kind, citing source spans | a mutable row or task |
 | relation | a directed claim between two records of one scope, citing evidence | a foreign key to caller data |
-| time | `occurred_at` (caller-supplied, optional) and `retained_at` (the store's `created_at`, set by Neo4j's statement clock at write) | a state machine |
+| time | `occurred_at` (caller-supplied, optional) and `stored_at` (the store's `created_at`, set by Neo4j's statement clock at write) | a state machine |
 
 A caller concept that needs state transitions (open/closed, assigned, due) stays with the caller. Memory may record *that* something happened, as an outcome or a supersedes relation, but never answers "what is its state now".
 
@@ -40,10 +40,10 @@ A caller concept that needs state transitions (open/closed, assigned, due) stays
 | Embed what is not yet embedded | `index` | built | one exact scope (a write without `stage`) |
 | Get this exact thing | `show` (`record`, `turn`, `turn_by_key`) | built | one exact scope; exact or `not_found` |
 | What's connected to this | `show` (`units`, `following`, `bundle`) | built | one exact scope; bounded walk that reports where it stopped |
-| What's relevant to this query | `recall` | built; subtree in PR 1 | exact scope or `S/**`; ranked over records/relations **and** chunked turns; reports omissions and incomplete channels |
-| What's there, in order | `list` | PR 2 | exact scope or `S/**` |
-| Is the store healthy and the same store | `status` | built; subtree in PR 1 | exact scope or `S/**` |
-| Prepare a scope or subtree | `init` | built; subtree in PR 1 | exact scope or `S/**` (write grant) |
+| What's relevant to this query | `recall` | built, with subtrees | exact scope or `S/**`; ranked over records/relations **and** chunked turns; reports omissions and incomplete channels |
+| What's there, in order | `list` | built | exact scope or `S/**` |
+| Is the store healthy and the same store | `status` | built, with subtrees | exact scope or `S/**` |
+| Prepare a scope or subtree | `init` | built, with subtrees | exact scope or `S/**` (write grant) |
 | Keep the embedding model resident; warm the database read paths | `warm`; `warm --db v1` | built | exact scope |
 
 Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence`, refuses it `scope_denied` inside `authorize`, before any storage call. The extension transport (`pi-extension/memory-process.mjs`) serves one exact scope and refuses a selector at startup with `scope_unresolved`.
@@ -152,18 +152,19 @@ Recall fuses its concurrently run lexical channels in completion order, and `589
 
 None added by PR 1: selectors refused where they are not accepted reuse `scope_denied`; malformed selectors are not selectors and fall through to exact authorization. The QUALIFICATION.md code lists and their pins stay unchanged.
 
-## `list` (PR 2)
+## `list`
 
-`list {kind?, status?, source?, conversation_id?, limit?, max_bytes?, cursor?}` over an exact scope or `S/**` → `{kind:"list", scope, order:"retained_desc", items, next_cursor}`; `next_cursor: null` means the walk is complete.
+`list {kind?, status?, source?, conversation_id?, limit?, max_bytes?, cursor?}` over an exact scope or `S/**` → `{kind:"list", scope, order:"stored_desc", items, next_cursor}`; `next_cursor: null` means the walk is complete.
 
 | Rule | Definition |
 |---|---|
-| order | newest first by `(retained_at, uid)`. `retained_at` is the store's `created_at` on turns and records, written since the first release and compared as a Neo4j `datetime` at full (nanosecond) precision, so the up to 128 records of one `enrich` keep a total order by uid. A node without `created_at` (a direct writer) sorts as the oldest instant and is reported with `retained_at: null` |
-| exactness | keyset paging on that immutable, unique key: a full walk returns every item committed before its first page exactly once; an item committed during the walk appears at most once |
-| selection | from the request, by the membership rule on `n.scope`, not by tree labels, so `list` is exact before migration. Each page sorts the whole selection: O(n log n) per page with the range indexes; a store that never ran a tree `init` has none, and a flat `list` then scans every turn or record in the database (flat `init` stays unchanged) |
+| order | newest first by `(stored_at, uid)`. Every item carries `stored_at`, its per-item freshness; it is a node property outside the body and hash, so record identity and digest do not change. `stored_at` is the store's `created_at` on turns and records, written since the first release and compared exactly as a Neo4j `datetime`; each write statement stamps its own time, in milliseconds on Neo4j 5.26, so equal times are common and are ordered by uid. A `created_at` that is not a datetime is treated as missing. A node without `created_at` (a direct writer) sorts as the oldest instant and is reported with `stored_at: null` |
+| exactness | keyset paging on that immutable, unique key: a full walk returns every item committed before its first page exactly once; an item committed during the walk appears at most once. Assumes every page reads the same up-to-date store, as a single Neo4j instance does |
+| selection | from the request, by the membership rule on `n.scope`, not by tree labels, so `list` is exact before migration. One query per page applies the filters before its limit and sorts the matching selection; selection is a seek with the range indexes; a store that never ran a tree `init` has none, and a flat `list` then scans every turn or record in the database (flat `init` stays unchanged) |
 | filters | `kind`: `turn` or a record kind; `status` (records); `source` and `conversation_id` (turns; records by any evidence turn). Memory's own fields only |
-| items | turn: fixed-size header `{kind:"turn", scope, id, source, conversation_id, turn_id, parent_turn_id, occurred_at, retained_at, entry_count, bytes}`; text via `show`. record: `{kind:"record", scope, id, record_kind, status, text, attribution, evidence, retained_at}` with span coordinates, not excerpts |
-| bounds | `limit` 1–64 (default 16); `max_bytes` 4,096–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before the first item that would exceed it. An item that alone exceeds `max_bytes` is returned as a stub `{kind, scope, id, retained_at, bytes, content_omitted:"max_bytes"}`, admitted alone if need be, and the walk advances; it is never cut |
+| filters in the query | record kind and status, and a legacy turn's source keys, are matched as anchored patterns in the stored JSON body: this store writes those keys in a fixed order and escapes every quote inside a value, so a pattern can match only the top-level key |
+| items | turn: bounded header `{kind:"turn", scope, id, source, conversation_id, turn_id, parent_turn_id, occurred_at, stored_at, entry_count}`, cut from the stored envelope inside the database, so entry text is never returned; text via `show`. r1's draft `bytes` is not offered: Cypher can measure a string only in UTF-16 units, not UTF-8 bytes, so an exact byte size would mean returning the entries, and `entry_count` takes its place. record: `{kind:"record", scope, id, record_kind, status, text, attribution, evidence, stored_at}` with span coordinates, not excerpts |
+| bounds | `limit` 1–64 (default 16); `max_bytes` 4,096–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before the first item that would exceed it. An item that cannot fit in `items` alone (`bytes + 2 > max_bytes`) is returned as a stub `{kind, scope, id, stored_at, bytes, content_omitted:"max_bytes"}`, admitted alone if need be, and the walk advances; it is never cut |
 | cursor | opaque; binds the selection and filters; a cursor from another request is `invalid_input` |
 | not offered | `since`/`until`: `created_at` follows the statement clock, not commit order, so a time window can miss an earlier-stamped item that commits later; a cursor walk cannot |
 
