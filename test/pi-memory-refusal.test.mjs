@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -11,6 +11,7 @@ import { createCoverageJournal } from '../pi-extension/coverage.mjs';
 import { createMemoryClient } from '../pi-extension/memory-client.mjs';
 import { createMemoryHandlers, STAGED_METHODS } from '../pi-extension/memory-process.mjs';
 import { createClient, serve } from '../pi-extension/ndjson.mjs';
+import { main as serveMain } from '../pi-extension/serve.mjs';
 
 test('an explicit pre-write server rejection is distinguished from a transport timeout', async () => {
   const inbound = new PassThrough(), outbound = new PassThrough(), stopped = new AbortController();
@@ -49,6 +50,38 @@ test('only a staged method carries a write stage on its failure frame; other fra
       '{"id":"4","ok":false,"error":"fiction_refused","stage":"unknown"}',
       '{"id":"5","ok":false,"error":"fiction_refused","stage":"unknown"}']);
   } finally { client.close(); stopped.abort(); inbound.end(); outbound.end(); await server; }
+});
+
+test('the memory process stages its ingest and enrich failure frames and no others', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pi-memory-serve-'));
+  const inbound = new PassThrough(), outbound = new PassThrough();
+  const frames = [];
+  outbound.on('data', part => frames.push(...String(part).trimEnd().split('\n').map(JSON.parse)));
+  const rolledBack = code => Object.assign(new MemoryError(code), { stage: 'rolled_back' });
+  const store = { async getTurn() { return { id: 'turn-fiction', source: 'pi-memory', entries: [] }; },
+    async ingest() { throw new TypeError('driver detail'); },
+    async enrich() { throw rolledBack('outcome_referent_required'); },
+    async status() { throw rolledBack('fiction_status_refused'); },
+    async close() {} };
+  const config = join(directory, 'config.json');
+  writeFileSync(config, JSON.stringify({ scopes: { read: ['fiction'], write: ['fiction'] } }));
+  mkdirSync(join(directory, 'intents'), { mode: 0o700 });
+  const served = serveMain(['--config', config, '--scope', 'fiction', '--intent-dir', join(directory, 'intents')],
+    { input: inbound, output: outbound, store });
+  try {
+    const turn = { source: 'pi-memory', conversation_id: 'harbour', turn_id: 't1', entries: [{ id: 'u1', role: 'user', text: 'Orla reopened the harbour.' }] };
+    const outcome = { records: [{ id: 'harbour-outcome', kind: 'outcome', text: 'The fictional harbour reopened.', attribution: 'fiction',
+      evidence: [{ turn: 'turn-fiction', entry_id: 'u1', start: 0, end: 4 }] }], relations: [] };
+    for (const [id, method, args] of [['1', 'ingest', { scope: 'fiction', turn }],
+      ['2', 'enrich', { scope: 'fiction', input: outcome, trigger: 'turn-fiction' }], ['3', 'status', { scope: 'fiction' }]]) {
+      inbound.write(`${JSON.stringify({ id, method, args })}\n`);
+    }
+    while (frames.length < 3) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.deepEqual(frames.sort((a, b) => a.id.localeCompare(b.id)), [
+      { id: '1', ok: false, error: 'request_failed', stage: 'unknown' },
+      { id: '2', ok: false, error: 'outcome_referent_required', stage: 'rolled_back' },
+      { id: '3', ok: false, error: 'fiction_status_refused' }]);
+  } finally { inbound.end(); await served; outbound.end(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test('the client keeps only a known stage from a failure frame', async () => {
