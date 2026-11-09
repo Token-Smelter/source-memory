@@ -69,7 +69,8 @@ function validateCaseTrace({ packet, trace, spec, seal }) {
       || trace.budgetRefusals.some(row => !validRefusal(row)) || typeof trace.host_replaced_text !== 'boolean'
       || (trace.citations.length > 0 && trace.host_replaced_text) || !/^[a-f0-9]{64}$/.test(trace.model_text_sha256 ?? '')
       || typeof trace.citation_repair_failed !== 'boolean' || (trace.citation_repair_failed && trace.citations.length > 0)
-      || trace.abstention !== abstentionMarker(trace.citations.length, trace.citation_repair_failed, trace.budgetRefusals.length)) throw fail('citation_trace_invalid');
+      || ![undefined, true, false].includes(trace.answer_call_limit) || (trace.answer_call_limit && trace.citations.length > 0)
+      || trace.abstention !== abstentionMarker(trace.citations.length, trace.citation_repair_failed, trace.budgetRefusals.length, trace.answer_call_limit === true)) throw fail('citation_trace_invalid');
   }
 }
 

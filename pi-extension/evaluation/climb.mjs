@@ -146,7 +146,9 @@ const tally = values => Object.fromEntries([...new Set(values)].sort().map(value
 /** One completed run's candidate graph plus the metadata the climb dashboard compares across runs. */
 export function runExport({ treatment, seal, report, reportSha256, graph, answers }) {
   if (typeof treatment !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(treatment)) throw fail('treatment_invalid');
-  if (seal?.digest !== report?.seal_sha256 || report.coverage?.status !== 'complete' || !report.scorecard?.deltas
+  // Every checkpoint must be covered; a run whose case evaluation failed afterwards is exported with its scored cases.
+  if (seal?.digest !== report?.seal_sha256 || !['complete', 'case_failed'].includes(report.coverage?.status)
+    || report.coverage.processed !== report.coverage.scheduled || !report.scorecard?.deltas
     || !/^[a-f0-9]{64}$/.test(reportSha256 ?? '')) throw fail('run_unqualified');
   // The export label must agree with the sealed treatment; an unsealed run is a baseline.
   if (seal.spec.treatment ? !(treatment === seal.spec.treatment.id || treatment.startsWith(`${seal.spec.treatment.id}-`)) : /^(D|T)\d/.test(treatment)) throw fail('treatment_label_mismatch');
@@ -161,6 +163,7 @@ export function runExport({ treatment, seal, report, reportSha256, graph, answer
       ? { from: seal.spec.resume.codeTransition.from, to: seal.spec.resume.codeTransition.to, cursor: seal.spec.resume.cursor } : null,
     seal_sha256: report.seal_sha256, report_sha256: reportSha256, dataset_sha256: seal.spec.datasetSha256,
     models: Object.fromEntries(Object.entries(seal.spec.budget?.purposes ?? {}).map(([purpose, row]) => [purpose, row.route])),
+    coverage_status: report.coverage.status,
     primary: { metric: 'candidate usefulness delta vs no-memory baseline', value: report.scorecard.deltas.candidate,
       sensitivity: report.scorecard.sensitivity, confidence: report.scorecard.confidence, cases: answers.filter(row => row.arm === 'candidate').length,
       status: 'provisional pending owner semantic review' },

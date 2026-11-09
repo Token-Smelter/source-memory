@@ -30,6 +30,7 @@ export const ANSWERER_CITED_TOOLS_SHA256 = hash(ANSWERER_CITED_TOOLS);
 export const ANSWERER_TOOLS_V2_SHA256 = hash([{ ...ANSWERER_TOOLS[0], description: 'Search the permitted derived-memory items.' }, ...ANSWERER_TOOLS.slice(1)]);
 export const SCORER_TOOLS_SHA256 = hash(SCORER_TOOLS);
 export const SCORER_GROUNDED_TOOLS_SHA256 = hash(SCORER_GROUNDED_TOOLS);
+const CALL_LIMIT_ANSWER = () => ({ text: 'No submission within the model-call limit.', citations: [], callLimitReached: true });
 export const ANSWERER_FORMAT_SUFFIX = ' Submit the final answer with the submit_answer tool.';
 export const ANSWERER_BUDGET_SUFFIX = ' If the item budget is exhausted, answer from retrieved items or state uncertainty.';
 export const ANSWERER_CITATION_SUFFIX = ' Search the permitted memory before answering. If no relevant information supports an answer, say you do not know; never guess. Cite only evidence actually returned by memory_resolve using its item_id and evidence_id. Only a memory_search row marked kind "source_excerpt" is itself evidence: cite its id as item_id and its listed evidence id as evidence_id. Every other row must be resolved with memory_resolve before it can be cited. If no evidence supports an answer, submit an empty citations array.';
@@ -105,7 +106,8 @@ export function createPiAnswererResponder({ runtime, model, sessionId, expectedT
     let usedInput = 0, usedCost = 0n, repairs = 0;
     for (let count = 0; count < modelCalls + 1; count++) {
       if (hash(context.tools) !== expectedToolsSha256) throw fail('answerer_tools_mismatch');
-      if (count >= modelCalls && repairs === 0) throw fail('model_call_limit');
+      // A cited answerer that never submits within its calls is scored as a marked abstention, not a run failure.
+      if (count >= modelCalls && repairs === 0) { if (cited) return CALL_LIMIT_ANSWER(); throw fail('model_call_limit'); }
       if (usedInput >= inputTokens || usedCost >= BigInt(costNano)) throw fail('answer_budget_exceeded');
       const message = await call(runtime, model, context, { maxTokens: outputTokens, reasoning, maxRetries: 0, sessionId }, onRaw,
         { role: 'answerer', attempt: count + 1 });
@@ -159,6 +161,7 @@ export function createPiAnswererResponder({ runtime, model, sessionId, expectedT
         context.messages.push({ role: 'user', content: repair, timestamp: Date.now() });
       }
     }
+    if (cited) return CALL_LIMIT_ANSWER();
     throw fail('model_call_limit');
   };
 }

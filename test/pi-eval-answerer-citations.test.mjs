@@ -256,6 +256,20 @@ test('a citation miss lists citable pairs, and a second miss becomes a marked ab
     trace: { ...result.trace, abstention: 'host_enforced_no_citations' } }), /citation_trace_invalid/);
 });
 
+test('a cited answerer that never submits within its calls becomes a marked abstention', async () => {
+  const fake = metered([tool('s1', 'memory_search', { query: 'one' }), tool('s2', 'memory_search', { query: 'two' })]);
+  const value = settings(); value.answerer.limits.modelCalls = 2;
+  const seal = sealComparison(value);
+  const respond = createPiAnswererResponder({ runtime: fake.runtime, model: fictionalModel(), sessionId: 'fiction', expectedToolsSha256: ANSWERER_CITED_TOOLS_SHA256 });
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: { async search() { return [item]; }, async resolve() {} },
+    archive: { async search() { return []; } }, respond });
+  const result = await answerer.run({ arm: 'candidate', case: fictionalCase() });
+  assert.deepEqual([result.answer, result.trace.abstention, result.trace.answer_call_limit, fake.calls.length],
+    [{ text: UNKNOWN_ANSWER, citations: [] }, 'host_enforced_call_limit', true, 2]);
+  assert.throws(() => scoreCase({ seal, expectedDigest: seal.digest, packet: scoringPacket(), judgment: { clauses: [] },
+    trace: { ...result.trace, abstention: 'host_enforced_no_citations' } }), /citation_trace_invalid/);
+});
+
 test('grounded scorer receives exact cited text and rejects support without a cited ID', async () => {
   const value = settings(); value.scorer.model = 'one'; value.scorer.tools_sha256 = SCORER_GROUNDED_TOOLS_SHA256;
   value.scorer.repair_instruction = SCORER_GROUNDED_REPAIR;
