@@ -27,7 +27,7 @@ export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onE
   const queue = createSessionQueue(onError);
   pi.on('agent_settled', (_event, ctx) => {
     try {
-      const snapshot = settledSnapshot(ctx);
+      const snapshot = settledSnapshot(ctx, { throughSummaries: true });
       if (!snapshot) return;
       snapshot.sessionFile = ctx.sessionManager.getSessionFile?.() ?? null;
       queue.push(snapshot.sessionId, async () => {
@@ -48,6 +48,8 @@ export function registerLiveMemory(pi, { controllerFor, onResult = () => {}, onE
 export function createLiveController({ journal, cursorStore, conversationId, open, maxRetries = 3 }) {
   if (!journal || !journal.options?.effectIds || !journal.options?.pidLock || !cursorStore || typeof open !== 'function'
     || typeof conversationId !== 'string' || !conversationId || !Number.isSafeInteger(maxRetries) || maxRetries < 0) throw fail('controller_invalid');
+  // Live sessions compact; summaries follow the dependency-closure rule instead of blocking every later interval.
+  const summaryPolicy = 'dependency_closure';
   let session = null;
   let busy = false;
 
@@ -132,7 +134,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
 
   async function run(entries, through, cursor, retry) {
     const current = await getSession();
-    const result = await runCoveredInterval({ journal, session: { ...current, entries }, through, cursor, retry });
+    const result = await runCoveredInterval({ journal, session: { ...current, entries }, through, cursor, retry, summaryPolicy });
     if (covered.has(result.disposition)) {
       const saveError = save(through, result.id);
       return saveError ? { ...result, cursor_save: saveError } : result;
@@ -157,7 +159,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         if (['failed', 'unresolved_scope'].includes(state.status)) {
           // A gap is retried wherever it still validates, also on another branch; nothing else may begin before it closes.
           if (journal.attempts(state.id) > maxRetries) return { status: 'blocked', code: 'retry_limit', id: state.id, results, reconciled };
-          try { sourceInterval(entries, state.through, state.cursor, conversationId); }
+          try { sourceInterval(entries, state.through, state.cursor, conversationId, { summaryPolicy }); }
           catch { return { status: 'blocked', code: 'coverage_gap_unreachable', id: state.id, results, reconciled }; }
           const retried = await run(entries, state.through, state.cursor, true);
           results.push(retried);
@@ -165,7 +167,7 @@ export function createLiveController({ journal, cursorStore, conversationId, ope
         }
         const cursor = resolveCursor(entries, path);
         if (leafId === cursor) return { status: 'current', cursor, results, reconciled };
-        try { sourceInterval(entries, leafId, cursor, conversationId); }
+        try { sourceInterval(entries, leafId, cursor, conversationId, { summaryPolicy }); }
         catch (problem) { return { status: 'skipped', code: problem.code ?? 'source_invalid', cursor, results, reconciled }; }
         const result = await run(entries, leafId, cursor, false);
         results.push(result);

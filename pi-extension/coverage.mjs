@@ -180,7 +180,12 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
         },
       });
     },
-    finish(disposition, code = null, search = null) {
+    finish(disposition, code = null, search = null, { boundaries } = {}) {
+      if (boundaries !== undefined && (!Array.isArray(boundaries) || !boundaries.length
+        || boundaries.some(row => !row || Object.keys(row).sort().join(',') !== 'disposition,entry_id,reason,type'
+          || typeof row.entry_id !== 'string' || !row.entry_id || !['compaction', 'branch_summary'].includes(row.type)
+          || !['admissible', 'gap'].includes(row.disposition) || (row.disposition === 'gap') !== (typeof row.reason === 'string')
+          || (row.reason !== null && !/^summary_[a-z_]{1,64}$/.test(row.reason))))) throw fail('boundaries_invalid');
       if (!active) throw fail('interval_not_started');
       if (search !== null && (typeof search !== 'object' || typeof search.incomplete !== 'boolean' || !Array.isArray(search.statuses))) throw fail('search_status_invalid');
       const uncertain = [...active.effects.values()].some(row => !['confirmed', 'refused'].includes(row.state));
@@ -190,7 +195,7 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
       if (disposition === 'committed' && !active.derived) throw fail('disposition_invalid');
       const reconciliationRequired = active.derived && !covered.has(disposition) && disposition !== 'uncertain';
       append({ type: 'finish', id: active.id, disposition, code, ...(search ? { search_incomplete: search.incomplete, search_statuses: search.statuses } : {}),
-        ...(reconciliationRequired ? { reconciliation_required: true } : {}) });
+        ...(reconciliationRequired ? { reconciliation_required: true } : {}), ...(boundaries ? { boundaries } : {}) });
       return disposition;
     },
     reconcile({ id, disposition, evidenceRef }) {
@@ -232,16 +237,18 @@ export function createCoverageJournal({ directory, sessionKey, effectIds = false
 }
 
 /** The session's distiller and ingest path must both use the same journal-tracked memory facade. */
-export async function runCoveredInterval({ journal, session, through, cursor, allowInterrupted = false, retry = false }) {
+export async function runCoveredInterval({ journal, session, through, cursor, allowInterrupted = false, retry = false, summaryPolicy }) {
   if (session?.memory?.[tracking] !== journal || session?.distiller?.memory !== session.memory) throw fail('tracking_required');
+  if (summaryPolicy !== undefined && summaryPolicy !== 'dependency_closure') throw fail('invalid_input');
   const id = journal.begin({ through, cursor, retry });
   try {
-    const result = await distillThrough(session, through, cursor, { allowInterrupted });
+    const result = await distillThrough(session, through, cursor, { allowInterrupted, ...(summaryPolicy ? { summaryPolicy } : {}) });
     const disposition = result.distillation.disposition;
     if (!covered.has(disposition)) throw fail('disposition_invalid');
     const limits = result.distillation.search_limitations;
     const search = limits ? { incomplete: limits.incomplete, statuses: limits.statuses } : null;
-    const actual = journal.finish(disposition, null, search);
+    const boundaries = result.omissions?.summaries;
+    const actual = journal.finish(disposition, null, search, boundaries ? { boundaries } : {});
     if (!covered.has(actual)) return { id, through, cursor, disposition: actual, code: 'write_uncertain' };
     return { ...result, id, disposition: actual, ...(search ? { search_incomplete: search.incomplete, search_statuses: search.statuses } : {}) };
   } catch (error) {

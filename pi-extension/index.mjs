@@ -1,7 +1,11 @@
 import { distillThrough } from './core.mjs';
 
-/** The settled message leaf and an immutable copy of the entries, or null when the leaf is a summary boundary or has no message. */
-export function settledSnapshot(ctx) {
+/**
+ * The settled message leaf and an immutable copy of the entries, or null when there is no message leaf. By default a summary
+ * leaf also yields null; throughSummaries steps past it to the message before it, so a turn that ended in an automatic
+ * compaction is covered at this settle rather than the next one.
+ */
+export function settledSnapshot(ctx, { throughSummaries = false } = {}) {
   const manager = ctx.sessionManager;
   const snapshot = { sessionId: manager.getSessionId(), leafId: manager.getLeafId(), entries: structuredClone(manager.getEntries()) };
   const rows = new Map(snapshot.entries.map(row => [row.id, row]));
@@ -9,7 +13,7 @@ export function settledSnapshot(ctx) {
   while (snapshot.leafId && !seen.has(snapshot.leafId)) {
     seen.add(snapshot.leafId);
     const row = rows.get(snapshot.leafId);
-    if (!row || row.type === 'compaction' || row.type === 'branch_summary') return null;
+    if (!row || (!throughSummaries && (row.type === 'compaction' || row.type === 'branch_summary'))) return null;
     if (row.message) break;
     snapshot.leafId = row.parentId;
   }

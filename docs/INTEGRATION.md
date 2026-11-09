@@ -111,13 +111,28 @@ registerLiveMemory(pi, { controllerFor: () => controller, onError });
 
 Presence is read after the writing session is closed. It cannot cover a Neo4j commit that the server accepted but had not applied at read time. The default `createCoverageJournal` options leave harness journal rows and locks byte-identical (pinned by a golden test).
 
+### Compaction and branch summaries (implemented for the live controller)
+
+The live controller passes `summaryPolicy: 'dependency_closure'` to the core. That applies the frozen `memory-retention/r2-v1` availability invariant: "Use only material proven available and eligible on the selected active branch at the checkpoint. A summary is admissible only when its full dependency closure is permitted." This implementation reads "permitted" as "on the active path". Summaries are derived, never source. Each interval still retains only the original message entries after its cursor, so a compaction no longer blocks later intervals.
+
+| Summary on the active path | Verdict |
+|---|---|
+| Pi compaction with `firstKeptEntryId` earlier on the path, `fromHook` absent or `false`, whose summarized span (previous kept boundary up to `firstKeptEntryId`) and previous compaction are admissible | `admissible`; it is not withheld; Pi's own context keeps it only while it is the latest compaction or inside the latest one's kept region |
+| Compaction without a resolvable earlier `firstKeptEntryId`, or extension-provided (`fromHook` present with any value other than `false`) | `gap`, `summary_closure_unproved` |
+| `branch_summary` (it describes an abandoned branch) | `gap`, `summary_source_off_branch` |
+| Compaction whose span or previous summary includes a gap | `gap`, `summary_dependency_inadmissible`. A gap is permanent: every later compaction inherits it through Pi's previous-summary input. |
+
+Trust assumption: Pi does not record `/compact <instructions>` or a `session_before_compact` handler that changes the preparation without returning its own compaction. A standard compaction is taken to summarize exactly its recorded span. The verdicts are checked against Pi's own `prepareCompaction` for repeated compactions, cuts inside a previous kept region, branch summaries in a span or kept region, split turns, and hook compactions.
+
+Summaries inside the interval are returned in `omissions.summaries`. A covered or uncertain `finish` row records them as `boundaries`; a failed one does not. Every inadmissible summary on the path is passed to the distiller as `excludedSummaryIds`. `createPiDistiller` replaces each of these summaries in its Pi context with a fixed user-role placeholder that carries no derived text (`contextMessages`), so the context stays user-first and refuses with `summary_exclusion_unavailable` if compaction could run in the distiller session and re-admit them. Any other distiller must honor the list itself. `registerLiveMemory` steps from a summary leaf (for example Pi's end-of-run compaction) to the message before it, so that turn is covered at the same settle. Later intervals continue normally. Without the option, the core keeps the sealed `coverage-r2-v1` behavior, so replay and the harness still raise `source_boundary_unresolved`.
+
 ### Legacy `registerPiMemory` boundary
 
 **`registerPiMemory` is not restart-safe.** Use the live controller instead. The host must implement `saveCursor` and durable cursor loading and bind them to the correct session and branch. A `createSliceSession` result built with `coverageJournal` cannot be used directly with `registerPiMemory`: the hook does not begin an interval and tracked ingest fails with `interval_not_started`. Use the journal through `runCoveredInterval` or `replay`, not by passing it to the live hook. The cursor save is not atomic with the journal.
 
 **Failure may duplicate source.** Ingest and derived writes happen before cursor saving. If the distiller or `saveCursor` fails, the next settle can ingest a wider interval under a different turn ID, overlapping earlier source and records. The live hook has no same-interval retry or reconciliation. It also does not check budget before ingestion; the host must check in `prepare` and refuse before returning when budget or usage is unavailable.
 
-**Compacted sessions are not covered.** A compaction or branch summary anywhere in active ancestry, including before the saved cursor, causes `source_boundary_unresolved` on later intervals. No automatic policy resolves it. After a crash an orphan journal lock requires operator inspection; an unfinished interval reloads as `uncertain` and blocks progress until reconciliation. An existing link-intent file indicates unknown outcome, never permission to retry. In-memory queues and incremental-copy state do not survive restart.
+**Compacted sessions are not covered by `registerPiMemory` or replay.** Without `summaryPolicy`, a compaction or branch summary anywhere in active ancestry, including before the saved cursor, causes `source_boundary_unresolved` on later intervals. After a crash an orphan journal lock requires operator inspection; an unfinished interval reloads as `uncertain` and blocks progress until reconciliation. An existing link-intent file indicates unknown outcome, never permission to retry. In-memory queues and incremental-copy state do not survive restart.
 
 A no-op re-settle may produce `cursor_unresolved`; a user, tool-result or unfinished assistant leaf produces `turn_incomplete`. A branch switch can leave the saved cursor outside the new ancestry and needs host action. Missing `saveCursor` can throw after ingestion; synchronous handler errors can propagate to Pi instead of `onError`. Treat per-branch cursor custody and partial writes explicitly rather than blindly retrying.
 
@@ -157,7 +172,7 @@ Turns created by this adapter use source `pi-memory`. Their `turn_id` is derived
 | Area | Implemented and exercised | Still required or planned |
 |---|---|---|
 | Event adapter | Injectable `agent_settled` hook and per-session in-memory queue; nonblocking registration has a fictional test | Real host bootstrap, queue ordering/error/cursor-save tests, lifecycle and operational authorization |
-| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save** | Budget-before-ingest and compacted-session handling; operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
+| Cursor and effects | Cursor-bounded core; replay coverage journal and explicit uncertain-write reconciliation; **live controller with durable atomic cursor, journal-authoritative restart recovery, deterministic-ID reconciliation and non-overlapping retry after a failed save, and dependency-closure handling of compaction and branch summaries** | Budget-before-ingest; operator tooling for `applyLinks` unknowns and abandoned-branch gaps |
 | Retrieval | Scoped Memory search and proposal handles; bounded-state disclosure | Compact per-record results and chosen-handle evidence fetch; eliminate the observed truncation fault |
 | Distiller | Private incremental Pi copy, sequential memory tools, metering interfaces and fictional/offline SDK tests | Production route qualification, bounded provider costs and host-level access controls |
 | Evidence and identity | Current-turn evidence labels, private image blobs, explicit `pi-memory` source | Cross-source deduplication and visual-content citation |
