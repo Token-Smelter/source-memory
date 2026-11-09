@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createAnswerer, CITATION_PROTOCOL, UNKNOWN_ANSWER, citationId, textSha256 } from '../pi-extension/evaluation/answerer.mjs';
+import { createAnswerer, CITATION_PROTOCOL, UNKNOWN_ANSWER, citationId, rawEvidenceId, textSha256 } from '../pi-extension/evaluation/answerer.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, ANSWERER_CITED_TOOLS_SHA256, ANSWERER_CITED_REPAIR,
   SCORER_GROUNDED_TOOLS_SHA256, SCORER_GROUNDED_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
 import { hash, sealComparison } from '../pi-extension/evaluation/seal.mjs';
@@ -122,9 +122,10 @@ test('raw-only diagnostics cite a directly returned source using its returned id
   const answerer = createAnswerer({ seal, expectedDigest: seal.digest,
     memory: { async search() { throw new Error('derived_forbidden'); }, async resolve() { throw new Error('resolve_forbidden'); } },
     archive: { async search() { return [{ id: 'raw', scope: 'fiction', text: 'Fictional source.' }]; } },
-    async respond({ tools }) { await tools.search('fiction'); return { text: 'Fiction.', citations: [{ item_id: 'raw', evidence_id: 'raw' }] }; } });
+    async respond({ tools }) { const [row] = await tools.search('fiction');
+      return { text: 'Fiction.', citations: [{ item_id: 'raw', evidence_id: row.evidence[0].id }] }; } });
   const result = await answerer.run({ arm: 'raw-only', case: fictionalCase() });
-  assert.deepEqual([result.answer.citations, result.diagnostic], [[{ item_id: 'raw', evidence_id: 'raw' }], true]);
+  assert.deepEqual([result.answer.citations, result.diagnostic], [[{ item_id: 'raw', evidence_id: rawEvidenceId('raw', 'Fictional source.') }], true]);
 });
 
 test('scoring refuses citations or unknown text altered after answer generation', async () => {
@@ -147,19 +148,18 @@ test('scoring refuses citations or unknown text altered after answer generation'
   await assert.rejects(scorer.score({ packet: scoringPacket(), answer: { text: 'Forged claim.', citations: [] }, trace: empty.trace }), /citation_trace_invalid/);
 });
 
-test('a raw source returned again keeps one citation identity; changed text is refused', async () => {
+test('a raw source returned again with query-dependent excerpts keeps each excerpt citable', async () => {
   const seal = sealComparison(settings());
-  let text = 'Fiction.';
-  const make = () => createAnswerer({ seal, expectedDigest: seal.digest,
+  const run = second => createAnswerer({ seal, expectedDigest: seal.digest,
     memory: { async search() { return []; }, async resolve() {} },
-    archive: { async search() { return [{ id: 'raw', scope: 'fiction', text }]; } },
-    async respond({ tools }) { await tools.search('one'); text = textAfter; await tools.search('two');
-      return { text: 'Fiction.', citations: [{ item_id: 'raw', evidence_id: 'raw' }] }; } });
-  let textAfter = 'Fiction.';
-  const result = await make().run({ arm: 'raw-only', case: fictionalCase() });
-  assert.deepEqual([result.trace.returnedItemIds, result.trace.returnedEvidence.length, result.trace.returnedItems], [['raw'], 1, 2]);
-  text = 'Fiction.'; textAfter = 'Changed.';
-  await assert.rejects(make().run({ arm: 'raw-only', case: fictionalCase() }), /retrieval_failed|evidence_identity_changed/);
+    archive: { async search({ query }) { return [{ id: 'raw', scope: 'fiction', text: query === 'one' ? 'First excerpt.' : second }]; } },
+    async respond({ tools }) { const [a] = await tools.search('one'); const [b] = await tools.search('two');
+      return { text: 'Fiction.', citations: [...new Set([a.evidence[0].id, b.evidence[0].id])].map(evidence_id => ({ item_id: 'raw', evidence_id })) }; } })
+    .run({ arm: 'raw-only', case: fictionalCase() });
+  const same = await run('First excerpt.');
+  assert.deepEqual([same.trace.returnedItemIds, same.trace.returnedEvidence.length, same.trace.returnedItems, same.answer.citations.length], [['raw'], 1, 2, 1]);
+  const different = await run('Second excerpt.');
+  assert.deepEqual([different.trace.returnedItemIds, different.trace.citedEvidence.map(row => row.text)], [['raw'], ['First excerpt.', 'Second excerpt.']]);
 });
 
 test('a derived item returned by a later search is accepted unless its evidence changed or it repeats in one response', async () => {
