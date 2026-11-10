@@ -169,7 +169,9 @@ export class Memory {
   /**
    * Exact enumeration of turns and records over one scope or a subtree, newest first by write time, keyset-paged: one
    * filtered store query per page. A full walk returns every item committed before its first page exactly once. Turns are
-   * bounded headers; an item too large for `max_bytes` by itself is named by a stub and the walk moves past it.
+   * bounded headers; an item too large for `max_bytes` by itself is named by a stub and the walk moves past it. With
+   * `relations: true` the reply also carries the relations touching the page's records, from one more query, bounded and
+   * never silently cut; the items and cursor are the ones the same request without it returns.
    */
   async list(scope, input = {}) {
     const target = authorizeTarget(this.config, scope);
@@ -180,6 +182,9 @@ export class Memory {
     const status = input.status === undefined ? null : text(input.status, 32);
     requireThat(status === null || RECORD_STATUSES.includes(status), 'invalid_status');
     requireThat(status === null || kind !== 'turn', 'invalid_input');
+    requireThat(input.relations === undefined || typeof input.relations === 'boolean', 'invalid_input');
+    const withRelations = input.relations === true;
+    requireThat(!withRelations || kind !== 'turn', 'invalid_input');
     const source = input.source === undefined ? null : text(input.source, 256);
     const conversation = input.conversation_id === undefined ? null : text(input.conversation_id, 256);
     const limit = integer(input.limit, 16, 1, 64);
@@ -190,23 +195,30 @@ export class Memory {
     const rows = await this.store.listPage(target, { turns: kind === 'turn' || (kind === null && status === null), records: kind !== 'turn',
       kind: kind === 'turn' ? null : kind, status, source, conversation, after, limit });
     const items = [];
+    const uids = [];
     let bytes = 2;
     let last = null;
+    let full = rows.length === limit;
     for (const row of rows) {
       const item = listItem(row);
       const size = Buffer.byteLength(JSON.stringify(item));
       const added = size + (items.length ? 1 : 0);
       if (bytes + added > maxBytes) {
-        if (items.length) return listPage(scope, items, last, binding);
+        if (items.length) {
+          full = true;
+          break;
+        }
         items.push({ kind: item.kind, scope: item.scope, id: item.id, stored_at: item.stored_at, bytes: size, content_omitted: 'max_bytes' });
         bytes += Buffer.byteLength(JSON.stringify(items[0]));
       } else {
         items.push(item);
         bytes += added;
       }
+      if (row.type === 'record') uids.push(row.uid);
       last = { at: row.at, uid: row.uid };
     }
-    return listPage(scope, items, rows.length < limit ? null : last, binding);
+    const page = listPage(scope, items, full ? last : null, binding);
+    return withRelations ? { ...page, ...await pageRelations(this.store, target, uids) } : page;
   }
 
   // Which of a caller's candidate keys already names a stored turn. More than one is reported, never resolved here.
@@ -663,10 +675,32 @@ const vectorHits = (kind, nodes, withScope = false) => nodes.map(row => kind ===
   match: { turn: row.turn_uid, entry_id: row.entry_id, start: row.start, end: row.end },
 } : { kind: 'record', id: row.record_id, text: row.text, ...(withScope ? { scope: row.scope } : {}) });
 
-const LIST_KEYS = ['kind', 'status', 'source', 'conversation_id', 'limit', 'max_bytes', 'cursor'];
+const LIST_KEYS = ['kind', 'status', 'source', 'conversation_id', 'limit', 'max_bytes', 'cursor', 'relations'];
+// Bounds on the relations one `list` page carries. The byte cap admits any single relation: its largest normalized form,
+// 16 evidence spans of maximal ids with every character JSON-escaped, is under 48 KiB.
+export const LIST_RELATIONS_MAX = 256;
+export const LIST_RELATIONS_MAX_BYTES = 131_072;
 // The shape of Neo4j's `toString` of a zoned datetime, with in-range fields. Only a hand-made cursor can still name an
 // impossible date (such as February 30) or an unknown zone; Neo4j then refuses it.
 const STORED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2}(:\d{2})?)(\[[A-Za-z0-9_+/-]{1,64}\])?$/u;
+
+// Relations whose `from` or `to` is a record of the page, in that record's own scope; an endpoint off the page is an id.
+async function pageRelations(store, target, uids) {
+  if (!uids.length) return { relations: [], relations_truncated: false, relations_total: 0 };
+  const { total, rows } = await store.listRelations(target, uids, LIST_RELATIONS_MAX);
+  const relations = [];
+  let bytes = 2;
+  for (const row of rows) {
+    const edge = JSON.parse(row.body);
+    const relation = { scope: row.scope, id: edge.id, type: edge.type, from: edge.from, to: edge.to, attribution: edge.attribution,
+      evidence: edge.evidence, stored_at: row.untimed ? null : row.at };
+    const added = Buffer.byteLength(JSON.stringify(relation)) + (relations.length ? 1 : 0);
+    if (bytes + added > LIST_RELATIONS_MAX_BYTES) break;
+    relations.push(relation);
+    bytes += added;
+  }
+  return { relations, relations_truncated: relations.length < total, relations_total: total };
+}
 
 const encodeCursor = (binding, key) => Buffer.from(JSON.stringify({ v: 1, q: binding, at: key.at, uid: key.uid })).toString('base64url');
 

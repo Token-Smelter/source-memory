@@ -15,7 +15,7 @@ const HELP = `source-memory <init|ingest|enrich|index|recall|show|list|status|wa
 
 JSON input is read from --input or stdin for ingest/enrich/recall/show.
 index and list accept optional --input only; they never read stdin.
-index takes {"limit":256}; list takes {"kind","status","source","conversation_id","limit","max_bytes","cursor"}; init/status/warm need no input.
+index takes {"limit":256}; list takes {"kind","status","source","conversation_id","limit","max_bytes","cursor","relations"}; init/status/warm need no input.
 recall accepts --diagnostic-phases v1: bounded start/end phase markers and one footer line on stderr; stdout is unchanged.
 warm sends one fixed embedding request and never touches the database.
 warm --db v1 instead runs the read-only recall query paths once against Neo4j, makes no model call, and reports ready or unavailable.
