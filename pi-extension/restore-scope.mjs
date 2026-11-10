@@ -1,5 +1,5 @@
 import neo4j from 'neo4j-driver';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, readlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -106,7 +106,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       } finally { await session.close(); }
       await memory.init(scope);
       const restored = await restoreScope({ driver: memory.store.driver, snapshot, scope });
-      const output = `/scratch/restore-check-${expectedSha.slice(0, 16)}.json`;
+      // Cases at one checkpoint share a byte-identical snapshot, so a replay restores the same digest more than once.
+      const output = `/scratch/restore-check-${expectedSha.slice(0, 16)}${mode === '--replace' ? `-${randomUUID()}` : ''}.json`;
       const receipt = await exportScope({ driver: memory.store.driver, scope, output, allowedDir: '/scratch' });
       if (!sameLogicalSnapshot(snapshot, JSON.parse(readFileSync(output, 'utf8')))) throw fail('snapshot_mismatch');
       return { ...restored, source_sha256: expectedSha, restored_sha256: receipt.sha256, equivalent: true };
