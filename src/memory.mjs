@@ -339,7 +339,7 @@ export class Memory {
       for (const seed of request.seeds) {
         const found = seed.kind === 'turn' ? await this.store.getTurn(scope, seed.id) : await this.store.getRecord(scope, seed.id);
         if (!found) { missing.push(seed); continue; }
-        seeds.push(await this.bundle(scope, { ...seed, score: null, channels: [] }, '', maxNodes, maxHops, null, passthrough, digests));
+        seeds.push(await this.bundle(scope, { ...seed, score: null, channels: [] }, '', maxNodes, maxHops, ...bundleFlags(digests)));
       }
       units.push({ key: request.key, seeds, missing,
         ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, cache) } : {}) });
@@ -358,7 +358,7 @@ export class Memory {
     const digests = digestsOption(input);
     if (seed.kind === 'turn') requireThat(await this.store.getTurn(scope, id), 'not_found');
     else requireThat(await this.store.getRecord(scope, id), 'not_found');
-    const bundle = await this.bundle(scope, { kind: seed.kind, id, score: null, channels: [] }, '', maxNodes, maxHops, null, passthrough, digests);
+    const bundle = await this.bundle(scope, { kind: seed.kind, id, score: null, channels: [] }, '', maxNodes, maxHops, ...bundleFlags(digests));
     return { kind: 'bundle', bundle };
   }
 
@@ -532,14 +532,15 @@ export class Memory {
     let budgetOmitted = 0;
     let groupedOutput = {};
     if (grouped) {
-      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow, trace, digests);
+      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow, trace,
+        ...flag(digests));
       budgetOmitted = result.budget_omitted;
       groupedOutput = { units: result.units, pool_truncated: result.pool_truncated, budget_unit: 'utf8_bytes' };
       bundles.push(...result.units.flatMap(unit => unit.seeds));
     } else {
       for (const [index, seed] of ranked.slice(0, limit).entries()) {
         const label = `bundle.${index}`;
-        const bundle = await trace(label, () => this.bundle(seed.scope ?? scope, seed, query, maxNodes, maxHops, null, scoped(trace, label), digests));
+        const bundle = await trace(label, () => this.bundle(seed.scope ?? scope, seed, query, maxNodes, maxHops, null, scoped(trace, label), ...flag(digests)));
         const size = JSON.stringify(bundle).length;
         if (chars + size > maxChars) { budgetOmitted += 1; continue; }
         bundles.push(bundle);
@@ -607,7 +608,7 @@ export class Memory {
       for (const candidate of unit.candidates) {
         const label = `bundle.${ordinal++}`;
         const bundle = await trace(label, () => this.bundle(candidate.scope ?? scope, candidate, query, maxNodes, maxHops, reads, scoped(trace, label),
-          digests));
+          ...flag(digests)));
         seeds.push(bundle);
         const evidence = [bundle.source, ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence)].filter(Boolean);
         for (const span of evidence) {
@@ -717,6 +718,9 @@ function digestsOption(input) {
 
 // Store reads take the option only when it is set, so a read without it makes exactly the calls it always made.
 const digestArgs = digests => digests ? [{ digests: true }] : [];
+// Likewise internal calls take the trailing flag only when set, so their arguments are the ones they always were.
+const flag = digests => digests ? [true] : [];
+const bundleFlags = digests => digests ? [null, passthrough, true] : [];
 // Bounds on the relations one `list` page carries. The byte cap admits any single relation: its largest normalized form,
 // 16 evidence spans of maximal ids with every character JSON-escaped, is under 48 KiB.
 export const LIST_RELATIONS_MAX = 256;

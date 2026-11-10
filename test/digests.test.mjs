@@ -67,6 +67,9 @@ test('with digests every record carries its stored hash, or null without one, an
   assert.equal(JSON.parse(opted.show_record_unhashed.reply).record.record_digest, null);
   const seeds = JSON.parse(opted.recall_seeds.reply).ranked;
   assert.ok(seeds.some(item => item.kind === 'record') && seeds.filter(item => item.kind === 'record').every(item => item.record_digest === DIGEST[item.id]));
+  // With both vector indexes missing, recall scores the scanned vectors itself; those record seeds carry the digest too.
+  const scanned = JSON.parse(opted.recall_seeds_fallback.reply).ranked.filter(item => item.channels.some(trace => trace.channel === 'record_vector'));
+  assert.deepEqual(scanned.map(item => [item.id, item.record_digest]).sort(), [['r2', DIGEST.r2], ['r3', null]]);
   const stub = JSON.parse(opted.list_stub.reply).items[0];
   assert.deepEqual([stub.content_omitted, stub.record_digest], ['max_bytes', DIGEST.r4]);
 });
@@ -86,6 +89,19 @@ test('show works on an object derived from a Memory, with and without digests', 
   const derived = Object.create(await memoryWith(t));
   assert.equal((await derived.show(SCOPE, { kind: 'record', id: 'r1' })).record.record_digest, undefined);
   assert.equal((await derived.show(SCOPE, { kind: 'record', id: 'r1', digests: true })).record.record_digest, DIGEST.r1);
+});
+
+test('without digests the internal bundle and unit calls keep their old arguments', async t => {
+  const memory = await memoryWith(t);
+  const seen = [];
+  for (const name of ['bundle', 'conversationUnits']) {
+    const original = memory[name];
+    memory[name] = function (...args) { seen.push([name, args.length]); return original.apply(this, args); };
+  }
+  await memory.show(SCOPE, { kind: 'bundle', seed: { kind: 'record', id: 'r1' } });
+  await memory.recall(SCOPE, { query: 'lantern', limit: 1 });
+  await memory.recall(SCOPE, { query: 'lantern', group: 'conversation', limit: 1 });
+  assert.deepEqual([...new Set(seen.map(row => row.join(':')))].sort(), ['bundle:5', 'bundle:7', 'conversationUnits:11']);
 });
 
 test('a malformed digests value is refused before any store call', async t => {

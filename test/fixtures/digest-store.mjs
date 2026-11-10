@@ -37,7 +37,8 @@ const decoded = (row, options) => ({ uid: row.uid, scope: SCOPE, ...body(row),
 const recordHit = (row, options, extra = {}) => ({ kind: 'record', id: row.id, text: row.text, ...extra,
   ...(options?.digests ? { record_digest: typeof row.hash === 'string' ? row.hash : null } : {}) });
 
-export function digestStore(log = []) {
+// `missing: true` reports both vector indexes missing, so recall scores the scanned vectors itself (the fallback path).
+export function digestStore(log = [], { missing = false } = {}) {
   const call = (name, impl) => async (...args) => {
     log.push([name, ...structuredClone(args.filter(arg => typeof arg !== 'function'))]);
     return impl(...args);
@@ -50,7 +51,9 @@ export function digestStore(log = []) {
   return {
     identity: call('identity', () => ({ system: 'neo4j', database_id: 'db-fixture', database: 'neo4j' })),
     status: call('status', () => ({ turns: 2, chunks: 2, records: 4, relations: 1, unindexed: 0 })),
-    vectorIndexStatus: call('vectorIndexStatus', () => 'online'),
+    vectorIndexStatus: call('vectorIndexStatus', () => missing ? 'missing' : 'online'),
+    vectors: call('vectors', () => [{ ...node(RECORDS.r2), embedding: [1, 0] }, { ...node(RECORDS.r3), embedding: [0.6, 0.8] },
+      { uid: 'chunk_t1', scope: SCOPE, turn_uid: 't1', entry_id: 'x1-u', start: 0, end: 20, text: 'The keeper wants the', embedding: [1, 0] }]),
     lexicalStatus: call('lexicalStatus', () => ({ status: 'ready' })),
     chunkLexicalStatus: call('chunkLexicalStatus', () => ({ status: 'ready' })),
     lexical: call('lexical', (_scope, kind, _query, _limit, _exclude, options) => kind === 'turn'
@@ -109,7 +112,7 @@ export async function embeddingFixture() {
 }
 
 const units = { units: [{ key: KEY, seeds: [{ kind: 'turn', id: 't1' }, { kind: 'record', id: 'r2' }, { kind: 'record', id: 'missing' }] }] };
-/** Every call pinned, by name: [method, input, options?]. `extra` is merged into each input (for example digests). */
+/** Every call pinned, by name: [method, input, options?, store options?]. `extra` is merged into each input (for example digests). */
 export const BATTERY = [
   ['recall', 'recall', { query: 'lantern teal' }],
   ['recall_limited', 'recall', { query: 'lantern teal', limit: 2, candidates: 4 }],
@@ -129,6 +132,8 @@ export const BATTERY = [
   ['list_page', 'list', { kind: 'decision', limit: 1 }],
   ['list_stub', 'list', { max_bytes: 4096 }],
   ['list_turns', 'list', { kind: 'turn' }],
+  ['recall_fallback', 'recall', { query: 'lantern teal' }, null, { missing: true }],
+  ['recall_seeds_fallback', 'recall', { query: 'lantern' }, { seedsOnly: true }, { missing: true }],
 ];
 
 /** Runs the battery with `MemoryClass` and returns {name: {reply, calls}}, the embedding key replaced by a fixed token. */
@@ -139,9 +144,9 @@ export async function runBattery(MemoryClass, extra = {}) {
     const config = { scopes: { read: [SCOPE], write: [] }, embedding: fixture.embedding };
     const { embeddingIdentity } = await import('../../src/models.mjs');
     const key = embeddingIdentity(fixture.embedding);
-    for (const [name, method, input, options] of BATTERY) {
+    for (const [name, method, input, options, storeOptions] of BATTERY) {
       const log = [];
-      const memory = new MemoryClass(config, digestStore(log));
+      const memory = new MemoryClass(config, digestStore(log, storeOptions));
       const reply = await memory[method](SCOPE, { ...input, ...extra }, ...(options ? [options] : []));
       out[name] = { reply: JSON.stringify(reply).replaceAll(key, '<embedding_key>'), calls: JSON.stringify(log).replaceAll(key, '<embedding_key>') };
     }
