@@ -30,6 +30,13 @@ test('a known failed question write releases its slot; an unknown write outcome 
   await assert.rejects(held.record('question', 'Another fictional question?', ['ref-000001']), /memory_question_cap/);
 });
 
+test('a completed question write keeps its slot even when indexing then fails', async () => {
+  const tools = createTurnTools({ scope: 'fiction', turn, receipt: { id: 'turn' }, maxQuestions: 1, memory: { async enrich() { return { indexing: { status: 'pending' } }; } },
+    async ensureIndexed() { throw Object.assign(new Error('fictional_index_failure'), { code: 'fictional_index_failure' }); } });
+  await assert.rejects(tools.record('question', 'Written fictional question?', ['ref-000001']), /fictional_index_failure/);
+  await assert.rejects(tools.record('question', 'Later fictional question?', ['ref-000001']), /memory_question_cap/);
+});
+
 test('a zero cap refuses every new question; an absent cap leaves the default path uncapped', async () => {
   await assert.rejects(toolsFor(async () => ({}), 0).record('question', 'Fictional question?', ['ref-000001']), /memory_question_cap/);
   const open = toolsFor(async () => ({}), null);
