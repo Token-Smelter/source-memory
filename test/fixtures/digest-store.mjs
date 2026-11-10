@@ -136,18 +136,18 @@ export const BATTERY = [
   ['recall_seeds_fallback', 'recall', { query: 'lantern' }, { seedsOnly: true }, { missing: true }],
 ];
 
-/** Runs the battery with `MemoryClass` and returns {name: {reply, calls}}, the embedding key replaced by a fixed token. */
-export async function runBattery(MemoryClass, extra = {}) {
+/** Runs the battery (or the calls named in `only`) against `scope` and returns {name: {reply, calls}}, the embedding key normalized. */
+export async function runBattery(MemoryClass, extra = {}, scope = SCOPE, only = null) {
   const fixture = await embeddingFixture();
   const out = {};
   try {
     const config = { scopes: { read: [SCOPE], write: [] }, embedding: fixture.embedding };
     const { embeddingIdentity } = await import('../../src/models.mjs');
     const key = embeddingIdentity(fixture.embedding);
-    for (const [name, method, input, options, storeOptions] of BATTERY) {
+    for (const [name, method, input, options, storeOptions] of BATTERY.filter(([key]) => !only || only.includes(key))) {
       const log = [];
       const memory = new MemoryClass(config, digestStore(log, storeOptions));
-      const reply = await memory[method](SCOPE, { ...input, ...extra }, ...(options ? [options] : []));
+      const reply = await memory[method](scope, { ...input, ...extra }, ...(options ? [options] : []));
       out[name] = { reply: JSON.stringify(reply).replaceAll(key, '<embedding_key>'), calls: JSON.stringify(log).replaceAll(key, '<embedding_key>') };
     }
   } finally { await fixture.close(); }

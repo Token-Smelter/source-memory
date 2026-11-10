@@ -1,5 +1,5 @@
 import {
-  authorize, authorizeTarget, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
+  authorize, authorizeSelection, authorizeTarget, chunkEntries, cosine, fuse, fuseGroups, identity, isNested, isScopeSet, scopePath, SCOPE_SET_MAX, integer, markStage, MemoryError,
   digest, normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, RECORD_KINDS, RECORD_STATUSES, requireThat, sourceExcerpt, text,
 } from './core.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
@@ -155,15 +155,20 @@ export class Memory {
     return { visible: await this.store.recordVectorsVisible(scope, key, ids) };
   }
 
+  // `bundle`, `units` and `following` also read a set of exact scopes; every other kind takes one exact scope.
   async show(scope, input) {
-    authorize(this.config, scope);
+    // Any array, even of one element, is a set, and only these kinds read one.
+    if (Array.isArray(scope)) requireThat(SET_SHOW_KINDS.includes(input?.kind), 'scope_denied');
+    const target = Array.isArray(scope) ? authorizeSelection(this.config, scope) : authorize(this.config, scope);
+    if (Array.isArray(scope) && !isScopeSet(target)) return this.show(target, input);
     const digests = digestsOption(input);
-    const reply = await this.showKind(scope, input, digests);
+    const reply = await this.showKind(target, input, digests);
     return digests ? { ...reply, store_identity: await this.storeIdentity() } : reply;
   }
 
   async showKind(scope, input, digests = false) {
-    authorize(this.config, scope);
+    if (isScopeSet(scope)) requireThat(SET_SHOW_KINDS.includes(input.kind), 'scope_denied');
+    else authorize(this.config, scope);
     if (input.kind === 'bundle') return this.showBundle(scope, input);
     if (input.kind === 'units') return this.showUnits(scope, input);
     if (input.kind === 'following') return this.showFollowing(scope, input);
@@ -188,7 +193,10 @@ export class Memory {
    * never silently cut; the items and cursor are the ones the same request without it returns.
    */
   async list(scope, input = {}) {
-    const target = authorizeTarget(this.config, scope);
+    const target = authorizeSelection(this.config, scope);
+    if (Array.isArray(scope) && !isScopeSet(target)) return this.list(target, input);
+    // A set binds its cursor to the canonical array, which never canonicalizes like one scope's string.
+    const named = isScopeSet(target) ? target.scopes : scope;
     requireThat(input && typeof input === 'object' && !Array.isArray(input)
       && Object.keys(input).every(key => LIST_KEYS.includes(key)), 'invalid_input');
     const kind = input.kind === undefined ? null : text(input.kind, 32);
@@ -204,7 +212,7 @@ export class Memory {
     const conversation = input.conversation_id === undefined ? null : text(input.conversation_id, 256);
     const limit = integer(input.limit, 16, 1, 64);
     const maxBytes = integer(input.max_bytes, 65536, 4096, 1_000_000);
-    const binding = digest(['source-memory.list/1', scope, kind, status, source, conversation]).slice(0, 32);
+    const binding = digest(['source-memory.list/1', named, kind, status, source, conversation]).slice(0, 32);
     const after = input.cursor === undefined ? null : decodeCursor(input.cursor, binding);
     // A status filter names a record field, so it selects records only.
     const rows = await this.store.listPage(target, { turns: kind === 'turn' || (kind === null && status === null), records: kind !== 'turn',
@@ -233,7 +241,7 @@ export class Memory {
       if (row.type === 'record') uids.push(row.uid);
       last = { at: row.at, uid: row.uid };
     }
-    const page = listPage(scope, items, full ? last : null, binding);
+    const page = listPage(named, items, full ? last : null, binding);
     const reply = withRelations ? { ...page, ...await pageRelations(this.store, target, uids) } : page;
     return digests ? { ...reply, store_identity: await this.storeIdentity() } : reply;
   }
@@ -253,8 +261,9 @@ export class Memory {
   }
 
   // Later turns of one conversation, by exact parent links only. Nothing here says a later turn replaces an earlier one.
-  async showFollowing(scope, input) {
-    authorize(this.config, scope);
+  // Over a set, `scope` names the element to walk; the walk itself never leaves one scope.
+  async showFollowing(target, input) {
+    const scope = elementOf(setScopes(this.config, target), target, input.scope);
     const start = await this.store.getTurn(scope, text(input.turn, 256));
     requireThat(start, 'not_found');
     const limit = integer(input.limit, 2, 1, 16);
@@ -295,27 +304,38 @@ export class Memory {
     return { turns, end, bound, unlinked };
   }
 
+  // Each root is walked in the scope of the span that names it (its record's, or the bundle's), not in the unit's: lineage
+  // never crosses scopes. An entry names its scope only when that differs from the unit's.
   async followingForBundles(scope, seeds, follow, cache, reads = null) {
     authorize(this.config, scope);
-    const roots = [...new Set(seeds.flatMap(bundle => [bundle.source?.id,
-      ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence.map(span => span.turn))]).filter(Boolean))].sort();
+    const roots = new Map();
+    const add = (owner, turn) => { if (turn) roots.set(JSON.stringify([turn, owner]), { owner, turn }); };
+    for (const bundle of seeds) {
+      const home = bundle.scope ?? scope;
+      add(home, bundle.source?.id);
+      for (const row of [...bundle.records, ...bundle.relations]) for (const span of row.supporting_evidence) add(span.scope ?? row.scope ?? home, span.turn);
+    }
     const following = [];
-    for (const after of roots) {
-      if (!cache.has(after)) cache.set(after, (async () => {
-        const start = await immutableRead(reads, scope, 'turn', after, () => this.store.getTurn(scope, after));
+    for (const key of [...roots.keys()].sort()) {
+      const { owner, turn: after } = roots.get(key);
+      authorize(this.config, owner);
+      if (!cache.has(key)) cache.set(key, (async () => {
+        const start = await immutableRead(reads, owner, 'turn', after, () => this.store.getTurn(owner, after));
         requireThat(start, 'source_unavailable');
-        const read = await this.walkFollowing(scope, start, follow.turns, follow.bytes);
+        const read = await this.walkFollowing(owner, start, follow.turns, follow.bytes);
         return { after, status: read.end === 'limit' ? 'has_more' : ['branched', 'cycle'].includes(read.end)
           ? read.end : read.unlinked ? 'unknown' : 'recorded_end',
           bound: read.bound, turns: read.turns.map(followingTurn), unlinked_turns: read.unlinked };
       })());
-      following.push(await cache.get(after));
+      const entry = await cache.get(key);
+      following.push(owner === scope ? entry : { ...entry, scope: owner });
     }
     return following;
   }
 
+  // Over a set, each unit key names its element, and each unit is bundled and followed in that scope.
   async showUnits(scope, input) {
-    authorize(this.config, scope);
+    const scopes = setScopes(this.config, scope);
     const follow = followingOptions(input.follow, true);
     const maxNodes = integer(input.max_nodes, 48, 1, 256);
     const maxHops = integer(input.max_hops, 4, 0, 12);
@@ -324,7 +344,7 @@ export class Memory {
     const requests = input.units.map(unit => {
       requireThat(unit && unit.key && Array.isArray(unit.seeds) && unit.seeds.length <= 20);
       const key = { scope: text(unit.key.scope, 256), source: text(unit.key.source, 256), conversation_id: text(unit.key.conversation_id, 256) };
-      requireThat(key.scope === scope, 'scope_denied');
+      requireThat(scopes ? scopes.includes(key.scope) : key.scope === scope, 'scope_denied');
       const seeds = unit.seeds.map(seed => {
         requireThat(seed && ['turn', 'record'].includes(seed.kind), 'invalid_kind');
         return { kind: seed.kind, id: text(seed.id, 256) };
@@ -334,31 +354,36 @@ export class Memory {
     const cache = new Map();
     const units = [];
     for (const request of requests) {
+      const home = request.key.scope;
       const seeds = [];
       const missing = [];
       for (const seed of request.seeds) {
-        const found = seed.kind === 'turn' ? await this.store.getTurn(scope, seed.id) : await this.store.getRecord(scope, seed.id);
+        const found = seed.kind === 'turn' ? await this.store.getTurn(home, seed.id) : await this.store.getRecord(home, seed.id);
         if (!found) { missing.push(seed); continue; }
-        seeds.push(await this.bundle(scope, { ...seed, score: null, channels: [] }, '', maxNodes, maxHops, ...bundleFlags(digests)));
+        seeds.push(await this.bundle(home, { ...seed, ...(scopes ? { scope: home } : {}), score: null, channels: [] }, '', maxNodes, maxHops,
+          ...bundleFlags(digests)));
       }
       units.push({ key: request.key, seeds, missing,
-        ...(follow ? { following: await this.followingForBundles(scope, seeds, follow, cache) } : {}) });
+        ...(follow ? { following: await this.followingForBundles(home, seeds, follow, cache) } : {}) });
     }
     return { kind: 'units', units };
   }
 
   // Rebuilds one seed's relationship-closed bundle without a query, so a caller can detect changes since it last read it.
-  async showBundle(scope, input) {
-    authorize(this.config, scope);
+  // Over a set, the seed names its element as `scope`.
+  async showBundle(target, input) {
+    const scopes = setScopes(this.config, target);
     const seed = input.seed;
     requireThat(seed && ['turn', 'record'].includes(seed.kind), 'invalid_kind');
     const id = text(seed.id, 256);
+    const scope = elementOf(scopes, target, seed.scope);
     const maxNodes = integer(input.max_nodes, 48, 1, 256);
     const maxHops = integer(input.max_hops, 4, 0, 12);
     const digests = digestsOption(input);
     if (seed.kind === 'turn') requireThat(await this.store.getTurn(scope, id), 'not_found');
     else requireThat(await this.store.getRecord(scope, id), 'not_found');
-    const bundle = await this.bundle(scope, { kind: seed.kind, id, score: null, channels: [] }, '', maxNodes, maxHops, ...bundleFlags(digests));
+    const bundle = await this.bundle(scope, { kind: seed.kind, id, ...(scopes ? { scope } : {}), score: null, channels: [] }, '', maxNodes, maxHops,
+      ...bundleFlags(digests));
     return { kind: 'bundle', bundle };
   }
 
@@ -378,30 +403,123 @@ export class Memory {
 
   // `phases` is an opt-in marker sink (src/phase-diagnostic.mjs). Absent, recall makes exactly the calls it always made.
   async recall(scope, input, { phases = null, seedsOnly = false } = {}) {
-    const target = authorizeTarget(this.config, scope);
+    const target = authorizeSelection(this.config, scope);
+    if (isScopeSet(target)) return this.recallSet(target.scopes, input, { phases, seedsOnly });
+    // A one-element set is that exact scope: the same request, so the same reply.
+    if (Array.isArray(scope)) return this.recall(target, input, { phases, seedsOnly });
+    const tree = selection(target).tree;
+    const trace = tracer(phases);
+    const options = recallOptions(this.config, input);
+    const { channels, availability, omitted } = await this.retrieve(target, options, trace, queryEmbedder(this.config, options.query));
+    // Nodes of the selection that the tree indexes cannot see yet make every channel over that kind partial.
+    const pending = tree ? await this.store.treePending(target) : null;
+    if (pending) markPending(availability, pending);
+    const { grouped, candidates, digests } = options;
+    const ranked = await this.rerankSeeds(grouped ? fuse(channels) : fuse(channels).slice(0, candidates), options.query, availability);
+
+    if (seedsOnly) {
+      requireThat(!grouped, 'invalid_input');
+      return { scope, ranked, candidate_limit: candidates, channels: Object.fromEntries(Object.entries(availability).map(([name, state]) =>
+        [name, { ...state, ...(channels[name] ? { candidate_limit_reached: channels[name].length >= candidates } : {}) }])),
+        ...(pending ? { scope_tree: { pending } } : {}),
+        ...(digests ? { store_identity: await this.storeIdentity() } : {}) };
+    }
+
+    const { bundles, budgetOmitted, groupedOutput } = await this.renderSeeds(scope, ranked, channels, omitted, options, trace);
+    const unavailable = Object.values(availability).some(row => row.status === 'unavailable');
+    return {
+      scope, query: options.query,
+      status: unavailable ? 'degraded' : budgetOmitted > 0 ? 'budget_limited' : bundles.length ? 'ready' : 'no_matches',
+      channels: Object.fromEntries(Object.entries(availability).sort(([a], [b]) => a.localeCompare(b))),
+      retrieval_complete: Object.values(availability).every(row => ['ready', 'not_needed'].includes(row.status)),
+      relationship_context_complete: budgetOmitted === 0 && bundles.every(row => row.relationship_context_complete),
+      budget_omitted: budgetOmitted,
+      candidate_count: ranked.length,
+      excluded_conversations: options.exclude.length,
+      bundles,
+      authority: AUTHORITY,
+      ...groupedOutput,
+      ...(options.mode === undefined ? {} : { mode: options.mode, mode_contract: MODE_CONTRACTS[options.mode] }),
+      ...(pending ? { scope_tree: { pending } } : {}),
+      ...(digests ? { store_identity: await this.storeIdentity() } : {}),
+    };
+  }
+
+  /**
+   * Recall over a set of 2–4 exact scopes: each index group (one root's nested elements, or one flat scope) runs exactly the
+   * channel logic of an exact read of its elements, with its own status, census, pending and vector budget; ranks are
+   * fused per group, and every element reports its own channel states in `by_scope`.
+   */
+  async recallSet(scopes, input, { phases = null, seedsOnly = false } = {}) {
+    const trace = tracer(phases);
+    const options = recallOptions(this.config, input);
+    const { grouped, candidates, digests } = options;
+    const groups = indexGroups(scopes);
+    const embedQuery = queryEmbedder(this.config, options.query);
+    const results = await Promise.all(groups.map(async (group, index) => {
+      const result = await this.retrieve(group.target, options, trace === passthrough ? passthrough : scoped(trace, `group.${index}`), embedQuery);
+      // A one-element group is read exactly as that scope alone, whose hits do not name it.
+      if (typeof group.target === 'string') nameHits(result, group.target);
+      const pending = !group.tree ? null : typeof group.target === 'string' ? { [group.target]: await this.store.treePending(group.target) }
+        : await this.store.treePendingByScope(group.target);
+      return { ...result, pending };
+    }));
+    const reranker = {};
+    const ranked = await this.rerankSeeds(grouped ? fuseGroups(results.map(row => row.channels))
+      : fuseGroups(results.map(row => row.channels)).slice(0, candidates), options.query, reranker);
+    const byScope = {};
+    for (const [index, group] of groups.entries()) {
+      for (const scope of group.scopes) {
+        const states = { ...results[index].availability };
+        const pending = results[index].pending?.[scope];
+        if (pending) markPending(states, pending);
+        byScope[scope] = { group: group.name, channels: Object.fromEntries(Object.keys(CHANNEL_KINDS).sort().map(name => [name, { ...states[name],
+          ...(seedsOnly ? { candidate_limit_reached: results[index].channels[name].length >= candidates } : {}) }])),
+          ...(pending ? { scope_tree: { pending } } : {}) };
+      }
+    }
+    const ordered = Object.fromEntries(scopes.map(scope => [scope, byScope[scope]]));
+    const channels = aggregateChannels(ordered, reranker.reranker);
+    const elementStates = [...Object.values(ordered).flatMap(row => Object.values(row.channels)), reranker.reranker];
+
+    if (seedsOnly) {
+      requireThat(!grouped, 'invalid_input');
+      return { scopes, ranked, candidate_limit: candidates, channels, by_scope: ordered,
+        ...(digests ? { store_identity: await this.storeIdentity() } : {}) };
+    }
+
+    const merged = Object.fromEntries(Object.keys(CHANNEL_KINDS).map(name => [name, results.flatMap(row => row.channels[name])]));
+    const { bundles, budgetOmitted, groupedOutput } = await this.renderSeeds(scopes, ranked, merged, results.flatMap(row => row.omitted),
+      options, trace);
+    const unavailable = elementStates.some(row => row.status === 'unavailable');
+    return {
+      scopes, query: options.query,
+      status: unavailable ? 'degraded' : budgetOmitted > 0 ? 'budget_limited' : bundles.length ? 'ready' : 'no_matches',
+      channels,
+      retrieval_complete: elementStates.every(row => ['ready', 'not_needed'].includes(row.status)),
+      relationship_context_complete: budgetOmitted === 0 && bundles.every(row => row.relationship_context_complete),
+      budget_omitted: budgetOmitted,
+      candidate_count: ranked.length,
+      excluded_conversations: options.exclude.length,
+      bundles,
+      authority: AUTHORITY,
+      ...groupedOutput,
+      ...(options.mode === undefined ? {} : { mode: options.mode, mode_contract: MODE_CONTRACTS[options.mode] }),
+      by_scope: ordered,
+      ...(digests ? { store_identity: await this.storeIdentity() } : {}),
+    };
+  }
+
+  /**
+   * The five retrieval channels over one exact scope, one subtree or one set group: their hits, states and admission
+   * omissions. Nothing here reads beyond the target; `embedQuery` embeds the query once per request.
+   */
+  async retrieve(target, options, trace, embedQuery) {
     const sel = selection(target);
     const tree = sel.tree;
-    const trace = tracer(phases);
     // Only the grouped admission query has finer steps worth bracketing; it takes the trace as an extra trailing argument.
-    const traced = phases ? [trace] : [];
-    const mode = input.mode;
-    requireThat(mode === undefined || (typeof mode === 'string' && Object.hasOwn(MODE_CONTRACTS, mode)), 'invalid_input');
-    requireThat(input.group === undefined || input.group === 'conversation', 'invalid_input');
-    const grouped = input.group === 'conversation';
-    const perConversation = integer(input.per_conversation, 2, 1, 4);
-    const follow = followingOptions(input.follow, grouped);
-    const query = text(input.query, 4000);
-    const candidates = integer(input.candidates, 64, 1, 256);
-    const limit = integer(input.limit, 8, 1, 32);
-    const maxNodes = integer(input.max_nodes, 48, 1, 256);
-    const maxHops = integer(input.max_hops, 4, 0, 12);
-    // Only grouped evidence_advice may ask for the larger pool; there max_chars counts serialized UTF-8 bytes of whole units.
-    const maxChars = integer(input.max_chars, 24000, 256, isPoolRequest({ mode, group: input.group }) ? POOL_MAX_CHARS : 200000);
-    const vectorLimit = integer(this.config.vector_scan_limit, 10000, 1, 100000);
-    // A caller's own conversation is excluded inside every channel, before its candidate limit: matches from it never
-    // take the place of eligible ones, and its unindexed text does not hold the others back.
-    const exclude = exclusions(input.exclude_conversations);
-    const digests = digestsOption(input);
+    const traced = trace === passthrough ? [] : [trace];
+    const { grouped, perConversation, query, candidates, vectorLimit, exclude, digests } = options;
     const availability = {};
     const channels = {};
     const omitted = [];
@@ -438,7 +556,7 @@ export class Memory {
     if (this.config.embedding) {
       try {
         const key = embeddingIdentity(this.config.embedding);
-        const [queryVector] = await embed(this.config.embedding, [query]);
+        const [queryVector] = await embedQuery();
         const catalog = await vectorCatalog(this.store, target, queryVector.length);
         const missing = catalog.filter(entry => entry.vector_index === 'missing');
         const prepareFallback = async kind => {
@@ -465,12 +583,12 @@ export class Memory {
                 ...digestArgs(digests && kind === 'record'));
               unindexed = census.unindexed;
               result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, scan.uids, candidates, perConversation, exclude)
-                : { hits: vectorHits(kind, scan.nodes, sel.subtree, digests) };
+                : { hits: vectorHits(kind, scan.nodes, sel.named, digests) };
             } else if (vector_index === 'online') {
               result = await this.store.indexedVectors(target, kind, key, queryVector, candidates, grouped ? perConversation : null, exclude, budget,
                 ...(census ? [census] : []));
               unindexed = result.unindexed;
-              if (!grouped) result.hits = vectorHits(kind, result.nodes, sel.subtree, digests);
+              if (!grouped) result.hits = vectorHits(kind, result.nodes, sel.named, digests);
             } else {
               // Share only a truly combined missing-index scan. One kind's failure never blocks an online sibling.
               const fallback = missing.length === 2 ? sharedFallback ??= prepareFallback(null) : prepareFallback(kind);
@@ -478,7 +596,7 @@ export class Memory {
               unindexed = counts.unindexed;
               scan_truncated = data.scan_truncated;
               result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, data.scanned, candidates, perConversation, exclude)
-                : { hits: vectorHits(kind, data.ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates), sel.subtree, digests) };
+                : { hits: vectorHits(kind, data.ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates), sel.named, digests) };
             }
             const state = { status: result.partial || scan_truncated || unindexed > 0 ? 'partial' : 'ready',
               scan_truncated, unindexed, embedding_key: key,
@@ -502,74 +620,50 @@ export class Memory {
       availability.chunk_vector = { status: 'unconfigured' };
       availability.record_vector = { status: 'unconfigured' };
     }
-    // Nodes of the selection that the tree indexes cannot see yet make every channel over that kind partial.
-    const pending = tree ? await this.store.treePending(target) : null;
-    if (pending) for (const [name, kind] of Object.entries(CHANNEL_KINDS)) {
-      const state = availability[name];
-      if (!pending[kind] || !['ready', 'partial'].includes(state.status)) continue;
-      availability[name] = { ...state, status: 'partial', scope_tree_pending: pending[kind], ...(state.reason ? {} : { reason: 'scope_tree_pending' }) };
-    }
-    let ranked = grouped ? fuse(channels) : fuse(channels).slice(0, candidates);
+    return { channels, availability, omitted };
+  }
+
+  // One rerank call over the fused list; its state is written to `availability.reranker`.
+  async rerankSeeds(ranked, query, availability) {
     if (this.config.reranker && ranked.length) {
       try {
         // This cut affects ranking only. Evidence is read independently from the retained source.
         const cut = ranked.some(item => item.text.length > 16000);
-        ranked = await rerank(this.config.reranker, query, ranked.map(item => ({ ...item, text: item.text.slice(0, 16000) })));
+        const reordered = await rerank(this.config.reranker, query, ranked.map(item => ({ ...item, text: item.text.slice(0, 16000) })));
         availability.reranker = { status: 'ready', ranking_text_truncated: cut };
+        return reordered;
       } catch (error) { availability.reranker = { status: 'unavailable', reason: safeCode(error) }; }
     } else availability.reranker = { status: this.config.reranker ? 'not_needed' : 'unconfigured' };
+    return ranked;
+  }
 
-    if (seedsOnly) {
-      requireThat(!grouped, 'invalid_input');
-      return { scope, ranked, candidate_limit: candidates, channels: Object.fromEntries(Object.entries(availability).map(([name, state]) =>
-        [name, { ...state, ...(channels[name] ? { candidate_limit_reached: channels[name].length >= candidates } : {}) }])),
-        ...(pending ? { scope_tree: { pending } } : {}),
-        ...(digests ? { store_identity: await this.storeIdentity() } : {}) };
+  // Bundles of the ranked seeds within the byte budget, or grouped conversation units. A seed without a scope is in `scope`.
+  async renderSeeds(scope, ranked, channels, omitted, options, trace) {
+    const { query, limit, maxChars, maxNodes, maxHops, follow, digests } = options;
+    if (options.grouped) {
+      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow, trace,
+        ...flag(digests));
+      return { bundles: result.units.flatMap(unit => unit.seeds), budgetOmitted: result.budget_omitted,
+        groupedOutput: { units: result.units, pool_truncated: result.pool_truncated, budget_unit: 'utf8_bytes' } };
     }
-
     const bundles = [];
     let chars = 0;
     let budgetOmitted = 0;
-    let groupedOutput = {};
-    if (grouped) {
-      const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow, trace,
-        ...flag(digests));
-      budgetOmitted = result.budget_omitted;
-      groupedOutput = { units: result.units, pool_truncated: result.pool_truncated, budget_unit: 'utf8_bytes' };
-      bundles.push(...result.units.flatMap(unit => unit.seeds));
-    } else {
-      for (const [index, seed] of ranked.slice(0, limit).entries()) {
-        const label = `bundle.${index}`;
-        const bundle = await trace(label, () => this.bundle(seed.scope ?? scope, seed, query, maxNodes, maxHops, null, scoped(trace, label), ...flag(digests)));
-        const size = JSON.stringify(bundle).length;
-        if (chars + size > maxChars) { budgetOmitted += 1; continue; }
-        bundles.push(bundle);
-        chars += size;
-      }
+    for (const [index, seed] of ranked.slice(0, limit).entries()) {
+      const label = `bundle.${index}`;
+      const bundle = await trace(label, () => this.bundle(seed.scope ?? scope, seed, query, maxNodes, maxHops, null, scoped(trace, label), ...flag(digests)));
+      const size = JSON.stringify(bundle).length;
+      if (chars + size > maxChars) { budgetOmitted += 1; continue; }
+      bundles.push(bundle);
+      chars += size;
     }
-    const unavailable = Object.values(availability).some(row => row.status === 'unavailable');
-    return {
-      scope, query,
-      status: unavailable ? 'degraded' : budgetOmitted > 0 ? 'budget_limited' : bundles.length ? 'ready' : 'no_matches',
-      channels: Object.fromEntries(Object.entries(availability).sort(([a], [b]) => a.localeCompare(b))),
-      retrieval_complete: Object.values(availability).every(row => ['ready', 'not_needed'].includes(row.status)),
-      relationship_context_complete: budgetOmitted === 0 && bundles.every(row => row.relationship_context_complete),
-      budget_omitted: budgetOmitted,
-      candidate_count: ranked.length,
-      excluded_conversations: exclude.length,
-      bundles,
-      authority: 'Evidence and attributed records; not execution permission or a guarantee of current state.',
-      ...groupedOutput,
-      ...(mode === undefined ? {} : { mode, mode_contract: MODE_CONTRACTS[mode] }),
-      ...(pending ? { scope_tree: { pending } } : {}),
-      ...(digests ? { store_identity: await this.storeIdentity() } : {}),
-    };
+    return { bundles, budgetOmitted, groupedOutput: {} };
   }
 
   // In a subtree read every seed names its own scope, and so does the unit key it is packaged under.
   async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops, follow = null, trace = passthrough,
     digests = false) {
-    authorizeTarget(this.config, scope);
+    authorizeSelection(this.config, scope);
     const reads = new Map();
     const priority = new Map();
     for (const [rank, seed] of ranked.entries()) for (const context of seed.conversations) {
@@ -708,7 +802,7 @@ const vectorHits = (kind, nodes, withScope = false, digests = false) => nodes.ma
 const LIST_KEYS = ['kind', 'status', 'source', 'conversation_id', 'limit', 'max_bytes', 'cursor', 'relations', 'digests'];
 
 // Optional features a caller can probe with `status {capabilities: true}`; an older build returns no `capabilities`.
-export const CAPABILITIES = Object.freeze({ record_digests: true });
+export const CAPABILITIES = Object.freeze({ scope_set_max: SCOPE_SET_MAX, record_digests: true });
 
 // `digests: true` adds each record's stored digest and the store identity to a read; absent or false, nothing changes.
 function digestsOption(input) {
@@ -759,7 +853,7 @@ function decodeCursor(value, binding) {
   return { at: cursor.at, uid: cursor.uid };
 }
 
-const listPage = (scope, items, last, binding) => ({ kind: 'list', scope, order: 'stored_desc', items,
+const listPage = (scope, items, last, binding) => ({ kind: 'list', ...(Array.isArray(scope) ? { scopes: scope } : { scope }), order: 'stored_desc', items,
   next_cursor: last === null ? null : encodeCursor(binding, last) });
 
 // Turn fields come from the node's own properties first, then from its stored envelope header (a legacy turn has no properties).
@@ -780,6 +874,99 @@ function listItem(row, digests = false) {
 }
 
 const CHANNEL_KINDS = { turn_lexical: 'turn', chunk_lexical: 'chunk', record_lexical: 'record', chunk_vector: 'chunk', record_vector: 'record' };
+
+const SET_SHOW_KINDS = ['bundle', 'units', 'following'];
+
+// An exact scope (null) or a set, re-authorized element by element (its scopes), for show kinds a set may name.
+function setScopes(config, target) {
+  if (!isScopeSet(target)) { authorize(config, target); return null; }
+  const checked = authorizeSelection(config, target.scopes);
+  requireThat(isScopeSet(checked), 'scope_denied');
+  return checked.scopes;
+}
+
+// The scope a set read names for one item: present, else invalid_input; an element, else scope_denied.
+function elementOf(scopes, target, value) {
+  if (!scopes) return target;
+  text(value, 256);
+  requireThat(scopes.includes(value), 'scope_denied');
+  return value;
+}
+
+const AUTHORITY = 'Evidence and attributed records; not execution permission or a guarantee of current state.';
+
+// Every recall input, validated before any storage call.
+function recallOptions(config, input) {
+  const mode = input.mode;
+  requireThat(mode === undefined || (typeof mode === 'string' && Object.hasOwn(MODE_CONTRACTS, mode)), 'invalid_input');
+  requireThat(input.group === undefined || input.group === 'conversation', 'invalid_input');
+  const grouped = input.group === 'conversation';
+  const perConversation = integer(input.per_conversation, 2, 1, 4);
+  const follow = followingOptions(input.follow, grouped);
+  const query = text(input.query, 4000);
+  const candidates = integer(input.candidates, 64, 1, 256);
+  const limit = integer(input.limit, 8, 1, 32);
+  const maxNodes = integer(input.max_nodes, 48, 1, 256);
+  const maxHops = integer(input.max_hops, 4, 0, 12);
+  // Only grouped evidence_advice may ask for the larger pool; there max_chars counts serialized UTF-8 bytes of whole units.
+  const maxChars = integer(input.max_chars, 24000, 256, isPoolRequest({ mode, group: input.group }) ? POOL_MAX_CHARS : 200000);
+  const vectorLimit = integer(config.vector_scan_limit, 10000, 1, 100000);
+  // A caller's own conversation is excluded inside every channel, before its candidate limit: matches from it never
+  // take the place of eligible ones, and its unindexed text does not hold the others back.
+  const exclude = exclusions(input.exclude_conversations);
+  const digests = digestsOption(input);
+  return { mode, grouped, perConversation, follow, query, candidates, limit, maxNodes, maxHops, maxChars, vectorLimit, exclude, digests };
+}
+
+// The query is embedded at most once per request, however many index groups read vectors.
+function queryEmbedder(config, query) {
+  let vectors;
+  return () => vectors ??= embed(config.embedding, [query]);
+}
+
+// Nodes the tree indexes cannot see yet make every channel over that kind partial.
+function markPending(availability, pending) {
+  for (const [name, kind] of Object.entries(CHANNEL_KINDS)) {
+    const state = availability[name];
+    if (!pending[kind] || !['ready', 'partial'].includes(state.status)) continue;
+    availability[name] = { ...state, status: 'partial', scope_tree_pending: pending[kind], ...(state.reason ? {} : { reason: 'scope_tree_pending' }) };
+  }
+}
+
+/**
+ * A set's index groups, in the set's order: nested elements under one root share that root's tree and one query per channel;
+ * every flat element (depth 1, opted-in root included, or opaque) is its own group, read exactly as it is read alone.
+ */
+function indexGroups(scopes) {
+  const groups = new Map();
+  for (const scope of scopes) {
+    const name = isNested(scope) ? scopePath(scope)[0] : scope;
+    const key = JSON.stringify([isNested(scope), name]);
+    if (!groups.has(key)) groups.set(key, { name, tree: isNested(scope), scopes: [] });
+    groups.get(key).scopes.push(scope);
+  }
+  return [...groups.values()].map(group => ({ ...group, target: group.scopes.length === 1 ? group.scopes[0] : { scopes: group.scopes } }));
+}
+
+// Hits, and seeds admission omitted, of a one-element group, named with its scope as every item of a set read is.
+function nameHits(result, scope) {
+  for (const name of Object.keys(result.channels)) result.channels[name] = result.channels[name].map(item => item.scope === undefined ? { ...item, scope } : item);
+  result.omitted = result.omitted.map(seed => seed.scope === undefined ? { ...seed, scope } : seed);
+}
+
+const STATUS_ORDER = ['unavailable', 'pending', 'partial', 'unconfigured', 'not_needed', 'ready'];
+
+/** A set read's `channels`: the worst element status per channel, naming those elements unless every element has it. */
+function aggregateChannels(byScope, reranker) {
+  const scopes = Object.keys(byScope);
+  const channels = Object.fromEntries(Object.keys(CHANNEL_KINDS).map(name => {
+    const statuses = scopes.map(scope => byScope[scope].channels[name].status);
+    const worst = STATUS_ORDER.find(status => statuses.includes(status)) ?? statuses[0];
+    const at = scopes.filter((_, index) => statuses[index] === worst);
+    return [name, { status: worst, ...(at.length < scopes.length ? { scopes: at } : {}) }];
+  }));
+  return Object.fromEntries(Object.entries({ ...channels, reranker }).sort(([a], [b]) => a.localeCompare(b)));
+}
 
 const followingTurn = turn => ({ id: turn.id, turn_id: turn.turn_id, occurred_at: turn.occurred_at ?? null,
   entries: turn.entries.map(entry => ({ id: entry.id, role: entry.role, text: entry.text })) });
