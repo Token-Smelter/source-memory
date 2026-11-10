@@ -1,8 +1,8 @@
 # Source Memory namespacing: home scopes, set reads, cross-scope links
 
-**Bottom line:** Every turn, record and relation keeps exactly one permanent *home scope*. Two planned features are added on top, in this order: (1) **set reads**, where `recall`, `list` and `show` (`bundle`, `units`, `following`) cover up to 4 exact scopes the caller names and is granted; (2) **cross-scope links**, where a relation is written in the scope of its later record (`from`) and names an earlier record in another readable scope as `to: {scope, id}`. Links are stored under their own label, so builds without PR B never see them. A reader that did not select the far scope sees the link with its far end hidden. Both features are additive. No stored byte, uid or hash changes, `RECORD_CONTRACT` stays `source-memory.record/1`, and every single-scope read stays byte-identical. A host can write and read one exact scope per call today without either feature. The only decisions that cannot be revised later are where each item lives (home scope, scope name, tree root, granularity). If those turn out wrong, the supported fix is to re-ingest the lossless source turns into a new scope scheme and re-distil them.
+**Bottom line:** Every turn, record and relation keeps exactly one permanent *home scope*. Two planned features are added on top, in this order: (1) **set reads**, where `recall`, `list` and `show` (`bundle`, `units`, `following`) cover up to 4 exact scopes the caller names and is granted; (2) **cross-scope links**, where a relation is written in the scope of its later record (`from`) and names an earlier record in another readable scope as `to: {scope, id}`. Links are stored under their own label, so builds without PR B never see them. A reader that did not select the far scope sees the link with its far end hidden. Reads can opt in to each record's stored digest and the store identity, and a link can require the far record's digest. Both features are additive. No stored byte, uid or hash changes, `RECORD_CONTRACT` stays `source-memory.record/1`, and every single-scope read stays byte-identical. A host can write and read one exact scope per call today without either feature. The only decisions that cannot be revised later are where each item lives (home scope, scope name, tree root, granularity). If those turn out wrong, the supported fix is to re-ingest the lossless source turns into a new scope scheme and re-distil them.
 
-Status: design r1 (revised after independent review), planned work. No code in this PR. Delivery order: PR A set reads, then PR B cross-scope links, each with its own independent review. The surface reference is [TOOL-SURFACE.md](TOOL-SURFACE.md) (r2 links here).
+Status: design r2, planned work. r1 was revised after independent review. r2 adds read-only digest fields (PR A), an optional digest precondition on a link's far end (PR B) and the least-privilege boundary (section 6). Docs only. Delivery order: PR A set reads, then PR B cross-scope links, each with its own independent review. The surface reference is [TOOL-SURFACE.md](TOOL-SURFACE.md) (r2 links here).
 
 ```mermaid
 flowchart LR
@@ -45,7 +45,7 @@ flowchart LR
 | order | The set is canonicalized by sorting in UTF-16 code-unit order. Replies, cursor bindings and query parameters use that order |
 | grants | Every element must pass `authorize(config, element, 'read')`: listed exactly, or covered by an `A/**` pattern. If any element fails, the whole read is refused `scope_denied` inside `authorize`, before any storage call. No element is ever dropped silently. A set is closed and enumerated. It never acts as a subtree, so exact grants never add up to an open set, and a set never grants anything an element's own grant does not |
 | operations | `recall` (all modes, `group:"conversation"`, `seedsOnly`), `list` (with `relations`), and `show` kinds `bundle`, `units`, `following`. `show` `record`, `turn` and `turn_by_key`, `status`, `init`, every write, `sourceChunks` and the vector-status reads stay exact or selector-only and refuse a set with `scope_denied`. The extension transport (`pi-extension/memory-process.mjs`) keeps serving one exact scope |
-| capability | `status` with input `{"capabilities": true}` adds `capabilities: {scope_set_max: 4}`, and after PR B also `cross_scope_relations: true`. Without that input the `status` reply is unchanged. A build without the feature ignores the input and returns no `capabilities`, so its absence means unsupported. A two-element set `list` over granted scopes is an equivalent probe: older builds refuse it `invalid_input` (API) or `invalid_arguments` (CLI) |
+| capability | `status` with input `{"capabilities": true}` adds `capabilities: {scope_set_max: 4, record_digests: true}`, and after PR B also `cross_scope_relations: true`. Without that input the `status` reply is unchanged. A build without the feature ignores the input and returns no `capabilities`, so its absence means unsupported. A two-element set `list` over granted scopes is an equivalent probe: older builds refuse it `invalid_input` (API) or `invalid_arguments` (CLI) |
 
 ### Fan-out: one query per index group per channel
 
@@ -130,7 +130,7 @@ sequenceDiagram
 | Rule | Definition |
 |---|---|
 | one scope | A relation is always written to exactly one scope: the written scope, which is the scope of its `from` record, the later record. Its evidence spans must be turns of the written scope (unchanged `evidence_unavailable`) |
-| far endpoint | Only `to` may be in another scope. It is spelled `to: {scope, id}` with exactly those keys: `scope` an exact scope of ≤256 characters, `id` ≤256 characters. `from` stays a string id in the written scope. The natural direction of all five types puts the earlier record at `to`: `supersedes` (replacement → replaced), `qualifies`, `contradicts`, `depends_on` (dependent → prerequisite) and `outcome_of` (outcome → action, decision or intention) |
+| far endpoint | Only `to` may be in another scope. It is spelled `to: {scope, id, expected_digest?}` with no other keys: `scope` an exact scope of ≤256 characters, `id` ≤256 characters, and an optional `expected_digest`, a precondition defined in section 6 that is never stored. `from` stays a string id in the written scope. The natural direction of all five types puts the earlier record at `to`: `supersedes` (replacement → replaced), `qualifies`, `contradicts`, `depends_on` (dependent → prerequisite) and `outcome_of` (outcome → action, decision or intention) |
 | one spelling | A same-scope relation keeps `to` as a string. `to.scope` equal to the written scope is `invalid_relation`. A relation's far endpoint cannot be another record of the same call: payload records are in the written scope, and the far record must already exist |
 | identity keys | Endpoints are keyed by `(scope, id)` everywhere: the enrich endpoint map, the outcome kind checks and bundle maps (by uid). A payload record whose id equals a far `to.id` is a different record and never satisfies the far lookup. `self_relation` stays `from === to` for a string `to`. With an object `to` it cannot occur, because `to.scope` differs from the written scope |
 | authority | The writer needs WRITE on the written scope (the existing `authorize`) and READ on every far scope (`authorize(config, to.scope, 'read')`). Both are checked in `beforeWrite`, before the transaction, against the same configuration object. A missing read grant, or a selector as `to.scope`, is refused `cross_scope_denied` |
@@ -171,6 +171,7 @@ Rollout guidance follows from that. Upgrade every writer of a scope before writi
 | every relation with string `to` (all inputs record/1 accepts) | normalized, stored, hashed | identical uid, body and digest |
 | relation with object `to` | refused `invalid_input` (`text(edge.to, 256)`, `src/core.mjs:227`) | accepted as a cross-scope relation |
 | relation with a top-level `to_scope` key | key dropped as unknown | key still dropped as unknown. It is not the spelling of a far endpoint |
+| object `to` with `expected_digest` | refused `invalid_input` | validated, checked, then dropped: the normalized output is the same as without it |
 
 Every input that record/1 accepts yields the same uid, normalized output and replay digest, so under its own definition (`src/core.mjs:194`) the contract does not change. The new form is one that record/1 refused. A build without PR B therefore fails closed (`invalid_input`, `before_write`) instead of writing a same-scope relation by mistake. PR B tightens the comment on `RECORD_CONTRACT` to state this: the contract covers every input the version accepts, and a form it refused may be added later with an optional stored field that is absent unless used.
 
@@ -210,10 +211,11 @@ On data without links, the subtree expansion selects the same relations in the s
 | `invalid_input` | pre-commit-only | malformed `to` object (wrong keys, non-string or oversized `scope` or `id`) |
 | `invalid_relation` | pre-commit-only | `to.scope` equal to the written scope |
 | `relation_endpoint_unavailable` | in-transaction-rolled-back † | the far record lookup, inside the existing endpoint loop before the first `MERGE` |
+| `relation_endpoint_digest_mismatch` (new) | in-transaction-rolled-back † | right after the far record lookup: `to.expected_digest` differs from the far record's stored `hash` (section 6) |
 | `invalid_outcome_relation`, `outcome_referent_required` | in-transaction-rolled-back † | unchanged codes, with far-aware lookups |
 | `relation_identity_conflict` | in-transaction-rolled-back | unchanged after the relation `MERGE`. New site, also not †: the cross-label uid check just before each relation's `MERGE` |
 
-Q-SM-3 adds `cross_scope_denied` to its exercised codes (the run fails if a listed code goes unexercised), plus a far-endpoint `relation_endpoint_unavailable` case. The source-order pin keeps every † check before the first `MERGE` in `Neo4jStore.enrich`. PR A adds no codes.
+Q-SM-3 adds `cross_scope_denied` and `relation_endpoint_digest_mismatch` to its exercised codes (the run fails if a listed code goes unexercised), plus a far-endpoint `relation_endpoint_unavailable` case. A malformed `expected_digest` is `invalid_input`, `before_write`. The source-order pin keeps every † check before the first `MERGE` in `Neo4jStore.enrich`. PR A adds no codes.
 
 ## 3. What stays changeable
 
@@ -345,3 +347,30 @@ A new `npm run test:integration -- --suite namespacing` runs in the repository's
 | writes (PR B) | Q-SM-3 cases for `cross_scope_denied` (`before_write`) and a missing far endpoint (`rolled_back`), far `outcome_of` kind checks, `outcome_referent_required` with a stored far referent, replay, conflict on a changed `to_scope`, the cross-label conflict (same id written as a relation and as a link, sequentially and concurrently), a grant revoked between replays and the presence settlement through `list` on A, and a refusal after a real driver retry (`stage:unknown`) |
 | following | grouped recall and `show units` with `follow` over {A, B}, where a bundle holds B's record: each root is walked in its own scope, and `also_cites` keys carry their own scope |
 | capabilities | `status {capabilities:true}` reports them; plain `status` bytes are unchanged |
+| digests (PR A) | with `digests:true`, every record's `record_digest` equals the stored `hash` and the canonical digest of the normalized submission. `store_identity` equals `status.store`. A record node without a string `hash` reports `null`. Without the flag, every reply's bytes are unchanged (the golden pins above run without it). `list` on the base build refuses `digests` with `invalid_input` |
+| expected digest (PR B) | a matching `expected_digest` writes the link. A mismatch gives `relation_endpoint_digest_mismatch`, `rolled_back`, and nothing is written. A first write and a replay, each with or without a matching `expected_digest`, store one link with one body |
+
+## 6. Digest fields, endpoint preconditions and least privilege
+
+### Read-only digest fields (PR A)
+
+| Rule | Definition |
+|---|---|
+| opt-in | `digests: true` on `recall`, `list` and `show` (every kind). Without it no reply gains a field, so every reply, the eval's pinned runs included, stays byte-identical. A build without the feature ignores the flag on `recall` and `show`, which shows up as missing `store_identity`. It refuses the flag on `list` as `invalid_input` (`LIST_KEYS` is strict). `capabilities.record_digests` reports support |
+| `record_digest` | On every record object in an opted-in reply: bundle records in `recall` and `show bundle`/`units`, `show record`, `list` record items and `max_bytes` stubs, and record seeds in `seedsOnly` `ranked`. The value is the record node's stored `hash`, which is `digest(normalized record)` written at creation (`src/store.mjs:369-374`). It equals the canonical digest a caller computes from the normalized record it submitted, which is the QUALIFICATION exact-read `match`. It is `null` for a record node without a string `hash` (another writer) |
+| `store_identity` | Once per opted-in reply, top level: `{system, database_id, database, record_contract}`, the same object and the same `db.info()` read as `status.store`. A digest is meaningful only for that store and contract |
+| what it changes | Nothing stored: no byte, uid, hash or `RECORD_CONTRACT`. It exposes an existing property. The opted-in cost is one `db.info()` read per reply, plus the `hash` property already on each node read |
+| not included | Relation and turn digests. Turns are found by deterministic key, and relations settle by presence (section 2). Add them only if a caller needs them |
+
+### Far-end digest precondition (PR B)
+
+| Rule | Definition |
+|---|---|
+| input | `to.expected_digest`: optional, 64 lowercase hex characters, otherwise `invalid_input` (`before_write`) |
+| check | Inside the write transaction, right after the far record lookup and before the first `MERGE` (†): it must equal the far record's stored `hash`, otherwise `relation_endpoint_digest_mismatch` (new code, `rolled_back` on the first attempt, `unknown` after a driver retry, as every in-transaction code). Without `expected_digest` the check is existence only |
+| not stored | A precondition, not content: normalization drops it after validation, so the link's body, hash and uid are the same with or without it. A replay with or without it converges on one link, and `RECORD_CONTRACT` is unchanged. Records never change, so a check that passed once passes on every replay |
+| disclosure | Runs only after the read grant on the far scope passed (`cross_scope_denied` first), so a mismatch tells the writer nothing it could not read |
+
+### Least privilege is a host concern
+
+Source Memory enforces one thing: the static `scopes.read` and `scopes.write` allowlists of the configuration it was constructed with (`authorize`, `src/core.mjs:79`). There are no tokens, sessions, per-call credentials or per-run grants, and no request field widens a grant. A set read, a subtree read and a link's far-scope check are all decided against that one allowlist. A host that wants least privilege for each run or task builds a `Memory`, or starts a CLI or extension process, with a configuration narrowed to that run's scopes, and decides itself which run gets which configuration.
