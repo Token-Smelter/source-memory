@@ -151,10 +151,18 @@ export async function runList(database, scratch = null) {
           assert.deepEqual(page.relations.map(row => `${row.scope}:${row.id}`).sort(), expected.sort(), `${scope} ${JSON.stringify(input)}`);
           assert.deepEqual([page.relations_truncated, page.relations_total], [false, expected.length]);
           assert.ok(page.relations.every(row => typeof row.stored_at === 'string' && row.evidence.length === 1 && row.evidence[0].start === 0));
-          const types = page.relations.map(row => row.type);
-          assert.deepEqual(types, [...types].sort((a, b) => (a !== 'supersedes') - (b !== 'supersedes')), 'supersedes first');
+          // Supersedes first, then newest first by (stored_at, uid): each key strictly precedes the next.
+          const keys = page.relations.map(row => [row.type === 'supersedes' ? 0 : 1, -Date.parse(row.stored_at), identity('relation', row.scope, row.id)]);
+          for (let index = 1; index < keys.length; index += 1) {
+            const [a, b] = [keys[index - 1], keys[index]];
+            assert.ok(a[0] < b[0] || (a[0] === b[0] && (a[1] < b[1] || (a[1] === b[1] && a[2] > b[2]))), `relation order at ${index}`);
+          }
         }
       }
+      const all = await memory.store.listRelations('rel', [identity('record', 'rel', 'd1'), identity('record', 'rel', 'd2')], 256);
+      const cut = await memory.store.listRelations('rel', [identity('record', 'rel', 'd1'), identity('record', 'rel', 'd2')], 2);
+      assert.deepEqual([all.total, all.rows.length, cut.total, cut.rows], [3, 3, 3, all.rows.slice(0, 2)], 'the store cut keeps its order and counts the rest');
+      assert.equal(all.rows[0].uid, identity('relation', 'rel', 'd2-over-d1'));
       const exact = await memory.list('rel/a', { relations: true });
       assert.deepEqual(exact.relations.map(row => [row.scope, row.id, row.type, row.from, row.to]), [['rel/a', 'x1-vs-d1', 'contradicts', 'x1', 'd1']],
         'a record id shared with another scope never draws that scope\'s relations');
@@ -166,7 +174,19 @@ export async function runList(database, scratch = null) {
 
     await check('list relations: one query per page, seeking page records by uid rather than scanning or seeking by scope', async () => {
       const original = memory.store.transaction.bind(memory.store);
-      for (const scope of ['rel', 'rel/**']) {
+      const dropRangeIndexes = () => original('write', tx => tx.run('DROP INDEX smrecord_scope IF EXISTS'))
+        .then(() => original('write', tx => tx.run('DROP INDEX smrelation_scope IF EXISTS')));
+      try {
+        for (const [scope, ranges] of [['rel', true], ['rel/**', true], ['rel', false], ['rel/**', false]]) {
+          if (!ranges) await dropRangeIndexes();
+          await planCheck(scope, ranges);
+        }
+      } finally {
+        // Restore the range indexes a tree init creates for the suites that follow.
+        await memory.init('rel/a');
+        await original('read', tx => tx.run('CALL db.awaitIndexes(60)'));
+      }
+      async function planCheck(scope, ranges) {
         const queries = [];
         memory.store.transaction = (mode, action) => original(mode, tx => action({ run: (query, params) => { queries.push({ query, params }); return tx.run(query, params); } }));
         try { await memory.list(scope, { relations: true }); } finally { memory.store.transaction = original; }
@@ -176,10 +196,24 @@ export async function runList(database, scratch = null) {
         const operators = [];
         const visit = node => { operators.push(`${node.operatorType} ${node.arguments?.Details ?? ''}`); node.children.forEach(visit); };
         visit(plan);
-        assert.ok(operators.some(row => /^NodeUniqueIndexSeek/u.test(row) && /SMRecord\(uid\)/u.test(row)), `${scope}: ${operators.join(' | ')}`);
-        assert.ok(!operators.some(row => /LabelScan|AllNodesScan|smrecord_scope|smrelation_scope|\(scope\)/u.test(row)), `${scope}: ${operators.join(' | ')}`);
-        assert.ok(!operators.some(row => /SMRelation/u.test(row) && /Scan|IndexSeek/u.test(row.split(' ')[0])), `${scope}: relations are reached by their edges`);
+        const seen = `${scope} ranges=${ranges}: ${operators.join(' | ')}`;
+        assert.ok(operators.some(row => /^NodeUniqueIndexSeek/u.test(row) && /SMRecord\(uid\)/u.test(row)), seen);
+        assert.ok(!operators.some(row => /LabelScan|AllNodesScan|smrecord_scope|smrelation_scope|\(scope\)/u.test(row)), seen);
+        assert.ok(!operators.some(row => /SMRelation/u.test(row) && /Scan|IndexSeek/u.test(row.split(' ')[0])), `${seen}: relations are reached by their edges`);
       }
+    });
+
+    await check('list relations on a store without the uid constraint ignores the hint and returns the same relations', async () => {
+      const before = await memory.list('rel', { relations: true });
+      const schema = async kind => (await memory.store.transaction('read', tx => tx.run(`SHOW ${kind} YIELD name, labelsOrTypes, properties
+        WHERE labelsOrTypes = ['SMRecord'] AND properties = ['uid'] RETURN name`))).records.map(row => row.get('name'));
+      const dropped = [];
+      for (const name of await schema('CONSTRAINTS')) { await memory.store.transaction('write', tx => tx.run(`DROP CONSTRAINT ${name}`)); dropped.push(name); }
+      for (const name of await schema('INDEXES')) { await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name}`)); dropped.push(name); }
+      try {
+        assert.deepEqual(await schema('INDEXES'), [], `dropped ${dropped}`);
+        assert.deepEqual(await memory.list('rel', { relations: true }), before, `dropped ${dropped}`);
+      } finally { await memory.init('rel'); }
     });
 
     await check('the CLI lists with or without --input, never waits on stdin, and refuses a foreign cursor', async () => {

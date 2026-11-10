@@ -760,7 +760,8 @@ export class Neo4jStore {
    * first by (created_at, uid), the first `limit` plus the total. Each page record is found through its uid constraint
    * index, by hint because the planner otherwise seeks the scope range index and reads the whole scope or subtree, and its
    * relations by their endpoint edges, so the cost is the page's records and their degree, with or without range indexes.
-   * A relation and its endpoints share one scope, so the selection holds every relation returned.
+   * A relation and its endpoints share one scope, so the selection holds every relation returned. On a store that never ran
+   * `init` there is no uid index; Neo4j then ignores the hint (unless `dbms.cypher.hints_error` is set) and scans.
    */
   async listRelations(target, uids, limit) {
     const sel = selection(target);

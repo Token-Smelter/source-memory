@@ -192,6 +192,19 @@ test('relations stop at a count and a byte cap, and say so with the total', asyn
   assert.ok(sized.relations.length > 0 && bytes <= LIST_RELATIONS_MAX_BYTES, `${bytes} bytes`);
   assert.ok(bytes + 1 + Buffer.byteLength(JSON.stringify(sized.relations[0])) > LIST_RELATIONS_MAX_BYTES, 'it stops only before a relation that would not fit');
   assert.deepEqual([sized.relations_truncated, sized.relations_total], [true, LIST_RELATIONS_MAX]);
+  const prefix = [...heavy.slice(0, 40), relationRow('acme/x', 'a000', 'qualifies', 'r1', 'r_gone', '2026-01-01T00:00:01Z')];
+  const cut = await memory(fakeStore(rows, prefix)).list('acme/x', { kind: 'decision', relations: true });
+  const stored = (await fakeStore(rows, prefix).listRelations('acme/x', ['r1'], LIST_RELATIONS_MAX)).rows.map(row => row.uid);
+  assert.equal(stored.at(-1), 'a000');
+  assert.deepEqual(cut.relations.map(row => row.id), stored.slice(0, cut.relations.length), 'a prefix of the store order');
+  assert.ok(!cut.relations.some(row => row.id === 'a000'), 'a smaller later relation never jumps the cut');
+});
+
+test('a record cut from the page by max_bytes draws no relations', async () => {
+  const pageRows = [recordRow('acme', 'r_small', '2026-01-01T00:00:02Z', {}), recordRow('acme', 'r_big', '2026-01-01T00:00:01Z', { text: 'x'.repeat(6000) })];
+  const store = fakeStore(pageRows, [relationRow('acme', 'e_big', 'qualifies', 'r_big', 'r_gone', '2026-01-01T00:00:03Z')]);
+  const page = await memory(store).list('acme', { max_bytes: 4096, limit: 2, relations: true });
+  assert.deepEqual([page.items.map(item => item.id), store.relationCalls.map(call => call.uids), page.relations], [['r_small'], [['r_small']], []]);
 });
 
 test('relations is a boolean and refused for a turn-only list, before storage', async () => {
