@@ -128,7 +128,7 @@ export async function readGoldenCorpus(memory, config) {
  * conversation fields an item keeps from whichever channel found it first. Only those are normalized: keys and traces
  * sorted by name, first-channel fields dropped. Fused scores are exact (at most two lexical terms per item), so they are not.
  */
-function canonicalRun(replies) {
+export function canonicalRun(replies) {
   return replies.map(reply => !reply.ranked ? reply : { ...reply,
     channels: Object.fromEntries(Object.entries(reply.channels).sort(([a], [b]) => a.localeCompare(b))),
     ranked: reply.ranked.map(({ text: _text, match: _match, conversation: _conversation, ...item }) =>

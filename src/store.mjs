@@ -8,6 +8,13 @@ import {
 const unwrap = node => node?.properties ?? null;
 const decodeTurn = props => props ? { id: props.uid, scope: props.scope, ...JSON.parse(props.body) } : null;
 const decodeRecord = props => props ? { uid: props.uid, scope: props.scope, ...JSON.parse(props.body) } : null;
+// The stored hash is digest(normalized record), written at creation; a node another writer made without one reports null.
+export const recordDigest = props => typeof props?.hash === 'string' ? props.hash : null;
+// Only a caller that opted in to digests gets the field, so every other reply keeps its bytes.
+const decodeRecordWith = (props, digests) => {
+  const record = decodeRecord(props);
+  return record && digests ? { ...record, record_digest: recordDigest(props) } : record;
+};
 const decodeRelation = props => props ? { uid: props.uid, ...JSON.parse(props.body) } : null;
 
 /**
@@ -318,11 +325,11 @@ export class Neo4jStore {
     });
   }
 
-  async getRecord(scope, id) {
+  async getRecord(scope, id, { digests = false } = {}) {
     const uid = identity('record', scope, id);
     return this.transaction('read', async tx => {
       const result = await tx.run('MATCH (r:SMRecord {uid:$uid, scope:$scope}) RETURN r', { uid, scope });
-      return decodeRecord(unwrap(result.records[0]?.get('r')));
+      return decodeRecordWith(unwrap(result.records[0]?.get('r')), digests);
     });
   }
 
@@ -446,7 +453,7 @@ export class Neo4jStore {
   }
 
   // The exclusion is applied before the limit, so excluded matches never take the place of eligible ones.
-  async lexical(scope, kind, query, limit, exclude = []) {
+  async lexical(scope, kind, query, limit, exclude = [], { digests = false } = {}) {
     const lucene = lexicalQuery(query);
     if (!lucene) return [];
     const sel = selection(scope);
@@ -459,7 +466,8 @@ export class Neo4jStore {
       return result.records.map(row => {
         const node = unwrap(row.get('node'));
         requireThat(sel.owns(node.scope), 'index_scope_mismatch');
-        return { kind, id: kind === 'turn' ? node.uid : node.record_id, text: node.text, ...(sel.subtree ? { scope: node.scope } : {}) };
+        return { kind, id: kind === 'turn' ? node.uid : node.record_id, text: node.text, ...(sel.subtree ? { scope: node.scope } : {}),
+          ...(digests && kind === 'record' ? { record_digest: recordDigest(node) } : {}) };
       });
     });
   }
@@ -701,14 +709,14 @@ export class Neo4jStore {
    * Exact cosine over a nested scope's or subtree's tree-labelled vectors, scored in Cypher so no embedding leaves the
    * database: the top `limit` hits with the fields a recall hit needs, and every eligible uid for grouped admission.
    */
-  async treeVectorScan(target, kind, model, vector, limit, exclude = []) {
+  async treeVectorScan(target, kind, model, vector, limit, exclude = [], { digests = false } = {}) {
     const sel = selection(target);
     requireThat(sel.tree, 'invalid_input');
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n:${sel.members[kind]} {embedding_key:$model}) WHERE ${sel.where('n')} AND ${eligible('n')}
         WITH n, vector.similarity.cosine(n.embedding, $vector) AS score ORDER BY score DESC, n.uid
         WITH collect({uid:n.uid, scope:n.scope, turn_uid:n.turn_uid, record_id:n.record_id, entry_id:n.entry_id, start:n.start, end:n.end,
-          text:n.text}) AS rows
+          text:n.text${digests ? ', hash:n.hash' : ''}}) AS rows
         RETURN rows[..$limit] AS top, [row IN rows | row.uid] AS uids`, { ...sel.params, model, vector, exclude, limit: neo4j.int(limit) });
       const row = result.records[0];
       const top = row.get('top');
@@ -724,7 +732,7 @@ export class Neo4jStore {
    * writes those keys in a fixed order and escapes every quote inside a value, so the anchored patterns can match only
    * the top-level key. Turns return their envelope header (the body before its entries) and entry count, not their text.
    */
-  async listPage(target, { turns, records, kind = null, status = null, source = null, conversation = null, after = null, limit }) {
+  async listPage(target, { turns, records, kind = null, status = null, source = null, conversation = null, after = null, limit, digests = false }) {
     const sel = selection(target);
     const keys = t => `($source IS NULL OR CASE WHEN ${t}.source IS NULL THEN ${t}.body STARTS WITH $sourceBody ELSE ${t}.source = $source END)
       AND ($conversation IS NULL OR CASE WHEN ${t}.conversation_id IS NULL THEN ${t}.body CONTAINS $conversationBody ELSE ${t}.conversation_id = $conversation END)`;
@@ -745,7 +753,8 @@ export class Neo4jStore {
           CASE WHEN type = 'turn' THEN split(n.body, ',"entries":')[0] + '}' END AS header,
           CASE WHEN type = 'turn' THEN size(split(n.body, '{"id":"')) - 1 END AS entry_count,
           CASE WHEN type = 'turn' THEN {source: n.source, conversation_id: n.conversation_id, turn_id: n.turn_key, parent_turn_id: n.parent_turn_id} END AS properties,
-          CASE WHEN type = 'record' THEN n.body END AS body`,
+          CASE WHEN type = 'record' THEN n.body END AS body${digests ? `,
+          CASE WHEN type = 'record' THEN n.hash END AS hash` : ''}`,
       { ...sel.params, turns, records, after, epoch: LIST_EPOCH, limit: neo4j.int(limit),
         kind: kind === null ? null : `,"kind":${JSON.stringify(kind)},"text":`,
         status: status === null ? null : `,"status":${JSON.stringify(status)},"attribution":`,
@@ -788,11 +797,11 @@ export class Neo4jStore {
     });
   }
 
-  async recordsForTurn(scope, uid, limit) {
+  async recordsForTurn(scope, uid, limit, { digests = false } = {}) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (r:SMRecord {scope:$scope})-[:SM_EVIDENCE]->(t:SMTurn {uid:$uid,scope:$scope})
         RETURN DISTINCT r ORDER BY r.uid LIMIT $limit`, { scope, uid, limit: neo4j.int(limit) });
-      return result.records.map(row => decodeRecord(unwrap(row.get('r'))));
+      return result.records.map(row => decodeRecordWith(unwrap(row.get('r')), digests));
     });
   }
 

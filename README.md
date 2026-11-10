@@ -85,8 +85,9 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `show` | `{"kind":"units","units":[{"key":{"scope":"...","source":"...","conversation_id":"..."},"seeds":[{"kind":"turn"\|"record","id":"..."}]}],"follow":{}}` | Recheck up to 4 units of up to 20 exact seeds each, optionally folding following; no ranking or exclusion |
 | `show` | `{"kind":"following","turn":"<turn id>","limit":2}` | Later turns of the same conversation by exact `parent_turn_id` links (see below) |
 | `show` | `{"kind":"turn_by_key","source":"...","conversation_id":"...","turn_ids":["..."]}` | Which of up to 16 caller turn keys already name stored turns (`found`, in request order); for callers that must reuse an existing identity |
-| `list` | Optional `--input` `{"kind","status","source","conversation_id","limit","max_bytes","cursor","relations"}`; never reads stdin | Exact enumeration of turns and records over a scope or `'S/**'`, newest first, keyset-paged (below) |
-| `status` | None | Counts, unindexed items, configured models, and `store` (`system`, `database_id`, `database`, `record_contract`) naming the physical store and the record-contract version |
+| `recall`, `show`, `list` | add `"digests":true` | Each record also carries `record_digest` and the reply names the store once as `store_identity` (below) |
+| `list` | Optional `--input` `{"kind","status","source","conversation_id","limit","max_bytes","cursor","relations","digests"}`; never reads stdin | Exact enumeration of turns and records over a scope or `'S/**'`, newest first, keyset-paged (below) |
+| `status` | None; optional `--input` `{"capabilities":true}` | Counts, unindexed items, configured models, and `store` (`system`, `database_id`, `database`, `record_contract`) naming the physical store and the record-contract version. With `capabilities:true` it adds `capabilities` (below) |
 | `warm` | None | Sends one fixed embedding request (no memory text) through the configured `embedding` endpoint, never connecting to Neo4j or writing, and returns `{warm:{model,embedding_key,ms}}`, or `{warm:{status:"unconfigured"}}` with no request. It keeps a local embedding model resident: that consumes shared model memory on the endpoint, so callers should schedule it only while recall is in use |
 | `warm --db v1` | None | Opt-in database warm-up (below). Needs read authorization for `--scope`; makes no model call and no write |
 
@@ -191,10 +192,21 @@ Every root segment has its own tree: labels `SMTree<d>Turn`, `SMTree<d>Chunk`, `
 | Filters | `kind`: `turn` or a record kind; `status` (records only); `source` and `conversation_id` match a turn, or any evidence turn of a record |
 | Turn items | `{kind:"turn", scope, id, source, conversation_id, turn_id, parent_turn_id, occurred_at, stored_at, entry_count}`, cut from the stored envelope inside the database so entry text is never returned; text via `show` |
 | Record items | `{kind:"record", scope, id, record_kind, status, text, attribution, evidence, stored_at}`; evidence as span coordinates; excerpts via `show` |
-| Bounds | `limit` 1–64 (default 16); `max_bytes` 4,096–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before an item that would exceed it. An item that cannot fit in `items` alone (`bytes + 2 > max_bytes`) is listed as `{kind, scope, id, stored_at, bytes, content_omitted:"max_bytes"}` and the walk moves on |
+| Bounds | `limit` 1–64 (default 16); `max_bytes` 4,096–1,000,000 serialized UTF-8 bytes of `items` (default 65,536). A page stops before an item that would exceed it. An item that cannot fit in `items` alone (`bytes + 2 > max_bytes`) is listed as `{kind, scope, id, stored_at, bytes, content_omitted:"max_bytes"}` (plus `record_digest` for a record with `digests:true`) and the walk moves on |
 | Cursor | Opaque and bound to the request's scope and filters; any other use is `invalid_input` |
 | Cost | One query per page: filters run inside it, before its limit, and it sorts the matching part of the selection. With the scope range indexes (created by any nested or subtree `init`) selection is a seek; a store without them scans every turn or record |
 | Relations | `relations: true` (refused with `kind:"turn"`) adds `relations`: every relation whose `from` or `to` is a record of the page, as `{scope, id, type, from, to, attribution, evidence, stored_at}`, `supersedes` first, so a replaced record can be folded under its replacement. Both endpoints are records of the relation's `scope`; one off the page is an id only. `stored_at` is `null` for a relation without a datetime `created_at` (written before this release, or by another writer). A relation touching records on two pages appears on both; dedupe by `(scope, id)`. At most 256 relations and 131,072 bytes; `relations_truncated` says whether that cut any, and `relations_total` counts them all. `items` and `next_cursor` do not change. Cost: one more query per page with records, seeking each page record by uid and following its relation edges, with or without the scope range indexes. A store that never ran `init` has no uid constraint and scans instead |
+
+## Record digests
+
+`digests: true` on `recall`, `show` (every kind) or `list` exposes the digest each record was stored with, so a caller can check that a record is the one it wrote or read before. Without it no reply changes.
+
+| Field | Where | Value |
+|---|---|---|
+| `record_digest` | every record object: bundle records in `recall` and `show bundle`/`units`, `show record`, `list` record items and their `max_bytes` stubs, record seeds of a ranking-only recall | the record node's stored `hash`, the canonical digest of the normalized record it was written from (`digest` in `src/core.mjs`); `null` for a node without a string hash (another writer) |
+| `store_identity` | once per reply, top level | `{system, database_id, database, record_contract}`, the same object as `status.store`: a digest is meaningful only for that store and record contract |
+
+The digest counts toward every byte budget (`max_chars`, unit and pool bytes, `list` `max_bytes`), so an opted-in reply can omit a unit or end a page earlier; the `list` cursor does not bind `digests`, so a walk stays exact either way. Nothing stored changes. A malformed value is `invalid_input`. `status {"capabilities":true}` returns `capabilities: {record_digests: true}`; any other `capabilities` value is ignored, as older builds ignore the whole input. A build without the feature returns no `capabilities`, ignores `digests` on `recall` and `show` (no `store_identity`) and refuses it on `list` (`invalid_input`). Design: [docs/NAMESPACING.md](docs/NAMESPACING.md) section 6.
 
 ## Following a conversation
 
