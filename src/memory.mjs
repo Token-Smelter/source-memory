@@ -316,8 +316,9 @@ export class Memory {
       for (const row of [...bundle.records, ...bundle.relations]) for (const span of row.supporting_evidence) add(span.scope ?? row.scope ?? home, span.turn);
     }
     const following = [];
-    for (const key of [...roots.keys()].sort()) {
-      const { owner, turn: after } = roots.get(key);
+    const byTurn = (a, b) => a.turn < b.turn ? -1 : a.turn > b.turn ? 1 : a.owner < b.owner ? -1 : a.owner > b.owner ? 1 : 0;
+    for (const { owner, turn: after } of [...roots.values()].sort(byTurn)) {
+      const key = JSON.stringify([after, owner]);
       authorize(this.config, owner);
       if (!cache.has(key)) cache.set(key, (async () => {
         const start = await immutableRead(reads, owner, 'turn', after, () => this.store.getTurn(owner, after));
@@ -450,14 +451,16 @@ export class Memory {
    * channel logic of an exact read of its elements, with its own status, census, pending and vector budget; ranks are
    * fused per group, and every element reports its own channel states in `by_scope`.
    */
-  async recallSet(scopes, input, { phases = null, seedsOnly = false } = {}) {
+  async recallSet(set, input, { phases = null, seedsOnly = false } = {}) {
+    const scopes = setScopes(this.config, { scopes: set });
     const trace = tracer(phases);
     const options = recallOptions(this.config, input);
     const { grouped, candidates, digests } = options;
     const groups = indexGroups(scopes);
     const embedQuery = queryEmbedder(this.config, options.query);
     const results = await Promise.all(groups.map(async (group, index) => {
-      const result = await this.retrieve(group.target, options, trace === passthrough ? passthrough : scoped(trace, `group.${index}`), embedQuery);
+      // Each group is bracketed whole, so a large set does not crowd the render phase out of the bounded marker budget.
+      const result = await trace(`group.${index}`, () => this.retrieve(group.target, options, passthrough, embedQuery));
       // A one-element group is read exactly as that scope alone, whose hits do not name it.
       if (typeof group.target === 'string') nameHits(result, group.target);
       const pending = !group.tree ? null : typeof group.target === 'string' ? { [group.target]: await this.store.treePending(group.target) }
@@ -515,6 +518,7 @@ export class Memory {
    * omissions. Nothing here reads beyond the target; `embedQuery` embeds the query once per request.
    */
   async retrieve(target, options, trace, embedQuery) {
+    authorizeRead(this.config, target);
     const sel = selection(target);
     const tree = sel.tree;
     // Only the grouped admission query has finer steps worth bracketing; it takes the trace as an extra trailing argument.
@@ -876,6 +880,12 @@ function listItem(row, digests = false) {
 const CHANNEL_KINDS = { turn_lexical: 'turn', chunk_lexical: 'chunk', record_lexical: 'record', chunk_vector: 'chunk', record_vector: 'record' };
 
 const SET_SHOW_KINDS = ['bundle', 'units', 'following'];
+
+// Re-authorizes a target a public read method was handed directly: an exact scope, a subtree or a set.
+function authorizeRead(config, target) {
+  if (isScopeSet(target)) return setScopes(config, target);
+  return authorizeTarget(config, typeof target === 'object' && target !== null && target.subtree === true ? `${target.scope}/**` : target);
+}
 
 // An exact scope (null) or a set, re-authorized element by element (its scopes), for show kinds a set may name.
 function setScopes(config, target) {

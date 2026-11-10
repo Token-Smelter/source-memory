@@ -14,7 +14,7 @@ export const NESTED_BASE_COMMIT = 'f5b49e322fd741d6596cbac43d7e70f64f98fe58';
 export const NESTED_GOLDEN_SCOPES = ['ngolden/team', 'ngolden/team/ops'];
 const SUBTREE = 'ngolden/**';
 const SOUTH = [{ source: 'golden-fixture', conversation_id: 'south' }];
-const SET_GRANTS = ['fan/**', 'fan2/**', 'fa', 'fb', 'fc', 'fd', 'ova/**', 'ovb/**', 'rep/**', 'repf', 'lset/**', 'lsetf'];
+const SET_GRANTS = ['fan/**', 'fan2/**', 'fa', 'fb', 'fc', 'fd', 'ova/**', 'ovb/**', 'rep/**', 'repf', 'fan/odd name'];
 
 async function waitReady(memory, scope) {
   for (let attempt = 0; attempt < 2400; attempt += 1) {
@@ -247,6 +247,17 @@ export async function runNamespacing(database, scratch = null) {
           assert.equal(lexical, 3 * groups - (input.group ? 0 : groups), `${scopes}: lexical queries ${JSON.stringify(counts)}`);
           assert.equal(counts.chunkLexical ?? 0, input.group ? 0 : groups);
           assert.equal(vector, 2 * groups, `${scopes}: vector queries ${JSON.stringify(counts)}`);
+          // Status, census and pending reads: each group makes those of an exact read of one of its elements, once.
+          const exact = {};
+          for (const first of [...new Set(scopes.map(scope => scope.startsWith('fan/') ? 'fan/a' : scope))]) {
+            const single = counting();
+            await single.memory.recall(first, input);
+            for (const [name, count] of Object.entries(single.counts)) exact[name] = (exact[name] ?? 0) + count;
+          }
+          for (const name of ['lexicalStatus', 'chunkLexicalStatus', 'vectorIndexStatus', 'vectorCounts']) {
+            assert.equal(counts[name] ?? 0, exact[name] ?? 0, `${scopes}: ${name}`);
+          }
+          assert.equal((counts.treePending ?? 0) + (counts.treePendingByScope ?? 0), exact.treePending ?? 0, `${scopes}: pending reads`);
           assert.ok(new Set(reply.bundles.map(bundle => bundle.scope)).size >= Math.min(scopes.length, 2), 'hits come from several elements');
           for (const bundle of reply.bundles) assert.ok(scopes.includes(bundle.scope));
         }
@@ -365,14 +376,63 @@ export async function runNamespacing(database, scratch = null) {
       const narrow = new Memory({ ...fixtures.config, scopes: { read: ['fa', 'fb'], write: [] } }, counted.store);
       await assert.rejects(narrow.recall(['fa', 'fc'], { query: 'harbor' }), { code: 'scope_denied' });
       await assert.rejects(narrow.list(['fa', 'fc'], {}), { code: 'scope_denied' });
-      await assert.rejects(memory.recall(['fa', 'fan/**'], { query: 'harbor' }), { code: 'scope_denied' });
-      await assert.rejects(memory.recall([...FLAT, 'fan/a'], { query: 'harbor' }), { code: 'invalid_input' });
+      await assert.rejects(counted.recall(['fa', 'fan/**'], { query: 'harbor' }), { code: 'scope_denied' });
+      await assert.rejects(counted.recall([...FLAT, 'fan/a'], { query: 'harbor' }), { code: 'invalid_input' });
       assert.deepEqual(counts, {});
+    });
+
+    await check('sets with an opted-in root, an ancestor and its descendant, an opaque name, and digests group and report as specified', async () => {
+      // An opted-in depth-1 root stays its own flat group beside its nested scopes, and ranks as its exact read ranks.
+      await memory.init('fan/**');
+      await seedScope('fan', 'c-fan', 'The harbor lantern note of the fan root.', [['d1', 'Lantern decision of the fan root.']]);
+      await seedScope('fan/a/b', 'c-fan-a-b', 'The harbor lantern note of fan a b.', [['d1', 'Lantern decision of fan a b.']]);
+      await memory.init('fan/odd name');
+      await seedScope('fan/odd name', 'c-odd', 'The harbor lantern note of an opaque name.', [['d1', 'Lantern decision of the opaque name.']]);
+      for (const scope of ['fan', 'fan/a/b', 'fan/odd name']) await waitReady(memory, scope);
+      const query = { query: 'harbor lantern note' };
+      const rootSet = counting();
+      const mixed = await rootSet.memory.recall(['fan/a', 'fan'], query, { seedsOnly: true });
+      assert.deepEqual([mixed.by_scope.fan.group, mixed.by_scope.fan.scope_tree, mixed.by_scope['fan/a'].group, Boolean(mixed.by_scope['fan/a'].scope_tree)],
+        ['fan', undefined, 'fan', true]);
+      assert.equal(rootSet.counts.lexical, 4, 'the root and its nested scope are two groups');
+      const alone = await memory.recall('fan', query, { seedsOnly: true });
+      const ranks = items => Object.fromEntries(items.filter(item => (item.scope ?? 'fan') === 'fan').map(item => [`${item.kind}:${item.id}`,
+        [...item.channels].sort((a, b) => a.channel.localeCompare(b.channel))]));
+      assert.deepEqual(ranks(mixed.ranked), ranks(alone.ranked), 'the root\'s per-channel ranks equal its exact read\'s');
+      // An ancestor and its descendant are one group of exact elements, never a subtree.
+      const pair = counting();
+      const nested = await pair.memory.recall(['fan/a', 'fan/a/b'], query, { seedsOnly: true });
+      assert.equal(pair.counts.lexical, 2, 'one group');
+      assert.deepEqual([...new Set(nested.ranked.map(item => item.scope))].sort(), ['fan/a', 'fan/a/b']);
+      // An opaque name containing '/' is its own flat group, and list reads it with any other element.
+      const opaque = counting();
+      const odd = await opaque.memory.recall(['fa', 'fan/odd name'], query, { seedsOnly: true });
+      assert.deepEqual([opaque.counts.lexical, odd.by_scope['fan/odd name'].group, odd.by_scope['fan/odd name'].scope_tree], [4, 'fan/odd name', undefined]);
+      assert.ok((await memory.list(['fa', 'fan/odd name'], {})).items.some(item => item.scope === 'fan/odd name'));
+      // Digests over a set: one store identity, and every record's stored hash.
+      const opted = await memory.recall(['fa', 'fan/a'], { query: 'harbor lantern decision', digests: true });
+      const status = await memory.status('fa');
+      assert.deepEqual(opted.store_identity, status.store);
+      assert.equal(JSON.stringify(opted).split('"store_identity"').length, 2);
+      const hashes = Object.fromEntries((await memory.store.transaction('read', tx => tx.run(`MATCH (r:SMRecord) WHERE r.scope IN ['fa', 'fan/a']
+        RETURN r.scope + ':' + r.record_id AS key, r.hash AS hash`))).records.map(row => [row.get('key'), row.get('hash')]));
+      const records = opted.bundles.flatMap(bundle => bundle.records);
+      assert.ok(records.length > 0 && records.every(row => row.record_digest === hashes[`${row.scope}:${row.id}`]));
+      const seeds = await memory.recall(['fa', 'fan/a'], { query: 'harbor lantern decision', digests: true }, { seedsOnly: true });
+      const seededRecords = seeds.ranked.filter(item => item.kind === 'record');
+      assert.ok(seededRecords.length > 0 && seededRecords.every(item => item.record_digest === hashes[`${item.scope}:${item.id}`]));
     });
 
     await check('list over a set walks the union of its elements exactly once, newest first, with a cursor bound to the set', async () => {
       const set = ['fan/a', 'fa', 'fan2/a'];
-      const all = await walk(memory, set, { limit: 2, relations: true });
+      const faTurn = (await memory.list('fa', { kind: 'turn', limit: 1 })).items[0];
+      const faText = 'The harbor lantern note of fa.';
+      await memory.enrich('fa', { records: [{ id: 'd2', kind: 'decision', text: 'A second fa decision.', attribution: 'fixture',
+        evidence: [{ turn: faTurn.id, entry_id: 'u', start: 0, end: faText.length }] }],
+      relations: [{ id: 'd2-over-d1', type: 'supersedes', from: 'd2', to: 'd1', attribution: 'fixture', evidence: [{ turn: faTurn.id, entry_id: 'u', start: 0, end: faText.length }] }] });
+      const { counts, memory: counted } = counting();
+      const all = await walk(counted, set, { limit: 2, relations: true });
+      assert.equal(counts.listPage, all.length, 'one query per page');
       const items = all.flatMap(page => page.items);
       const singles = [];
       for (const scope of set) singles.push(...(await walk(memory, scope, { limit: 64 })).flatMap(page => page.items));
@@ -393,7 +453,11 @@ export async function runNamespacing(database, scratch = null) {
       const single = await memory.list('fa', { limit: 1 });
       await assert.rejects(memory.list(['fa', 'fb'], { limit: 1, cursor: single.next_cursor }), { code: 'invalid_input' });
       assert.equal(JSON.stringify(await memory.list(['fa'], { limit: 1 })), JSON.stringify(single));
-      assert.ok(all.every(page => page.relations.every(relation => set.includes(relation.scope))));
+      const relations = all.flatMap(page => page.relations);
+      assert.ok(relations.some(relation => relation.id === 'd2-over-d1' && relation.scope === 'fa'));
+      assert.ok(relations.every(relation => set.includes(relation.scope)));
+      const other = await memory.list(['fa', 'fb'], { limit: 2 });
+      await assert.rejects(memory.list(set, { limit: 2, cursor: other.next_cursor }), { code: 'invalid_input' }, 'a cursor of another set');
     });
 
     await check('show units and grouped recall over a set follow each root in its own scope', async () => {

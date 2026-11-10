@@ -105,9 +105,10 @@ export const isScopeSet = target => typeof target === 'object' && target !== nul
 export function authorizeSelection(config, value, operation = 'read') {
   if (!Array.isArray(value)) return authorizeTarget(config, value, operation);
   requireThat(value.length >= 1 && value.length <= SCOPE_SET_MAX, 'invalid_input');
-  value.forEach(scope => text(scope, 256));
+  // for...of visits every index, so a hole in a sparse array is an undefined element and refused like one.
+  for (const scope of value) text(scope, 256);
   requireThat(new Set(value).size === value.length, 'invalid_input');
-  value.forEach(scope => authorize(config, scope, operation));
+  for (const scope of value) authorize(config, scope, operation);
   return value.length === 1 ? value[0] : { scopes: [...value].sort() };
 }
 
@@ -285,7 +286,7 @@ export function fuseGroups(groups) {
     const seen = new Set();
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      // Only subtree hits carry a scope; a record id is unique only within its scope.
+      // Only subtree and set hits carry a scope; a record id is unique only within its scope.
       const key = item.scope === undefined ? `${item.kind}:${item.id}` : JSON.stringify([item.kind, item.id, item.scope]);
       if (seen.has(key)) continue;
       seen.add(key);

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -97,8 +99,76 @@ function twoScopeStore(log, { failing = null } = {}) {
     }),
     getRecord: call('getRecord', (scope, id) => { const row = records[scope]?.find(([key]) => key === id); return row ? record(scope, row) : null; }),
     neighbors: call('neighbors', () => []),
+    lexicalStatus: call('lexicalStatus', () => ({ status: 'ready' })),
+    admittedLexical: call('admittedLexical', () => ({ hits: [], omitted: [], admitted_conversations: 0, exhausted: false })),
+    vectorIndexStatus: call('vectorIndexStatus', () => 'online'),
+    indexedVectors: call('indexedVectors', () => ({ nodes: [], partial: false, unindexed: 0, ran: true })),
   };
 }
+
+// A loopback model endpoint: embeds every text as [1, 0] (or fails), reranks by input order (or fails), and counts requests.
+async function models(t, { failEmbed = false, failRerank = false } = {}) {
+  const requests = { embed: 0, rerank: 0 };
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const part of req) body += part;
+    const input = JSON.parse(body);
+    if (req.url === '/embed') {
+      requests.embed += 1;
+      if (failEmbed) { res.writeHead(503).end(); return; }
+      res.end(JSON.stringify({ model: input.model, data: input.input.map((_, index) => ({ index, embedding: [1, 0] })) }));
+    } else {
+      requests.rerank += 1;
+      if (failRerank) { res.writeHead(503).end(); return; }
+      res.end(JSON.stringify({ results: input.documents.map((_, index) => ({ index, relevance_score: 1 - index / 100 })) }));
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(done => { server.closeAllConnections(); server.close(done); }));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  return { requests, embedding: { url: `${url}/embed`, model: 'fixture', dimensions: 2 }, reranker: { url: `${url}/rerank`, model: 'fixture' } };
+}
+
+test('recallSet and retrieve, called directly, authorize every element before any storage call', async () => {
+  const memory = new Memory(settings(['fa']), untouched());
+  await assert.rejects(memory.recallSet(['fa', 'secret'], { query: 'q' }, { seedsOnly: true }), { code: 'scope_denied' });
+  await assert.rejects(memory.retrieve('secret', {}, async (_name, run) => run(), () => []), { code: 'scope_denied' });
+  await assert.rejects(memory.retrieve({ scopes: ['fa', 'secret'] }, {}, async (_name, run) => run(), () => []), { code: 'scope_denied' });
+  await assert.rejects(memory.retrieve({ scope: 'fa', subtree: true }, {}, async (_name, run) => run(), () => []), { code: 'scope_denied' });
+});
+
+test('a hole in a sparse set is an element like undefined: invalid_input before any storage call', async () => {
+  const memory = new Memory(settings(['fa', 'fb']), untouched());
+  for (const value of [['fa', , ], [, 'fa'], ['fa', undefined]]) {
+    assert.throws(() => authorizeSelection(settings(['fa']), value), { code: 'invalid_input' });
+    await assert.rejects(memory.list(value, {}), { code: 'invalid_input' });
+    await assert.rejects(memory.recall(value, { query: 'q' }), { code: 'invalid_input' });
+  }
+});
+
+test('a set embeds the query once for all its groups; an embedding or rerank failure degrades every element, not the call', async t => {
+  const ok = await models(t);
+  const memory = new Memory({ ...settings(['fa', 'fb']), embedding: ok.embedding }, twoScopeStore([]));
+  const reply = await memory.recall(['fa', 'fb'], { query: 'lantern' });
+  assert.equal(ok.requests.embed, 1);
+  assert.deepEqual([reply.by_scope.fa.channels.record_vector.status, reply.by_scope.fb.channels.record_vector.status], ['ready', 'ready']);
+  const down = await models(t, { failEmbed: true, failRerank: true });
+  const failing = new Memory({ ...settings(['fa', 'fb']), embedding: down.embedding, reranker: down.reranker }, twoScopeStore([]));
+  const degraded = await failing.recall(['fa', 'fb'], { query: 'lantern' });
+  assert.equal(down.requests.embed, 1);
+  for (const scope of ['fa', 'fb']) {
+    assert.deepEqual(degraded.by_scope[scope].channels.chunk_vector, { status: 'unavailable', reason: 'model_request_failed' });
+  }
+  assert.deepEqual([degraded.status, degraded.channels.reranker, degraded.channels.record_vector, degraded.retrieval_complete],
+    ['degraded', { status: 'unavailable', reason: 'model_request_failed' }, { status: 'unavailable' }, false]);
+  assert.ok(degraded.bundles.length > 0, 'lexical hits still reach the caller');
+});
+
+test('ranking only and grouped together are refused for a set as for one scope', async () => {
+  const memory = new Memory(settings(['fa', 'fb']), twoScopeStore([]));
+  await assert.rejects(memory.recall(['fa', 'fb'], { query: 'lantern', group: 'conversation' }, { seedsOnly: true }), { code: 'invalid_input' });
+});
 
 test('a set recall runs each flat element as its own group and reports every element in by_scope', async () => {
   const log = [];
@@ -171,4 +241,6 @@ test('the CLI reads a repeated --scope as a set; one --scope stays one exact sco
   assert.deepEqual(await cli(t, ['status', '--scope', 'fa', '--scope', 'fb'], store), { ok: false, error: 'scope_denied' });
   assert.deepEqual(await cli(t, ['ingest', '--scope', 'fa', '--scope', 'fb'], store), { ok: false, error: 'scope_denied', stage: 'before_write' });
   assert.deepEqual(await cli(t, ['recall', '--scope', 'fa', '--config', 'x'], store), { ok: false, error: 'invalid_arguments' });
+  assert.deepEqual(await cli(t, ['recall', '--scope', 'fa', '--scope', 'fa'], store), { ok: false, error: 'invalid_input' });
+  assert.deepEqual(await cli(t, ['recall', ...['fa', 'fb', 'fc', 'fd', 'fe'].flatMap(scope => ['--scope', scope])], store), { ok: false, error: 'invalid_input' });
 });
