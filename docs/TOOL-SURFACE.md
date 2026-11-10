@@ -2,7 +2,7 @@
 
 **Bottom line:** Source Memory answers five kinds of question, and each has exactly one operation: *store this*, *derive from it*, *get this exact thing*, *find what's relevant*, *enumerate what's there*. Every read is complete or names what it left out. Scopes become hierarchical paths (`org/project/thread`): a content write lands in exactly one scope, a read covers one scope or a whole subtree, and grants are exact or subtree patterns. A flat scope keeps its own indexes and its stored data, so its reads are byte-identical to today's. Memory's only concepts are its own: **scope**, **source turns**, **records** (7 kinds), **relations** (5 types), **evidence** and **time**. Callers map theirs (users, projects, people, tasks) onto those.
 
-Status: r2. r1 (nested scopes, `list`) is built. r2 adds two planned features, designed in [NAMESPACING.md](NAMESPACING.md) and delivered in this order: (A) set reads over up to 4 exact scopes, (B) cross-scope links. The read-only digest fields of NAMESPACING section 6 are built: `digests: true` on `recall`, `show` and `list` adds each record's stored `record_digest` and the reply's `store_identity`, and `status {capabilities: true}` reports them. Until A and B ship, every statement below describes the built surface, and "cross-scope relations do not exist" still holds. Host integration (capture, distillation, context injection, session tools) is not part of this surface; any host calls the operations below.
+Status: r2. r1 (nested scopes, `list`) is built. r2 adds two planned features, designed in [NAMESPACING.md](NAMESPACING.md) and delivered in this order: (A) set reads over up to 4 exact scopes, (B) cross-scope links. The read-only digest fields of NAMESPACING section 6 are built: `digests: true` on `recall`, `show` and `list` adds each record's stored `record_digest` and the reply's `store_identity`, and `status {capabilities: true}` reports them. Set reads (A) are built as NAMESPACING section 1 specifies: `recall`, `list` and `show` (`bundle`, `units`, `following`) also take an array of 2–4 exact scopes (CLI: `--scope` repeated), each granted on its own, and reply with `scopes` and, for recall, `by_scope`. Until B ships, every other statement below describes the built surface, and "cross-scope relations do not exist" still holds. Host integration (capture, distillation, context injection, session tools) is not part of this surface; any host calls the operations below.
 
 ```mermaid
 flowchart LR
@@ -39,16 +39,16 @@ A caller concept that needs state transitions (open/closed, assigned, due) stays
 | Derive knowledge from it | `enrich` | built | one exact scope; evidence and endpoints in that scope |
 | Embed what is not yet embedded | `index` | built | one exact scope (a write without `stage`) |
 | Get this exact thing | `show` (`record`, `turn`, `turn_by_key`) | built | one exact scope; exact or `not_found` |
-| What's connected to this | `show` (`units`, `following`, `bundle`) | built | one exact scope; bounded walk that reports where it stopped |
-| What's relevant to this query | `recall` | built, with subtrees | exact scope or `S/**`; ranked over records/relations **and** chunked turns; reports omissions and incomplete channels |
-| What's there, in order | `list` | built | exact scope or `S/**` |
+| What's connected to this | `show` (`units`, `following`, `bundle`) | built | one exact scope or a set of 2–4 exact scopes; bounded walk that reports where it stopped |
+| What's relevant to this query | `recall` | built, with subtrees and sets | exact scope, `S/**` or a set of 2–4 exact scopes; ranked over records/relations **and** chunked turns; reports omissions and incomplete channels |
+| What's there, in order | `list` | built | exact scope, `S/**` or a set of 2–4 exact scopes |
 | Is the store healthy and the same store | `status` | built, with subtrees | exact scope or `S/**` |
 | Prepare a scope or subtree | `init` | built, with subtrees | exact scope or `S/**` (write grant) |
 | Keep the embedding model resident; warm the database read paths | `warm`; `warm --db v1` | built | exact scope |
 
 `recall`, `show` (every kind) and `list` accept `digests: true` (built): every record object gains `record_digest`, its stored hash or `null`, and the reply gains one top-level `store_identity`, the shape of `status.store` (NAMESPACING section 6; README "Record digests"). `status {capabilities: true}` adds `capabilities`.
 
-Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence`, refuses it `scope_denied` inside `authorize`, before any storage call. The extension transport (`pi-extension/memory-process.mjs`) serves one exact scope and refuses a selector at startup with `scope_unresolved`.
+Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence`, refuses it `scope_denied` inside `authorize`, before any storage call. The extension transport (`pi-extension/memory-process.mjs`) serves one exact scope and refuses a selector at startup with `scope_unresolved`. Only `recall`, `list` and `show` (`bundle`, `units`, `following`) accept a set; every other operation, and every other `show` kind, refuses any array, even of one element, with `scope_denied` before any storage call.
 
 ## Scopes (PR 1)
 

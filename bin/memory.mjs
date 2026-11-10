@@ -12,6 +12,7 @@ const HELP = `source-memory <init|ingest|enrich|index|recall|show|list|status|wa
 
 --config defaults to $SOURCE_MEMORY_CONFIG.
 --scope 'S/**' names the subtree under path scope S for recall, list, status and init; every other command takes one exact scope.
+--scope repeated 2-4 times names a set of exact scopes for recall, list and show (bundle, units, following).
 
 JSON input is read from --input or stdin for ingest/enrich/recall/show.
 index and list accept optional --input only; they never read stdin.
@@ -71,10 +72,15 @@ export async function main(argv = process.argv.slice(2), io = {}) {
   let input = {};
   try {
     requireThat(['init', 'ingest', 'enrich', 'index', 'recall', 'show', 'list', 'status', 'warm'].includes(command), 'unknown_command');
+    const scopes = [];
     for (let i = 0; i < rest.length; i += 2) {
-      requireThat(['--config', '--scope', '--input', '--diagnostic-phases', '--db'].includes(rest[i]) && rest[i + 1] && !options[rest[i]], 'invalid_arguments');
+      requireThat(['--config', '--scope', '--input', '--diagnostic-phases', '--db'].includes(rest[i]) && rest[i + 1]
+        && (rest[i] === '--scope' || !options[rest[i]]), 'invalid_arguments');
+      if (rest[i] === '--scope') scopes.push(rest[i + 1]);
       options[rest[i]] = rest[i + 1];
     }
+    // A repeated --scope names a set of exact scopes, which recall, list and show (bundle, units, following) read.
+    if (scopes.length > 1) options['--scope'] = scopes;
     requireThat(options['--diagnostic-phases'] === undefined || (command === 'recall' && options['--diagnostic-phases'] === 'v1'), 'invalid_arguments');
     const configPath = options['--config'] ?? process.env.SOURCE_MEMORY_CONFIG;
     requireThat(configPath && options['--scope'], 'config_and_scope_required');

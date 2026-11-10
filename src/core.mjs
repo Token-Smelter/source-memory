@@ -75,8 +75,9 @@ const grantsFor = (config, operation) => {
   return config.scopes[operation];
 };
 
-/** One exact scope. A subtree selector is never an exact scope, so it can never be written. */
+/** One exact scope. A subtree selector is never an exact scope, so it can never be written; a set is never one scope. */
 export function authorize(config, scope, operation = 'read') {
+  requireThat(!Array.isArray(scope), 'scope_denied');
   text(scope, 256);
   requireThat(!isSelector(scope) && covered(grantsFor(config, operation), scope, true), 'scope_denied');
   return scope;
@@ -91,6 +92,24 @@ export function authorizeTarget(config, value, operation = 'read') {
   if (root === null) return authorize(config, value, operation);
   requireThat(covered(grantsFor(config, operation), root, false), 'scope_denied');
   return { scope: root, subtree: true };
+}
+
+export const SCOPE_SET_MAX = 4;
+export const isScopeSet = target => typeof target === 'object' && target !== null && Array.isArray(target.scopes);
+
+/**
+ * A read selection: an exact scope or subtree as authorizeTarget gives it, or for an array of exact scopes a closed set
+ * {scopes} in UTF-16 code-unit order. Every element needs its own read grant, so exact grants never add up to anything
+ * open; one refused element refuses the whole read. A one-element array is that exact scope.
+ */
+export function authorizeSelection(config, value, operation = 'read') {
+  if (!Array.isArray(value)) return authorizeTarget(config, value, operation);
+  requireThat(value.length >= 1 && value.length <= SCOPE_SET_MAX, 'invalid_input');
+  // for...of visits every index, so a hole in a sparse array is an undefined element and refused like one.
+  for (const scope of value) text(scope, 256);
+  requireThat(new Set(value).size === value.length, 'invalid_input');
+  for (const scope of value) authorize(config, scope, operation);
+  return value.length === 1 ? value[0] : { scopes: [...value].sort() };
 }
 
 export const targetName = target => typeof target === 'string' ? target : `${target.scope}/**`;
@@ -255,13 +274,19 @@ export function cosine(a, b) {
   return dot / Math.sqrt(aa * bb);
 }
 
-export function fuse(channels) {
+export const fuse = channels => fuseGroups([channels]);
+
+/**
+ * Reciprocal-rank fusion over channels run separately per index group: an item's rank in a channel is its rank in its own
+ * group's result, and every item of a set read carries the scope that puts it in exactly one group.
+ */
+export function fuseGroups(groups) {
   const hits = new Map();
-  for (const [channel, items] of Object.entries(channels)) {
+  for (const [channel, items] of groups.flatMap(channels => Object.entries(channels))) {
     const seen = new Set();
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      // Only subtree hits carry a scope; a record id is unique only within its scope.
+      // Only subtree and set hits carry a scope; a record id is unique only within its scope.
       const key = item.scope === undefined ? `${item.kind}:${item.id}` : JSON.stringify([item.kind, item.id, item.scope]);
       if (seen.has(key)) continue;
       seen.add(key);

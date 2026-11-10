@@ -1,7 +1,7 @@
 import neo4j from 'neo4j-driver';
 import { passthrough } from './phase-diagnostic.mjs';
 import {
-  digest, identity, indexNames, integer, isNested, markStage, MemoryError, namespace, OUTCOME_REFERENT_KINDS, requireThat, scopePath, scopeTerm,
+  digest, identity, indexNames, integer, isNested, isScopeSet, markStage, MemoryError, namespace, OUTCOME_REFERENT_KINDS, requireThat, scopePath, scopeTerm,
   scopeTerms, sourceExcerpt, lexicalQuery, treeLayout,
 } from './core.mjs';
 
@@ -43,11 +43,12 @@ const LIST_EPOCH = '0001-01-01T00:00:00Z';
  * rule: a path equal to the root or starting with `root/`, so a non-path name such as `S/a b` is never a member.
  */
 export function selection(target) {
+  if (isScopeSet(target)) return setSelection(target.scopes);
   const subtree = typeof target === 'object' && target !== null && target.subtree === true;
   const scope = subtree ? target.scope : target;
   if (!subtree && !isNested(scope)) {
     const ns = namespace(scope);
-    return { scope, subtree: false, tree: false, names: indexNames(scope), labels: { turn: `${ns}Turn`, chunk: `${ns}Chunk`, record: `${ns}Record` },
+    return { scope, subtree: false, named: false, tree: false, names: indexNames(scope), labels: { turn: `${ns}Turn`, chunk: `${ns}Chunk`, record: `${ns}Record` },
       params: { scope }, where: n => `${n}.scope=$scope`, owns: value => value === scope, lucene: query => query };
   }
   requireThat(scopePath(scope) !== null, 'scope_denied');
@@ -55,7 +56,7 @@ export function selection(target) {
   const path = scopePath(scope);
   const depth = path.length;
   const layout = treeLayout(path[0]);
-  return { scope, subtree, tree: true, names: layout.indexes, labels: layout.labels,
+  return { scope, subtree, named: subtree, tree: true, names: layout.indexes, labels: layout.labels,
     members: { turn: `SMTurn:${layout.labels.turn}`, chunk: `SMChunk:${layout.labels.chunk}`, record: `SMRecord:${layout.labels.record}` },
     params: subtree ? { scope, scopePrefix: `${scope}/`, scopeRegex: depth < 8 ? `${scope}(/[A-Za-z0-9_-]{1,64}){1,${8 - depth}}` : '(?!)' } : { scope },
     where: subtree ? n => `(${n}.scope=$scope OR (${n}.scope STARTS WITH $scopePrefix AND size(${n}.scope) <= 256 AND ${n}.scope =~ $scopeRegex))`
@@ -63,6 +64,24 @@ export function selection(target) {
     owns: subtree ? value => value === scope || (typeof value === 'string' && value.startsWith(`${scope}/`) && scopePath(value) !== null)
       : value => value === scope,
     lucene: query => `text:(${query}) AND scope_terms:${term}^0` };
+}
+
+/**
+ * A closed set of exact scopes, selected by `n.scope IN $scopes`. Nested scopes under one root share that root's tree
+ * indexes, filtered by their exact terms inside Lucene with boost 0, so each keeps the score an exact read of it gives;
+ * any other set has no shared index and serves `list` only. Items of a set read always name their scope.
+ */
+function setSelection(scopes) {
+  const paths = scopes.map(scopePath);
+  const roots = new Set(paths.map(path => (path?.length ?? 0) >= 2 ? path[0] : null));
+  const base = { scope: null, scopes, subtree: false, named: true, params: { scopes }, where: n => `${n}.scope IN $scopes`,
+    owns: value => scopes.includes(value) };
+  if (roots.size !== 1 || roots.has(null)) return { ...base, tree: false };
+  const layout = treeLayout([...roots][0]);
+  const terms = scopes.map(scope => scopeTerm(scope, true)).join(' OR ');
+  return { ...base, tree: true, names: layout.indexes, labels: layout.labels,
+    members: { turn: `SMTurn:${layout.labels.turn}`, chunk: `SMChunk:${layout.labels.chunk}`, record: `SMRecord:${layout.labels.record}` },
+    lucene: query => `text:(${query}) AND scope_terms:(${terms})^0` };
 }
 
 /**
@@ -242,6 +261,20 @@ export class Neo4jStore {
       for (const [kind, base] of [['turn', 'SMTurn'], ['chunk', 'SMChunk'], ['record', 'SMRecord']]) {
         const result = await tx.run(`MATCH (n:${base}) WHERE ${sel.where('n')} AND NOT n:${sel.labels[kind]} RETURN count(n) AS count`, sel.params);
         counts[kind] = result.records[0].get('count');
+      }
+      return counts;
+    });
+  }
+
+  /** treePending of a set's tree group, counted per element in one read, so each element reports only its own nodes. */
+  async treePendingByScope(target) {
+    const sel = selection(target);
+    requireThat(sel.tree && sel.scopes, 'invalid_input');
+    return this.transaction('read', async tx => {
+      const counts = Object.fromEntries(sel.scopes.map(scope => [scope, { turn: 0, chunk: 0, record: 0 }]));
+      for (const [kind, base] of [['turn', 'SMTurn'], ['chunk', 'SMChunk'], ['record', 'SMRecord']]) {
+        const result = await tx.run(`MATCH (n:${base}) WHERE ${sel.where('n')} AND NOT n:${sel.labels[kind]} RETURN n.scope AS scope, count(n) AS count`, sel.params);
+        for (const row of result.records) counts[row.get('scope')][kind] = row.get('count');
       }
       return counts;
     });
@@ -466,7 +499,7 @@ export class Neo4jStore {
       return result.records.map(row => {
         const node = unwrap(row.get('node'));
         requireThat(sel.owns(node.scope), 'index_scope_mismatch');
-        return { kind, id: kind === 'turn' ? node.uid : node.record_id, text: node.text, ...(sel.subtree ? { scope: node.scope } : {}),
+        return { kind, id: kind === 'turn' ? node.uid : node.record_id, text: node.text, ...(sel.named ? { scope: node.scope } : {}),
           ...(digests && kind === 'record' ? { record_digest: recordDigest(node) } : {}) };
       });
     });
@@ -501,7 +534,7 @@ export class Neo4jStore {
         // An inexact legacy entry join must not discard an otherwise valid lexical hit.
         const role = entries.length === 1 ? node.role ?? entries[0].role : 'unknown';
         const legacy = parent.source == null || parent.conversation_id == null;
-        return { kind: 'turn', id: parent.uid, text: node.text, ...(sel.subtree ? { scope: parent.scope } : {}),
+        return { kind: 'turn', id: parent.uid, text: node.text, ...(sel.named ? { scope: parent.scope } : {}),
           match: { turn: parent.uid, entry_id: node.entry_id, start: node.start, end: node.end, role },
           conversation: { scope: parent.scope, source: parent.source ?? body.source, conversation_id: parent.conversation_id ?? body.conversation_id,
             ...(legacy ? { legacy: true } : {}) } };
@@ -592,7 +625,7 @@ export class Neo4jStore {
           contexts.set(token, { key, ...(old || contexts.get(token)?.legacy ? { legacy: true } : {}) });
         }
         const conversations = [...contexts.values()];
-        const own = sel.subtree ? { scope: node.scope } : {};
+        const own = sel.named ? { scope: node.scope } : {};
         if (kind !== 'chunk') return { kind, id: kind === 'turn' ? node.uid : node.record_id, text: node.text, ...own, conversations };
         const parent = parents[0];
         const entries = JSON.parse(parent.body).entries.filter(entry => entry.id === node.entry_id);
@@ -600,8 +633,8 @@ export class Neo4jStore {
         return { kind: 'turn', id: parent.uid, text: node.text, ...own,
           match: { turn: parent.uid, entry_id: node.entry_id, start: node.start, end: node.end, role }, conversations };
       });
-      // Omitted seeds name their scope only in a subtree read, where a record id alone is ambiguous.
-      const omitted = (row?.get('omitted') ?? []).map(({ scope: owner, ...seed }) => sel.subtree ? { ...seed, scope: owner } : seed);
+      // Omitted seeds name their scope only in a subtree or set read, where a record id alone is ambiguous.
+      const omitted = (row?.get('omitted') ?? []).map(({ scope: owner, ...seed }) => sel.named ? { ...seed, scope: owner } : seed);
       return { hits, omitted, exhausted: row?.get('exhausted') ?? false,
         admitted_conversations: new Set(hits.flatMap(hit => hit.conversations.map(context => JSON.stringify(context.key)))).size,
         ...(withRawCount ? { raw_count: row?.get('raw_count') ?? 0, considered: row?.get('considered') ?? 0 } : {}) };
