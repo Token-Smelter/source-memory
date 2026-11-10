@@ -2,7 +2,7 @@
 
 **Bottom line:** Source Memory answers five kinds of question, and each has exactly one operation: *store this*, *derive from it*, *get this exact thing*, *find what's relevant*, *enumerate what's there*. Every read is complete or names what it left out. Scopes become hierarchical paths (`org/project/thread`): a content write lands in exactly one scope, a read covers one scope or a whole subtree, and grants are exact or subtree patterns. A flat scope keeps its own indexes and its stored data, so its reads are byte-identical to today's. Memory's only concepts are its own: **scope**, **source turns**, **records** (7 kinds), **relations** (5 types), **evidence** and **time**. Callers map theirs (users, projects, people, tasks) onto those.
 
-Status: r2. r1 (nested scopes, `list`) is built. r2 adds two planned features, designed in [NAMESPACING.md](NAMESPACING.md) and delivered in this order: (A) set reads over up to 4 exact scopes, (B) cross-scope links. Until they ship, every statement below describes the built surface, and "cross-scope relations do not exist" still holds. Host integration (capture, distillation, context injection, session tools) is not part of this surface; any host calls the operations below.
+Status: r2. r1 (nested scopes, `list`) is built. r2 adds two planned features, designed in [NAMESPACING.md](NAMESPACING.md) and delivered in this order: (A) set reads over up to 4 exact scopes, (B) cross-scope links. The read-only digest fields of NAMESPACING section 6 are built: `digests: true` on `recall`, `show` and `list` adds each record's stored `record_digest` and the reply's `store_identity`, and `status {capabilities: true}` reports them. Until A and B ship, every statement below describes the built surface, and "cross-scope relations do not exist" still holds. Host integration (capture, distillation, context injection, session tools) is not part of this surface; any host calls the operations below.
 
 ```mermaid
 flowchart LR
@@ -154,7 +154,7 @@ None added by PR 1: selectors refused where they are not accepted reuse `scope_d
 
 ## `list`
 
-`list {kind?, status?, source?, conversation_id?, limit?, max_bytes?, cursor?, relations?}` over an exact scope or `S/**` → `{kind:"list", scope, order:"stored_desc", items, next_cursor}`, plus `relations`, `relations_truncated` and `relations_total` with `relations: true`; `next_cursor: null` means the walk is complete.
+`list {kind?, status?, source?, conversation_id?, limit?, max_bytes?, cursor?, relations?, digests?}` over an exact scope or `S/**` → `{kind:"list", scope, order:"stored_desc", items, next_cursor}`, plus `relations`, `relations_truncated` and `relations_total` with `relations: true`; `next_cursor: null` means the walk is complete.
 
 | Rule | Definition |
 |---|---|

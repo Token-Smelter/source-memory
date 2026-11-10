@@ -41,12 +41,12 @@ function canonicalSnapshot(snapshot, scope) {
   return canonical(value);
 }
 
-/** The base commit's src/, freshly extracted under the git-ignored .memory-local so it resolves this checkout's node_modules. */
-async function baseMemoryClass() {
+/** A commit's src/, freshly extracted under the git-ignored .memory-local so it resolves this checkout's node_modules. */
+export async function baseMemoryClass(commit = BASE_COMMIT) {
   const root = fileURLToPath(new URL('..', import.meta.url));
   await mkdir(join(root, '.memory-local'), { recursive: true, mode: 0o700 });
   const dir = await mkdtemp(join(root, '.memory-local', 'base-'));
-  await exec('git', ['-C', root, 'archive', '--format=tar', '-o', join(dir, 'src.tar'), BASE_COMMIT, 'src'], { timeout: 30000 });
+  await exec('git', ['-C', root, 'archive', '--format=tar', '-o', join(dir, 'src.tar'), commit, 'src'], { timeout: 30000 });
   await exec('tar', ['-xf', join(dir, 'src.tar'), '-C', dir], { timeout: 30000 });
   return (await import(pathToFileURL(join(dir, 'src', 'memory.mjs')).href)).Memory;
 }
