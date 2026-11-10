@@ -102,7 +102,7 @@ There is one query per page, regardless of roots. `list` selects by `n.scope` an
 | `bundle` | `seed` must carry `scope`, an element of the set. Expansion follows relations whose own scope is in the set (section 2, "Reads") |
 | `units` | Each `unit.key.scope` must be an element. Today it must equal the one scope, and `scope_denied` stays the refusal code. Each unit is bundled in its own scope |
 | `following` | Takes `scope`, an element. The walk follows parent links inside that one scope, because lineage never crosses scopes. The set adds nothing to the walk itself. It lets a host make one call per unit regardless of scope |
-| `follow` inside `units` and grouped recall | The roots a unit follows are its bundles' source turns and evidence turns. Each root is walked in the scope of the span that names it, not in `unit.key.scope` (today `followingForBundles` walks every root in the unit's scope, `src/memory.mjs:283-290`). With PR B a visible far record's evidence is in the far scope. A `following` entry, an evidence span and an `also_cites` key carry their own `scope`. `following` entries and evidence spans add a `scope` field only when it differs from the bundle's scope, so single-scope bytes are unchanged |
+| `follow` inside `units` and grouped recall | The roots a unit follows are its bundles' source turns and evidence turns. Each root is walked in the scope of the span that names it, not in `unit.key.scope` (today `followingForBundles` walks every root in the unit's scope, `src/memory.mjs:283-290`). With PR B a visible far record's evidence is in the far scope. A `following` entry, an evidence span and an `also_cites` key carry their own `scope`. A `following` entry adds a `scope` field only when it differs from the unit key's scope, and an evidence span only when it differs from the bundle's scope, so single-scope bytes are unchanged |
 
 ### Single-scope reads stay byte-identical
 
@@ -134,9 +134,9 @@ sequenceDiagram
 | one spelling | A same-scope relation keeps `to` as a string. `to.scope` equal to the written scope is `invalid_relation`. A relation's far endpoint cannot be another record of the same call: payload records are in the written scope, and the far record must already exist |
 | identity keys | Endpoints are keyed by `(scope, id)` everywhere: the enrich endpoint map, the outcome kind checks and bundle maps (by uid). A payload record whose id equals a far `to.id` is a different record and never satisfies the far lookup. `self_relation` stays `from === to` for a string `to`. With an object `to` it cannot occur, because `to.scope` differs from the written scope |
 | authority | The writer needs WRITE on the written scope (the existing `authorize`) and READ on every far scope (`authorize(config, to.scope, 'read')`). Both are checked in `beforeWrite`, before the transaction, against the same configuration object. A missing read grant, or a selector as `to.scope`, is refused `cross_scope_denied` |
-| id uniqueness | Inside the write transaction, before its first `MERGE` (†), the relation uid is looked up under the other label (`SMLink` for a same-scope relation, `SMRelation` for a link). A hit is `relation_identity_conflict`: one id names one relation per written scope, whatever its form. PR B takes the `from` record's write lock before this check, so two concurrent first writes of one id in two forms serialize, and a concurrency test confirms the lock leaves the record's stored bytes unchanged |
+| id uniqueness | Inside the write transaction, after the record `MERGE`s and immediately before each relation's own `MERGE`, the relation uid is looked up under the other label (`SMLink` for a same-scope relation, `SMRelation` for a link). A hit is `relation_identity_conflict`, `rolled_back`, at a site that is not †: one id names one relation per written scope, whatever its form. At that point the `from` record has been created by this transaction or explicitly write-locked by it, so two concurrent first writes of one id in two forms serialize on it. A concurrency test confirms the serialization and that the lock leaves the record's stored bytes unchanged |
 | existence | Inside the write transaction, before its first `MERGE`, the far record is matched by uid: `MATCH (r:SMRecord {uid: identity('record', to.scope, to.id), scope: to.scope})`. If it is absent the call is refused `relation_endpoint_unavailable`, the existing code, because the writer may read the far scope. Records are never deleted, so the check cannot go stale after commit |
-| kind checks | `invalid_outcome_relation` uses the far record's kind. The stored-referent lookup for `outcome_referent_required` resolves an `outcome_of` target by `e.to_uid` in `coalesce(e.to_scope, $scope)` instead of `$scope`. Both stay † (before the first `MERGE`) |
+| kind checks | `invalid_outcome_relation` uses the far record's kind. The stored-referent lookup for `outcome_referent_required` matches `outcome_of` relations under `SMRelation` or `SMLink` and resolves the target by `e.to_uid` in `coalesce(e.to_scope, $scope)` instead of `$scope`. Both stay † (before the first `MERGE`) |
 | no existence oracle | The read-grant check runs before any storage call. A writer without read on the far scope gets `cross_scope_denied` whether or not the far record exists, so it cannot probe the far scope |
 | link proposals | `src/link-proposals.mjs` proposes links only among records it was offered, all in one scope. Whether to link across scopes is the caller's decision |
 
@@ -158,11 +158,11 @@ In this document "relation" covers both labels and "link" means a cross-scope re
 | Build without PR B, on a store with links | Behaviour |
 |---|---|
 | reads of any scope | links are invisible, because no query matches `SMLink`. Nothing leaks, but a bundle or `list` page omits them without reporting it |
-| `status` | `relations` excludes links. A PR B build adds `cross_scope_relations: n` only when n > 0 |
+| `status` | `relations` excludes links. A PR B build adds `links: n` only when n > 0 |
 | enrich replay of an outcome whose only `outcome_of` is a link | refused `outcome_referent_required`, `rolled_back` (fail closed) |
 | `export-scope` of the written scope | exports the link's `SM_FROM` edge but not the link node, so `restore-scope` refuses the snapshot (`snapshot_invalid`). The far scope's snapshot is unchanged. These tools stay single-scope and flat-only, as for tree-labelled data |
 
-Rollout guidance follows from that: upgrade every reader before relying on links being reported. A mixed fleet is safe but incomplete.
+Rollout guidance follows from that. Upgrade every writer of a scope before writing links into it: a pre-PR-B writer runs no cross-label check and could create an `SMRelation` with a link's id. Readers may lag. They leak nothing, but until they are upgraded they omit links without reporting it.
 
 ### Record contract: stays `source-memory.record/1`
 
@@ -182,7 +182,7 @@ Pins in `test/qualification.test.mjs`: (1) the version-1 record and relation pin
 |---|---|
 | same written scope, id and normalized body | replay: `ok:true`, one relation, no new edge |
 | same id, different `to_scope` | `relation_identity_conflict` after the `MERGE`, `rolled_back` (unchanged rule: same id, other bytes) |
-| same id, same-scope versus cross-scope | `relation_identity_conflict` from the † cross-label check, `rolled_back` |
+| same id, same-scope versus cross-scope | `relation_identity_conflict` from the cross-label check, `rolled_back` |
 | replay after the writer lost read on the far scope | `cross_scope_denied`, `before_write`, even though the link is stored. Authority is checked for each call |
 | settling an unknown outcome | `list` with `relations` on the written scope shows the link (its id, type, `from`, attribution, evidence and `stored_at`) with the far end hidden when the far scope is not selected. That proves presence. Comparing the full body, `to_scope` included, needs a read whose selection includes the far scope (a set) |
 | replay after a driver retry | as today: a refusal on a later attempt is `stage:unknown` |
@@ -193,7 +193,7 @@ Pins in `test/qualification.test.mjs`: (1) the version-1 record and relation pin
 
 | Read | Rule |
 |---|---|
-| exact read (flat or nested) | Today's `neighbors` query (relations stored in the scope, by `from_uid`/`to_uid`) is extended to match `SMRelation` or `SMLink`, with the same order and limit. Endpoints are resolved by stored uid, never re-derived from id plus the bundle's scope, so a same-id record in the written scope is never joined by mistake. With no links, the query returns exactly today's rows |
+| exact read (flat or nested) | Today's `neighbors` query (relations stored in the scope, by `from_uid`/`to_uid`) is extended to match `SMRelation` or `SMLink`, written as a `UNION ALL` of two label-anchored `MATCH`es (as tree `status` does, `src/store.mjs:815-818`), with the same order and limit. Endpoints are resolved by stored uid, never re-derived from id plus the bundle's scope, so a same-id record in the written scope is never joined by mistake. With no links, the query returns exactly today's rows |
 | subtree or set | Expansion matches relations whose own scope is in the selection (`selection.where(e)` over the `SMRelation(scope)` and `SMLink(scope)` range indexes), with `from_uid` or `to_uid` in the frontier. That covers outgoing links and incoming links from other selected scopes. Order: `supersedes` first, then `e.uid`, as today. The far record is read in its own scope, and its evidence in its own scope |
 | bundle output | Records keep `scope`. A relation carries `scope` only when it differs from the bundle's scope, and `to_scope` (from its body) only when its far end is selected. A link with a hidden far end is included as an edge with `to: null, to_hidden: true`. It adds the gap `cross_scope_hidden` and sets `relationship_context_complete:false`, and expansion does not continue past it |
 | `list` with `relations` | A relation is listed when its own scope is in the selection and an endpoint is a page record (today's `e.scope = r.scope` becomes `selection.where(e)`, which is the same predicate for an exact scope). A link item adds `to_scope` when the far end is selected, and `to: null, to_hidden: true` otherwise. Every listed link counts in `relations_total` and in the caps as today |
@@ -211,7 +211,7 @@ On data without links, the subtree expansion selects the same relations in the s
 | `invalid_relation` | pre-commit-only | `to.scope` equal to the written scope |
 | `relation_endpoint_unavailable` | in-transaction-rolled-back † | the far record lookup, inside the existing endpoint loop before the first `MERGE` |
 | `invalid_outcome_relation`, `outcome_referent_required` | in-transaction-rolled-back † | unchanged codes, with far-aware lookups |
-| `relation_identity_conflict` | in-transaction-rolled-back | unchanged after the relation `MERGE`; new † site: the cross-label uid check before the first `MERGE` |
+| `relation_identity_conflict` | in-transaction-rolled-back | unchanged after the relation `MERGE`. New site, also not †: the cross-label uid check just before each relation's `MERGE` |
 
 Q-SM-3 adds `cross_scope_denied` to its exercised codes (the run fails if a listed code goes unexercised), plus a far-endpoint `relation_endpoint_unavailable` case. The source-order pin keeps every † check before the first `MERGE` in `Neo4jStore.enrich`. PR A adds no codes.
 
@@ -317,7 +317,7 @@ flowchart TD
 
 ### Leak tests for the hide rule (PR B)
 
-Fixture: scopes A (writer), B (far), C (unrelated), a nested pair under one root, and a link A → B. Canaries come in two sets. **B-canaries** are B's record text, id and uid, B's scope name and the link's `to_uid`. **A-canaries** are the link's id, type marker, evidence text and `from` id.
+Fixture: scopes A (writer), B (far), C (unrelated), a nested pair under one root, and a link A → B. Canaries come in two sets. **B-canaries** are B's record text, id and uid, B's scope name and the link's `to_uid`. **A-canaries** are strings unique to the link: its id and the text of an evidence span that only the link cites.
 
 | Reader selection | Expected |
 |---|---|
