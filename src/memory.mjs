@@ -1,5 +1,5 @@
 import {
-  authorize, authorizeSelection, authorizeTarget, chunkEntries, cosine, fuse, fuseGroups, identity, isNested, isScopeSet, scopePath, SCOPE_SET_MAX, integer, markStage, MemoryError,
+  authorize, authorizeSelection, authorizeTarget, chunkEntries, farEndpoint, granted, cosine, fuse, fuseGroups, identity, isNested, isScopeSet, scopePath, SCOPE_SET_MAX, integer, markStage, MemoryError,
   digest, normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, RECORD_KINDS, RECORD_STATUSES, requireThat, sourceExcerpt, text,
 } from './core.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
@@ -53,12 +53,27 @@ export class Memory {
     return { ...result, indexing: await this.indexAfterWrite(scope) };
   }
 
+  /**
+   * A relation may name its earlier record in another scope as `to: {scope, id, expected_digest?}`. It is still written to
+   * this scope only, and needs read on the far scope, checked here against the same configuration before any storage call,
+   * so a writer without it learns nothing about the far scope. The far record's existence, kind and digest are checked in
+   * the write transaction.
+   */
   async enrich(scope, input) {
-    const payload = beforeWrite(() => {
+    const { payload, expected } = beforeWrite(() => {
       authorize(this.config, scope, 'write');
-      return normalizeEnrichment(input);
+      const payload = normalizeEnrichment(input);
+      const expected = {};
+      for (const [index, edge] of payload.relations.entries()) {
+        if (edge.to_scope === undefined) continue;
+        requireThat(edge.to_scope !== scope, 'invalid_relation');
+        requireThat(granted(this.config, edge.to_scope, 'read'), 'cross_scope_denied');
+        const precondition = farEndpoint(input.relations[index].to).expected_digest;
+        if (precondition !== undefined) expected[edge.id] = precondition;
+      }
+      return { payload, expected };
     });
-    const result = await this.store.enrich(scope, payload);
+    const result = await this.store.enrich(scope, payload, ...(Object.keys(expected).length ? [{ expected }] : []));
     return { ...result, indexing: await this.indexAfterWrite(scope) };
   }
 
@@ -115,7 +130,7 @@ export class Memory {
       reranker: { configured: Boolean(this.config.reranker) },
       vector_indexes: Object.fromEntries(catalog.map(entry => [entry.kind, entry.vector_index])),
       ...(Object.keys(errors).length ? { vector_index_errors: errors } : {}),
-      ...(input?.capabilities === true ? { capabilities: CAPABILITIES } : {}) };
+      ...(input?.capabilities === true ? { capabilities: { ...CAPABILITIES, link_uid_lock: await this.store.linkUidLock() } } : {}) };
   }
 
   // A record digest is meaningful only for this store and record contract, so an opted-in read names both.
@@ -362,7 +377,7 @@ export class Memory {
         const found = seed.kind === 'turn' ? await this.store.getTurn(home, seed.id) : await this.store.getRecord(home, seed.id);
         if (!found) { missing.push(seed); continue; }
         seeds.push(await this.bundle(home, { ...seed, ...(scopes ? { scope: home } : {}), score: null, channels: [] }, '', maxNodes, maxHops,
-          ...bundleFlags(digests)));
+          ...(scopes ? [null, passthrough, digests, { scopes }] : bundleFlags(digests))));
       }
       units.push({ key: request.key, seeds, missing,
         ...(follow ? { following: await this.followingForBundles(home, seeds, follow, cache) } : {}) });
@@ -384,7 +399,7 @@ export class Memory {
     if (seed.kind === 'turn') requireThat(await this.store.getTurn(scope, id), 'not_found');
     else requireThat(await this.store.getRecord(scope, id), 'not_found');
     const bundle = await this.bundle(scope, { kind: seed.kind, id, ...(scopes ? { scope } : {}), score: null, channels: [] }, '', maxNodes, maxHops,
-      ...bundleFlags(digests));
+      ...(scopes ? [null, passthrough, digests, { scopes }] : bundleFlags(digests)));
     return { kind: 'bundle', bundle };
   }
 
@@ -426,7 +441,8 @@ export class Memory {
         ...(digests ? { store_identity: await this.storeIdentity() } : {}) };
     }
 
-    const { bundles, budgetOmitted, groupedOutput } = await this.renderSeeds(scope, ranked, channels, omitted, options, trace);
+    const { bundles, budgetOmitted, groupedOutput } = await this.renderSeeds(scope, ranked, channels, omitted, options, trace,
+      typeof target === 'string' ? null : target);
     const unavailable = Object.values(availability).some(row => row.status === 'unavailable');
     return {
       scope, query: options.query,
@@ -493,7 +509,7 @@ export class Memory {
 
     const merged = Object.fromEntries(Object.keys(CHANNEL_KINDS).map(name => [name, results.flatMap(row => row.channels[name])]));
     const { bundles, budgetOmitted, groupedOutput } = await this.renderSeeds(scopes, ranked, merged, results.flatMap(row => row.omitted),
-      options, trace);
+      options, trace, { scopes });
     const unavailable = elementStates.some(row => row.status === 'unavailable');
     return {
       scopes, query: options.query,
@@ -642,11 +658,12 @@ export class Memory {
   }
 
   // Bundles of the ranked seeds within the byte budget, or grouped conversation units. A seed without a scope is in `scope`.
-  async renderSeeds(scope, ranked, channels, omitted, options, trace) {
+  // `selection` is the subtree or set the read covers, for following relations across it; null for one exact scope.
+  async renderSeeds(scope, ranked, channels, omitted, options, trace, selection = null) {
     const { query, limit, maxChars, maxNodes, maxHops, follow, digests } = options;
     if (options.grouped) {
       const result = await this.conversationUnits(scope, ranked, channels, omitted, query, limit, maxChars, maxNodes, maxHops, follow, trace,
-        ...flag(digests));
+        ...(selection ? [digests, selection] : flag(digests)));
       return { bundles: result.units.flatMap(unit => unit.seeds), budgetOmitted: result.budget_omitted,
         groupedOutput: { units: result.units, pool_truncated: result.pool_truncated, budget_unit: 'utf8_bytes' } };
     }
@@ -655,7 +672,8 @@ export class Memory {
     let budgetOmitted = 0;
     for (const [index, seed] of ranked.slice(0, limit).entries()) {
       const label = `bundle.${index}`;
-      const bundle = await trace(label, () => this.bundle(seed.scope ?? scope, seed, query, maxNodes, maxHops, null, scoped(trace, label), ...flag(digests)));
+      const bundle = await trace(label, () => this.bundle(seed.scope ?? scope, seed, query, maxNodes, maxHops, null, scoped(trace, label),
+        ...(selection ? [digests, selection] : flag(digests))));
       const size = JSON.stringify(bundle).length;
       if (chars + size > maxChars) { budgetOmitted += 1; continue; }
       bundles.push(bundle);
@@ -666,7 +684,7 @@ export class Memory {
 
   // In a subtree read every seed names its own scope, and so does the unit key it is packaged under.
   async conversationUnits(scope, ranked, channels, omitted, query, limit, maxBytes, maxNodes, maxHops, follow = null, trace = passthrough,
-    digests = false) {
+    digests = false, selection = null) {
     authorizeSelection(this.config, scope);
     const reads = new Map();
     const priority = new Map();
@@ -706,11 +724,12 @@ export class Memory {
       for (const candidate of unit.candidates) {
         const label = `bundle.${ordinal++}`;
         const bundle = await trace(label, () => this.bundle(candidate.scope ?? scope, candidate, query, maxNodes, maxHops, reads, scoped(trace, label),
-          ...flag(digests)));
+          ...(selection ? [digests, selection] : flag(digests))));
         seeds.push(bundle);
         const evidence = [bundle.source, ...[...bundle.records, ...bundle.relations].flatMap(row => row.supporting_evidence)].filter(Boolean);
         for (const span of evidence) {
-          const key = { scope: unit.key.scope, source: span.source, conversation_id: span.conversation_id };
+          // A span names its scope when it is not the bundle's: a far record's evidence is in the far scope.
+          const key = { scope: span.scope ?? bundle.scope ?? unit.key.scope, source: span.source, conversation_id: span.conversation_id };
           if (conversationToken(key) !== conversationToken(unit.key)) unit.also.set(conversationToken(key), key);
         }
       }
@@ -726,54 +745,74 @@ export class Memory {
     return { units, pool_truncated: Math.max(0, pool.size - limit), budget_omitted: budgetOmitted };
   }
 
-  // `digests` adds each record's stored digest; the reads cache is per request, so one value of it per cache.
-  async bundle(scope, seed, query, maxNodes, maxHops, reads = null, trace = passthrough, digests = false) {
+  // `digests` adds each record's stored digest; the reads cache is per request, so one value of it per cache. `selection`
+  // is what the read covers when it is more than this scope (a subtree or a set): relations whose own scope is in it are
+  // followed, and a link's far end outside it is an opaque omission (`to: null, to_hidden: true`, gap `cross_scope_hidden`)
+  // past which expansion does not continue. A record or span of another scope than the bundle's names its scope.
+  async bundle(scope, seed, query, maxNodes, maxHops, reads = null, trace = passthrough, digests = false, selection = null) {
     const options = digestArgs(digests);
     authorize(this.config, scope);
+    const wide = selection !== null && selection !== scope;
+    if (wide) authorizeSelection(this.config, isScopeSet(selection) ? selection.scopes : selection.subtree ? `${selection.scope}/**` : selection);
+    // Records and relations are keyed by (scope, id): an id is unique only within its scope.
+    const key = (owner, id) => JSON.stringify([owner, id]);
     const records = new Map();
     const relations = new Map();
     const gaps = new Set();
     let source = null;
     const addRecord = record => {
       if (!record) { gaps.add('record_unavailable'); return; }
-      if (records.has(record.id)) return;
+      const at = key(record.scope ?? scope, record.id);
+      if (records.has(at)) return;
       if (records.size >= maxNodes) { gaps.add('node_limit'); return; }
-      records.set(record.id, record);
+      records.set(at, record);
     };
+    const readRecord = (owner, id) => immutableRead(reads, owner, 'record', id, () => this.store.getRecord(owner, id, ...options));
     if (seed.kind === 'turn') {
       const turn = await immutableRead(reads, scope, 'turn', seed.id, () => this.store.getTurn(scope, seed.id));
       requireThat(turn, 'source_unavailable');
       source = sourceView(turn, seed.matches ?? [], query);
       const linked = await this.store.recordsForTurn(scope, seed.id, maxNodes + 1, ...options);
       for (const record of linked) addRecord(record);
-    } else addRecord(await immutableRead(reads, scope, 'record', seed.id, () => this.store.getRecord(scope, seed.id, ...options)));
-    let frontier = [...records.keys()];
+    } else addRecord(await readRecord(scope, seed.id));
+    let frontier = [...records.values()];
     const visited = new Set();
     for (let hop = 0; hop <= maxHops && frontier.length; hop++) {
-      const edges = await this.store.neighbors(scope, frontier, maxNodes * 4 + 1);
-      if (edges.length > maxNodes * 4) gaps.add('edge_limit');
-      for (const id of frontier) visited.add(id);
-      const next = new Set();
-      for (const edge of edges.slice(0, maxNodes * 4)) {
-        if (!relations.has(edge.id) && relations.size >= maxNodes * 4) { gaps.add('edge_limit'); continue; }
-        const newEndpoints = [edge.from, edge.to].filter(id => !records.has(id));
+      // A one-scope read keeps its relation query; endpoints of its relations are in this scope, and a link's far end is hidden.
+      const rows = wide
+        ? await this.store.relationsIn(selection, frontier.map(record => identity('record', record.scope ?? scope, record.id)), maxNodes * 4 + 1)
+        : (await this.store.neighbors(scope, frontier.map(record => record.id), maxNodes * 4 + 1))
+          .map(edge => ({ edge, scope, to_scope: edge.to_hidden ? null : scope }));
+      if (rows.length > maxNodes * 4) gaps.add('edge_limit');
+      for (const record of frontier) visited.add(key(record.scope ?? scope, record.id));
+      const next = new Map();
+      for (const row of rows.slice(0, maxNodes * 4)) {
+        const { edge } = row;
+        const at = key(row.scope, edge.id);
+        if (!relations.has(at) && relations.size >= maxNodes * 4) { gaps.add('edge_limit'); continue; }
+        const ends = [[row.scope, edge.from], ...(row.to_scope === null ? [] : [[row.to_scope, edge.to]])];
+        const newEndpoints = ends.filter(([owner, id]) => !records.has(key(owner, id)));
         if (newEndpoints.length && hop === maxHops) { gaps.add('hop_limit'); continue; }
         if (records.size + newEndpoints.length > maxNodes) { gaps.add('node_limit'); continue; }
-        for (const id of newEndpoints) addRecord(await immutableRead(reads, scope, 'record', id, () => this.store.getRecord(scope, id, ...options)));
-        if (!records.has(edge.from) || !records.has(edge.to)) continue;
-        relations.set(edge.id, edge);
-        for (const id of [edge.from, edge.to]) if (!visited.has(id)) next.add(id);
+        for (const [owner, id] of newEndpoints) addRecord(await readRecord(owner, id));
+        if (!ends.every(([owner, id]) => records.has(key(owner, id)))) continue;
+        relations.set(at, row);
+        if (row.to_scope === null) gaps.add('cross_scope_hidden');
+        for (const [owner, id] of ends) if (!visited.has(key(owner, id))) next.set(key(owner, id), records.get(key(owner, id)));
       }
-      frontier = [...next];
+      frontier = [...next.values()];
     }
+    const named = (spans, owner) => owner === scope ? spans : spans.map(span => ({ ...span, scope: owner }));
     const withEvidence = [];
     const edges = [];
     await trace('evidence', async () => {
       for (const record of records.values()) {
-        withEvidence.push({ ...record, supporting_evidence: await this.evidence(scope, record.evidence, reads) });
+        const owner = record.scope ?? scope;
+        withEvidence.push({ ...record, supporting_evidence: named(await this.evidence(owner, record.evidence, reads), owner) });
       }
-      for (const relation of relations.values()) {
-        edges.push({ ...relation, supporting_evidence: await this.evidence(scope, relation.evidence, reads) });
+      for (const { edge, scope: owner } of relations.values()) {
+        edges.push({ ...edge, ...(owner === scope ? {} : { scope: owner }),
+          supporting_evidence: named(await this.evidence(owner, edge.evidence, reads), owner) });
       }
     });
     return {
@@ -806,7 +845,8 @@ const vectorHits = (kind, nodes, withScope = false, digests = false) => nodes.ma
 const LIST_KEYS = ['kind', 'status', 'source', 'conversation_id', 'limit', 'max_bytes', 'cursor', 'relations', 'digests'];
 
 // Optional features a caller can probe with `status {capabilities: true}`; an older build returns no `capabilities`.
-export const CAPABILITIES = Object.freeze({ scope_set_max: SCOPE_SET_MAX, record_digests: true });
+// `link_uid_lock` is added per store: whether its smlink_uid constraint exists, without which the relation id lock cannot serialize.
+export const CAPABILITIES = Object.freeze({ scope_set_max: SCOPE_SET_MAX, record_digests: true, cross_scope_relations: true });
 
 // `digests: true` adds each record's stored digest and the store identity to a read; absent or false, nothing changes.
 function digestsOption(input) {
@@ -831,11 +871,14 @@ const STORED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{
 async function pageRelations(store, target, uids) {
   if (!uids.length) return { relations: [], relations_truncated: false, relations_total: 0 };
   const { total, rows } = await store.listRelations(target, uids, LIST_RELATIONS_MAX);
+  const { owns } = selection(target);
   const relations = [];
   let bytes = 2;
   for (const row of rows) {
     const edge = JSON.parse(row.body);
-    const relation = { scope: row.scope, id: edge.id, type: edge.type, from: edge.from, to: edge.to, attribution: edge.attribution,
+    // A link names its far end only when the read selects the far scope; otherwise the end is an opaque omission.
+    const far = edge.to_scope === undefined ? { to: edge.to } : owns(edge.to_scope) ? { to: edge.to, to_scope: edge.to_scope } : { to: null, to_hidden: true };
+    const relation = { scope: row.scope, id: edge.id, type: edge.type, from: edge.from, ...far, attribution: edge.attribution,
       evidence: edge.evidence, stored_at: row.untimed ? null : row.at };
     const added = Buffer.byteLength(JSON.stringify(relation)) + (relations.length ? 1 : 0);
     if (bytes + added > LIST_RELATIONS_MAX_BYTES) break;

@@ -154,6 +154,55 @@ test('record contract version 1 derives the pinned uid, body and digest', () => 
   ]);
 });
 
+// A cross-scope `to` was refused by record/1 before links, so admitting it keeps the contract: the pins above still hold
+// and these add the new form. Moving any of them is a contract bump.
+test('record contract version 1 derives the pinned uid, body and digest of a cross-scope relation', () => {
+  const evidence = [{ turn: 'turn_fixture', entry_id: 'u1', start: 0, end: 4 }];
+  const link = { id: 'teal-after-paint', type: 'supersedes', from: 'lighthouse-teal', to: { scope: 'fiction-archive', id: 'lighthouse-paint' },
+    attribution: 'fixture', evidence };
+  const { relations: [relation] } = normalizeEnrichment({ records: [], relations: [link] });
+  assert.deepEqual([JSON.stringify(relation), digest(relation), identity('relation', 'fiction', relation.id), identity('record', relation.to_scope, relation.to)], [
+    '{"id":"teal-after-paint","type":"supersedes","from":"lighthouse-teal","to":"lighthouse-paint","to_scope":"fiction-archive","attribution":"fixture","evidence":[{"turn":"turn_fixture","entry_id":"u1","start":0,"end":4}]}',
+    '47a77b794ef1ed07f2503bdaded7e52e7fb3caa1447ebcb8389d0b398f6f8196',
+    'relation_886bbc2113dec7f5b1cd601c4494234ec8c544820ab79d4e5b47309859f4a73b',
+    'record_2f9bc8941f699f33afb11f125eb5ad1b456e19cc3b982a49f29bda9fd44af5f3',
+  ]);
+  const withPrecondition = normalizeEnrichment({ records: [], relations: [{ ...link, to: { ...link.to, expected_digest: 'a'.repeat(64) } }] }).relations[0];
+  assert.equal(JSON.stringify(withPrecondition), JSON.stringify(relation), 'expected_digest is a precondition, never stored');
+  const sameScope = { ...link, to: 'lighthouse-paint' };
+  assert.equal(JSON.stringify(normalizeEnrichment({ records: [], relations: [{ ...sameScope, to_scope: 'fiction-archive' }] }).relations[0]),
+    JSON.stringify(normalizeEnrichment({ records: [], relations: [sameScope] }).relations[0]), 'a top-level to_scope key is dropped as unknown');
+});
+
+test('a malformed cross-scope to is invalid_input; a same-id far end is not a self relation', () => {
+  const evidence = [{ turn: 'turn_fixture', entry_id: 'u1', start: 0, end: 4 }];
+  const edge = to => ({ records: [], relations: [{ id: 'e', type: 'qualifies', from: 'a', to, attribution: 'fixture', evidence }] });
+  for (const to of [{ scope: 'b' }, { id: 'x' }, { scope: 'b', id: 'x', extra: 1 }, { scope: 7, id: 'x' }, { scope: 'b', id: 'x'.repeat(257) },
+    { scope: 'b', id: 'x', expected_digest: 'A'.repeat(64) }, { scope: 'b', id: 'x', expected_digest: 'a'.repeat(63) }, ['b', 'x'], null]) {
+    assert.throws(() => normalizeEnrichment(edge(to)), { code: 'invalid_input' }, JSON.stringify(to));
+  }
+  assert.equal(normalizeEnrichment(edge({ scope: 'b', id: 'a' })).relations[0].to_scope, 'b');
+  assert.throws(() => normalizeEnrichment(edge('a')), { code: 'self_relation' });
+});
+
+test('enrich refuses a far scope it cannot read, or its own scope as far, before any storage call', async () => {
+  const link = to => ({ records: [], relations: [{ id: 'e', type: 'qualifies', from: 'lighthouse-teal', to, attribution: 'fixture',
+    evidence: [{ turn: 'turn_fixture', entry_id: 'u1', start: 0, end: 4 }] }] });
+  const settings = { scopes: { read: ['fiction', 'archive/**'], write: ['fiction'] } };
+  for (const [to, code] of [[{ scope: 'secret', id: 'x' }, 'cross_scope_denied'], [{ scope: 'archive/**', id: 'x' }, 'cross_scope_denied'],
+    [{ scope: 'fiction', id: 'x' }, 'invalid_relation'], [{ scope: 'archive/a', id: 'x', expected_digest: 'z' }, 'invalid_input']]) {
+    const store = fakeStore();
+    await assert.rejects(new Memory(settings, store).enrich('fiction', link(to)), error => error.code === code && error.stage === 'before_write', JSON.stringify(to));
+    assert.equal(store.writes, 0);
+  }
+  const calls = [];
+  const store = { ...fakeStore(), async enrich(...args) { calls.push(args); return { records: [], relations: ['e'] }; } };
+  await new Memory(settings, store).enrich('fiction', link({ scope: 'archive/a', id: 'x', expected_digest: 'b'.repeat(64) }));
+  await new Memory(settings, store).enrich('fiction', link({ scope: 'archive/a', id: 'x' }));
+  assert.deepEqual(calls.map(args => [args.length, args[2]?.expected]), [[3, { e: 'b'.repeat(64) }], [2, undefined]]);
+  assert.equal(calls[0][1].relations[0].to_scope, 'archive/a');
+});
+
 test('status names the store and the record contract', async () => {
   const store = { status: async () => ({ turns: 0 }), vectorIndexStatus: async () => 'missing',
     identity: async () => ({ system: 'neo4j', database_id: 'db-fixture', database: 'neo4j' }) };
@@ -161,13 +210,18 @@ test('status names the store and the record contract', async () => {
   assert.deepEqual(status.store, { system: 'neo4j', database_id: 'db-fixture', database: 'neo4j', record_contract: 'source-memory.record/1' });
 });
 
-// Q-SM-3: refusals the enrich transaction raises before its first MERGE.
-test('every enrich check that precedes the first MERGE precedes it in source order', () => {
+// Q-SM-3: refusals the enrich transaction raises before its first content MERGE. The relation id lock is not one: its
+// placeholder SMLink node is created and deleted in the same transaction, so it writes nothing durable. It runs after
+// every † check and before the first content MERGE.
+test('every enrich check that precedes the first content MERGE precedes it, and the relation id lock, in source order', () => {
   const source = Neo4jStore.prototype.enrich.toString();
   const firstMerge = source.indexOf('MERGE');
-  for (const marker of ["'evidence_unavailable'", 'sourceExcerpt(', "'relation_endpoint_unavailable'", "'invalid_outcome_relation'",
-    "'outcome_referent_required'"]) {
-    assert.ok(source.indexOf(marker) > 0 && source.indexOf(marker) < firstMerge, marker);
+  const idLock = source.indexOf('RELATION_ID_LOCK');
+  assert.ok(idLock > 0 && idLock < firstMerge, 'the id lock precedes the first content MERGE');
+  assert.match(source.slice(firstMerge), /^MERGE \(r:SMRecord/u);
+  for (const marker of ["'evidence_unavailable'", 'sourceExcerpt(', "'relation_endpoint_unavailable'", "'relation_endpoint_digest_mismatch'",
+    "'invalid_outcome_relation'", "'outcome_referent_required'"]) {
+    assert.ok(source.indexOf(marker) > 0 && source.indexOf(marker) < idLock, marker);
   }
   for (const marker of ["'record_identity_conflict'", "'relation_identity_conflict'"]) assert.ok(source.indexOf(marker) > firstMerge, marker);
 });

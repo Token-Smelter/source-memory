@@ -170,8 +170,8 @@ A scope that is a path, 1–8 segments of `[A-Za-z0-9_-]{1,64}` joined by `/` (a
 | Rule | Behaviour |
 |---|---|
 | Grants | `"S"` grants exactly `S`. `"S/**"` grants `S` and every descendant, including ones created later. A subtree read `S/**` needs a pattern on `S` or an ancestor; exact grants on its members never add up to it. Opaque names are granted only exactly |
-| Writes | `ingest`, `enrich` and `index` name one exact scope. A selector is refused `scope_denied` with `stage:"before_write"`. Evidence and relation endpoints stay in the written scope |
-| Reads | `recall`, `list`, `status` and `init` accept `--scope 'S/**'` (quote it in a shell). Every subtree hit, bundle and unit names its own exact `scope`; relations, evidence and following stay inside it. `show` takes an exact scope, or a set for `bundle`, `units` and `following` (below) |
+| Writes | `ingest`, `enrich` and `index` name one exact scope. A selector is refused `scope_denied` with `stage:"before_write"`. Evidence and `from` stay in the written scope; only a link's `to` may name another scope (below) |
+| Reads | `recall`, `list`, `status` and `init` accept `--scope 'S/**'` (quote it in a shell). Every subtree hit, bundle and unit names its own exact `scope`; relations and evidence stay inside it, apart from links (below), and following never leaves a scope. `show` takes an exact scope, or a set for `bundle`, `units` and `following` (below) |
 | Identity | Unchanged: ids hash the full scope, so the same record id in two scopes is two records. `RECORD_CONTRACT` stays `source-memory.record/1` |
 
 A flat scope (a depth-1 path or an opaque name) keeps its own labels and indexes, and its stored nodes and reads are byte-identical to those before nested scopes: an integration check has `589658d` write and read a fixed corpus, then reads it with this code before and after opt-in and after a replay, and compares the `export-scope` snapshot of a flat scope written by each commit. The normalizations cover only what `589658d` itself does not fix: recall fuses its concurrent lexical channels in completion order, so a candidate keeps the text, match and conversation fields of whichever channel found it first, and that text is what a reranker scores. The check sorts the ranking-only reply's channel keys and traces, drops those first-channel fields there, and uses a fixture reranker that scores the sentence every representation of a turn shares. Fused scores are exact and are compared unchanged.
@@ -193,6 +193,22 @@ Every root segment has its own tree: labels `SMTree<d>Turn`, `SMTree<d>Chunk`, `
 | `show` | `bundle`: the seed carries its `scope`, an element. `units`: each key's scope must be an element, and each unit is bundled and followed in its own scope. `following`: `scope` names the element; the reply is that of an exact read |
 
 `status {"capabilities":true}` reports `scope_set_max: 4`. Design: [docs/NAMESPACING.md](docs/NAMESPACING.md) section 1.
+
+## Cross-scope links
+
+A relation is written to one scope, its `from` record's, and may name an earlier record of another scope as `to: {scope, id, expected_digest?}` (`supersedes`, `qualifies`, `contradicts`, `depends_on`, `outcome_of` all point from the later record to the earlier). A same-scope relation keeps `to` as a string.
+
+| Rule | Behaviour |
+|---|---|
+| Authority | write on the written scope and read on the far scope, both checked before any storage call; a missing read grant or a selector is `cross_scope_denied` (`stage:"before_write"`) whether or not the far record exists. `to.scope` equal to the written scope is `invalid_relation` |
+| Far record | read by uid in its own scope inside the write transaction: absent is `relation_endpoint_unavailable`; with `expected_digest` (64 lowercase hex, its `record_digest`) a different stored hash is `relation_endpoint_digest_mismatch`. Both `rolled_back`. The far record is never written |
+| Stored form | label `SMLink` (no query of an older build matches it), body `{id, type, from, to, to_scope, attribution, evidence}`, uid `identity('relation', written scope, id)`. `expected_digest` is not stored. `RECORD_CONTRACT` stays `source-memory.record/1` |
+| One id, one relation | an id names one relation per written scope in either form (`relation_identity_conflict`); concurrent writers serialize on the `SMLink(uid)` constraint, which `init` creates; `status {"capabilities":true}` reports `link_uid_lock` |
+| Hide rule | a read that does not select the far scope (exact, subtree or set) shows the link with `to: null, to_hidden: true` and no `to_scope`; a bundle adds the gap `cross_scope_hidden` and does not expand past it. Selection decides, not grants. A reader of only the far scope never sees links pointing into it |
+| Selected far end | the bundle holds the far record (with its `scope`), the relation's `to_scope`, and spans of another scope name it; a relation stored in another selected scope names its `scope`. Following never crosses scopes |
+| `status` | `relations` counts same-scope relations; `links: n` is added when the scope stores any |
+
+Upgrade every writer of a scope and run `init` before writing links into it. `export-scope`/`restore-scope` stay single-scope: a snapshot of a scope that holds links is refused at restore (`snapshot_invalid`); the far scope's snapshot is unchanged. Design: [docs/NAMESPACING.md](docs/NAMESPACING.md) section 2.
 
 ## Listing
 
@@ -220,7 +236,7 @@ Every root segment has its own tree: labels `SMTree<d>Turn`, `SMTree<d>Chunk`, `
 | `record_digest` | every record object: bundle records in `recall` and `show bundle`/`units`, `show record`, `list` record items and their `max_bytes` stubs, record seeds of a ranking-only recall | the record node's stored `hash`, the canonical digest of the normalized record it was written from (`digest` in `src/core.mjs`); `null` for a node without a string hash (another writer) |
 | `store_identity` | once per reply, top level | `{system, database_id, database, record_contract}`, the same object as `status.store`: a digest is meaningful only for that store and record contract |
 
-The digest counts toward every byte budget (`max_chars`, unit and pool bytes, `list` `max_bytes`), so an opted-in reply can omit a unit or end a page earlier; the `list` cursor does not bind `digests`, so a walk stays exact either way. Nothing stored changes. A malformed value is `invalid_input`. `status {"capabilities":true}` returns `capabilities: {scope_set_max: 4, record_digests: true}`; any other `capabilities` value is ignored, as older builds ignore the whole input. A build without the feature returns no `capabilities`, ignores `digests` on `recall` and `show` (no `store_identity`) and refuses it on `list` (`invalid_input`). Design: [docs/NAMESPACING.md](docs/NAMESPACING.md) section 6.
+The digest counts toward every byte budget (`max_chars`, unit and pool bytes, `list` `max_bytes`), so an opted-in reply can omit a unit or end a page earlier; the `list` cursor does not bind `digests`, so a walk stays exact either way. Nothing stored changes. A malformed value is `invalid_input`. `status {"capabilities":true}` returns `capabilities: {scope_set_max: 4, record_digests: true, cross_scope_relations: true, link_uid_lock}`; any other `capabilities` value is ignored, as older builds ignore the whole input. A build without the feature returns no `capabilities`, ignores `digests` on `recall` and `show` (no `store_identity`) and refuses it on `list` (`invalid_input`). Design: [docs/NAMESPACING.md](docs/NAMESPACING.md) section 6.
 
 ## Following a conversation
 

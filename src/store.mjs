@@ -18,6 +18,21 @@ const decodeRecordWith = (props, digests) => {
 const decodeRelation = props => props ? { uid: props.uid, ...JSON.parse(props.body) } : null;
 
 /**
+ * A stored relation as a read shows it. A link (a body with `to_scope`) whose far scope the read does not select is an
+ * opaque omission: `to: null, to_hidden: true`, and neither the far id nor its scope appears.
+ */
+function relationView(props, visible) {
+  const edge = decodeRelation(props);
+  if (edge.to_scope === undefined || visible) return edge;
+  const { uid, id, type, from, attribution, evidence } = edge;
+  return { uid, id, type, from, to: null, to_hidden: true, attribution, evidence };
+}
+
+// The relation id lock (see Neo4jStore.enrich): takes the SMLink(uid) unique-index entry of `uid` and leaves nothing behind.
+const RELATION_ID_LOCK = `MERGE (p:SMLink {uid:uid}) ON CREATE SET p.sm_placeholder = true
+  WITH p WHERE p.sm_placeholder = true DELETE p`;
+
+/**
  * Cypher predicate over `$exclude` ([{source, conversation_id}]): false for a turn of an excluded conversation, a chunk of
  * such a turn, and a record whose every evidence turn is in one. A record with any other evidence stays, so a mixed bundle
  * still reaches the caller. Turns stored before lineage properties existed carry no conversation and are never excluded.
@@ -153,7 +168,7 @@ export class Neo4jStore {
     if (typeof target !== 'string' || isNested(target)) return this.initTree(target, dimensions);
     const scope = target;
     if (dimensions !== null) integer(dimensions, undefined, 1, 4096);
-    for (const label of ['SMTurn', 'SMChunk', 'SMRecord', 'SMRelation']) {
+    for (const label of ['SMTurn', 'SMChunk', 'SMRecord', 'SMRelation', 'SMLink']) {
       await this.transaction('write', tx => tx.run(`CREATE CONSTRAINT ${label.toLowerCase()}_uid IF NOT EXISTS FOR (n:${label}) REQUIRE n.uid IS UNIQUE`));
     }
     await this.transaction('write', tx => tx.run('CREATE INDEX smturn_lineage IF NOT EXISTS FOR (n:SMTurn) ON (n.scope, n.source, n.conversation_id, n.parent_turn_id)'));
@@ -188,12 +203,12 @@ export class Neo4jStore {
     if (dimensions !== null) integer(dimensions, undefined, 1, 4096);
     const sel = selection(target);
     const base = { turn: 'SMTurn', chunk: 'SMChunk', record: 'SMRecord' };
-    for (const label of ['SMTurn', 'SMChunk', 'SMRecord', 'SMRelation']) {
+    for (const label of ['SMTurn', 'SMChunk', 'SMRecord', 'SMRelation', 'SMLink']) {
       await this.transaction('write', tx => tx.run(`CREATE CONSTRAINT ${label.toLowerCase()}_uid IF NOT EXISTS FOR (n:${label}) REQUIRE n.uid IS UNIQUE`));
     }
     await this.transaction('write', tx => tx.run('CREATE CONSTRAINT smscopetree_root IF NOT EXISTS FOR (n:SMScopeTree) REQUIRE n.root IS UNIQUE'));
     await this.transaction('write', tx => tx.run('CREATE INDEX smturn_lineage IF NOT EXISTS FOR (n:SMTurn) ON (n.scope, n.source, n.conversation_id, n.parent_turn_id)'));
-    for (const label of [...Object.values(base), 'SMRelation']) {
+    for (const label of [...Object.values(base), 'SMRelation', 'SMLink']) {
       await this.transaction('write', tx => tx.run(`CREATE INDEX ${label.toLowerCase()}_scope IF NOT EXISTS FOR (n:${label}) ON (n.scope)`));
     }
     for (const [kind, index] of [['turn', sel.names.turns], ['record', sel.names.records], ['chunk', sel.names.chunks]]) {
@@ -373,7 +388,12 @@ export class Neo4jStore {
     });
   }
 
-  async enrich(scope, payload) {
+  /**
+   * One write transaction in one scope. A relation's `to` may be a record of another scope (`to_scope`); it is read here,
+   * never written: the link node, its evidence and both edges belong to the written scope. Every check marked † in
+   * QUALIFICATION.md runs before the relation id lock and the first content MERGE.
+   */
+  async enrich(scope, payload, { expected = {} } = {}) {
     return this.atomicWrite(async tx => {
       const allSpans = [...payload.records, ...payload.relations].flatMap(row => row.evidence);
       const turns = new Map();
@@ -384,24 +404,46 @@ export class Neo4jStore {
         turns.set(uid, turn);
       }
       for (const span of allSpans) sourceExcerpt(turns.get(span.turn), span);
-      const endpoints = new Map(payload.records.map(row => [row.id, row]));
-      for (const id of new Set(payload.relations.flatMap(edge => [edge.from, edge.to]))) {
-        if (endpoints.has(id)) continue;
-        const result = await tx.run('MATCH (r:SMRecord {uid:$uid, scope:$scope}) RETURN r', { uid: identity('record', scope, id), scope });
-        const record = decodeRecord(unwrap(result.records[0]?.get('r')));
+      // Endpoints are keyed by (scope, id): a payload record whose id equals a far `to` id is another record.
+      const endpoint = (owner, id) => JSON.stringify([owner, id]);
+      const endpoints = new Map(payload.records.map(row => [endpoint(scope, row.id), row]));
+      const ends = new Map(payload.relations.flatMap(edge => [[scope, edge.from], [edge.to_scope ?? scope, edge.to]])
+        .map(([owner, id]) => [endpoint(owner, id), { owner, id }]));
+      for (const [key, { owner, id }] of ends) {
+        if (endpoints.has(key)) continue;
+        const result = await tx.run('MATCH (r:SMRecord {uid:$uid, scope:$scope}) RETURN r', { uid: identity('record', owner, id), scope: owner });
+        const record = decodeRecordWith(unwrap(result.records[0]?.get('r')), true);
         requireThat(record, 'relation_endpoint_unavailable');
-        endpoints.set(id, record);
+        endpoints.set(key, record);
+      }
+      // A far end's digest precondition: the record the writer read is the record stored, or nothing is written.
+      for (const edge of payload.relations) {
+        if (expected[edge.id] === undefined) continue;
+        requireThat(endpoints.get(endpoint(edge.to_scope, edge.to)).record_digest === expected[edge.id], 'relation_endpoint_digest_mismatch');
       }
       for (const edge of payload.relations.filter(row => row.type === 'outcome_of')) {
-        requireThat(endpoints.get(edge.from).kind === 'outcome' && OUTCOME_REFERENT_KINDS.includes(endpoints.get(edge.to).kind), 'invalid_outcome_relation');
+        requireThat(endpoints.get(endpoint(scope, edge.from)).kind === 'outcome'
+          && OUTCOME_REFERENT_KINDS.includes(endpoints.get(endpoint(edge.to_scope ?? scope, edge.to)).kind), 'invalid_outcome_relation');
       }
       for (const record of payload.records.filter(row => row.kind === 'outcome')) {
         const supplied = payload.relations.some(edge => edge.from === record.id && edge.type === 'outcome_of');
         if (!supplied) {
-          const result = await tx.run(`MATCH (e:SMRelation {scope:$scope, from_uid:$uid, type:"outcome_of"})
-            MATCH (target:SMRecord {uid:e.to_uid, scope:$scope}) RETURN target`, { scope, uid: identity('record', scope, record.id) });
+          const result = await tx.run(`CALL {
+              MATCH (e:SMRelation {scope:$scope, from_uid:$uid, type:"outcome_of"}) RETURN e
+              UNION ALL
+              MATCH (e:SMLink {scope:$scope, from_uid:$uid, type:"outcome_of"}) RETURN e
+            }
+            MATCH (target:SMRecord {uid:e.to_uid, scope:coalesce(e.to_scope, $scope)}) RETURN target`, { scope, uid: identity('record', scope, record.id) });
           requireThat(result.records.length > 0 && result.records.every(row => OUTCOME_REFERENT_KINDS.includes(decodeRecord(unwrap(row.get('target'))).kind)), 'outcome_referent_required');
         }
+      }
+      // One relation id names one relation per written scope, in either form. Every relation write first takes the
+      // SMLink(uid) unique-index entry of its id, in uid order, through a placeholder created and deleted here: it writes
+      // nothing durable and is never visible after commit, but two concurrent first writes of one id in two forms
+      // serialize on it, so the later one sees the earlier at its cross-label check. Without the smlink_uid constraint
+      // (a store not initialized since links existed) there is no index entry to lock and `status` reports that.
+      if (payload.relations.length) {
+        await tx.run(`UNWIND $uids AS uid ${RELATION_ID_LOCK}`, { uids: [...new Set(payload.relations.map(edge => identity('relation', scope, edge.id)))].sort() });
       }
       const { Record: recordLabels } = await writeLabels(tx, scope, ['Record']);
       for (const record of payload.records) {
@@ -419,9 +461,17 @@ export class Neo4jStore {
       for (const edge of payload.relations) {
         const uid = identity('relation', scope, edge.id);
         const hash = digest(edge);
+        const link = edge.to_scope !== undefined;
         const from = identity('record', scope, edge.from);
-        const to = identity('record', scope, edge.to);
-        const result = await tx.run(`MERGE (e:SMRelation {uid:$uid})
+        const to = identity('record', edge.to_scope ?? scope, edge.to);
+        const other = await tx.run(`MATCH (x:${link ? 'SMRelation' : 'SMLink'} {uid:$uid}) RETURN count(x) AS count`, { uid });
+        requireThat(other.records[0].get('count') === 0, 'relation_identity_conflict');
+        const result = link ? await tx.run(`MERGE (e:SMLink {uid:$uid})
+          ON CREATE SET e.scope=$scope, e.hash=$hash, e.body=$body, e.type=$type, e.from_uid=$from, e.to_uid=$to, e.to_scope=$toScope, e.created_at=datetime()
+          WITH e MATCH (a:SMRecord {uid:$from,scope:$scope}), (b:SMRecord {uid:$to,scope:$toScope})
+          MERGE (e)-[:SM_FROM]->(a) MERGE (e)-[:SM_TO]->(b) RETURN e.hash AS hash`, {
+          uid, scope, hash, body: JSON.stringify(edge), type: edge.type, from, to, toScope: edge.to_scope,
+        }) : await tx.run(`MERGE (e:SMRelation {uid:$uid})
           ON CREATE SET e.scope=$scope, e.hash=$hash, e.body=$body, e.type=$type, e.from_uid=$from, e.to_uid=$to, e.created_at=datetime()
           WITH e MATCH (a:SMRecord {uid:$from,scope:$scope}), (b:SMRecord {uid:$to,scope:$scope})
           MERGE (e)-[:SM_FROM]->(a) MERGE (e)-[:SM_TO]->(b) RETURN e.hash AS hash`, {
@@ -809,14 +859,18 @@ export class Neo4jStore {
     const sel = selection(target);
     return this.transaction('read', async tx => {
       const result = await tx.run(`UNWIND $uids AS uid MATCH (r:SMRecord {uid: uid}) USING INDEX r:SMRecord(uid) WHERE ${sel.where('r')}
-        MATCH (e:SMRelation)-[:SM_FROM|SM_TO]->(r) WHERE e.scope = r.scope
+        CALL {
+          WITH r MATCH (e:SMRelation)-[:SM_FROM|SM_TO]->(r) WHERE ${sel.where('e')} RETURN e
+          UNION ALL
+          WITH r MATCH (e:SMLink)-[:SM_FROM|SM_TO]->(r) WHERE ${sel.where('e')} RETURN e
+        }
         WITH DISTINCT e
         WITH e, e.created_at IS :: ZONED DATETIME NOT NULL AS timed
         WITH e, timed, CASE WHEN timed THEN e.created_at ELSE datetime($epoch) END AS at
         ORDER BY CASE WHEN e.type = 'supersedes' THEN 0 ELSE 1 END, at DESC, e.uid DESC
         WITH collect({e: e, at: at, timed: timed}) AS found
         RETURN size(found) AS total, [row IN found[..$limit] | {uid: row.e.uid, scope: row.e.scope, body: row.e.body, at: toString(row.at),
-          untimed: NOT row.timed}] AS rows`, { ...sel.params, uids, epoch: LIST_EPOCH, limit: neo4j.int(limit) });
+          untimed: NOT row.timed, to_scope: row.e.to_scope}] AS rows`, { ...sel.params, uids, epoch: LIST_EPOCH, limit: neo4j.int(limit) });
       const row = result.records[0];
       return { total: row.get('total'), rows: row.get('rows') };
     });
@@ -838,15 +892,47 @@ export class Neo4jStore {
     });
   }
 
+  // Relations stored in this one scope touching `ids`. A link's far end is never in a one-scope read, so it is hidden.
   async neighbors(scope, ids, limit) {
     return this.transaction('read', async tx => {
-      const result = await tx.run(`MATCH (e:SMRelation {scope:$scope})
-        WHERE e.from_uid IN $uids OR e.to_uid IN $uids
+      const result = await tx.run(`CALL {
+          MATCH (e:SMRelation {scope:$scope}) WHERE e.from_uid IN $uids OR e.to_uid IN $uids RETURN e
+          UNION ALL
+          MATCH (e:SMLink {scope:$scope}) WHERE e.from_uid IN $uids OR e.to_uid IN $uids RETURN e
+        }
         RETURN e ORDER BY CASE WHEN e.type='supersedes' THEN 0 ELSE 1 END,e.uid LIMIT $limit`, {
         scope, uids: ids.map(id => identity('record', scope, id)), limit: neo4j.int(limit),
       });
-      return result.records.map(row => decodeRelation(unwrap(row.get('e'))));
+      return result.records.map(row => relationView(unwrap(row.get('e')), false));
     });
+  }
+
+  /**
+   * Relations whose own scope is in a subtree or set selection with an endpoint among `uids`, in `neighbors` order, each
+   * with its stored scope and endpoint uids. A link's far end is shown only when the selection holds the far scope.
+   */
+  async relationsIn(target, uids, limit) {
+    const sel = selection(target);
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`CALL {
+          MATCH (e:SMRelation) WHERE ${sel.where('e')} AND (e.from_uid IN $uids OR e.to_uid IN $uids) RETURN e
+          UNION ALL
+          MATCH (e:SMLink) WHERE ${sel.where('e')} AND (e.from_uid IN $uids OR e.to_uid IN $uids) RETURN e
+        }
+        RETURN e ORDER BY CASE WHEN e.type='supersedes' THEN 0 ELSE 1 END,e.uid LIMIT $limit`, { ...sel.params, uids, limit: neo4j.int(limit) });
+      return result.records.map(row => {
+        const props = unwrap(row.get('e'));
+        const visible = typeof props.to_scope !== 'string' || sel.owns(props.to_scope);
+        return { edge: relationView(props, visible), scope: props.scope, from_uid: props.from_uid, to_uid: visible ? props.to_uid : null,
+          to_scope: visible ? props.to_scope ?? props.scope : null };
+      });
+    });
+  }
+
+  /** Whether this store holds the SMLink(uid) constraint the relation id lock needs; `init` creates it. */
+  async linkUidLock() {
+    return this.transaction('read', async tx => (await tx.run("SHOW CONSTRAINTS YIELD name WHERE name = 'smlink_uid' RETURN count(*) AS count"))
+      .records[0].get('count') > 0);
   }
 
   // `unindexed` counts only what a recall with this exclusion could return.
@@ -857,15 +943,19 @@ export class Neo4jStore {
       const nodes = sel.tree ? `CALL {
           MATCH (n:SMTurn) WHERE ${sel.where('n')} RETURN n UNION ALL MATCH (n:SMChunk) WHERE ${sel.where('n')} RETURN n
           UNION ALL MATCH (n:SMRecord) WHERE ${sel.where('n')} RETURN n UNION ALL MATCH (n:SMRelation) WHERE ${sel.where('n')} RETURN n
-        } WITH n` : `MATCH (n) WHERE ${sel.where('n')} AND (n:SMTurn OR n:SMChunk OR n:SMRecord OR n:SMRelation)`;
+          UNION ALL MATCH (n:SMLink) WHERE ${sel.where('n')} RETURN n
+        } WITH n` : `MATCH (n) WHERE ${sel.where('n')} AND (n:SMTurn OR n:SMChunk OR n:SMRecord OR n:SMRelation OR n:SMLink)`;
       const result = await tx.run(`${nodes}
         RETURN count(CASE WHEN n:SMTurn THEN 1 END) AS turns,
           count(CASE WHEN n:SMChunk THEN 1 END) AS chunks,
           count(CASE WHEN n:SMRecord THEN 1 END) AS records,
           count(CASE WHEN n:SMRelation THEN 1 END) AS relations,
-          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed`,
+          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed,
+          count(CASE WHEN n:SMLink THEN 1 END) AS links`,
         { ...sel.params, model: embeddingKey, exclude });
-      return result.records[0].toObject();
+      // Links stored in the selection are counted apart from relations, and named only when there are any.
+      const { links, ...counts } = result.records[0].toObject();
+      return links > 0 ? { ...counts, links } : counts;
     });
   }
 }

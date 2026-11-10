@@ -11,6 +11,7 @@ import { runQualification } from '../test/qualification.mjs';
 import { runNestedScopes } from '../test/nested-scopes.mjs';
 import { runList } from '../test/list-integration.mjs';
 import { runNamespacing } from '../test/namespacing-integration.mjs';
+import { runLinks } from '../test/links-integration.mjs';
 import { integrationResources } from './integration-resources.mjs';
 
 const exec = promisify(execFile);
@@ -78,7 +79,7 @@ try {
   const database = { uri, auth: 'none', database: 'neo4j' };
   // Nested scopes run first: the flat integration checks then also run beside existing root trees.
   if (['all', 'scopes'].includes(suite)) results = [...await runNestedScopes(database, scratch), ...await runList(database, scratch)];
-  if (['all', 'namespacing'].includes(suite)) results = [...results, ...await runNamespacing(database, scratch)];
+  if (['all', 'namespacing'].includes(suite)) results = [...results, ...await runNamespacing(database, scratch), ...await runLinks(database, scratch)];
   if (suite === 'all') results = [...results, ...await runIntegration(database, scratch)];
   if (['all', 'qualification'].includes(suite)) results = [...results, ...await runQualification(database, scratch)];
 } catch (error) {

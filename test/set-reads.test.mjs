@@ -103,6 +103,7 @@ function twoScopeStore(log, { failing = null } = {}) {
     admittedLexical: call('admittedLexical', () => ({ hits: [], omitted: [], admitted_conversations: 0, exhausted: false })),
     vectorIndexStatus: call('vectorIndexStatus', () => 'online'),
     indexedVectors: call('indexedVectors', () => ({ nodes: [], partial: false, unindexed: 0, ran: true })),
+    relationsIn: call('relationsIn', () => []),
   };
 }
 
@@ -216,9 +217,9 @@ test('show bundle over a set needs the seed scope, an element of the set', async
 
 test('status reports the set bound among its capabilities', async () => {
   const store = { status: async () => ({ turns: 0 }), vectorIndexStatus: async () => 'missing',
-    identity: async () => ({ system: 'neo4j', database_id: 'db-fixture', database: 'neo4j' }) };
+    identity: async () => ({ system: 'neo4j', database_id: 'db-fixture', database: 'neo4j' }), linkUidLock: async () => true };
   const reply = await new Memory(settings(['fa']), store).status('fa', { capabilities: true });
-  assert.deepEqual(reply.capabilities, { scope_set_max: 4, record_digests: true });
+  assert.deepEqual(reply.capabilities, { scope_set_max: 4, record_digests: true, cross_scope_relations: true, link_uid_lock: true });
 });
 
 async function cli(t, args, store) {
