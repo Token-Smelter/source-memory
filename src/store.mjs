@@ -852,7 +852,9 @@ export class Neo4jStore {
    * first by (created_at, uid), the first `limit` plus the total. Each page record is found through its uid constraint
    * index, by hint because the planner otherwise seeks the scope range index and reads the whole scope or subtree, and its
    * relations by their endpoint edges, so the cost is the page's records and their degree, with or without range indexes.
-   * A relation and its endpoints share one scope, so the selection holds every relation returned. On a store that never ran
+   * A same-scope relation shares its endpoints' scope; a link reaches a far record too, so every relation is kept only when
+   * its own scope is in the selection, a filter applied after the edge expansion so that no label is sought by scope. Each
+   * link carries `to_scope` for the hide rule. On a store that never ran
    * `init` there is no uid index; Neo4j then ignores the hint (unless `dbms.cypher.hints_error` is set) and scans.
    */
   async listRelations(target, uids, limit) {
@@ -860,11 +862,11 @@ export class Neo4jStore {
     return this.transaction('read', async tx => {
       const result = await tx.run(`UNWIND $uids AS uid MATCH (r:SMRecord {uid: uid}) USING INDEX r:SMRecord(uid) WHERE ${sel.where('r')}
         CALL {
-          WITH r MATCH (e:SMRelation)-[:SM_FROM|SM_TO]->(r) WHERE ${sel.where('e')} RETURN e
+          WITH r MATCH (e:SMRelation)-[:SM_FROM|SM_TO]->(r) RETURN e
           UNION ALL
-          WITH r MATCH (e:SMLink)-[:SM_FROM|SM_TO]->(r) WHERE ${sel.where('e')} RETURN e
+          WITH r MATCH (e:SMLink)-[:SM_FROM|SM_TO]->(r) RETURN e
         }
-        WITH DISTINCT e
+        WITH DISTINCT e WHERE ${sel.where('e')}
         WITH e, e.created_at IS :: ZONED DATETIME NOT NULL AS timed
         WITH e, timed, CASE WHEN timed THEN e.created_at ELSE datetime($epoch) END AS at
         ORDER BY CASE WHEN e.type = 'supersedes' THEN 0 ELSE 1 END, at DESC, e.uid DESC
@@ -914,11 +916,15 @@ export class Neo4jStore {
   async relationsIn(target, uids, limit) {
     const sel = selection(target);
     return this.transaction('read', async tx => {
-      const result = await tx.run(`CALL {
-          MATCH (e:SMRelation) WHERE ${sel.where('e')} AND (e.from_uid IN $uids OR e.to_uid IN $uids) RETURN e
+      // Each frontier record is sought by uid and its relations reached by their edges, as `listRelations` does, so the cost is
+      // the frontier's degree rather than every relation of the selection.
+      const result = await tx.run(`UNWIND $uids AS uid MATCH (r:SMRecord {uid: uid}) USING INDEX r:SMRecord(uid)
+        CALL {
+          WITH r MATCH (e:SMRelation)-[:SM_FROM|SM_TO]->(r) RETURN e
           UNION ALL
-          MATCH (e:SMLink) WHERE ${sel.where('e')} AND (e.from_uid IN $uids OR e.to_uid IN $uids) RETURN e
+          WITH r MATCH (e:SMLink)-[:SM_FROM|SM_TO]->(r) RETURN e
         }
+        WITH DISTINCT e WHERE ${sel.where('e')}
         RETURN e ORDER BY CASE WHEN e.type='supersedes' THEN 0 ELSE 1 END,e.uid LIMIT $limit`, { ...sel.params, uids, limit: neo4j.int(limit) });
       return result.records.map(row => {
         const props = unwrap(row.get('e'));

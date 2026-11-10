@@ -251,16 +251,19 @@ export async function runLinks(database, scratch = null) {
           link: { records: [], relations: [{ id: `race-${round}`, type: 'qualifies', from: 'race-r3', to: { scope: F, id: 'f-action' }, attribution: 'x', evidence }] },
         };
         // The first writer holds its id lock until the second has started taking the same one.
+        // The second writer starts taking it only once the first holds it, so the order of the two is fixed.
         let secondStarted;
+        let firstLocked;
         const started = new Promise(resolve => { secondStarted = resolve; });
+        const locked = new Promise(resolve => { firstLocked = resolve; });
         const writers = order.map((form, index) => {
           const store = new Neo4jStore(database);
           const real = store.transaction.bind(store);
           store.transaction = (mode, action) => real(mode, tx => action({ run: async (query, params) => {
             const locking = query.includes('sm_placeholder');
-            if (locking && index === 1) secondStarted();
+            if (locking && index === 1) { await locked; secondStarted(); }
             const result = await tx.run(query, params);
-            if (locking && index === 0) { await started; await new Promise(resolve => setTimeout(resolve, 500)); }
+            if (locking && index === 0) { firstLocked(); await started; await new Promise(resolve => setTimeout(resolve, 500)); }
             return result;
           } }));
           return { form, memory: new Memory(fixtures.config, store) };

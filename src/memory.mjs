@@ -535,6 +535,8 @@ export class Memory {
    */
   async retrieve(target, options, trace, embedQuery) {
     authorizeRead(this.config, target);
+    // A set target is one tree group; any other set has no shared index to read (recallSet never builds one).
+    requireThat(!isScopeSet(target) || selection(target).tree, 'invalid_input');
     const sel = selection(target);
     const tree = sel.tree;
     // Only the grouped admission query has finer steps worth bracketing; it takes the trace as an extra trailing argument.
