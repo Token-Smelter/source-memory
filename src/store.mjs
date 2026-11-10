@@ -382,7 +382,7 @@ export class Neo4jStore {
         const from = identity('record', scope, edge.from);
         const to = identity('record', scope, edge.to);
         const result = await tx.run(`MERGE (e:SMRelation {uid:$uid})
-          ON CREATE SET e.scope=$scope, e.hash=$hash, e.body=$body, e.type=$type, e.from_uid=$from, e.to_uid=$to
+          ON CREATE SET e.scope=$scope, e.hash=$hash, e.body=$body, e.type=$type, e.from_uid=$from, e.to_uid=$to, e.created_at=datetime()
           WITH e MATCH (a:SMRecord {uid:$from,scope:$scope}), (b:SMRecord {uid:$to,scope:$scope})
           MERGE (e)-[:SM_FROM]->(a) MERGE (e)-[:SM_TO]->(b) RETURN e.hash AS hash`, {
           uid, scope, hash, body: JSON.stringify(edge), type: edge.type, from, to,
@@ -752,6 +752,30 @@ export class Neo4jStore {
         source, sourceBody: source === null ? null : `{"source":${JSON.stringify(source)},"conversation_id":`,
         conversation, conversationBody: conversation === null ? null : `,"conversation_id":${JSON.stringify(conversation)},"turn_id":` });
       return result.records.map(row => row.toObject());
+    });
+  }
+
+  /**
+   * Relations of the selection with an endpoint among `uids` (records of one `list` page): supersedes first, then newest
+   * first by (created_at, uid), the first `limit` plus the total. Each page record is found through its uid constraint
+   * index, by hint because the planner otherwise seeks the scope range index and reads the whole scope or subtree, and its
+   * relations by their endpoint edges, so the cost is the page's records and their degree, with or without range indexes.
+   * A relation and its endpoints share one scope, so the selection holds every relation returned.
+   */
+  async listRelations(target, uids, limit) {
+    const sel = selection(target);
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`UNWIND $uids AS uid MATCH (r:SMRecord {uid: uid}) USING INDEX r:SMRecord(uid) WHERE ${sel.where('r')}
+        MATCH (e:SMRelation)-[:SM_FROM|SM_TO]->(r) WHERE e.scope = r.scope
+        WITH DISTINCT e
+        WITH e, e.created_at IS :: ZONED DATETIME NOT NULL AS timed
+        WITH e, timed, CASE WHEN timed THEN e.created_at ELSE datetime($epoch) END AS at
+        ORDER BY CASE WHEN e.type = 'supersedes' THEN 0 ELSE 1 END, at DESC, e.uid DESC
+        WITH collect({e: e, at: at, timed: timed}) AS found
+        RETURN size(found) AS total, [row IN found[..$limit] | {uid: row.e.uid, scope: row.e.scope, body: row.e.body, at: toString(row.at),
+          untimed: NOT row.timed}] AS rows`, { ...sel.params, uids, epoch: LIST_EPOCH, limit: neo4j.int(limit) });
+      const row = result.records[0];
+      return { total: row.get('total'), rows: row.get('rows') };
     });
   }
 

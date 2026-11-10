@@ -26,15 +26,16 @@ const ids = pages => pages.flatMap(page => page.items.map(item => `${item.scope}
 export async function runList(database, scratch = null) {
   const results = [];
   const check = async (name, fn) => { await fn(); results.push({ name, pass: true }); console.log(`PASS ${name}`); };
-  const grants = ['lst', 'lst/**', 'lst/a b', 'tie', 'legacy', 'stat'];
+  const grants = ['lst', 'lst/**', 'lst/a b', 'tie', 'legacy', 'stat', 'rel', 'rel/**'];
   const config = { neo4j: database, scopes: { read: grants, write: grants } };
   const memory = new Memory(config);
-  const seed = async (scope, conversation, turnIds, records = []) => {
+  const seed = async (scope, conversation, turnIds, records = [], relations = []) => {
     const uids = [];
     let parent = null;
     for (const id of turnIds) { uids.push((await memory.ingest(scope, turn(conversation, id, parent))).id); parent = id; }
+    const evidence = [{ turn: uids[0], entry_id: `${turnIds[0]}-u`, start: 0, end: 10 }];
     if (records.length) await memory.enrich(scope, { records: records.map(([id, kind]) => ({ id, kind, text: `Fictional ${kind} ${id}.`, attribution: 'fixture',
-      evidence: [{ turn: uids[0], entry_id: `${turnIds[0]}-u`, start: 0, end: 10 }] })), relations: [] });
+      evidence })), relations: relations.map(([id, type, from, to]) => ({ id, type, from, to, attribution: 'fixture', evidence })) });
     return uids;
   };
   try {
@@ -129,6 +130,56 @@ export async function runList(database, scratch = null) {
       assert.deepEqual(ids(await walk(memory, 'stat', { status: 'accepted' })), ['stat:accepted-1']);
       assert.deepEqual(ids(await walk(memory, 'stat', { status: 'proposed' })), ['stat:decoy-1']);
       assert.deepEqual(ids(await walk(memory, 'stat', { kind: 'episode' })), []);
+    });
+
+    await check('list relations: each page carries exactly the relations touching its records, in their own scope', async () => {
+      await memory.init('rel');
+      await memory.init('rel/a');
+      await seed('rel', 'c-rel1', ['rel1'], [['d1', 'decision'], ['q1', 'question']], [['q1-on-d1', 'depends_on', 'q1', 'd1']]);
+      await seed('rel', 'c-rel2', ['rel2'], [['d2', 'decision'], ['o1', 'observation']],
+        [['d2-over-d1', 'supersedes', 'd2', 'd1'], ['o1-on-d2', 'qualifies', 'o1', 'd2']]);
+      await seed('rel/a', 'c-rel3', ['rel3'], [['d1', 'decision'], ['x1', 'observation']], [['x1-vs-d1', 'contradicts', 'x1', 'd1']]);
+      await seed('rel/a/b', 'c-rel4', ['rel4'], [['e1', 'episode']]);
+      const fixture = [['rel', 'q1-on-d1', 'q1', 'd1'], ['rel', 'd2-over-d1', 'd2', 'd1'], ['rel', 'o1-on-d2', 'o1', 'd2'], ['rel/a', 'x1-vs-d1', 'x1', 'd1']];
+      for (const [scope, input] of [['rel', { limit: 1 }], ['rel', { limit: 3, kind: 'decision' }], ['rel/**', { limit: 2 }], ['rel/a', {}], ['rel/**', { limit: 64 }]]) {
+        const plain = await walk(memory, scope, input);
+        const pages = await walk(memory, scope, { ...input, relations: true });
+        assert.deepEqual(pages.map(page => [page.items, page.next_cursor]), plain.map(page => [page.items, page.next_cursor]), `${scope} items and cursor unchanged`);
+        for (const page of pages) {
+          const onPage = new Set(page.items.filter(item => item.kind === 'record').map(item => `${item.scope}:${item.id}`));
+          const expected = fixture.filter(([at, , from, to]) => onPage.has(`${at}:${from}`) || onPage.has(`${at}:${to}`)).map(([at, id]) => `${at}:${id}`);
+          assert.deepEqual(page.relations.map(row => `${row.scope}:${row.id}`).sort(), expected.sort(), `${scope} ${JSON.stringify(input)}`);
+          assert.deepEqual([page.relations_truncated, page.relations_total], [false, expected.length]);
+          assert.ok(page.relations.every(row => typeof row.stored_at === 'string' && row.evidence.length === 1 && row.evidence[0].start === 0));
+          const types = page.relations.map(row => row.type);
+          assert.deepEqual(types, [...types].sort((a, b) => (a !== 'supersedes') - (b !== 'supersedes')), 'supersedes first');
+        }
+      }
+      const exact = await memory.list('rel/a', { relations: true });
+      assert.deepEqual(exact.relations.map(row => [row.scope, row.id, row.type, row.from, row.to]), [['rel/a', 'x1-vs-d1', 'contradicts', 'x1', 'd1']],
+        'a record id shared with another scope never draws that scope\'s relations');
+      const legacy = identity('relation', 'rel', 'q1-on-d1');
+      await memory.store.transaction('write', tx => tx.run('MATCH (e:SMRelation {uid:$uid}) REMOVE e.created_at', { uid: legacy }));
+      const page = await memory.list('rel', { kind: 'question', relations: true });
+      assert.deepEqual(page.relations.map(row => [row.id, row.stored_at]), [['q1-on-d1', null]], 'a relation written before stored_at reports null');
+    });
+
+    await check('list relations: one query per page, seeking page records by uid rather than scanning or seeking by scope', async () => {
+      const original = memory.store.transaction.bind(memory.store);
+      for (const scope of ['rel', 'rel/**']) {
+        const queries = [];
+        memory.store.transaction = (mode, action) => original(mode, tx => action({ run: (query, params) => { queries.push({ query, params }); return tx.run(query, params); } }));
+        try { await memory.list(scope, { relations: true }); } finally { memory.store.transaction = original; }
+        assert.equal(queries.length, 2, 'the page query and one relations query');
+        const { query, params } = queries[1];
+        const plan = (await original('read', tx => tx.run(`EXPLAIN ${query}`, params))).summary.plan;
+        const operators = [];
+        const visit = node => { operators.push(`${node.operatorType} ${node.arguments?.Details ?? ''}`); node.children.forEach(visit); };
+        visit(plan);
+        assert.ok(operators.some(row => /^NodeUniqueIndexSeek/u.test(row) && /SMRecord\(uid\)/u.test(row)), `${scope}: ${operators.join(' | ')}`);
+        assert.ok(!operators.some(row => /LabelScan|AllNodesScan|smrecord_scope|smrelation_scope|\(scope\)/u.test(row)), `${scope}: ${operators.join(' | ')}`);
+        assert.ok(!operators.some(row => /SMRelation/u.test(row) && /Scan|IndexSeek/u.test(row.split(' ')[0])), `${scope}: relations are reached by their edges`);
+      }
     });
 
     await check('the CLI lists with or without --input, never waits on stdin, and refuses a foreign cursor', async () => {
