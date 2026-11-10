@@ -343,7 +343,7 @@ export async function runIntegration(database, scratch) {
     await native.init('vector-scale');
     await waitForVectors(native, 'vector-scale');
     await writeFile('.memory-local/vector-index-latency.json', JSON.stringify({
-      fixture: 'private Neo4j 5.26.14; 1536m memory; 2 CPUs; 512m heap; 128m pagecache', dimensions: 3, candidates: 64,
+      fixture: 'private Neo4j 5.26.14; 2048m memory; 2 CPUs; 512m heap; 128m pagecache', dimensions: 3, candidates: 64,
       measurement: 'warm vector retrieval/scoring/top-k including native eligible census; excludes catalog readiness, model calls, fusion and bundle rendering',
       warmups: 1, measured_runs: 5, results: timings,
     }, null, 2));
