@@ -137,6 +137,9 @@ test('recallSet and retrieve, called directly, authorize every element before an
   await assert.rejects(memory.retrieve('secret', {}, async (_name, run) => run(), () => []), { code: 'scope_denied' });
   await assert.rejects(memory.retrieve({ scopes: ['fa', 'secret'] }, {}, async (_name, run) => run(), () => []), { code: 'scope_denied' });
   await assert.rejects(memory.retrieve({ scope: 'fa', subtree: true }, {}, async (_name, run) => run(), () => []), { code: 'scope_denied' });
+  const wide = new Memory(settings(['fa', 'x/a', 'y/a']), untouched());
+  await assert.rejects(wide.retrieve({ scopes: ['x/a', 'y/a'] }, {}, async (_name, run) => run(), () => []), { code: 'invalid_input' },
+    'a set target that is not one tree group');
 });
 
 test('a hole in a sparse set is an element like undefined: invalid_input before any storage call', async () => {
