@@ -90,13 +90,21 @@ export async function searchCombined(memory, scope, input) {
   const limit = integer(input?.limit, 8, 1, 32);
   if (![undefined, true, false].includes(input?.records)) throw fail('invalid_input');
   const records = input?.records !== false;
-  if (typeof memory.recall !== 'function' || typeof memory.bundle !== 'function') throw fail('search_unavailable');
-  const result = await memory.recall(scope, { query, candidates: 64, limit }, { seedsOnly: true });
+  if (typeof memory.recall !== 'function' || typeof memory.bundle !== 'function' || typeof memory.store?.lexicalStatus !== 'function'
+    || typeof memory.store?.chunkLexicalStatus !== 'function') throw fail('search_unavailable');
+  // Flat recall checks only the chunk index itself; turn and record readiness are checked here so no channel is silently empty.
+  const states = [...await Promise.all(['turn', 'record'].map(kind => memory.store.lexicalStatus(scope, kind))), await memory.store.chunkLexicalStatus(scope)];
+  if (states.some(state => state?.status !== 'ready')) throw fail('search_incomplete');
+  // The fused pool is cut before seeds are filtered; the control widens it and refuses a pool that could still hide source seeds.
+  const candidates = records ? 64 : 256;
+  const result = await memory.recall(scope, { query, candidates, limit }, { seedsOnly: true });
   if (result?.scope !== scope || !Array.isArray(result.ranked) || !result.channels
     || ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'].some(name => result.channels[name]?.status !== 'ready')
     || Object.values(result.channels).some(row => ['partial', 'pending', 'unavailable'].includes(row.status))) throw fail('search_incomplete');
   const output = [];
-  for (const seed of result.ranked.filter(row => records || row.kind !== 'record').slice(0, limit)) {
+  const seeds = result.ranked.filter(row => records || row.kind !== 'record');
+  if (!records && seeds.length < limit && result.ranked.length >= candidates) throw fail('search_incomplete');
+  for (const seed of seeds.slice(0, limit)) {
     const bundle = await memory.bundle(scope, seed, query, 48, 4);
     if (seed.kind === 'record') { output.push(project(scope, bundle, seed.id).record); continue; }
     if (seed.kind !== 'turn' || !bundle.source || !Array.isArray(bundle.source.excerpts)) throw fail('source_unavailable');

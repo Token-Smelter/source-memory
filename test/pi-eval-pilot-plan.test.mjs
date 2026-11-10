@@ -45,7 +45,7 @@ test('a re-answer plan seals its prior run and arms and cannot distill or resume
     routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } }, toolCallReviewSha256: 'f'.repeat(64) };
   const reanswer = { priorReportSha256: '1'.repeat(64), priorSealDigest: '2'.repeat(64), priorCodeSha: '3'.repeat(40), priorTreatment: TREATMENTS.T1, arms: ['combined'] };
   assert.deepEqual(createCitedPilotPlan({ ...options, reanswer }).spec.reanswer, reanswer);
-  for (const invalid of [{ ...options, reanswer, treatment: TREATMENTS.T1 }, { ...options, reanswer: { ...reanswer, arms: ['candidate'] } },
+  for (const invalid of [{ ...options, reanswer, treatment: TREATMENTS.T1 }, { ...options, reanswer: { ...reanswer, arms: ['baseline'] } },
     { ...options, reanswer: { ...reanswer, arms: ['combined', 'combined'] } }, { ...options, reanswer: { ...reanswer, extra: true } }])
     assert.throws(() => createCitedPilotPlan(invalid), /pilot_plan_invalid/);
 });

@@ -27,8 +27,11 @@ const groundedScorerInstructions = 'Judge each asserted answer or action clause 
 export const DISTILLER_MAX_OUTPUT_TOKENS = 16384, EVALUATOR_MAX_OUTPUT_TOKENS = 4096;
 
 export const BASELINE_CANDIDATE_ROUTE = 'anthropic/claude-haiku-5-5';
-/** Arms a re-answer run may evaluate against a completed run's per-case snapshots: product recall with and without record seeds. */
-export const REANSWER_ARMS = Object.freeze(['combined', 'recall-chunks']);
+/**
+ * Arms a re-answer run may evaluate against a completed run's per-case snapshots: product recall with and without record
+ * seeds, plus the original arms as same-snapshot, same-code controls.
+ */
+export const REANSWER_ARMS = Object.freeze(['combined', 'recall-chunks', 'raw-only', 'candidate']);
 
 /** Sealed treatment surfaces; a run without one is the baseline. */
 export const TREATMENTS = Object.freeze({

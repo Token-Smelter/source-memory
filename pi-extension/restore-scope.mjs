@@ -100,7 +100,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       const session = memory.store.driver.session({ database: 'neo4j' });
       try {
         // A re-answer replay replaces the whole private evaluation database; a resume still requires it empty.
-        if (mode === '--replace') await session.executeWrite(tx => tx.run('MATCH (n) DETACH DELETE n'));
+        if (mode === '--replace') await session.run('MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 1000 ROWS');
         const empty = await session.executeRead(tx => tx.run('MATCH (n) RETURN count(n) AS count'));
         if (empty.records[0].get('count') !== 0) throw fail('database_not_empty');
       } finally { await session.close(); }

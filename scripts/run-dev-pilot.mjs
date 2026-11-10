@@ -30,7 +30,7 @@ import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
 import { createScorer, scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
-import { hash } from '../pi-extension/evaluation/seal.mjs';
+import { hash, verifySeal } from '../pi-extension/evaluation/seal.mjs';
 import { createSnapshotVerifier } from '../pi-extension/evaluation/snapshot-verifier.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -357,7 +357,9 @@ async function main() {
     const report = JSON.parse(pinned(request.reportPath, request.reportSha256, 50_000_000).toString('utf8'));
     if (dirname(dirname(request.reportPath)) !== parent || report.run_dir !== dirname(request.reportPath)) throw fail('reanswer_invalid');
     const priorSeal = JSON.parse(pinned(report.artifacts['seal.json'].path, report.artifacts['seal.json'].sha256, 10_000_000).toString('utf8'));
+    verifySeal(priorSeal, report.seal_sha256);
     const cases = prepared.map(item => {
+      // Carried cases of a resumed run keep their snapshots under carried_cases; this mode fails closed on them.
       const ref = report.artifacts.case_snapshots?.find(row => row.case_id === item.publicCase.id);
       if (!ref) throw fail('reanswer_case_snapshot_missing');
       return { item, ref, bytes: pinned(ref.path, ref.sha256, 128_000_000) };
@@ -372,9 +374,11 @@ async function main() {
     toolCallReviewSha256: reviewMapSha, treatment, reanswer: reanswer?.plan ?? null,
     interpretationSha256: INTERPRETATION_02_SHA256 });
   // The re-answered arms must use exactly the prior run's evaluation contract.
-  if (reanswer && ['answerer', 'scorer', 'rubric', 'packets', 'cases', 'packetSchema', 'policySha256', 'sourceSha256', 'datasetSha256',
-    'toolCallReviewSha256', 'designSha256', 'access', 'safety', 'interpretation']
-    .some(key => hash(reanswer.priorSeal.spec[key] ?? null) !== hash(seal.spec[key] ?? null))) throw fail('reanswer_contract_mismatch');
+  const contract = spec => ({ ...Object.fromEntries(['answerer', 'scorer', 'rubric', 'packets', 'cases', 'packetSchema', 'policySha256', 'sourceSha256',
+    'datasetSha256', 'toolCallReviewSha256', 'designSha256', 'access', 'safety', 'interpretation', 'sdkSha256', 'stores', 'baseline', 'alternativeRule',
+    'comparison', 'dependenciesDigest'].map(key => [key, spec[key] ?? null])),
+  purposes: { answerer: spec.budget?.purposes?.answerer ?? null, scorer: spec.budget?.purposes?.scorer ?? null } });
+  if (reanswer && hash(contract(reanswer.priorSeal.spec)) !== hash(contract(seal.spec))) throw fail('reanswer_contract_mismatch');
   if (resume?.handbackRows.length) pairedReport({ seal, expectedDigest: seal.digest, rows: resume.handbackRows, dependencies: [],
     provenance: resume.originSeals.filter(row => row.digest !== seal.digest) });
   const runId = randomUUID(), dir = mkdtempSync(join(parent, 'pilot-'));

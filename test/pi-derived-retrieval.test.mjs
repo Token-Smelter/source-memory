@@ -40,9 +40,10 @@ test('raw-only diagnostic seeds from turn and chunk lexical channels, not derive
 test('combined recall keeps product ranking, projecting records as derived items and turns as source excerpts', async () => {
   const ready = { status: 'ready' };
   const channels = { turn_lexical: ready, record_lexical: ready, chunk_lexical: ready, chunk_vector: ready, record_vector: ready, reranker: { status: 'unconfigured' } };
-  const memory = channels => ({ config: { scopes: { read: ['fiction'] } },
-    async recall(scope, input, options) { assert.deepEqual([input.candidates, options.seedsOnly], [64, true]);
-      return { scope, channels, ranked: [{ kind: 'turn', id: 'turn' }, { kind: 'record', id: 'record' }] }; },
+  const memory = (channels, lexical = 'ready', ranked = [{ kind: 'turn', id: 'turn' }, { kind: 'record', id: 'record' }]) => ({ config: { scopes: { read: ['fiction'] } },
+    store: { async lexicalStatus() { return { status: lexical }; }, async chunkLexicalStatus() { return { status: 'ready' }; } },
+    async recall(scope, input, options) { assert.equal(options.seedsOnly, true);
+      return { scope, channels, ranked: ranked.slice(0, input.candidates) }; },
     async bundle(_scope, seed) { return seed.kind === 'turn' ? { source: { excerpts: [{ text: 'fictional raw source' }] } } : bundle; } });
   const rows = await searchCombined(memory(channels), 'fiction', { query: 'fiction', limit: 2 });
   assert.deepEqual([rows.map(row => [row.id, row.kind ?? 'derived']), rows[0].text, rows[1].text.includes('fictional proof'), rows[1].evidence.length],
@@ -50,6 +51,9 @@ test('combined recall keeps product ranking, projecting records as derived items
   const chunks = await searchCombined(memory(channels), 'fiction', { query: 'fiction', limit: 2, records: false });
   assert.deepEqual(chunks.map(row => row.kind), ['source_excerpt']);
   await assert.rejects(searchCombined(memory({ ...channels, chunk_vector: { status: 'partial' } }), 'fiction', { query: 'fiction' }), /search_incomplete/);
+  await assert.rejects(searchCombined(memory(channels, 'populating'), 'fiction', { query: 'fiction' }), /search_incomplete/);
+  const crowded = Array.from({ length: 256 }, (_, i) => ({ kind: 'record', id: `r${i}` }));
+  await assert.rejects(searchCombined(memory(channels, 'ready', crowded), 'fiction', { query: 'fiction', limit: 2, records: false }), /search_incomplete/);
 });
 
 test('derived evidence resolution rejects an unoffered source handle', async () => {
