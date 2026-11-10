@@ -64,6 +64,8 @@ export async function runLinks(database, scratch = null) {
     out.push(await memoryOf.recall(selection, { query, mode: 'evidence_advice', group: 'conversation', follow: {} }));
     out.push(await memoryOf.recall(selection, { query }, { seedsOnly: true }));
     out.push(await memoryOf.list(selection, { relations: true }));
+    // A subtree is read by recall and list only; show takes an exact scope or a set.
+    if (typeof selection === 'string' && selection.endsWith('/**')) return canonicalRun(out);
     const seedScope = exact ? {} : { scope: home };
     const seedId = home === A ? 'a-decision' : home === B ? 'canary-rec-b' : home === C ? 'c-note' : 'n-decision';
     out.push(await memoryOf.show(selection, { kind: 'bundle', seed: { kind: 'record', id: seedId, ...seedScope } }));
@@ -147,10 +149,15 @@ export async function runLinks(database, scratch = null) {
       const incoming = fromB.relations.find(row => row.id === 'canary-link-alpha');
       assert.deepEqual([incoming.scope, incoming.from, incoming.to, incoming.to_scope], [A, 'a-decision', 'canary-rec-b', B]);
       assert.ok(incoming.supporting_evidence.every(span => span.scope === A));
+      const units = await both.show([A, B], { kind: 'units', follow: {}, units: [{ key: { scope: A, source: 'link-fixture', conversation_id: `c-${A}` },
+        seeds: [{ kind: 'record', id: 'a-decision' }] }] });
+      const followed = units.units[0].following;
+      assert.ok(followed.some(entry => entry.scope === B && entry.after === ids[B]), 'show units follows a far evidence root in its own scope');
+      assert.ok(followed.filter(entry => entry.scope === undefined).every(entry => [ids[A], ids.span].includes(entry.after)));
       const page = await both.list([A, B], { relations: true });
       assert.deepEqual(page.relations.filter(row => row.id === 'canary-link-alpha').map(row => [row.scope, row.to, row.to_scope]), [[A, 'canary-rec-b', B]]);
-      const units = await both.recall([A, B], { query: 'harbor lantern alpha amber', group: 'conversation', mode: 'evidence_advice', follow: {} });
-      const unitA = units.units.find(unit => unit.key.scope === A && unit.seeds.some(seedBundle => seedBundle.records.some(row => row.id === 'canary-rec-b')));
+      const grouped = await both.recall([A, B], { query: 'harbor lantern alpha amber', group: 'conversation', mode: 'evidence_advice', follow: {} });
+      const unitA = grouped.units.find(unit => unit.key.scope === A && unit.seeds.some(seedBundle => seedBundle.records.some(row => row.id === 'canary-rec-b')));
       assert.ok(unitA, 'a unit of A holds B\'s record through the link');
       assert.ok(unitA.also_cites.some(key => key.scope === B), 'also_cites names the far evidence\'s own scope');
       assert.ok(unitA.following.some(entry => entry.scope === B), 'a far evidence root is followed in its own scope');
@@ -158,6 +165,17 @@ export async function runLinks(database, scratch = null) {
 
     await check('subtrees follow the hide rule by selection; the base build sees no link at all', async () => {
       const nested = reader(['lnest/**']);
+      const NB_CANARIES = [NB, identity('record', NB, 'n-far'), 'n-far', 'nested bravo lantern action', 'nested far lantern action'];
+      const NA_CANARIES = ['n-link', 'n-decision', 'nested alpha lantern decision'];
+      const narrowReads = await reads(nested, `${NA}/**`, { home: NA });
+      assert.deepEqual(leaks(narrowReads, NB_CANARIES), [], 'a subtree without the far scope');
+      assert.ok(JSON.stringify(narrowReads).includes('"to_hidden":true'));
+      const farOnly = await reads(nested, `${NB}/**`, { home: NB });
+      assert.deepEqual(leaks(farOnly, NA_CANARIES), [], 'a reader of only the far subtree sees nothing of the link');
+      assert.equal(farOnly[3].relations_total, 0);
+      assert.equal((await nested.status(`${NB}/**`)).links, undefined, 'and counts no link');
+      const wideReads = await reads(nested, 'lnest/**', { home: NA });
+      assert.ok(JSON.stringify(wideReads).includes('"to_scope":"lnest/b"'));
       const narrow = await nested.recall(`${NA}/**`, { query: 'nested alpha lantern decision' });
       const near = narrow.bundles.find(bundle => bundle.records.some(row => row.id === 'n-decision'));
       assert.deepEqual(near.relations.map(row => [row.id, row.to, row.to_hidden]), [['n-link', null, true]]);
@@ -166,10 +184,9 @@ export async function runLinks(database, scratch = null) {
       const both = wide.bundles.find(bundle => bundle.scope === NA && bundle.records.some(row => row.id === 'n-decision'));
       assert.deepEqual(both.relations.map(row => [row.id, row.to, row.to_scope]), [['n-link', 'n-far', NB]]);
       assert.deepEqual(both.records.map(row => row.scope).sort(), [NA, NB]);
+      // The base build matches no SMLink: every read it makes of A or B shows no trace of the link or of the other side.
       for (const [scope, canaries] of [[A, [...B_CANARIES, 'canary-link-alpha']], [B, A_CANARIES]]) {
-        const old = [await base.recall(scope, { query: 'lantern alpha bravo canary harbor' }), await base.list(scope, { relations: true }),
-          await base.show(scope, { kind: 'bundle', seed: { kind: 'record', id: scope === A ? 'a-decision' : 'canary-rec-b' } }), await base.status(scope)];
-        assert.deepEqual(leaks(old, canaries), [], `${NESTED_BASE_COMMIT.slice(0, 7)} reading ${scope}`);
+        assert.deepEqual(leaks(await reads(base, scope, { home: scope }), canaries), [], `${NESTED_BASE_COMMIT.slice(0, 7)} reading ${scope}`);
       }
     });
 
@@ -235,6 +252,12 @@ export async function runLinks(database, scratch = null) {
         { ok: false, error: 'cross_scope_denied', stage: 'before_write' });
       const settled = (await revoked.list(W, { relations: true })).relations.find(row => row.id === 'w-of');
       assert.deepEqual([settled.from, settled.to, settled.to_hidden, settled.type], ['w-outcome', null, true, 'outcome_of'], 'presence settles through list');
+      // Ids that name Object.prototype members write and replay like any other id, in both forms.
+      for (const input of [{ records: [], relations: [link('toString', 'w-anchor', { scope: F, id: 'f-action' }, { type: 'qualifies' })] },
+        { records: [], relations: [link('constructor', 'w-anchor', 'w-outcome', { type: 'qualifies' })] },
+        { records: [], relations: [link('__proto__', 'w-anchor', { scope: F, id: 'f-action', expected_digest: farDigest }, { type: 'qualifies' })] }]) {
+        for (const pass of ['write', 'replay']) assert.equal((await attempt(input)).ok, true, `${input.relations[0].id} ${pass}`);
+      }
       assert.deepEqual(await placeholders(), 0);
     });
 
@@ -245,6 +268,7 @@ export async function runLinks(database, scratch = null) {
       const evidenceTurn = await seed(W, 'c-lw-race', 'r1', text, [['race-r1', 'decision', 'Race target.'], ['race-r2', 'decision', 'Race from two.'],
         ['race-r3', 'decision', 'Race from three.']]);
       const evidence = spanOf(evidenceTurn, text);
+      const blocked = [];
       for (const [round, order] of [['x1', ['plain', 'link']], ['x2', ['link', 'plain']]]) {
         const inputs = {
           plain: { records: [], relations: [{ id: `race-${round}`, type: 'qualifies', from: 'race-r2', to: 'race-r1', attribution: 'x', evidence }] },
@@ -256,6 +280,16 @@ export async function runLinks(database, scratch = null) {
         let firstLocked;
         const started = new Promise(resolve => { secondStarted = resolve; });
         const locked = new Promise(resolve => { firstLocked = resolve; });
+        // The first writer goes on only once the database reports the second blocked on the same id lock.
+        const secondBlocked = async () => {
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            const waiting = (await memory.store.transaction('read', tx => tx.run(`SHOW TRANSACTIONS YIELD currentQuery, status
+              WHERE currentQuery CONTAINS 'sm_placeholder' AND status STARTS WITH 'Blocked' RETURN count(*) AS count`))).records[0].get('count');
+            if (waiting > 0) return true;
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          return false;
+        };
         const writers = order.map((form, index) => {
           const store = new Neo4jStore(database);
           const real = store.transaction.bind(store);
@@ -263,7 +297,7 @@ export async function runLinks(database, scratch = null) {
             const locking = query.includes('sm_placeholder');
             if (locking && index === 1) { await locked; secondStarted(); }
             const result = await tx.run(query, params);
-            if (locking && index === 0) { firstLocked(); await started; await new Promise(resolve => setTimeout(resolve, 500)); }
+            if (locking && index === 0) { firstLocked(); await started; blocked.push(await secondBlocked()); }
             return result;
           } }));
           return { form, memory: new Memory(fixtures.config, store) };
@@ -275,9 +309,15 @@ export async function runLinks(database, scratch = null) {
           RETURN labels(n) AS labels`, { uid: identity('relation', W, `race-${round}`) }))).records.map(row => row.get('labels'));
         assert.deepEqual(stored, [[order[0] === 'plain' ? 'SMRelation' : 'SMLink']], `${round}: one id names one relation`);
       }
+      assert.deepEqual(blocked, [true, true], 'the second writer waited on the first writer id lock');
       assert.equal(await placeholders(), 0, 'no placeholder survives a commit, a refusal or a rollback');
       const status = await memory.status('lw', { capabilities: true });
       assert.deepEqual([status.capabilities.cross_scope_relations, status.capabilities.link_uid_lock], [true, true]);
+      // Without the constraint there is no index entry to lock, and status says so until init creates it again.
+      await memory.store.transaction('write', tx => tx.run('DROP CONSTRAINT smlink_uid IF EXISTS'));
+      assert.equal((await memory.status('lw', { capabilities: true })).capabilities.link_uid_lock, false);
+      await memory.init('lw');
+      assert.equal((await memory.status('lw', { capabilities: true })).capabilities.link_uid_lock, true);
     });
 
     await check('a link refusal raised after a real driver retry carries stage unknown', async () => {

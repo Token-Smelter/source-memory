@@ -63,17 +63,18 @@ export class Memory {
     const { payload, expected } = beforeWrite(() => {
       authorize(this.config, scope, 'write');
       const payload = normalizeEnrichment(input);
-      const expected = {};
+      // Keyed by relation id, which is caller text: a Map, so an id such as `toString` or `__proto__` is only ever a key.
+      const expected = new Map();
       for (const [index, edge] of payload.relations.entries()) {
         if (edge.to_scope === undefined) continue;
         requireThat(edge.to_scope !== scope, 'invalid_relation');
         requireThat(granted(this.config, edge.to_scope, 'read'), 'cross_scope_denied');
         const precondition = farEndpoint(input.relations[index].to).expected_digest;
-        if (precondition !== undefined) expected[edge.id] = precondition;
+        if (precondition !== undefined) expected.set(edge.id, precondition);
       }
       return { payload, expected };
     });
-    const result = await this.store.enrich(scope, payload, ...(Object.keys(expected).length ? [{ expected }] : []));
+    const result = await this.store.enrich(scope, payload, ...(expected.size ? [{ expected }] : []));
     return { ...result, indexing: await this.indexAfterWrite(scope) };
   }
 
@@ -486,18 +487,19 @@ export class Memory {
     const reranker = {};
     const ranked = await this.rerankSeeds(grouped ? fuseGroups(results.map(row => row.channels))
       : fuseGroups(results.map(row => row.channels)).slice(0, candidates), options.query, reranker);
-    const byScope = {};
+    // Scope names are caller text (`__proto__` is a valid segment), so they key a Map, never a plain object.
+    const byScope = new Map();
     for (const [index, group] of groups.entries()) {
       for (const scope of group.scopes) {
         const states = { ...results[index].availability };
-        const pending = results[index].pending?.[scope];
+        const pending = results[index].pending && Object.hasOwn(results[index].pending, scope) ? results[index].pending[scope] : undefined;
         if (pending) markPending(states, pending);
-        byScope[scope] = { group: group.name, channels: Object.fromEntries(Object.keys(CHANNEL_KINDS).sort().map(name => [name, { ...states[name],
+        byScope.set(scope, { group: group.name, channels: Object.fromEntries(Object.keys(CHANNEL_KINDS).sort().map(name => [name, { ...states[name],
           ...(seedsOnly ? { candidate_limit_reached: results[index].channels[name].length >= candidates } : {}) }])),
-          ...(pending ? { scope_tree: { pending } } : {}) };
+          ...(pending ? { scope_tree: { pending } } : {}) });
       }
     }
-    const ordered = Object.fromEntries(scopes.map(scope => [scope, byScope[scope]]));
+    const ordered = Object.fromEntries(scopes.map(scope => [scope, byScope.get(scope)]));
     const channels = aggregateChannels(ordered, reranker.reranker);
     const elementStates = [...Object.values(ordered).flatMap(row => Object.values(row.channels)), reranker.reranker];
 

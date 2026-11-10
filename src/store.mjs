@@ -393,7 +393,7 @@ export class Neo4jStore {
    * never written: the link node, its evidence and both edges belong to the written scope. Every check marked † in
    * QUALIFICATION.md runs before the relation id lock and the first content MERGE.
    */
-  async enrich(scope, payload, { expected = {} } = {}) {
+  async enrich(scope, payload, { expected = new Map() } = {}) {
     return this.atomicWrite(async tx => {
       const allSpans = [...payload.records, ...payload.relations].flatMap(row => row.evidence);
       const turns = new Map();
@@ -418,8 +418,8 @@ export class Neo4jStore {
       }
       // A far end's digest precondition: the record the writer read is the record stored, or nothing is written.
       for (const edge of payload.relations) {
-        if (expected[edge.id] === undefined) continue;
-        requireThat(endpoints.get(endpoint(edge.to_scope, edge.to)).record_digest === expected[edge.id], 'relation_endpoint_digest_mismatch');
+        if (edge.to_scope === undefined || !expected.has(edge.id)) continue;
+        requireThat(endpoints.get(endpoint(edge.to_scope, edge.to)).record_digest === expected.get(edge.id), 'relation_endpoint_digest_mismatch');
       }
       for (const edge of payload.relations.filter(row => row.type === 'outcome_of')) {
         requireThat(endpoints.get(endpoint(scope, edge.from)).kind === 'outcome'
@@ -935,10 +935,19 @@ export class Neo4jStore {
     });
   }
 
-  /** Whether this store holds the SMLink(uid) constraint the relation id lock needs; `init` creates it. */
+  /**
+   * Whether this store holds a uniqueness constraint on SMLink(uid), which the relation id lock needs (`init` creates it),
+   * whatever its name; null when the configured user may not list constraints, so the answer is unknown.
+   */
   async linkUidLock() {
-    return this.transaction('read', async tx => (await tx.run("SHOW CONSTRAINTS YIELD name WHERE name = 'smlink_uid' RETURN count(*) AS count"))
-      .records[0].get('count') > 0);
+    try {
+      return await this.transaction('read', async tx => (await tx.run(`SHOW CONSTRAINTS YIELD type, labelsOrTypes, properties
+        WHERE type IN ['UNIQUENESS', 'NODE_KEY'] AND labelsOrTypes = ['SMLink'] AND properties = ['uid'] RETURN count(*) AS count`))
+        .records[0].get('count') > 0);
+    } catch (error) {
+      if (error?.code === 'Neo.ClientError.Security.Forbidden') return null;
+      throw error;
+    }
   }
 
   // `unindexed` counts only what a recall with this exclusion could return.

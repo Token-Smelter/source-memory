@@ -402,3 +402,13 @@ test('compact catalog and search report a link with a hidden far end as a graph 
   const search = await searchCompactRecords(memory, 'fiction', { query: 'fictional', kinds: [] });
   assert.deepEqual([search.graph_gaps, search.edges, search.records.map(row => row.id)], [['cross_scope_hidden'], [], ['near']]);
 });
+
+test('compact fetch omits a link with a hidden far end and says relations are incomplete', async () => {
+  const hidden = { uid: 'relation_x', id: 'far-link', type: 'qualifies', from: 'prior-1', to: null, to_hidden: true, attribution: 'fiction', evidence: [] };
+  const { handlers } = fixture({ count: 3, edges: [hidden] });
+  try {
+    const { bindings } = await handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input });
+    const full = await handlers.fetchCompact({ scope: 'fiction', trigger: 'turn', handle: bindings.find(binding => binding.id === 'prior-1').handle });
+    assert.deepEqual([full.relations, full.immediate_relations_complete, full.relationship_omitted_at_least], [[], false, 1]);
+  } finally { handlers.close(); }
+});

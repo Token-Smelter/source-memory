@@ -208,7 +208,7 @@ A relation is written to one scope, its `from` record's, and may name an earlier
 | Selected far end | the bundle holds the far record (with its `scope`), the relation's `to_scope`, and spans of another scope name it; a relation stored in another selected scope names its `scope`. Following never crosses scopes |
 | `status` | `relations` counts same-scope relations; `links: n` is added when the scope stores any |
 
-Upgrade every writer of a scope and run `init` before writing links into it. `export-scope`/`restore-scope` stay single-scope: a snapshot of a scope that holds links is refused at restore (`snapshot_invalid`); the far scope's snapshot is unchanged. Design: [docs/NAMESPACING.md](docs/NAMESPACING.md) section 2.
+Upgrade every writer of a scope and run `init` before writing links into it. `export-scope`/`restore-scope` stay single-scope: a snapshot of a scope that holds links is refused at restore (`snapshot_invalid`); the far scope's snapshot is unchanged. The compact retrieval helpers in `pi-extension` report a hidden link as the graph gap `cross_scope_hidden` (and a compact fetch as incomplete relations), so a host never mistakes it for complete relation context. Design: [docs/NAMESPACING.md](docs/NAMESPACING.md) section 2.
 
 ## Listing
 

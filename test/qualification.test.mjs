@@ -199,8 +199,49 @@ test('enrich refuses a far scope it cannot read, or its own scope as far, before
   const store = { ...fakeStore(), async enrich(...args) { calls.push(args); return { records: [], relations: ['e'] }; } };
   await new Memory(settings, store).enrich('fiction', link({ scope: 'archive/a', id: 'x', expected_digest: 'b'.repeat(64) }));
   await new Memory(settings, store).enrich('fiction', link({ scope: 'archive/a', id: 'x' }));
-  assert.deepEqual(calls.map(args => [args.length, args[2]?.expected]), [[3, { e: 'b'.repeat(64) }], [2, undefined]]);
+  assert.deepEqual(calls.map(args => [args.length, args[2]?.expected]), [[3, new Map([['e', 'b'.repeat(64)]])], [2, undefined]]);
   assert.equal(calls[0][1].relations[0].to_scope, 'archive/a');
+});
+
+// Relation ids are caller text: an id that names an Object.prototype member is an id like any other, in every form.
+test('a relation id such as toString, constructor or __proto__ writes, replays and carries its precondition like any id', async () => {
+  const evidence = [{ turn: 'turn_fixture', entry_id: 'u1', start: 0, end: 4 }];
+  const settings = { scopes: { read: ['fiction', 'archive'], write: ['fiction'] } };
+  for (const id of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
+    for (const [to, precondition] of [['lighthouse-paint', undefined], [{ scope: 'archive', id: 'paint' }, undefined],
+      [{ scope: 'archive', id: 'paint', expected_digest: 'c'.repeat(64) }, 'c'.repeat(64)]]) {
+      const input = { records: [], relations: [{ id, type: 'qualifies', from: 'lighthouse-teal', to, attribution: 'fixture', evidence }] };
+      const calls = [];
+      const store = { ...fakeStore(), async enrich(...args) { calls.push(args); return { records: [], relations: [id] }; } };
+      const reply = await new Memory(settings, store).enrich('fiction', input);
+      assert.deepEqual(reply.relations, [id]);
+      const [[, payload, options]] = calls;
+      assert.deepEqual([payload.relations[0].id, options?.expected?.get(id), options === undefined], [id, precondition, precondition === undefined],
+        `${id} ${JSON.stringify(to)}`);
+      assert.equal(JSON.stringify(payload), JSON.stringify(normalizeEnrichment(input)), 'the normalized output is unchanged');
+    }
+  }
+});
+
+test('the store checks a precondition only for a link that carries one, whatever the relation id', async () => {
+  const store = new Neo4jStore({ uri: 'bolt://127.0.0.1:1', auth: 'none' });
+  const runs = [];
+  const evidenceTurn = { id: 'turn_fixture', scope: 'fiction', source: 's', conversation_id: 'c', turn_id: 't', entries: [{ id: 'u1', role: 'user', text: 'Teal paint.' }] };
+  const record = (scope, id, hash) => ({ properties: { uid: `record_${id}`, scope, record_id: id, hash, body: JSON.stringify({ id, kind: 'decision', text: 'x', status: 'proposed', attribution: 'a', evidence: [] }) } });
+  try {
+    store.transaction = async (_mode, action) => action({ async run(query, params) {
+      runs.push(query.split('\n')[0].trim());
+      if (query.startsWith('MATCH (t:SMTurn')) return { records: [{ get: () => ({ properties: { uid: 'turn_fixture', scope: 'fiction', body: JSON.stringify(evidenceTurn) } }) }] };
+      if (query.startsWith('MATCH (r:SMRecord {uid:$uid, scope:$scope})')) return { records: [{ get: () => record(params.scope, params.uid, 'd'.repeat(64)) }] };
+      throw new Error('stop after the checks');
+    } });
+    const payload = id => normalizeEnrichment({ records: [], relations: [{ id, type: 'qualifies', from: 'teal', to: { scope: 'archive', id: 'paint' }, attribution: 'f',
+      evidence: [{ turn: 'turn_fixture', entry_id: 'u1', start: 0, end: 4 }] }] });
+    for (const id of ['toString', 'valueOf', '__proto__']) {
+      await assert.rejects(store.enrich('fiction', payload(id)), /stop after the checks/u, `${id}: no precondition, so no mismatch`);
+      await assert.rejects(store.enrich('fiction', payload(id), { expected: new Map([[id, 'e'.repeat(64)]]) }), { code: 'relation_endpoint_digest_mismatch' }, id);
+    }
+  } finally { await store.close(); }
 });
 
 test('status names the store and the record contract', async () => {
