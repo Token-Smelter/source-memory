@@ -1,8 +1,8 @@
 # Source Memory tool surface
 
-**Bottom line:** Source Memory answers five kinds of question, and each has exactly one operation: *store this*, *derive from it*, *get this exact thing*, *find what's relevant*, *enumerate what's there*. Every read is complete or names what it left out. Scopes become hierarchical paths (`project/initiative/actor`): a content write lands in exactly one scope, a read covers one scope or a whole subtree, and grants are exact or subtree patterns. A flat scope keeps its own indexes and its stored data, so its reads are byte-identical to today's. Memory's only concepts are its own: **scope**, **source turns**, **records** (7 kinds), **relations** (5 types), **evidence** and **time**. Callers map theirs (actors, projects, people, tasks) onto those.
+**Bottom line:** Source Memory answers five kinds of question, and each has exactly one operation: *store this*, *derive from it*, *get this exact thing*, *find what's relevant*, *enumerate what's there*. Every read is complete or names what it left out. Scopes become hierarchical paths (`org/project/thread`): a content write lands in exactly one scope, a read covers one scope or a whole subtree, and grants are exact or subtree patterns. A flat scope keeps its own indexes and its stored data, so its reads are byte-identical to today's. Memory's only concepts are its own: **scope**, **source turns**, **records** (7 kinds), **relations** (5 types), **evidence** and **time**. Callers map theirs (users, projects, people, tasks) onto those.
 
-Status: r1 (revised after independent review). Delivery order: (1) nested scopes, (2) `list`. Host integration (capture, distillation, context injection, session tools) is not part of this surface; any host, Sourcerer included, calls the operations below.
+Status: r2. r1 (nested scopes, `list`) is built. r2 adds two planned features, designed in [NAMESPACING.md](NAMESPACING.md) and delivered in this order: (A) set reads over up to 4 exact scopes, (B) cross-scope links. Until they ship, every statement below describes the built surface, and "cross-scope relations do not exist" still holds. Host integration (capture, distillation, context injection, session tools) is not part of this surface; any host calls the operations below.
 
 ```mermaid
 flowchart LR
@@ -22,11 +22,11 @@ flowchart LR
 
 | Concept | Meaning | Not |
 |---|---|---|
-| scope | a partition and the unit of authorization; a path scope also names a subtree | a user, actor or tenant model |
+| scope | a partition and the unit of authorization; a path scope also names a subtree | a user or tenant model |
 | source turn | caller-copied original text, immutable, keyed by (scope, source, conversation, turn) | a summary |
 | chunk | a word window inside one entry of a turn; a search handle that resolves to its turn | a separate memory |
 | record | one derived claim of a fixed kind, citing source spans | a mutable row or task |
-| relation | a directed claim between two records of one scope, citing evidence | a foreign key to caller data |
+| relation | a directed claim between two records of one scope, citing evidence (planned: its `to` may be in another readable scope, [NAMESPACING.md](NAMESPACING.md)) | a foreign key to caller data |
 | time | `occurred_at` (caller-supplied, optional) and `stored_at` (the store's `created_at`, set by Neo4j's statement clock at write) | a state machine |
 
 A caller concept that needs state transitions (open/closed, assigned, due) stays with the caller. Memory may record *that* something happened, as an outcome or a supersedes relation, but never answers "what is its state now".
@@ -54,9 +54,9 @@ Only `recall`, `list`, `status` and `init` accept a selector; every other operat
 
 | Class | Grammar | Example | Layout |
 |---|---|---|---|
-| path | 1–8 segments joined by `/`; segment `[A-Za-z0-9_-]{1,64}`; whole name ≤ 256 characters | `acme`, `acme/init-7/actor-3` | by depth, below |
+| path | 1–8 segments joined by `/`; segment `[A-Za-z0-9_-]{1,64}`; whole name ≤ 256 characters | `acme`, `acme/proj-7/thread-3` | by depth, below |
 | flat | a path of depth 1, or any name that is not a path (*opaque*, e.g. `my scope`, `acme/x y`, `acme/`) | `default`, `demo` | unchanged: per-scope labels and indexes (`src/core.mjs:42-44`) |
-| nested | a path of depth 2–8 | `acme/init-7` | its root's tree indexes; no per-scope label or index |
+| nested | a path of depth 2–8 | `acme/proj-7` | its root's tree indexes; no per-scope label or index |
 | selector | a path `S` of at most 253 characters followed by `/**` | `'acme/**'` | names the subtree of `S` for reads and `init`; never a write target |
 
 One membership rule, used everywhere (Cypher selection, JS exactness check, pending counts, migration, `list`): **`T` is in `S/**` iff `T` is a path and (`T = S` or `T` starts with `S/`)**. In Cypher that is a prefix seek on `n.scope` plus a regex post-filter, so an opaque name that merely starts with `S/` (such as `acme/x y`) is never in a subtree, never labelled and never given terms.
@@ -76,7 +76,7 @@ A target `T` is granted when the array contains `T`, or contains `A/**` with `T`
 
 ### Writes: exactly one scope
 
-`ingest`, `enrich` and `index` take one exact scope; a selector is refused `scope_denied` by `authorize` inside `beforeWrite`, so it replies `stage:"before_write"` and adds no write-path code. The marker read and conditional labelling inside the ingest/enrich transactions raise nothing, so Q-SM-3/6 and the enrich source-order pin hold. Evidence spans and relation endpoints must be in the written scope (unchanged `Neo4jStore.enrich` checks). Cross-scope relations do not exist. Identity is unchanged: `identity(kind, scope, ...)` (`src/core.mjs:41`) hashes the full scope string, so the same record id in two scopes is two records.
+`ingest`, `enrich` and `index` take one exact scope; a selector is refused `scope_denied` by `authorize` inside `beforeWrite`, so it replies `stage:"before_write"` and adds no write-path code. The marker read and conditional labelling inside the ingest/enrich transactions raise nothing, so Q-SM-3/6 and the enrich source-order pin hold. Evidence spans and relation endpoints must be in the written scope (unchanged `Neo4jStore.enrich` checks). Cross-scope relations do not exist yet; [NAMESPACING.md](NAMESPACING.md) plans them (PR B) without changing this rule for evidence or for `from`. Identity is unchanged: `identity(kind, scope, ...)` (`src/core.mjs:41`) hashes the full scope string, so the same record id in two scopes is two records.
 
 ### Reads: one scope or a subtree
 
@@ -90,12 +90,12 @@ Subtree replies name scopes where an id alone is ambiguous: each ranked seed, ea
 
 ### Index layout: one tree per root, no fan-out
 
-Per-scope indexes cannot serve a subtree: `acme/**` over 500 actor scopes would be 500 queries per channel, and every scope would add five Lucene/HNSW indexes. Nested scopes therefore share one set of tree indexes **per root segment**, filtered inside the query by a scope term. A selector never spans roots, so a read is one query per channel.
+Per-scope indexes cannot serve a subtree: `acme/**` over 500 member scopes would be 500 queries per channel, and every scope would add five Lucene/HNSW indexes. Nested scopes therefore share one set of tree indexes **per root segment**, filtered inside the query by a scope term. A selector never spans roots, so a read is one query per channel.
 
 ```mermaid
 flowchart TD
-  N["Node in nested scope acme/init-7"] -->|"label SMTree&lt;d&gt;Turn/Chunk/Record, d = digest of root acme"| T["Tree indexes of root acme"]
-  N -->|"scope_terms: t(acme) t(acme/init-7) x(acme/init-7)"| T
+  N["Node in nested scope acme/proj-7"] -->|"label SMTree&lt;d&gt;Turn/Chunk/Record, d = digest of root acme"| T["Tree indexes of root acme"]
+  N -->|"scope_terms: t(acme) t(acme/proj-7) x(acme/proj-7)"| T
   F["Node in flat scope acme"] --> P["Per-scope indexes smt_/smr_/smc_/smvc_/smvr_ (unchanged)"]
   F -.->|"only after init 'acme/**' (opt-in marker)"| T
   O["Node in opaque scope"] --> P
@@ -185,4 +185,4 @@ No new error code. It serves "the last N episodes", "every decision in this conv
 
 ## Not in the surface
 
-Deletion, retention policy, task or obligation state, per-caller schemas, caller identity fields, model calls inside reads, cross-scope relations, and host integration: when to capture, how to distill, what to inject and which tools a host's sessions see belong to the host.
+Deletion, retention policy, task or obligation state, per-caller schemas, caller identity fields, model calls inside reads, and host integration: when to capture, how to distill, what to inject and which tools a host's sessions see belong to the host. Set reads and cross-scope relations are planned ([NAMESPACING.md](NAMESPACING.md)), not excluded.

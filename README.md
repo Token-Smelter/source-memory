@@ -164,7 +164,7 @@ Chunks are word windows inside a single entry, recorded with exact UTF-16 offset
 
 ## Nested scopes
 
-A scope that is a path, 1–8 segments of `[A-Za-z0-9_-]{1,64}` joined by `/` (at most 256 characters), also names a subtree: `acme/init-7/actor-3` sits under `acme/init-7` and `acme`. Any other name (for example `my scope`) is an opaque scope with no parent or subtree.
+A scope that is a path, 1–8 segments of `[A-Za-z0-9_-]{1,64}` joined by `/` (at most 256 characters), also names a subtree: `acme/proj-7/thread-3` sits under `acme/proj-7` and `acme`. Any other name (for example `my scope`) is an opaque scope with no parent or subtree.
 
 | Rule | Behaviour |
 |---|---|
