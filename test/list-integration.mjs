@@ -208,9 +208,9 @@ export async function runList(database, scratch = null) {
       const schema = async kind => (await memory.store.transaction('read', tx => tx.run(`SHOW ${kind} YIELD name, labelsOrTypes, properties
         WHERE labelsOrTypes = ['SMRecord'] AND properties = ['uid'] RETURN name`))).records.map(row => row.get('name'));
       const dropped = [];
-      for (const name of await schema('CONSTRAINTS')) { await memory.store.transaction('write', tx => tx.run(`DROP CONSTRAINT ${name}`)); dropped.push(name); }
-      for (const name of await schema('INDEXES')) { await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name}`)); dropped.push(name); }
       try {
+        for (const name of await schema('CONSTRAINTS')) { await memory.store.transaction('write', tx => tx.run(`DROP CONSTRAINT ${name}`)); dropped.push(name); }
+        for (const name of await schema('INDEXES')) { await memory.store.transaction('write', tx => tx.run(`DROP INDEX ${name}`)); dropped.push(name); }
         assert.deepEqual(await schema('INDEXES'), [], `dropped ${dropped}`);
         assert.deepEqual(await memory.list('rel', { relations: true }), before, `dropped ${dropped}`);
       } finally { await memory.init('rel'); }
