@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { isSelector, markStage, normalizeEnrichment, OUTCOME_REFERENT_KINDS } from '../src/core.mjs';
 import * as defaultLinks from '../src/link-proposals.mjs';
-import { searchDerived, resolveDerived, searchRaw } from './derived-retrieval.mjs';
+import { searchDerived, resolveDerived, searchRaw, searchCombined } from './derived-retrieval.mjs';
 import { createAtomicOutcomes } from './atomic-outcome.mjs';
 import { catalogCompactRecords, searchCompactRecords } from './compact-retrieval.mjs';
 
@@ -154,6 +154,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
     async searchDerived({ scope, input }) { allowed(scope); return searchDerived(memory, scope, input); },
     async resolveDerived({ scope, input }) { allowed(scope); return resolveDerived(memory, scope, input); },
     async searchRaw({ scope, input }) { allowed(scope); return searchRaw(memory, scope, input); },
+    async searchCombined({ scope, input }) { allowed(scope); return searchCombined(memory, scope, input); },
     async enrich({ scope, input, trigger }) {
       let normalized;
       return stagedWrite(async () => {

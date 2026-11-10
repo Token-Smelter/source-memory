@@ -22,15 +22,17 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
   return {
     async run({ arm, case: input }) {
       const s = verifySeal(seal, expectedDigest);
-      if (!['candidate', 'baseline', 'empty', 'reference', 'raw-only'].includes(arm)) throw fail('arm_invalid');
+      if (!['candidate', 'baseline', 'empty', 'reference', 'raw-only', 'combined', 'recall-chunks'].includes(arm)) throw fail('arm_invalid');
+      const recall = ['combined', 'recall-chunks'].includes(arm);
+      if (recall && typeof memory.searchCombined !== 'function') throw fail('adapter_invalid');
       if (!nonempty(input?.id) || s.cases[input.id] !== hash(input)) throw fail('case_seal_mismatch');
       if (!nonempty(input?.request) || !nonempty(input?.actor) || !Number.isFinite(Date.parse(input?.queryTime))
         || !subset(input.readScopes, s.access.readScopes) || !subset(input.evidenceScopes, s.access.evidenceScopes)) throw fail('case_access_invalid');
       const limits = s.answerer.limits;
       const access = Object.freeze({ actor: input.actor, queryTime: input.queryTime,
         readScopes: Object.freeze([...input.readScopes]), evidenceScopes: Object.freeze([...input.evidenceScopes]) });
-      const storeId = { candidate: s.stores.candidate, baseline: s.baseline.storeId, reference: s.stores.reference }[arm];
-      const offered = new Map(), returnedEvidence = new Map(), refusals = [];
+      const storeId = { candidate: s.stores.candidate, combined: s.stores.candidate, 'recall-chunks': s.stores.candidate, baseline: s.baseline.storeId, reference: s.stores.reference }[arm];
+      const offered = new Map(), returnedEvidence = new Map(), refusals = [], excerptIds = new Set();
       let searches = 0, resolves = 0, returned = 0, evidenceBytes = 0, retrievalBytes = 0, inFlight = 0, closed = false, retrievalFailed = false;
       const budgetRefusal = (tool, code) => {
         if (refusals.length >= 64) { retrievalFailed = true; return fail('answer_refusal_limit'); }
@@ -71,13 +73,15 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
           const args = { ...access, query, limit: Math.min(remaining, perSearch) };
           inFlight++;
           try {
-            const rows = arm === 'empty' ? [] : arm === 'raw-only' ? await archive.search(args) : await memory.search({ ...args, storeId });
+            const rows = arm === 'empty' ? [] : arm === 'raw-only' ? await archive.search(args)
+              : recall ? await memory.searchCombined({ ...args, storeId, records: arm === 'combined' }) : await memory.search({ ...args, storeId });
             if (closed) throw fail('answer_closed');
             if (!Array.isArray(rows) || rows.length > args.limit) throw fail('retrieval_invalid');
             if (returned + rows.length > limits.returnedItems) throw budgetRefusal('search', 'item_limit');
             const next = new Map(), result = rows.map(row => {
               if (!nonempty(row?.id) || !nonempty(row?.text) || !access.readScopes.includes(row.scope)) throw fail('retrieval_scope_invalid');
-              if (arm === 'raw-only') {
+              // Product recall mixes source excerpts with derived records; each row keeps the protocol of its kind.
+              if (arm === 'raw-only' || (recall && row.kind === 'source_excerpt')) {
                 if (!access.evidenceScopes.includes(row.scope)) throw fail('evidence_scope_invalid');
                 // Raw excerpts depend on the query, so each distinct text is its own citable evidence.
                 const evidenceId = rawEvidenceId(row.id, row.text);
@@ -95,12 +99,12 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
             });
             const bytes = result.reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify(row)), 0);
             if (retrievalBytes + bytes > limits.retrievalBytes) throw budgetRefusal('search', 'retrieval_bytes_limit');
-            if (arm === 'raw-only' && evidenceBytes + bytes > limits.evidenceBytes) throw budgetRefusal('search', 'evidence_limit');
+            const excerpts = result.filter(row => row.kind === 'source_excerpt');
+            const excerptBytes = excerpts.reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify(row)), 0);
+            if (excerpts.length && evidenceBytes + excerptBytes > limits.evidenceBytes) throw budgetRefusal('search', 'evidence_limit');
             returned += rows.length; retrievalBytes += bytes;
-            if (arm === 'raw-only') {
-              evidenceBytes += bytes;
-              for (const row of result) remember(row.id, row.evidence[0].id, row.scope, row.text);
-            }
+            evidenceBytes += excerptBytes;
+            for (const row of excerpts) { remember(row.id, row.evidence[0].id, row.scope, row.text); excerptIds.add(row.id); }
             for (const [id, refs] of next) offered.set(id, refs);
             return result;
           } catch (error) {
@@ -111,7 +115,7 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
         },
         resolve(itemId, evidenceId) {
           if (closed) throw fail('answer_closed');
-          if (arm === 'raw-only' || !offered.get(itemId)?.has(evidenceId)) throw fail('not_offered');
+          if (arm === 'raw-only' || excerptIds.has(itemId) || !offered.get(itemId)?.has(evidenceId)) throw fail('not_offered');
           if (++resolves > limits.resolveCalls) throw budgetRefusal('resolve', 'resolve_limit');
           inFlight++;
           return (async () => {
@@ -153,7 +157,7 @@ export function createAnswerer({ seal, expectedDigest, memory, archive, respond 
         return { citation_id: citationId(row.item_id, row.evidence_id), ...evidence };
       });
       return { caseId: input.id, answer: { text: abstained ? UNKNOWN_ANSWER : answer.text, citations: structuredClone(answer.citations) },
-        condition: arm, diagnostic: ['reference', 'raw-only'].includes(arm),
+        condition: arm, diagnostic: ['reference', 'raw-only', 'combined', 'recall-chunks'].includes(arm),
         trace: { caseId: input.id, caseDigest: s.cases[input.id], sealDigest: seal.digest,
           context: { request: input.request, actor: input.actor, queryTime: input.queryTime, readScopes: [...input.readScopes], evidenceScopes: [...input.evidenceScopes] },
           searchCalls: searches, resolveCalls: resolves, returnedItems: returned, returnedItemIds: [...offered.keys()], evidenceBytes, retrievalBytes,

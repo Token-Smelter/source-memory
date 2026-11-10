@@ -78,6 +78,42 @@ export async function searchRaw(memory, scope, input) {
   return output;
 }
 
+/**
+ * The product's own recall: every channel (turn, record and chunk lexical; chunk and record vector) and the configured
+ * reranker rank one pool. Record seeds become derived items whose evidence is resolved separately; turn seeds become
+ * source excerpts that are themselves evidence. Partial or unavailable required channels fail rather than narrow.
+ * With records false only turn seeds are kept: fused scores are per item, so this equals fusing the source channels alone.
+ */
+export async function searchCombined(memory, scope, input) {
+  authorize(memory.config, scope);
+  const query = text(input?.query, 4000);
+  const limit = integer(input?.limit, 8, 1, 32);
+  if (![undefined, true, false].includes(input?.records)) throw fail('invalid_input');
+  const records = input?.records !== false;
+  if (typeof memory.recall !== 'function' || typeof memory.bundle !== 'function' || typeof memory.store?.lexicalStatus !== 'function'
+    || typeof memory.store?.chunkLexicalStatus !== 'function') throw fail('search_unavailable');
+  // Flat recall checks only the chunk index itself; turn and record readiness are checked here so no channel is silently empty.
+  const states = [...await Promise.all(['turn', 'record'].map(kind => memory.store.lexicalStatus(scope, kind))), await memory.store.chunkLexicalStatus(scope)];
+  if (states.some(state => state?.status !== 'ready')) throw fail('search_incomplete');
+  // The fused pool is cut before seeds are filtered; the control widens it and refuses a pool that could still hide source seeds.
+  const candidates = records ? 64 : 256;
+  const result = await memory.recall(scope, { query, candidates, limit }, { seedsOnly: true });
+  if (result?.scope !== scope || !Array.isArray(result.ranked) || !result.channels
+    || ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'].some(name => result.channels[name]?.status !== 'ready')
+    || Object.values(result.channels).some(row => ['partial', 'pending', 'unavailable'].includes(row.status))) throw fail('search_incomplete');
+  const output = [];
+  const seeds = result.ranked.filter(row => records || row.kind !== 'record');
+  if (!records && seeds.length < limit && result.ranked.length >= candidates) throw fail('search_incomplete');
+  for (const seed of seeds.slice(0, limit)) {
+    const bundle = await memory.bundle(scope, seed, query, 48, 4);
+    if (seed.kind === 'record') { output.push(project(scope, bundle, seed.id).record); continue; }
+    if (seed.kind !== 'turn' || !bundle.source || !Array.isArray(bundle.source.excerpts)) throw fail('source_unavailable');
+    const body = bundle.source.excerpts.map(row => row.text).filter(value => typeof value === 'string').join('\n');
+    if (body) output.push({ id: seed.id, kind: 'source_excerpt', scope, text: body });
+  }
+  return output;
+}
+
 /** Re-resolve only evidence belonging to the named derived item or its displayed links. */
 export async function resolveDerived(memory, scope, input) {
   authorize(memory.config, scope);
@@ -109,6 +145,12 @@ export function createDerivedAdapter({ stores }) {
     async search(args) {
       const store = await select(args);
       const result = await store.client.searchDerived(store.scope, { query: args.query, limit: args.limit });
+      await recheck(store, args.queryTime);
+      return result;
+    },
+    async searchCombined(args) {
+      const store = await select(args);
+      const result = await store.client.searchCombined(store.scope, { query: args.query, limit: args.limit, records: args.records });
       await recheck(store, args.queryTime);
       return result;
     },
