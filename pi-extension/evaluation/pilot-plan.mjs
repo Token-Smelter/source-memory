@@ -48,6 +48,12 @@ export const TREATMENTS = Object.freeze({
     product: true }),
   T1b: Object.freeze({ id: 'T1b', surface: 'distiller instructions', guidance: 'typed-records-and-links-v3', guidanceSha256: GUIDANCE_T1B_SHA256, product: true }),
   T1: Object.freeze({ id: 'T1', surface: 'distiller instructions', guidance: 'typed-records-and-links-v2', guidanceSha256: GUIDANCE_SHA256, product: true }),
+  // Calibration of the Sourcerer integration candidate's question cap over unchanged T1 v2 guidance. Its other prompt parts
+  // (job task and agent prompts, dynamic inputs) are not reproduced, so this is not full-integration prompt equivalence.
+  T1c: Object.freeze({ id: 'T1c', surface: 'distiller instructions and per-turn question cap', guidance: 'typed-records-and-links-v2', guidanceSha256: GUIDANCE_SHA256,
+    maxQuestions: 1, capSource: Object.freeze({ repository: 'sourcerer', commit: 'ed9c0345862bfbe555e6342e363b820357039a21',
+      semantics: 'at most N distinct question record ids per source turn, rejected on the host before write with memory_question_cap; no ranking, dropping, truncation or retyping' }),
+    product: true }),
 });
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
 /** Runtime paths whose change can alter candidate behavior; each changed one must be named as reviewed. */

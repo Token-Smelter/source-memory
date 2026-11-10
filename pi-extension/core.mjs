@@ -173,8 +173,12 @@ export const RETRIEVAL_MODES = ['search', 'oracle-catalog'];
 /** Diagnostic D0: 'oracle-catalog' replaces ranked search with every prior record in scope; it is not a product mode. */
 const SEARCH_SHAPE = { search: { channels: ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'], seeds: 48, pool: 64, bytes: 24000 },
   'oracle-catalog': { channels: ['catalog'], seeds: 256, pool: 256, bytes: 120000 } };
-export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [], requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate', retrieval = 'search' }) {
+export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [], requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate', retrieval = 'search',
+  maxQuestions = null }) {
   if (!RETRIEVAL_MODES.includes(retrieval)) throw fail('invalid_input');
+  if (maxQuestions !== null && (!Number.isSafeInteger(maxQuestions) || maxQuestions < 0 || maxQuestions > 16)) throw fail('invalid_input');
+  // One tools instance serves one source turn, so this set is the turn's distinct question records.
+  const questionIds = new Set();
   const shape = SEARCH_SHAPE[retrieval];
   if (typeof scope !== 'string' || !scope || !turn?.turn_id || !Array.isArray(turn.entries) || !receipt?.id || !memory) throw fail('invalid_input');
   const labels = new Map();
@@ -213,38 +217,51 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
     async record(kind, text, refs, options = {}) {
       if (requireSearch && (!searches || searchFailed)) throw fail('search_required');
       const record = buildRecord(kind, text, refs);
-      if (offer) {
-        try { if (typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token); }
-        catch (problem) { searchFailed = true; throw problem; }
-        finally { offer = null; offerHandles = null; choices = null; choiceCount = 0; }
+      // The cap is checked before any write. A repeated identical question takes no new slot; no record is dropped, cut or retyped.
+      let reserved = null;
+      if (maxQuestions !== null && kind === 'question' && !questionIds.has(record.id)) {
+        if (questionIds.size >= maxQuestions) throw fail('memory_question_cap');
+        questionIds.add(record.id); reserved = record.id;
       }
-      let write;
-      if (kind === 'outcome') {
-        const handle = options.action_handle;
-        const actionInput = options.new_action;
-        if (Boolean(handle) === Boolean(actionInput) || (handle && !actionHandles.has(handle))) throw fail('outcome_referent_required');
-        if (typeof memory.beginOutcome !== 'function' || typeof memory.applyOutcome !== 'function') throw fail('outcome_unavailable');
-        const action = actionInput ? buildRecord('action', actionInput.text, actionInput.evidence_labels) : null;
-        const offered = await memory.beginOutcome(scope, receipt.id, record, action, handle ?? null);
-        let review = null;
-        if (offered.proposal?.requires_review) {
-          if (reviewMode !== 'separate' || typeof reviewer?.review !== 'function') throw fail('review_required');
-          const decision = await reviewer.review({ proposal: offered.proposal, mode: reviewMode });
-          if (!decision || !Array.isArray(decision.approved) || typeof decision.reviewer !== 'string' || typeof decision.decision_ref !== 'string') throw fail('review_invalid');
-          if (!decision.approved.includes(0)) { await memory.cancelOutcome(offered.token); return { status: 'refused', reason: 'review_rejected' }; }
-          review = { reviewer: `separate:${decision.reviewer}`, decision_ref: decision.decision_ref,
-            proposal_sha256: offered.proposal.proposal_sha256, approved: [0] };
+      try {
+        if (offer) {
+          try { if (typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token); }
+          catch (problem) { searchFailed = true; throw problem; }
+          finally { offer = null; offerHandles = null; choices = null; choiceCount = 0; }
         }
-        write = await memory.applyOutcome(scope, offered.token, review);
-        if (write?.status !== 'written' || !write.records?.includes(record.id)) throw fail('outcome_write_unknown');
-        for (const id of write.records) if (!recordIds.includes(id)) recordIds.push(id);
-      } else {
-        if (options.action_handle || options.new_action) throw fail('invalid_input');
-        const payload = normalizeEnrichment({ records: [record], relations: [] });
-        write = await memory.enrich(scope, payload, { trigger: receipt.id });
-        if (!recordIds.includes(record.id)) recordIds.push(record.id);
+        let write;
+        if (kind === 'outcome') {
+          const handle = options.action_handle;
+          const actionInput = options.new_action;
+          if (Boolean(handle) === Boolean(actionInput) || (handle && !actionHandles.has(handle))) throw fail('outcome_referent_required');
+          if (typeof memory.beginOutcome !== 'function' || typeof memory.applyOutcome !== 'function') throw fail('outcome_unavailable');
+          const action = actionInput ? buildRecord('action', actionInput.text, actionInput.evidence_labels) : null;
+          const offered = await memory.beginOutcome(scope, receipt.id, record, action, handle ?? null);
+          let review = null;
+          if (offered.proposal?.requires_review) {
+            if (reviewMode !== 'separate' || typeof reviewer?.review !== 'function') throw fail('review_required');
+            const decision = await reviewer.review({ proposal: offered.proposal, mode: reviewMode });
+            if (!decision || !Array.isArray(decision.approved) || typeof decision.reviewer !== 'string' || typeof decision.decision_ref !== 'string') throw fail('review_invalid');
+            if (!decision.approved.includes(0)) { await memory.cancelOutcome(offered.token); return { status: 'refused', reason: 'review_rejected' }; }
+            review = { reviewer: `separate:${decision.reviewer}`, decision_ref: decision.decision_ref,
+              proposal_sha256: offered.proposal.proposal_sha256, approved: [0] };
+          }
+          write = await memory.applyOutcome(scope, offered.token, review);
+          if (write?.status !== 'written' || !write.records?.includes(record.id)) throw fail('outcome_write_unknown');
+          for (const id of write.records) if (!recordIds.includes(id)) recordIds.push(id);
+        } else {
+          if (options.action_handle || options.new_action) throw fail('invalid_input');
+          const payload = normalizeEnrichment({ records: [record], relations: [] });
+          write = await memory.enrich(scope, payload, { trigger: receipt.id });
+          if (!recordIds.includes(record.id)) recordIds.push(record.id);
+        }
+        reserved = null;
+        if (typeof ensureIndexed === 'function') await ensureIndexed(memory, scope, write?.indexing, { recordIds: write?.records ?? [] });
+      } catch (error) {
+        // A known no-write failure releases the slot; a completed or unknown write keeps it held.
+        if (reserved && !error?.write_outcome_unknown && error?.code !== 'write_reconciliation_required') questionIds.delete(reserved);
+        throw error;
       }
-      if (typeof ensureIndexed === 'function') await ensureIndexed(memory, scope, write?.indexing, { recordIds: write?.records ?? [] });
       offer = null;
       offerHandles = null;
       choices = null;

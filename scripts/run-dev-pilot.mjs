@@ -367,8 +367,12 @@ async function main() {
     reanswer = { request, report, priorSeal, cases, plan: { priorReportSha256: request.reportSha256, priorSealDigest: priorSeal.digest,
       priorCodeSha: priorSeal.spec.codeSha, priorTreatment: priorSeal.spec.treatment ?? null, arms: [...request.arms] } };
   }
-  const remaining = WORKER_SHARE_NANO - previous;
-  if (remaining <= 0n) throw fail('soft_cap_exhausted');
+  const shareRemaining = WORKER_SHARE_NANO - previous;
+  if (shareRemaining <= 0n) throw fail('soft_cap_exhausted');
+  // An operator run cap may only lower the sealed soft cap below the remaining share.
+  if (process.env.PILOT_CAP_NANO !== undefined && !/^[1-9][0-9]{0,17}$/.test(process.env.PILOT_CAP_NANO)) throw fail('run_cap_invalid');
+  const runCap = process.env.PILOT_CAP_NANO ? BigInt(process.env.PILOT_CAP_NANO) : null;
+  const remaining = runCap !== null && runCap < shareRemaining ? runCap : shareRemaining;
   const seal = createCitedPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
     codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null,
     toolCallReviewSha256: reviewMapSha, treatment, reanswer: reanswer?.plan ?? null,
@@ -501,6 +505,8 @@ async function main() {
             partialCaseHandback: resume.partialCase?.descriptor ?? null, checkpointSnapshotEquivalent: resume.checkpointSnapshotEquivalent,
             sourceTreeDriftSha256: resume.plan.sourceTreeDriftSha256 ?? null });
           if (JSON.stringify(current) !== JSON.stringify(resumeValidation)) throw fail('resume_provenance_mismatch');
+          // A retried turn cannot be seeded with the questions its failed attempt may already have written.
+          if (treatment?.maxQuestions != null && resumeValidation.retryFirst) throw fail('question_cap_retry_unsupported');
           const output = execFileSync('/usr/bin/docker', ['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/restore-scope.mjs',
             '/scratch/resume-snapshot.json', resume.plan.snapshotSha256, scope], { encoding: 'utf8', timeout: 180000, maxBuffer: 100000 });
           const restored = JSON.parse(output);
@@ -526,7 +532,7 @@ async function main() {
         }
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model, candidateOrigin), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
-          retrieval: treatment?.retrieval ?? 'search', guidance: treatment?.guidance ?? null,
+          retrieval: treatment?.retrieval ?? 'search', guidance: treatment?.guidance ?? null, maxQuestions: treatment?.maxQuestions ?? null,
           budget: createInputBudget(Number.MAX_SAFE_INTEGER),
           imageArchive: createImageArchive({ directory: imageDir }),
           ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state,
