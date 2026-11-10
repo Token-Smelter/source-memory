@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDerivedAdapter, resolveDerived, searchDerived, searchRaw } from '../pi-extension/derived-retrieval.mjs';
+import { createDerivedAdapter, resolveDerived, searchCombined, searchDerived, searchRaw } from '../pi-extension/derived-retrieval.mjs';
 
 const span = { turn: 'turn', entry_id: 'entry', start: 0, end: 15, text: 'fictional proof' };
 const bundle = { records: [{ id: 'record', kind: 'decision', text: 'Fictional decision', status: 'proposed', attribution: 'fiction', supporting_evidence: [span] }],
@@ -35,6 +35,21 @@ test('raw-only diagnostic seeds from turn and chunk lexical channels, not derive
   const rows = await searchRaw(memory, 'fiction', { query: 'fiction', limit: 1 });
   assert.deepEqual([kinds, rows], [['status:turn', 'status:chunk', 'search:turn', 'search:chunk'],
     [{ id: 'turn', scope: 'fiction', text: 'fictional raw source' }]]);
+});
+
+test('combined recall keeps product ranking, projecting records as derived items and turns as source excerpts', async () => {
+  const ready = { status: 'ready' };
+  const channels = { turn_lexical: ready, record_lexical: ready, chunk_lexical: ready, chunk_vector: ready, record_vector: ready, reranker: { status: 'unconfigured' } };
+  const memory = channels => ({ config: { scopes: { read: ['fiction'] } },
+    async recall(scope, input, options) { assert.deepEqual([input.candidates, options.seedsOnly], [64, true]);
+      return { scope, channels, ranked: [{ kind: 'turn', id: 'turn' }, { kind: 'record', id: 'record' }] }; },
+    async bundle(_scope, seed) { return seed.kind === 'turn' ? { source: { excerpts: [{ text: 'fictional raw source' }] } } : bundle; } });
+  const rows = await searchCombined(memory(channels), 'fiction', { query: 'fiction', limit: 2 });
+  assert.deepEqual([rows.map(row => [row.id, row.kind ?? 'derived']), rows[0].text, rows[1].text.includes('fictional proof'), rows[1].evidence.length],
+    [[['turn', 'source_excerpt'], ['record', 'derived']], 'fictional raw source', false, 1]);
+  const chunks = await searchCombined(memory(channels), 'fiction', { query: 'fiction', limit: 2, records: false });
+  assert.deepEqual(chunks.map(row => row.kind), ['source_excerpt']);
+  await assert.rejects(searchCombined(memory({ ...channels, chunk_vector: { status: 'partial' } }), 'fiction', { query: 'fiction' }), /search_incomplete/);
 });
 
 test('derived evidence resolution rejects an unoffered source handle', async () => {

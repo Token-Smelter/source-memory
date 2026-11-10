@@ -1,7 +1,7 @@
 import { createClient } from './ndjson.mjs';
 
 const noPersistentWrite = new Set(['status', 'recordPresence', 'recordVectorStatus', 'turnVectorStatus', 'sourceChunks', 'recall', 'searchCompact', 'fetchCompact', 'releaseCompact', 'beginLinks', 'finishLinks', 'cancelLinks', 'beginOutcome', 'cancelOutcome',
-  'searchDerived', 'resolveDerived', 'searchRaw']);
+  'searchDerived', 'resolveDerived', 'searchRaw', 'searchCombined']);
 
 /** Facade for one long-lived Memory subprocess; never exposes raw relation writes. */
 export function createMemoryClient({ input, output, timeoutMs, indexTimeoutMs = timeoutMs, reviewContract = 'pi-memory-review/v1', onReceipt = () => {} }) {
@@ -41,6 +41,7 @@ export function createMemoryClient({ input, output, timeoutMs, indexTimeoutMs = 
     searchDerived: (scope, input, options) => call('searchDerived', { scope, input }, options),
     resolveDerived: (scope, input, options) => call('resolveDerived', { scope, input }, options),
     searchRaw: (scope, input, options) => call('searchRaw', { scope, input }, options),
+    searchCombined: (scope, input, options) => call('searchCombined', { scope, input }, options),
     enrich: (scope, input, { trigger, signal } = {}) => call('enrich', { scope, input, trigger }, { signal }),
     beginLinks: (scope, turn, recordIds, { candidateHandles, signal } = {}) => call('beginLinks',
       { scope, turn, record_ids: recordIds, ...(candidateHandles ? { candidate_handles: candidateHandles } : {}), review_contract: reviewContract }, { signal }),

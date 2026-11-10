@@ -21,7 +21,7 @@ import { createSliceSession, resolvePiModels } from '../pi-extension/slice-runti
 import { createAnswerer, CITATION_PROTOCOL } from '../pi-extension/evaluation/answerer.mjs';
 import { prepareDevelopmentCases, toolCallReviewSummary, verifyToolCallReview } from '../pi-extension/evaluation/dev-dataset.mjs';
 import { createPiAnswererResponder, createPiScorerJudge, createPiScorerSpecificRepair, SCORER_SPECIFIC_REPAIR, SCORER_MULTI_REPAIR } from '../pi-extension/evaluation/pi-calls.mjs';
-import { BASELINE_CANDIDATE_ROUTE, CITED_RESUME_TRANSITIONS, DISTILLER_MAX_OUTPUT_TOKENS, EVALUATOR_MAX_OUTPUT_TOKENS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
+import { BASELINE_CANDIDATE_ROUTE, REANSWER_ARMS, CITED_RESUME_TRANSITIONS, DISTILLER_MAX_OUTPUT_TOKENS, EVALUATOR_MAX_OUTPUT_TOKENS, TREATMENTS, createCitedPilotPlan, DESIGN_SHA256, INTERPRETATION_02_SHA256 } from '../pi-extension/evaluation/pilot-plan.mjs';
 import { WORKER_SHARE_NANO, attestedPriorSpend, priorSoftSpend, validatePriorSpendContinuity } from '../pi-extension/evaluation/prior-spend.mjs';
 import { validatePilotResume } from '../pi-extension/evaluation/pilot-resume.mjs';
 import { validateCaseHandback, validatePartialCaseHandback } from '../pi-extension/evaluation/pilot-handback.mjs';
@@ -30,6 +30,7 @@ import { checkpointId, runPilotSequence } from '../pi-extension/evaluation/pilot
 import { pairedReport } from '../pi-extension/evaluation/report.mjs';
 import { createScorer, scoreCase } from '../pi-extension/evaluation/scorer.mjs';
 import { createSoftBudget } from '../pi-extension/evaluation/soft-budget.mjs';
+import { hash } from '../pi-extension/evaluation/seal.mjs';
 import { createSnapshotVerifier } from '../pi-extension/evaluation/snapshot-verifier.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -345,12 +346,35 @@ async function main() {
     resume = { report, priorSeal, progress, journalBytes, snapshotBytes, checkpointSnapshotEquivalent, driftBytes, plan, superseded, partialCase,
       handbacks, handbackRows, carriedRows, carriedSnapshots, originSeals, carriedCases, originBundles };
   }
+  // Re-answer mode: the sealed answerer and scorer re-run named arms against a completed run's per-case snapshots.
+  let reanswer = null;
+  if (process.env.PILOT_REANSWER) {
+    if (process.env.PILOT_RESUME || treatment) throw fail('reanswer_invalid');
+    let request;
+    try { request = JSON.parse(process.env.PILOT_REANSWER); } catch { throw fail('reanswer_invalid'); }
+    if (!request || !Array.isArray(request.arms) || !request.arms.length || request.arms.some(arm => !REANSWER_ARMS.includes(arm))
+      || new Set(request.arms).size !== request.arms.length) throw fail('reanswer_invalid');
+    const report = JSON.parse(pinned(request.reportPath, request.reportSha256, 50_000_000).toString('utf8'));
+    if (dirname(dirname(request.reportPath)) !== parent || report.run_dir !== dirname(request.reportPath)) throw fail('reanswer_invalid');
+    const priorSeal = JSON.parse(pinned(report.artifacts['seal.json'].path, report.artifacts['seal.json'].sha256, 10_000_000).toString('utf8'));
+    const cases = prepared.map(item => {
+      const ref = report.artifacts.case_snapshots?.find(row => row.case_id === item.publicCase.id);
+      if (!ref) throw fail('reanswer_case_snapshot_missing');
+      return { item, ref, bytes: pinned(ref.path, ref.sha256, 128_000_000) };
+    });
+    reanswer = { request, report, priorSeal, cases, plan: { priorReportSha256: request.reportSha256, priorSealDigest: priorSeal.digest,
+      priorCodeSha: priorSeal.spec.codeSha, priorTreatment: priorSeal.spec.treatment ?? null, arms: [...request.arms] } };
+  }
   const remaining = WORKER_SHARE_NANO - previous;
   if (remaining <= 0n) throw fail('soft_cap_exhausted');
   const seal = createCitedPilotPlan({ cases: prepared, sourceSha256: source.source_sha256, datasetSha256: manifestSha, sdkSha256: sdkSessionSha,
     codeSha, routes: routeRates, capNano: remaining.toString(), priorSpendNano: previous.toString(), resume: resume?.plan ?? null,
-    toolCallReviewSha256: reviewMapSha, treatment,
+    toolCallReviewSha256: reviewMapSha, treatment, reanswer: reanswer?.plan ?? null,
     interpretationSha256: INTERPRETATION_02_SHA256 });
+  // The re-answered arms must use exactly the prior run's evaluation contract.
+  if (reanswer && ['answerer', 'scorer', 'rubric', 'packets', 'cases', 'packetSchema', 'policySha256', 'sourceSha256', 'datasetSha256',
+    'toolCallReviewSha256', 'designSha256', 'access', 'safety', 'interpretation']
+    .some(key => hash(reanswer.priorSeal.spec[key] ?? null) !== hash(seal.spec[key] ?? null))) throw fail('reanswer_contract_mismatch');
   if (resume?.handbackRows.length) pairedReport({ seal, expectedDigest: seal.digest, rows: resume.handbackRows, dependencies: [],
     provenance: resume.originSeals.filter(row => row.digest !== seal.digest) });
   const runId = randomUUID(), dir = mkdtempSync(join(parent, 'pilot-'));
@@ -362,6 +386,7 @@ async function main() {
   mkdirSync(join(driverDir, 'intents'), { mode: 0o700 });
   const sourceCopy = join(dir, 'source.jsonl'); writePrivate(sourceCopy, sourceBytes);
   writePrivate(join(dir, 'seal.json'), seal);
+  if (reanswer) reanswer.cases.forEach((row, index) => writePrivate(join(driverDir, `reanswer-${index}.json`), row.bytes));
   let resumeValidation = null;
   if (resume) {
     if (resume.superseded) writePrivate(join(dir, 'superseded-case-attempt.json'), resume.superseded);
@@ -505,7 +530,35 @@ async function main() {
           meterRuntime: (underlying, context) => budget.wrap(underlying, () => ({ ...meta,
             purpose: context.purpose, task_version: context.purpose === 'candidate' ? 'distiller-r2-v4' : 'link-review-r2-v3' })) });
         const evaluatorRuntime = budget.wrap(runtime, () => meta);
-        sequenceResult = await runPilotSequence({ session, journal, checkpoints, cases: prepared, budget,
+        // Each case is answered against its own restored snapshot; nothing is distilled.
+        const replayCases = async ({ evaluateCase, onCase }) => {
+          const evaluated = [];
+          for (const [index, row] of reanswer.cases.entries()) {
+            if (budget.state().stopped) return { status: 'budget_stopped', cursor: null, results: [], evaluated };
+            const output = execFileSync('/usr/bin/docker', ['exec', driver, '/usr/local/bin/node', '/memory/pi-extension/restore-scope.mjs',
+              `/scratch/reanswer-${index}.json`, row.ref.sha256, scope, '--replace'], { encoding: 'utf8', timeout: 180000, maxBuffer: 100000 });
+            const restored = JSON.parse(output);
+            if (restored.equivalent !== true || restored.source_sha256 !== row.ref.sha256) throw fail('reanswer_restore_unverified');
+            const ids = JSON.parse(row.bytes).nodes.filter(node => node.labels?.includes('SMRecord')).map(node => node.properties?.record_id);
+            for (let i = 0; i === 0 || i < ids.length; i += 16) await ensureIndexed(memory, scope, { status: 'ready' }, { waitForVectors: true, recordIds: ids.slice(i, i + 16) });
+            // Full-text indexes populate asynchronously after a bulk restore; the arm must not see a narrowed pool.
+            for (let poll = 0; ; poll++) {
+              try { await memory.searchCombined(scope, { query: 'readiness', limit: 1 }); break; } catch (error) {
+                if (error?.code !== 'search_incomplete' || poll >= 120) throw fail('reanswer_index_unready');
+                await sleep(500);
+              }
+            }
+            progress.append({ type: 'reanswer_restore', case_id: row.item.publicCase.id, source_sha256: row.ref.sha256, restored_sha256: restored.restored_sha256 });
+            let result;
+            try { result = await evaluateCase(row.item, row.item.through); }
+            catch (error) { return { status: 'case_failed', cursor: null, results: [], evaluated, failure: error?.code ?? 'case_failed' }; }
+            evaluated.push(result);
+            await onCase(result, budget.state());
+            if (result.status !== 'scored') return { status: 'case_failed', failure: 'reanswer_case_partial', cursor: null, results: [], evaluated };
+          }
+          return { status: 'reanswer_complete', cursor: null, results: [], evaluated };
+        };
+        sequenceResult = await (reanswer ? replayCases : runPilotSequence)({ session, journal, checkpoints, cases: prepared, budget,
           initialCursor: resumeValidation?.cursor ?? null, retryFirst: resumeValidation?.retryFirst ?? false,
           completedCaseIds: resume?.handbacks.map(row => row.caseId) ?? [],
           async onBeforeCheckpoint(checkpoint) { meta = { purpose: 'candidate', arm: 'candidate', checkpoint: checkpoint.id,
@@ -578,7 +631,7 @@ async function main() {
                     reason: 'specific_repair_still_invalid', repairSealDigest: seal.digest });
                 }
               };
-              for (const arm of ['candidate', 'baseline', 'empty', 'raw-only']) {
+              for (const arm of reanswer?.plan.arms ?? ['candidate', 'baseline', 'empty', 'raw-only']) {
                 if (partial && arm === 'candidate') { arms.candidate = partial.candidateJudgment.score; continue; }
                 if (partial?.baselineJudgment && arm === 'baseline') {
                   arms.baseline = partial.baselineJudgment.score;
@@ -615,7 +668,7 @@ async function main() {
                   source_snapshot_sha256: partial?.descriptor.snapshotSha256 ?? null };
                 return { case_id: item.publicCase.id, status: 'partial', failed_arms: failedArms, reference: 'pending_reference_freeze', snapshot: caseSnapshots[item.publicCase.id] };
               }
-              reportRows.push({ caseId: item.publicCase.id, sessions: [sourceKey], sealDigest: seal.digest, packetDigest: arms.candidate.packetDigest, arms,
+              reportRows.push({ caseId: item.publicCase.id, sessions: [sourceKey], sealDigest: seal.digest, packetDigest: (arms.candidate ?? Object.values(arms)[0]).packetDigest, arms,
                 ...(partial && !partial.baselineJudgment ? { repair: { arm: 'baseline', format: 'scorer-r2-v3-specific-repair', repairSealDigest: seal.digest } } : {}),
                 ...(repairs.length ? { repairs } : {}) });
               return { case_id: item.publicCase.id, status: 'scored', reference: 'pending_reference_freeze', snapshot: caseSnapshots[item.publicCase.id] };
@@ -644,7 +697,7 @@ async function main() {
     } });
   let scorecard = null;
   try {
-    if (reportRows.length && sequenceResult?.status !== 'invalid_search_truncation') scorecard = pairedReport({ seal, expectedDigest: seal.digest, rows: reportRows, dependencies: [],
+    if (reportRows.length && !reanswer && sequenceResult?.status !== 'invalid_search_truncation') scorecard = pairedReport({ seal, expectedDigest: seal.digest, rows: reportRows, dependencies: [],
       provenance: (resume?.originSeals ?? []).filter(row => row.digest !== seal.digest) });
   } catch (error) { failure ??= typeof error?.code === 'string' ? error.code : 'scorecard_failed'; }
   process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm);
@@ -696,7 +749,9 @@ async function main() {
   }
   const final = { status: sequenceResult?.status === 'invalid_search_truncation' ? 'invalid: search truncation fault'
     : harness.status === 'complete' && !failure && sequenceResult?.status === 'complete' ? 'partial_reference_unavailable'
-      : harness.status === 'complete' && !failure && sequenceResult?.status === 'complete_with_partial_cases' ? 'partial_scorer_failed' : 'failed_or_partial',
+      : harness.status === 'complete' && !failure && sequenceResult?.status === 'complete_with_partial_cases' ? 'partial_scorer_failed'
+        : harness.status === 'complete' && !failure && sequenceResult?.status === 'reanswer_complete' ? 'reanswer_complete' : 'failed_or_partial',
+    reanswer: seal.spec.reanswer ?? null,
     harness_status: harness.status, failure: failure ?? harness.code ?? null, resume: resumeValidation, resume_restore: resumeRestore ?? null,
     source_tree_drift: resume?.driftBytes ? { sha256: sha(resume.driftBytes), artifact: join(dir, 'prior-source-tree-drift.json'),
       limitation: 'The preceding run experienced disclosed additive source-tree drift; see the retained incident.' } : null,

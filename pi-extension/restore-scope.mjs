@@ -77,10 +77,10 @@ export function sameLogicalSnapshot(a, b) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [path, expectedSha, scope] = process.argv.slice(2);
+  const [path, expectedSha, scope, mode] = process.argv.slice(2);
   const run = async () => {
     if (!/^\/scratch\/[a-zA-Z0-9._-]+\.json$/.test(path ?? '') || !/^[a-f0-9]{64}$/.test(expectedSha ?? '')
-      || typeof scope !== 'string' || !scope) throw fail('snapshot_invalid');
+      || typeof scope !== 'string' || !scope || ![undefined, '--replace'].includes(mode)) throw fail('snapshot_invalid');
     inspectNamespace({ interfaces: readdirSync('/sys/class/net').sort(), ipv4Routes: readFileSync('/proc/net/route', 'utf8'),
       ipv6Routes: readFileSync('/proc/net/ipv6_route', 'utf8'), namespace: readlinkSync('/proc/self/ns/net') });
     const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -99,6 +99,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     try {
       const session = memory.store.driver.session({ database: 'neo4j' });
       try {
+        // A re-answer replay replaces the whole private evaluation database; a resume still requires it empty.
+        if (mode === '--replace') await session.executeWrite(tx => tx.run('MATCH (n) DETACH DELETE n'));
         const empty = await session.executeRead(tx => tx.run('MATCH (n) RETURN count(n) AS count'));
         if (empty.records[0].get('count') !== 0) throw fail('database_not_empty');
       } finally { await session.close(); }

@@ -128,6 +128,33 @@ test('raw-only diagnostics cite a directly returned source using its returned id
   assert.deepEqual([result.answer.citations, result.diagnostic], [[{ item_id: 'raw', evidence_id: rawEvidenceId('raw', 'Fictional source.') }], true]);
 });
 
+test('combined recall cites excerpts directly and derived items only through resolution', async () => {
+  const seal = sealComparison(settings());
+  const excerpt = { id: 'raw', kind: 'source_excerpt', scope: 'fiction', text: 'Fictional source.' };
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest,
+    memory: { async search() { throw new Error('derived_only_forbidden'); }, async searchCombined() { return [excerpt, item]; },
+      async resolve(request) { return { id: request.evidenceId, scope: 'fiction', text: 'Fictional record source.' }; } },
+    archive: { async search() { throw new Error('archive_forbidden'); } },
+    async respond({ tools }) { const [raw] = await tools.search('fiction');
+      assert.throws(() => tools.resolve('raw', raw.evidence[0].id), /not_offered/);
+      await tools.resolve('item', 'source');
+      return { text: 'Fiction.', citations: [{ item_id: 'raw', evidence_id: raw.evidence[0].id }, citation] }; } });
+  const result = await answerer.run({ arm: 'combined', case: fictionalCase() });
+  assert.deepEqual([result.trace.citedEvidence.map(row => row.text), result.diagnostic], [['Fictional source.', 'Fictional record source.'], true]);
+});
+
+test('the recall-chunks control asks product recall to drop record seeds', async () => {
+  const seal = sealComparison(settings());
+  const requests = [];
+  const excerpt = { id: 'raw', kind: 'source_excerpt', scope: 'fiction', text: 'Fictional source.' };
+  const answerer = createAnswerer({ seal, expectedDigest: seal.digest,
+    memory: { async search() { throw new Error('derived_only_forbidden'); }, async searchCombined(args) { requests.push(args.records); return [excerpt]; }, async resolve() {} },
+    archive: { async search() { throw new Error('archive_forbidden'); } },
+    async respond({ tools }) { const [raw] = await tools.search('fiction'); return { text: 'Fiction.', citations: [{ item_id: 'raw', evidence_id: raw.evidence[0].id }] }; } });
+  await answerer.run({ arm: 'recall-chunks', case: fictionalCase() });
+  assert.deepEqual(requests, [false]);
+});
+
 test('scoring refuses citations or unknown text altered after answer generation', async () => {
   const seal = sealComparison(settings());
   const answerer = createAnswerer({ seal, expectedDigest: seal.digest, memory: { async search() { return [item]; },

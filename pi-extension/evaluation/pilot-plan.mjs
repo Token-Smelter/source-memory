@@ -27,6 +27,8 @@ const groundedScorerInstructions = 'Judge each asserted answer or action clause 
 export const DISTILLER_MAX_OUTPUT_TOKENS = 16384, EVALUATOR_MAX_OUTPUT_TOKENS = 4096;
 
 export const BASELINE_CANDIDATE_ROUTE = 'anthropic/claude-haiku-5-5';
+/** Arms a re-answer run may evaluate against a completed run's per-case snapshots: product recall with and without record seeds. */
+export const REANSWER_ARMS = Object.freeze(['combined', 'recall-chunks']);
 
 /** Sealed treatment surfaces; a run without one is the baseline. */
 export const TREATMENTS = Object.freeze({
@@ -145,6 +147,14 @@ export function createCitedPilotPlan(options) {
   const settings = structuredClone(createPilotPlan({ ...options, candidateRoute: options.treatment?.candidateRoute ?? BASELINE_CANDIDATE_ROUTE }).spec);
   settings.toolCallReviewSha256 = options.toolCallReviewSha256;
   settings.designSha256 = DESIGN_SHA256;
+  if (options.reanswer !== undefined && options.reanswer !== null) {
+    const r = options.reanswer;
+    if (Object.keys(r).sort().join(',') !== 'arms,priorCodeSha,priorReportSha256,priorSealDigest,priorTreatment'
+      || !/^[a-f0-9]{64}$/.test(r.priorReportSha256 ?? '') || !/^[a-f0-9]{64}$/.test(r.priorSealDigest ?? '') || !/^[a-f0-9]{40}$/.test(r.priorCodeSha ?? '')
+      || !Array.isArray(r.arms) || !r.arms.length || r.arms.some(arm => !REANSWER_ARMS.includes(arm))
+      || new Set(r.arms).size !== r.arms.length || options.resume != null || options.treatment != null) throw fail('pilot_plan_invalid');
+    settings.reanswer = structuredClone(r);
+  }
   if (options.treatment !== undefined && options.treatment !== null) {
     if (!TREATMENTS[options.treatment?.id] || JSON.stringify(options.treatment) !== JSON.stringify(TREATMENTS[options.treatment.id])) throw fail('pilot_plan_invalid');
     settings.treatment = structuredClone(options.treatment);

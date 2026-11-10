@@ -38,3 +38,14 @@ test('fresh cited plan seals grounded scorer and leaves candidate and model rout
   assert.throws(() => createPilotPlan({ ...options, candidateRoute: 'other/model' }), /pilot_plan_invalid/);
   assert.throws(() => createCitedPilotPlan({ ...options, toolCallReviewSha256: undefined }), /pilot_plan_invalid/);
 });
+
+test('a re-answer plan seals its prior run and arms and cannot distill or resume', () => {
+  const options = { cases: [{ publicCase: fictionalCase(), packet: { ...scoringPacket(), evidenceContract: BLOCK_EVIDENCE_CONTRACT } }], sourceSha256: 'a'.repeat(64),
+    datasetSha256: 'b'.repeat(64), sdkSha256: 'c'.repeat(64), codeSha: 'd'.repeat(40),
+    routes: { candidate: { mode: 'soft' }, reviewer: { mode: 'soft' } }, toolCallReviewSha256: 'f'.repeat(64) };
+  const reanswer = { priorReportSha256: '1'.repeat(64), priorSealDigest: '2'.repeat(64), priorCodeSha: '3'.repeat(40), priorTreatment: TREATMENTS.T1, arms: ['combined'] };
+  assert.deepEqual(createCitedPilotPlan({ ...options, reanswer }).spec.reanswer, reanswer);
+  for (const invalid of [{ ...options, reanswer, treatment: TREATMENTS.T1 }, { ...options, reanswer: { ...reanswer, arms: ['candidate'] } },
+    { ...options, reanswer: { ...reanswer, arms: ['combined', 'combined'] } }, { ...options, reanswer: { ...reanswer, extra: true } }])
+    assert.throws(() => createCitedPilotPlan(invalid), /pilot_plan_invalid/);
+});
