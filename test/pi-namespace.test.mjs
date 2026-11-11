@@ -83,8 +83,9 @@ test('the namespace adapter inventories foreign endpoints and verifies matching 
     if (argv[0] === 'start') return argv[1];
     if (argv[0] === 'ps') return [NETWORK_DB, DRIVER, FOREIGN].join('\n');
     if (argv[0] === 'exec') return 'net:[123]';
-    if (argv[0] === 'inspect' && argv[1] === '--format') return JSON.stringify({ Networks: { x: { IPAddress: '172.17.0.8' } },
-      Ports: { '7687/tcp': [{ HostPort: '27690' }], '7474/tcp': [{ HostPort: '17474' }] } });
+    if (argv[0] === 'inspect' && argv[1] === '--format') return JSON.stringify({ Id: FOREIGN,
+      NetworkSettings: { Networks: { x: { IPAddress: '172.17.0.8' } },
+        Ports: { '7687/tcp': [{ HostPort: '27690' }], '7474/tcp': [{ HostPort: '17474' }] } } });
     if (argv[0] === 'inspect' && argv[1] === NETWORK_DB) return JSON.stringify([{ Id: NETWORK_DB, Image: IMAGE, Config: { Labels: { 'pi-memory.run': RUN } },
       HostConfig: { NetworkMode: 'none', PortBindings: null }, NetworkSettings: { Networks: { none: {} } },
       Mounts: [{ Type: 'volume', Name: `pi-memory-${RUN}-data`, Destination: '/data' }, { Type: 'volume', Name: `pi-memory-${RUN}-logs`, Destination: '/logs' }] }]);
