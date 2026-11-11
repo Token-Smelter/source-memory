@@ -127,13 +127,14 @@ export function readPinned(path, expected, max = 256_000_000) {
   } finally { closeSync(fd); }
 }
 
-export function readDevReference(sourceKey) {
+/** `map` rewrites the pinned absolute reference root (archive remap); the default reads it in place. */
+export function readDevReference(sourceKey, map = path => path) {
   assertDevelopment(sourceKey);
-  const ref = DEV_REFERENCES[sourceKey], manifest = JSON.parse(readPinned(join(ref.root, ref.manifest), ref.sha256, 20_000_000));
+  const ref = DEV_REFERENCES[sourceKey], root = map(ref.root), manifest = JSON.parse(readPinned(join(root, ref.manifest), ref.sha256, 20_000_000));
   if (manifest.source_key !== sourceKey || manifest.source_sha256 !== ref.source_sha256) throw fail('reference_source_mismatch');
   const file = key => {
     if (!manifest.files?.[key]?.sha256) throw fail('reference_file_unpinned');
-    return JSON.parse(readPinned(join(ref.root, key), manifest.files[key].sha256));
+    return JSON.parse(readPinned(join(root, key), manifest.files[key].sha256));
   };
   const graph = ref.format === 'cut' ? referenceGraph({ format: 'cut', cut: file(ref.cut) })
     : referenceGraph({ format: 'checkpoints', checkpoints: Object.keys(manifest.files)

@@ -23,11 +23,15 @@ export function writeNew(path, bytes) {
 export const pathFields = value => Array.isArray(value) ? value.flatMap(pathFields) : value && typeof value === 'object'
   ? Object.entries(value).flatMap(([key, item]) => (/(path|dir)$/i.test(key) && typeof item === 'string' ? [item] : []).concat(typeof item === 'object' ? pathFields(item) : [])) : [];
 
-function openReport(reportPath, reportSha) {
+// `map` rewrites every absolute path that comes from pinned data (archive remap); the default reads each path in place.
+const inPlace = path => path;
+
+function openReport(reportPath, reportSha, map = inPlace) {
   const runDir = dirname(reportPath), report = JSON.parse(readPinned(reportPath, reportSha, 50_000_000));
-  if (realpathSync(report.run_dir ?? '') !== runDir) throw fail('run_dir_mismatch');
-  refuseHoldoutPaths([reportPath, ...pathFields(report.artifacts ?? {})]);
-  const seal = JSON.parse(readPinned(report.artifacts['seal.json'].path, report.artifacts['seal.json'].sha256));
+  if (realpathSync(map(report.run_dir ?? '')) !== runDir) throw fail('run_dir_mismatch');
+  const fields = pathFields(report.artifacts ?? {});
+  refuseHoldoutPaths([reportPath, ...fields, ...fields.map(map)]);
+  const seal = JSON.parse(readPinned(map(report.artifacts['seal.json'].path), report.artifacts['seal.json'].sha256));
   verifySeal(seal, report.seal_sha256);
   return { runDir, report, seal };
 }
@@ -36,27 +40,27 @@ function openReport(reportPath, reportSha) {
  * Loads a completed run only through hashes pinned by its report. A resumed run inherits checkpoint snapshots from its
  * prior runs; each prior run must be the one its successor's seal names, and its own report pins its write receipts.
  */
-export function loadRun(reportPath, reportSha) {
-  const head = openReport(reportPath, reportSha), chain = [head];
-  const snapshotDirs = new Set(head.report.artifacts.checkpoint_snapshots.map(row => dirname(dirname(row.path))));
+export function loadRun(reportPath, reportSha, map = inPlace) {
+  const head = openReport(reportPath, reportSha, map), chain = [head];
+  const snapshotDirs = new Set(head.report.artifacts.checkpoint_snapshots.map(row => dirname(dirname(map(row.path)))));
   for (let seal = head.seal; seal.spec.resume;) {
     const prior = [...snapshotDirs].filter(dir => !chain.some(row => row.runDir === dir)).map(dir => JSON.parse(readFileSync(join(dir, 'REPORT.json'))))
       .find(row => row.seal_sha256 === seal.spec.resume.priorSealDigest);
     if (!prior) throw fail('resume_chain_incomplete');
-    const path = join(prior.run_dir, 'REPORT.json'), opened = openReport(path, sha(readFileSync(path)));
+    const path = join(map(prior.run_dir), 'REPORT.json'), opened = openReport(path, sha(readFileSync(path)), map);
     if (opened.report.run_id !== seal.spec.resume.priorRunId) throw fail('resume_chain_mismatch');
     chain.push(opened);
     seal = opened.seal;
   }
   const roots = chain.map(row => `${row.runDir}/`);
-  if (head.report.artifacts.checkpoint_snapshots.some(row => !roots.some(root => row.path.startsWith(root)))) throw fail('artifact_outside_run');
-  const artifact = (report, name) => readPinned(report.artifacts[name].path, report.artifacts[name].sha256);
+  if (head.report.artifacts.checkpoint_snapshots.some(row => !roots.some(root => map(row.path).startsWith(root)))) throw fail('artifact_outside_run');
+  const artifact = (report, name) => readPinned(map(report.artifacts[name].path), report.artifacts[name].sha256);
   const journals = readdirSync(head.runDir).filter(name => /^coverage-[a-f0-9]{64}\.jsonl$/.test(name));
   if (journals.length !== 1) throw fail('coverage_journal_ambiguous');
   // The resumed journal carries its predecessors' intervals, so it dates writes across the whole chain.
   const journalBytes = readFileSync(join(head.runDir, journals[0]));
   const graph = storeGraph({ schedule: head.report.coverage.dispositions.map(row => row.through),
-    snapshots: head.report.artifacts.checkpoint_snapshots.map(row => ({ through: row.through, snapshot: JSON.parse(readPinned(row.path, row.sha256)) })),
+    snapshots: head.report.artifacts.checkpoint_snapshots.map(row => ({ through: row.through, snapshot: JSON.parse(readPinned(map(row.path), row.sha256)) })),
     journal: jsonl(journalBytes), receipts: chain.flatMap(row => jsonl(artifact(row.report, 'memory-receipts.jsonl'))) });
   const answers = jsonl(artifact(head.report, 'case-results.jsonl')).filter(row => row.type === 'answer');
   return { report: head.report, seal: head.seal, graph, answers, journalSha256: sha(journalBytes),
