@@ -244,6 +244,16 @@ test('the store checks a precondition only for a link that carries one, whatever
   } finally { await store.close(); }
 });
 
+test('link lock capability is unknown only when constraint inspection is forbidden', async () => {
+  const store = new Neo4jStore({ uri: 'bolt://127.0.0.1:1', auth: 'none' });
+  try {
+    store.transaction = async () => { throw Object.assign(new Error('forbidden'), { code: 'Neo.ClientError.Security.Forbidden' }); };
+    assert.equal(await store.linkUidLock(), null);
+    store.transaction = async () => { throw Object.assign(new Error('unavailable'), { code: 'ServiceUnavailable' }); };
+    await assert.rejects(store.linkUidLock(), { code: 'ServiceUnavailable' });
+  } finally { await store.close(); }
+});
+
 test('status names the store and the record contract', async () => {
   const store = { status: async () => ({ turns: 0 }), vectorIndexStatus: async () => 'missing',
     identity: async () => ({ system: 'neo4j', database_id: 'db-fixture', database: 'neo4j' }) };

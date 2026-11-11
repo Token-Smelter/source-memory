@@ -17,7 +17,7 @@ const B = 'canary-far-b';
 const C = 'link-c';
 const NA = 'lnest/a';
 const NB = 'lnest/b';
-const GRANTS = [A, B, C, 'lnest/**', 'lw', 'lw-far', 'lw-hidden'];
+const GRANTS = [A, B, C, 'lnest/**', 'lw', 'lw-far', 'lw-hidden', '__proto__', 'constructor', 'toString'];
 const B_CANARIES = [B, 'canary-rec-b', 'canary far text bravo', identity('record', B, 'canary-rec-b')];
 const A_CANARIES = ['canary-link-alpha', 'canary span alpha'];
 
@@ -64,8 +64,12 @@ export async function runLinks(database, scratch = null) {
     out.push(await memoryOf.recall(selection, { query, mode: 'evidence_advice', group: 'conversation', follow: {} }));
     out.push(await memoryOf.recall(selection, { query }, { seedsOnly: true }));
     out.push(await memoryOf.list(selection, { relations: true }));
-    // A subtree is read by recall and list only; show takes an exact scope or a set.
-    if (typeof selection === 'string' && selection.endsWith('/**')) return canonicalRun(out);
+    // Show takes an exact scope or a set; subtree reads still cover counts and its refusal reply.
+    if (typeof selection === 'string' && selection.endsWith('/**')) {
+      out.push(await memoryOf.status(selection));
+      out.push(await stageOf(memoryOf.show(selection, { kind: 'record', id: 'n-far' })));
+      return canonicalRun(out);
+    }
     const seedScope = exact ? {} : { scope: home };
     const seedId = home === A ? 'a-decision' : home === B ? 'canary-rec-b' : home === C ? 'c-note' : 'n-decision';
     out.push(await memoryOf.show(selection, { kind: 'bundle', seed: { kind: 'record', id: seedId, ...seedScope } }));
@@ -166,7 +170,7 @@ export async function runLinks(database, scratch = null) {
     await check('subtrees follow the hide rule by selection; the base build sees no link at all', async () => {
       const nested = reader(['lnest/**']);
       const NB_CANARIES = [NB, identity('record', NB, 'n-far'), 'n-far', 'nested bravo lantern action', 'nested far lantern action'];
-      const NA_CANARIES = ['n-link', 'n-decision', 'nested alpha lantern decision'];
+      const NA_CANARIES = [NA, identity('record', NA, 'n-decision'), 'n-link', 'n-decision', 'nested alpha lantern decision'];
       const narrowReads = await reads(nested, `${NA}/**`, { home: NA });
       assert.deepEqual(leaks(narrowReads, NB_CANARIES), [], 'a subtree without the far scope');
       assert.ok(JSON.stringify(narrowReads).includes('"to_hidden":true'));
@@ -261,6 +265,33 @@ export async function runLinks(database, scratch = null) {
       assert.deepEqual(await placeholders(), 0);
     });
 
+    await check('prototype-key scope names and segments write, replay and read through exact, set and subtree selections', async () => {
+      const scopes = ['__proto__', 'constructor', 'toString', 'lnest/__proto__'];
+      for (const scope of scopes) {
+        await memory.init(scope);
+        const text = 'Fictional prototype lantern decision.';
+        const uid = await seed(scope, `c-${scope}`, 'p1', text,
+          [['constructor', 'decision', text], ['toString', 'observation', 'Fictional lantern observation.']]);
+        const input = { records: [], relations: [{ id: '__proto__', type: 'qualifies', from: 'constructor', to: 'toString',
+          attribution: 'fixture', evidence: spanOf(uid, text) }] };
+        for (const pass of ['write', 'replay']) assert.deepEqual((await memory.enrich(scope, input)).relations, ['__proto__'], `${scope} ${pass}`);
+        await waitReady(memory, scope);
+        const page = await memory.list(scope, { relations: true });
+        assert.deepEqual(page.relations.map(row => [row.id, row.from, row.to]), [['__proto__', 'constructor', 'toString']]);
+        const shown = await memory.show(scope, { kind: 'bundle', seed: { kind: 'record', id: 'constructor' } });
+        assert.deepEqual(shown.bundle.records.map(row => row.id).sort(), ['constructor', 'toString']);
+      }
+      const selected = await memory.recall(scopes, { query: 'prototype lantern' }, { seedsOnly: true });
+      assert.deepEqual(Object.keys(selected.by_scope), [...scopes].sort());
+      for (const scope of scopes) {
+        assert.ok(Object.hasOwn(selected.by_scope, scope));
+        assert.equal(selected.by_scope[scope].channels.record_lexical.status, 'ready');
+        assert.ok(selected.ranked.some(row => row.scope === scope && row.id === 'constructor'));
+      }
+      const subtree = await memory.list('lnest/__proto__/**', { relations: true });
+      assert.deepEqual(subtree.relations.map(row => [row.scope, row.id]), [['lnest/__proto__', '__proto__']]);
+    });
+
     await check('the relation id lock serializes concurrent first writes of one id in two forms with different from records', async () => {
       const W = 'lw';
       const F = 'lw-far';
@@ -316,6 +347,12 @@ export async function runLinks(database, scratch = null) {
       // Without the constraint there is no index entry to lock, and status says so until init creates it again.
       await memory.store.transaction('write', tx => tx.run('DROP CONSTRAINT smlink_uid IF EXISTS'));
       assert.equal((await memory.status('lw', { capabilities: true })).capabilities.link_uid_lock, false);
+      await memory.store.transaction('write', tx => tx.run('CREATE CONSTRAINT smlink_uid FOR (n:SMRecord) REQUIRE n.fixture_only IS UNIQUE'));
+      assert.equal((await memory.status('lw', { capabilities: true })).capabilities.link_uid_lock, false, 'the expected name on the wrong schema grants no lock');
+      await memory.store.transaction('write', tx => tx.run('DROP CONSTRAINT smlink_uid'));
+      await memory.store.transaction('write', tx => tx.run('CREATE CONSTRAINT fixture_link_uid FOR (n:SMLink) REQUIRE n.uid IS UNIQUE'));
+      assert.equal((await memory.status('lw', { capabilities: true })).capabilities.link_uid_lock, true, 'the actual schema works under another name');
+      await memory.store.transaction('write', tx => tx.run('DROP CONSTRAINT fixture_link_uid'));
       await memory.init('lw');
       assert.equal((await memory.status('lw', { capabilities: true })).capabilities.link_uid_lock, true);
     });
