@@ -33,6 +33,8 @@ export async function catalogCompactRecords(memory, scope) {
     const edges = await memory.store.neighbors(scope, [...ids], maxSummaryEdges + 1);
     if (!Array.isArray(edges) || edges.some(row => !row?.id || !RELATIONS.includes(row.type))) throw fail('search_incomplete');
     if (edges.length > maxSummaryEdges) gaps.push('summary_edge_limit');
+    // A link whose far end is in another scope is shown hidden; it is relation context this summary cannot hold, so say so.
+    if (edges.some(edge => edge.to_hidden === true)) gaps.push('cross_scope_hidden');
     for (const edge of edges.slice(0, maxSummaryEdges)) if (ids.has(edge.from) && ids.has(edge.to)) relations.set(edge.id, edge);
   }
   const pairs = new Map();
@@ -113,6 +115,8 @@ export async function searchCompactRecords(memory, scope, input) {
       if (ordered.length > maxEdges) gaps.add('edge_limit');
       const next = new Set();
       for (const edge of ordered.slice(0, maxEdges)) {
+        // A link whose far end is in another scope cannot be followed from this scope: a gap, never a silent omission.
+        if (edge.to_hidden === true) { gaps.add('cross_scope_hidden'); continue; }
         const missing = [edge.from, edge.to].filter(id => !local.has(id));
         if (missing.length && hop === maxHops) { gaps.add('hop_limit'); continue; }
         if (local.size + missing.length > maxNodes) { gaps.add('node_limit'); continue; }

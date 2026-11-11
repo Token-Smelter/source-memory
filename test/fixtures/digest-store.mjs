@@ -51,6 +51,7 @@ export function digestStore(log = [], { missing = false } = {}) {
   return {
     identity: call('identity', () => ({ system: 'neo4j', database_id: 'db-fixture', database: 'neo4j' })),
     status: call('status', () => ({ turns: 2, chunks: 2, records: 4, relations: 1, unindexed: 0 })),
+    linkUidLock: call('linkUidLock', () => false),
     vectorIndexStatus: call('vectorIndexStatus', () => missing ? 'missing' : 'online'),
     vectors: call('vectors', () => [{ ...node(RECORDS.r2), embedding: [1, 0] }, { ...node(RECORDS.r3), embedding: [0.6, 0.8] },
       { uid: 'chunk_t1', scope: SCOPE, turn_uid: 't1', entry_id: 'x1-u', start: 0, end: 20, text: 'The keeper wants the', embedding: [1, 0] }]),

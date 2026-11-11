@@ -119,9 +119,12 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       const shown = await memory.show(scope, { kind: 'record', id: offered.id });
       if (shown?.kind !== 'record' || shown.record?.scope !== scope || shown.record.id !== offered.id || !Array.isArray(shown.evidence)
         || !shown.evidence.length || shown.evidence.some(row => typeof row?.role !== 'string' || typeof row.text !== 'string' || !row.text)) throw fail('search_incomplete');
-      const relations = await memory.store.neighbors(scope, [offered.id], 65);
-      if (!Array.isArray(relations) || relations.length > 65
-        || relations.some(row => row.from !== offered.id && row.to !== offered.id)) throw fail('search_incomplete');
+      const read = await memory.store.neighbors(scope, [offered.id], 65);
+      if (!Array.isArray(read) || read.length > 65
+        || read.some(row => row.from !== offered.id && row.to !== offered.id)) throw fail('search_incomplete');
+      // A link whose far end is in another scope has no endpoint here to offer: it is omitted and counted, never silently.
+      const hidden = read.filter(row => row.to_hidden === true).length;
+      const relations = read.filter(row => row.to_hidden !== true);
       const ids = [...new Set(relations.slice(0, 64).flatMap(row => [row.from, row.to]))];
       const endpoints = await memory.store.getRecords(scope, ids);
       if (!Array.isArray(endpoints) || endpoints.length !== ids.length || new Set(endpoints.map(row => row.id)).size !== ids.length
@@ -132,7 +135,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
         evidence: shown.evidence.map(row => ({ role: row.role, text: row.text })),
         relations: relations.slice(0, 64).map(row => ({ type: row.type, from_id: row.from, to_id: row.to,
           from_handle: handles.get(row.from), to_handle: handles.get(row.to) })),
-        immediate_relations_complete: relations.length <= 64, relationship_omitted_at_least: relations.length > 64 ? 1 : 0 };
+        immediate_relations_complete: relations.length <= 64 && hidden === 0, relationship_omitted_at_least: (relations.length > 64 ? 1 : 0) + hidden };
       if (Buffer.byteLength(JSON.stringify(result)) > 120000) throw fail('fetch_budget_exceeded');
       registerCompact(offers);
       return result;

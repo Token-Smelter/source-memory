@@ -193,7 +193,7 @@ export async function runNamespacing(database, scratch = null) {
     await check('status reports capabilities only when asked, and the CLI carries digests and capabilities', async () => {
       const plain = await memory.status('dg');
       assert.equal(JSON.stringify(plain), JSON.stringify(await base.status('dg')));
-      assert.deepEqual((await memory.status('dg', { capabilities: true })).capabilities, { scope_set_max: 4, record_digests: true });
+      assert.deepEqual((await memory.status('dg', { capabilities: true })).capabilities, { scope_set_max: 4, record_digests: true, cross_scope_relations: true, link_uid_lock: true });
       assert.equal((await base.status('dg', { capabilities: true })).capabilities, undefined, 'absent means unsupported');
       const dir = await mkdtemp(join(scratch ?? tmpdir(), 'namespacing-cli-'));
       await writeFile(join(dir, 'config.json'), JSON.stringify(fixtures.config));
@@ -204,7 +204,7 @@ export async function runNamespacing(database, scratch = null) {
           { stdout: { write: line => { out += line; } }, stderr: { write() {} } });
         return JSON.parse(out);
       };
-      assert.deepEqual((await cli('status', { capabilities: true })).capabilities, { scope_set_max: 4, record_digests: true });
+      assert.deepEqual((await cli('status', { capabilities: true })).capabilities, { scope_set_max: 4, record_digests: true, cross_scope_relations: true, link_uid_lock: true });
       const listed = await cli('list', { kind: 'decision', digests: true });
       assert.deepEqual(listed.items.map(item => item.record_digest).sort(), Object.values(expected.dg).sort());
       assert.deepEqual(listed.store_identity, plain.store);

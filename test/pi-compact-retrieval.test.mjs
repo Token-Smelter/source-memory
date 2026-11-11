@@ -380,3 +380,35 @@ test('the D0 oracle catalog offers every prior record with its relations, ignori
     await assert.rejects(handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input: { ...input, max_bytes: 120000 } }), /invalid_input/);
   } finally { handlers.close(); }
 });
+
+test('compact catalog and search report a link with a hidden far end as a graph gap, never a silent omission', async () => {
+  const { catalogCompactRecords, searchCompactRecords } = await import('../pi-extension/compact-retrieval.mjs');
+  const rows = ['near', 'other'].map(id => ({ id, scope: 'fiction', kind: 'decision', status: 'proposed', text: `Fictional ${id}.`, attribution: 'f',
+    evidence: [{ turn: 't', entry_id: 'e', start: 0, end: 4 }] }));
+  const hidden = { uid: 'relation_x', id: 'far-link', type: 'qualifies', from: 'near', to: null, to_hidden: true, attribution: 'f', evidence: [] };
+  const channels = Object.fromEntries(['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector', 'reranker']
+    .map(name => [name, { status: 'ready', candidate_limit_reached: false }]));
+  const memory = { config: { scopes: { read: ['fiction'], write: [] } },
+    async recall(scope) { return { scope, channels, ranked: [{ kind: 'record', id: 'near', score: 0.5 }] }; },
+    store: {
+      async lexicalStatus() { return { status: 'ready' }; },
+      async getRecords(_scope, ids) { return rows.filter(row => ids.includes(row.id)); },
+      async recordsForTurn() { return []; },
+      async catalogRecords() { return rows; },
+      async neighbors(_scope, ids) { return ids.includes('near') ? [hidden] : []; },
+    } };
+  const catalog = await catalogCompactRecords(memory, 'fiction');
+  assert.deepEqual([catalog.graph_gaps, catalog.edges], [['cross_scope_hidden'], []]);
+  const search = await searchCompactRecords(memory, 'fiction', { query: 'fictional', kinds: [] });
+  assert.deepEqual([search.graph_gaps, search.edges, search.records.map(row => row.id)], [['cross_scope_hidden'], [], ['near']]);
+});
+
+test('compact fetch omits a link with a hidden far end and says relations are incomplete', async () => {
+  const hidden = { uid: 'relation_x', id: 'far-link', type: 'qualifies', from: 'prior-1', to: null, to_hidden: true, attribution: 'fiction', evidence: [] };
+  const { handlers } = fixture({ count: 3, edges: [hidden] });
+  try {
+    const { bindings } = await handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input });
+    const full = await handlers.fetchCompact({ scope: 'fiction', trigger: 'turn', handle: bindings.find(binding => binding.id === 'prior-1').handle });
+    assert.deepEqual([full.relations, full.immediate_relations_complete, full.relationship_omitted_at_least], [[], false, 1]);
+  } finally { handlers.close(); }
+});

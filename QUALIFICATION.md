@@ -12,10 +12,10 @@ Run of 2026-11-09 on `feat/qualification-q-sm`: the full integration run passed 
 |---|---|---|---|
 | Q-SM-1 | Same id and normalized record twice: one record, success both times | **PASS** | Both `enrich` replies `ok:true, records:["q1-decision"]`. The second used another key order, wrote the default `status`, and carried an unknown field. Scope holds 1 record and its stored digest equals the normalized record's. A replayed `ingest` gives `replayed:true` and 1 turn |
 | Q-SM-2 | Same id, other bytes: `record_identity_conflict`, record unchanged | **PASS** | `{"ok":false,"error":"record_identity_conflict","stage":"rolled_back"}`, exit 1. The stored record is deep-equal before and after, and the count is unchanged |
-| Q-SM-3 | Each no_write code only before the first `MERGE`; each in-transaction code rolls back | **PASS** | 24 of the 25 pre-commit-only codes returned `stage:before_write`; the 25th, `unknown_command`, has no stage because no write command was named. All 9 in-transaction codes returned `stage:rolled_back`. Each `enrich` case carried a valid companion record; none was written, and store counts were unchanged after all 36 refusals. For `record_identity_conflict` and `relation_identity_conflict` the companion's `MERGE` ran first and was rolled back. The run fails if any code in the table below goes unexercised. The source-order test puts all six † checks before the first `MERGE` in `Neo4jStore.enrich`. An unreachable database gives `operation_failed`, `stage:unknown` |
+| Q-SM-3 | Each no_write code only before the first `MERGE`; each in-transaction code rolls back | **PASS** | 25 of the 26 pre-commit-only codes returned `stage:before_write`; the 26th, `unknown_command`, has no stage because no write command was named. All 10 in-transaction codes returned `stage:rolled_back`, `relation_endpoint_unavailable` also for a missing far endpoint of a cross-scope relation. Each `enrich` case carried a valid companion record; none was written, and store counts were unchanged after all 39 refusals. For `record_identity_conflict` and `relation_identity_conflict` the companion's `MERGE` ran first and was rolled back. The run fails if any code in the table below goes unexercised. The source-order test puts all seven † checks before the relation id lock and the first content `MERGE` in `Neo4jStore.enrich`. The id lock (a `MERGE` of a placeholder `SMLink` node, deleted in the same transaction) is excluded from "first `MERGE`" because it writes nothing durable: the placeholder is never visible after commit, and no classification changes. An unreachable database gives `operation_failed`, `stage:unknown` |
 | Q-SM-4 | Injected failure after commit (indexing, process exit), then exact read: one record | **PASS** | Indexing endpoint returns 503: `ok:true`, `indexing:{status:"unavailable",reason:"model_request_failed",source_retained:true}`, which is a receipt. Writer killed with `SIGKILL` while its post-commit embedding request was open, for `ingest` and `enrich`: no stdout, no reply, so the outcome is unknown. Exact read finds the turn (`turn_by_key`) and the record, whose digest equals the normalized submission. A resend converges on the same single record |
 | Q-SM-5 | Store and record-contract identity procedure | **PASS** | `status.store = {system:"neo4j", database_id, database:"neo4j", record_contract:"source-memory.record/1"}`, the same from two processes and two scopes. The two runs' disposable containers reported different ids (`7A7EFD72…` and `A2CFA6D8…`). The record-contract pin is in `test/qualification.test.mjs`. Procedure below |
-| Q-SM-6 | No post-commit `scope_denied`; the transport shows code provenance | **PASS** | `scope_denied` gives `stage:before_write` for both `ingest` and `enrich`, with nothing written. A conflict gives `stage:rolled_back`. A post-commit indexing failure gives `ok:true` with `indexing.status:"unavailable"`. All 41 `ingest`/`enrich` failure replies in the suite carried a stage. Unit test: revoking the write grant during the store write no longer throws; on `main` the same test fails with `scope_denied` |
+| Q-SM-6 | No post-commit `scope_denied`; the transport shows code provenance | **PASS** | `scope_denied` gives `stage:before_write` for both `ingest` and `enrich`, with nothing written. A conflict gives `stage:rolled_back`. A post-commit indexing failure gives `ok:true` with `indexing.status:"unavailable"`. All 44 `ingest`/`enrich` failure replies in the suite carried a stage (41 before the three cross-scope Q-SM-3 cases). Unit test: revoking the write grant during the store write no longer throws; on `main` the same test fails with `scope_denied` |
 
 ## Reply contract (CLI transport)
 
@@ -83,7 +83,7 @@ Every code a `requireThat` or `new MemoryError` can raise in the modules `bin/me
 Classes, for `ingest` and `enrich`:
 
 - **pre-commit-only**: raised before the write transaction begins. Reply `stage: before_write`.
-- **in-transaction-rolled-back**: raised inside the write transaction, which rolls back. Reply `stage: rolled_back` on the first attempt, `unknown` after a driver retry. Codes marked † are raised before the transaction's first `MERGE`; the others after a `MERGE` whose effect the rollback discards.
+- **in-transaction-rolled-back**: raised inside the write transaction, which rolls back. Reply `stage: rolled_back` on the first attempt, `unknown` after a driver retry. Codes marked † are raised before the transaction's relation id lock and its first content `MERGE`; the others after a `MERGE` whose effect the rollback discards (for a call with relations and no records that may be only the id lock's placeholder `MERGE`). The id lock takes the `SMLink(uid)` unique-index entry of each relation id through a placeholder node created and deleted in the transaction, so it writes nothing durable.
 - **post-commit**: appears only as `indexing.reason` inside an `ok:true` reply, never as an error reply. Any other code can also appear as a reason; it is still a committed write.
 - **stage-dependent**: `stage` decides it.
 - **not-on-write-path**: not raised by `ingest` or `enrich` (read commands, `init`, `warm`).
@@ -101,7 +101,8 @@ Classes, for `ingest` and `enrich`:
 | `database_must_be_loopback` | pre-commit-only | `Neo4jStore` constructor |
 | `database_credentials_unavailable` | pre-commit-only | `Neo4jStore` constructor |
 | `scope_denied` | pre-commit-only | `authorize` in `ingest`/`enrich` (the post-commit call is removed) |
-| `invalid_input` | pre-commit-only | `text`/`integer`/shape checks in `normalizeTurn`, `normalizeEnrichment`, `authorize` |
+| `cross_scope_denied` | pre-commit-only | `Memory.enrich` `beforeWrite`: no read grant on a cross-scope relation's `to.scope`, or `to.scope` is a selector; checked before any storage call, so it says nothing about the far scope |
+| `invalid_input` | pre-commit-only | `text`/`integer`/shape checks in `normalizeTurn`, `normalizeEnrichment` (including a malformed `to` object or `expected_digest`), `authorize` |
 | `duplicate_entry` | pre-commit-only | `normalizeTurn` |
 | `invalid_role` | pre-commit-only | `normalizeTurn` |
 | `invalid_timestamp` | pre-commit-only | `normalizeTurn` |
@@ -113,16 +114,17 @@ Classes, for `ingest` and `enrich`:
 | `evidence_required` | pre-commit-only | `evidenceSpans` |
 | `evidence_too_large` | pre-commit-only | `evidenceSpans` |
 | `duplicate_relation` | pre-commit-only | `normalizeEnrichment` |
-| `invalid_relation` | pre-commit-only | `normalizeEnrichment` |
+| `invalid_relation` | pre-commit-only | `normalizeEnrichment`; `Memory.enrich` for a `to.scope` equal to the written scope |
 | `self_relation` | pre-commit-only | `normalizeEnrichment` |
 | `evidence_unavailable` | in-transaction-rolled-back | † `Neo4jStore.enrich` evidence turn lookup |
 | `invalid_evidence_span` | in-transaction-rolled-back | † `sourceExcerpt` inside `Neo4jStore.enrich` |
 | `derived_is_not_original_evidence` | in-transaction-rolled-back | † `sourceExcerpt` inside `Neo4jStore.enrich` |
-| `relation_endpoint_unavailable` | in-transaction-rolled-back | † `Neo4jStore.enrich` endpoint lookup |
+| `relation_endpoint_unavailable` | in-transaction-rolled-back | † `Neo4jStore.enrich` endpoint lookup, including a cross-scope `to` looked up by uid in its own scope |
+| `relation_endpoint_digest_mismatch` | in-transaction-rolled-back | † `Neo4jStore.enrich`, right after the endpoint lookup: a cross-scope `to.expected_digest` differs from the far record's stored hash (or the far record has no string hash) |
 | `invalid_outcome_relation` | in-transaction-rolled-back | † `Neo4jStore.enrich`: an `outcome_of` edge whose source is not an `outcome` or whose target is not an `action`, `decision` or `intention` |
 | `outcome_referent_required` | in-transaction-rolled-back | † `Neo4jStore.enrich`: an `outcome` in the bundle with no `outcome_of` edge in the bundle and either no stored `outcome_of` edge or a stored one whose target is not an `action`, `decision` or `intention` |
 | `record_identity_conflict` | in-transaction-rolled-back | `Neo4jStore.enrich`, after the record `MERGE` (IR3) |
-| `relation_identity_conflict` | in-transaction-rolled-back | `Neo4jStore.enrich`, after the relation `MERGE` |
+| `relation_identity_conflict` | in-transaction-rolled-back | `Neo4jStore.enrich`, after the relation `MERGE`, and at the cross-label check just before it (the id already names a relation of the other form in the written scope) |
 | `source_identity_conflict` | in-transaction-rolled-back | `Neo4jStore.ingest`, after the turn `MERGE` |
 | `model_request_failed` | post-commit | `localJson` during indexing |
 | `model_timeout` | post-commit | `localJson` during indexing |

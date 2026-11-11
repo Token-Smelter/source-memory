@@ -83,6 +83,12 @@ export function authorize(config, scope, operation = 'read') {
   return scope;
 }
 
+/** Whether `scope` is one exact scope the configuration grants for `operation`; never throws. */
+export function granted(config, scope, operation) {
+  try { authorize(config, scope, operation); return true; }
+  catch (error) { if (error instanceof MemoryError) return false; throw error; }
+}
+
 /**
  * An exact scope (returned as the string) or a subtree selector `S/**` (returned as {scope:S, subtree:true}). A subtree is
  * granted only by a pattern on S or an ancestor: exact grants on its current members never add up to an open-ended subtree.
@@ -210,8 +216,10 @@ export function sourceExcerpt(turn, span) {
   return { ...span, role: entry.role, text: entry.text.slice(span.start, span.end), occurred_at: entry.occurred_at ?? turn.occurred_at };
 }
 
-// Names the stored record contract: uid derivation, normalizeEnrichment output and the digest compared on replay. A change
-// that alters a stored uid, body or hash for the same input is a new version; test/qualification.test.mjs pins version 1.
+// Names the stored record contract: uid derivation, normalizeEnrichment output and the digest compared on replay, for every
+// input the version accepts. A change that alters a stored uid, body or hash for such an input is a new version;
+// test/qualification.test.mjs pins version 1. A form the version refused may be added later with an optional stored field
+// that is absent unless used, as a cross-scope `to` adds `to_scope`.
 export const RECORD_CONTRACT = 'source-memory.record/1';
 
 export const RECORD_KINDS = ['decision', 'observation', 'outcome', 'question', 'intention', 'episode', 'action'];
@@ -243,11 +251,27 @@ export function normalizeEnrichment(input) {
     edgeIds.add(id);
     requireThat(RELATIONS.includes(edge.type), 'invalid_relation');
     const from = text(edge.from, 256);
-    const to = text(edge.to, 256);
-    requireThat(from !== to, 'self_relation');
-    return { id, type: edge.type, from, to, attribution: text(edge.attribution, 512), evidence: evidenceSpans(edge.evidence) };
+    const far = farEndpoint(edge.to);
+    const to = far ? far.id : text(edge.to, 256);
+    requireThat(far || from !== to, 'self_relation');
+    return { id, type: edge.type, from, to, ...(far ? { to_scope: far.scope } : {}), attribution: text(edge.attribution, 512),
+      evidence: evidenceSpans(edge.evidence) };
   });
   return { records, relations };
+}
+
+const DIGEST = /^[0-9a-f]{64}$/u;
+
+/**
+ * A cross-scope `to`: exactly {scope, id, expected_digest?}, or null for the string form. `expected_digest` is a
+ * precondition checked at write, never stored, so it is validated here and dropped from the normalized relation.
+ */
+export function farEndpoint(to) {
+  if (to === null || typeof to !== 'object' || Array.isArray(to)) return null;
+  requireThat(Object.keys(to).every(key => ['scope', 'id', 'expected_digest'].includes(key)));
+  const far = { scope: text(to.scope, 256), id: text(to.id, 256) };
+  requireThat(to.expected_digest === undefined || (typeof to.expected_digest === 'string' && DIGEST.test(to.expected_digest)));
+  return to.expected_digest === undefined ? far : { ...far, expected_digest: to.expected_digest };
 }
 
 export function validateVector(vector, dimensions) {

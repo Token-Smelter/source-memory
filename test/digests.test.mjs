@@ -80,7 +80,7 @@ test('status reports capabilities only when asked', async t => {
   assert.equal(plain.capabilities, undefined);
   assert.deepEqual(await memory.status(SCOPE, {}), plain);
   const asked = await memory.status(SCOPE, { capabilities: true });
-  assert.deepEqual(asked.capabilities, { scope_set_max: 4, record_digests: true });
+  assert.deepEqual(asked.capabilities, { scope_set_max: 4, record_digests: true, cross_scope_relations: true, link_uid_lock: false });
   assert.deepEqual({ ...asked, capabilities: undefined }, { ...plain, capabilities: undefined });
   assert.deepEqual(plain.store, STORE, 'store_identity has the shape of status.store');
 });
