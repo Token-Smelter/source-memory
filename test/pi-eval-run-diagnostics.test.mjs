@@ -304,6 +304,19 @@ test('a fetch or offer without record ids makes the reach unavailable, not a def
   assert.equal(limited.search_reach.findings.find(row => row.from === 'R10' && row.to === 'R1').furthest_stage, 'proposed');
 });
 
+test('search id fields that are not arrays make the reach and funnel unavailable instead of throwing', () => {
+  for (const [surface, field] of [['compact-records', 'previewed_ids'], ['selected-link-offer', 'candidate_ids']]) {
+    const report = diagnose(input => {
+      const three = input.artifacts.report.coverage.dispositions[2];
+      three.search_statuses = three.search_statuses.map(row => row.surface === surface ? { ...row, [field]: 'fictional missing ids' } : row);
+      return input;
+    });
+    const byEdge = Object.fromEntries(report.search_reach.findings.map(row => [`${row.from}>${row.to}`, row]));
+    assert.deepEqual([byEdge['R5>R2'].reason, byEdge['R5>R3'].reason, byEdge['R4>R1'].reason], Array(3).fill('search_statuses_without_ids'), surface);
+    if (surface === 'selected-link-offer') assert.equal(report.link_funnel.checkpoints[2].counts.offered, null);
+  }
+});
+
 test('a reviewer decision that was not recorded is unknown, not a refusal or an acceptance', () => {
   const report = diagnose(input => {
     input.artifacts.receiptRuns = [input.artifacts.receiptRuns[0].filter(row => !(row.method === 'applyLinks' && row.checkpoint === 'e4'))];
@@ -623,6 +636,11 @@ test('a coverage journal that differs from the digest the export pins is a chang
   rmSync(path);
   symlinkSync(copy, path);
   assert.deepEqual(run(linked).report.link_funnel, UNAVAILABLE('run_artifact_invalid'));
+  // The pinned reader sees the journal before loadRun's bare read does: a journal that is not a regular file is refused as invalid.
+  const nonregular = fresh(), target = join(nonregular.runDir, readdirSync(nonregular.runDir).find(name => name.startsWith('coverage-')));
+  rmSync(target);
+  mkdirSync(target);
+  assert.deepEqual(run(nonregular).report.link_funnel, UNAVAILABLE('run_artifact_invalid'));
   const unpinned = fresh();
   const { coverage_journal_sha256: _pin, ...rest } = unpinned.exported, bytes = Buffer.from(JSON.stringify(rest)), file = join(unpinned.climbDir, 'runs', 'unpinned.json');
   writeFileSync(file, bytes);

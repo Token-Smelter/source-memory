@@ -106,15 +106,16 @@ function openPrior(path, map, priorRunId) {
 
 /** Opens the run through loadRun, follows its resume chain, and reads every pinned receipt file. */
 function loadArtifacts(run, runDir, map) {
-  const head = loadRun(join(runDir, 'REPORT.json'), run.report_sha256, map), chain = [{ original: run.run_dir, ...head }];
-  if (head.seal.digest !== run.seal_sha256 || head.seal.spec.sourceSha256 !== run.source_sha256 || head.report.run_id !== run.run_id
-    || JSON.stringify(head.graph) !== JSON.stringify(run.graph)) throw fail('run_export_mismatch');
-  // The journal is not in REPORT.json; the export pins its digest. loadRun already read it, so reopen it through the pinned reader.
+  // The journal is not in REPORT.json; the export pins its digest. loadRun reads the journal with a bare readFileSync, so the
+  // pinned reader (no symlink, regular file, size limit, SHA-256) must see it first.
   if (!/^[a-f0-9]{64}$/.test(run.coverage_journal_sha256 ?? '')) throw fail('run_export_invalid');
-  if (head.journalSha256 !== run.coverage_journal_sha256) throw fail('run_export_mismatch');
   const journals = readdirSync(runDir).filter(name => /^coverage-[a-f0-9]{64}\.jsonl$/.test(name));
   if (journals.length !== 1) throw fail('coverage_journal_ambiguous');
   readPinned(join(runDir, journals[0]), run.coverage_journal_sha256);
+  const head = loadRun(join(runDir, 'REPORT.json'), run.report_sha256, map), chain = [{ original: run.run_dir, ...head }];
+  if (head.seal.digest !== run.seal_sha256 || head.seal.spec.sourceSha256 !== run.source_sha256 || head.report.run_id !== run.run_id
+    || JSON.stringify(head.graph) !== JSON.stringify(run.graph)) throw fail('run_export_mismatch');
+  if (head.journalSha256 !== run.coverage_journal_sha256) throw fail('run_export_mismatch');
   for (let current = head; current.seal.spec.resume;) {
     const dirs = new Set(current.report.artifacts.checkpoint_snapshots.map(row => dirname(dirname(map(row.path)))));
     const prior = [...dirs].map(dir => { try { return JSON.parse(readFileSync(join(dir, 'REPORT.json'))); } catch { return null; } })

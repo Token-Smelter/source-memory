@@ -149,7 +149,8 @@ function searchEvidence(disposition) {
   const offersKnown = compact.length > 0 && offers.every(row => isIds(row.candidate_ids));
   // A fetch that was refused by a limit names no record; any other selected-record row without an id hides what was fetched.
   const fetchedKnown = records.every(row => (typeof row.id === 'string' && row.id) || ['fetch_limit', 'fetch_budget_exceeded'].includes(row.status));
-  const strings = values => values.filter(value => typeof value === 'string');
+  // A malformed field (not an array) was already marked incomplete above; it contributes no ids here.
+  const strings = values => (Array.isArray(values) ? values.filter(value => typeof value === 'string') : []);
   return { ids, offersKnown, fetchedKnown, complete: ids && offersKnown && fetchedKnown, offers: offers.length,
     previewed: new Set(compact.flatMap(row => strings(row.previewed_ids ?? []))),
     fetched: new Set(strings(records.map(row => row.id))),
