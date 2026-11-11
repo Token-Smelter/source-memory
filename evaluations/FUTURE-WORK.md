@@ -24,12 +24,12 @@ Clean first, then label: references and questions are produced on cleaned text, 
 | Detectors | Flag file paths, project and repository names, personal names, secrets and credentials, URLs and hostnames |
 | LLM rewrite | Replace flagged spans with consistent fictional stand-ins that keep the technical meaning |
 | Independent LLM review | A separate model reviews each rewritten file for residual identifying content and meaning loss |
-| Question filter | Drop any challenge question whose answer depends on content the rewrite removed or altered |
 | Human spot-checks | Sampled passages, not whole logs; a human cannot read every session end to end |
+| Question filter | Drop any challenge question whose answer depends on content the rewrite removed or altered |
 
 ## Private holdout
 
-A sealed set of sessions never used for tuning. A treatment that gains on the published set but not on the holdout is overfitting to it. Holdout results are not published; only whether a published-set gain held on the holdout.
+A sealed set of sessions never used for tuning. A treatment that gains on the published set but not on the holdout is overfitting to it. Holdout results are not published; only whether a published-set gain held on the holdout is reported.
 
 ## Contributor rule
 

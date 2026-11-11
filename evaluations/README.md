@@ -48,7 +48,7 @@ No model is fine-tuned. A treatment changes one or more of these surfaces and le
 
 ### Neuro-symbolic split
 
-The neural part extracts meaning; the symbolic part constrains what can be stored. Constraints are enforced by the store, so a treatment that changes prompts, tools or ranking cannot relax them. Adding a kind or relation type is a store-vocabulary change, judged by the same protocol:
+The neural part extracts meaning; the symbolic part constrains what can be stored. Constraints are enforced by the store, so no treatment of the surfaces above can relax them:
 
 | Constraint | Effect |
 |---|---|
@@ -56,6 +56,8 @@ The neural part extracts meaning; the symbolic part constrains what can be store
 | Evidence spans | Every record and relation cites exact source offsets resolved from stored turns |
 | Immutability | Records are append-only; corrections are new records with `supersedes` or `qualifies` |
 | Scope grants | Reads and writes are limited to configured scopes |
+
+Adding a kind or relation type is a store-vocabulary change, judged by the same protocol.
 
 ## The map is not the territory
 
@@ -76,10 +78,10 @@ Structural agreement alone rewards copying the teacher's style. The functional t
 ```mermaid
 flowchart TB
   Question["Challenge question (no arm, no case id)"] --> ArmChoice{"Arm"}
-  ArmChoice -->|memory-only| MemoryOnly["Records and relations only"]
+  ArmChoice -->|memory-only| MemoryOnly["Records and relations with cited evidence"]
   ArmChoice -->|raw-only| RawOnly["Source text search"]
   ArmChoice -->|combined| Combined["Product recall over all channels"]
-  ArmChoice -->|reference| ReferenceArm["Teacher's reference graph"]
+  ArmChoice -->|reference| ReferenceArm["Teacher's reference graph (not yet run)"]
   ArmChoice -->|empty| Empty["No memory"]
   MemoryOnly --> Answer["Cited answer"]
   RawOnly --> Answer
@@ -94,10 +96,10 @@ flowchart TB
 | memory-only (harness arm `candidate`) | Candidate records and relations, plus the evidence spans they cite; no search over source text | Primary measure of what the student stored; it cannot fall back to full-text search |
 | raw-only | Source text search | Diagnostic: how far plain retrieval gets |
 | combined | Product `recall` over turns, chunks and records | Diagnostic: the shipped retrieval path |
-| reference | The teacher's graph | Score of the teacher's graph: a target, not a hard ceiling |
+| reference | The teacher's graph | Score of the teacher's graph: a target, not a hard ceiling (designed; not yet run) |
 | empty | Nothing | Floor; detects answers from prior knowledge |
 
-The harness also has a `baseline` arm (a store derived from an empty start) and a `recall-chunks` diagnostic; see the [harness README](../pi-extension/evaluation/README.md). Neither is the "baseline v2.1" candidate reported in the README.
+The harness also has a `baseline` arm (an empty derived store: the no-memory comparator, which returns no records) and a `recall-chunks` diagnostic; see the [harness README](../pi-extension/evaluation/README.md). Neither is the "baseline v2.1" candidate reported in the README.
 
 The scorer counts requirements met and flags safety failures per case:
 
@@ -123,7 +125,7 @@ flowchart LR
   Pick["Pick one treatment"] --> Register["Pre-register acceptance rule"]
   Register --> Run["Run all sessions"]
   Run --> Valid{"Any fault?"}
-  Valid -->|yes| Rerun["Invalid: rerun"]
+  Valid -->|yes| Rerun["Invalid: rerun or resume"]
   Rerun --> Run
   Valid -->|no| Checks["Noise band, policy-suspect, per-type checks"]
   Checks --> Outcome{"Rule met?"}
@@ -159,6 +161,6 @@ After each run, structural differences are mapped to the surface most likely res
 | Data | Where it lives |
 |---|---|
 | Development sessions | Used for public results; published only as structure and aggregates |
-| Private holdout | Sealed; not used for tuning; detects overfitting to development sessions; results not published |
+| Private holdout | Sealed; not used for tuning; detects overfitting to development sessions; results not published beyond whether a gain held |
 | Real runs: transcripts, references, candidate stores, answers, scores | A private store outside this repository |
 | Published here | Structure-only charts (dots, arcs, checkpoint columns; no session text, labels limited to Session A–C, checkpoint counts, row labels and the kind legend) and aggregate counts |
