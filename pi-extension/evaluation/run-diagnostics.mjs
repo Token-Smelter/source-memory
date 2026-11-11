@@ -125,23 +125,34 @@ function alignmentGate({ run, exportSha256, alignment, reference }) {
       || STORED.has(row.status) !== (row.candidate_ids.length > 0)) return missing('alignment_invalid');
     items.set(row.reference_id, row);
   }
-  for (const edge of summary.relations) {
-    if (!items.has(edge?.from) || !items.has(edge?.to) || typeof edge.type !== 'string' || !RELATION_STATUSES.has(edge.status)
-      || (edge.status === 'directed_edge_observed_provisional' && (!items.get(edge.from).candidate_ids.length || !items.get(edge.to).candidate_ids.length))) return missing('alignment_invalid');
+  if (!Array.isArray(reference.relations)) return missing('reference_unavailable');
+  // Every reference edge at or before the cutoff must appear once, in reference order: a missing edge is unknown, not absent.
+  const wanted = reference.relations.filter(edge => expected.has(edge?.from) && expected.has(edge?.to));
+  if (wanted.length !== summary.relations.length) return missing('alignment_invalid');
+  for (const [index, edge] of summary.relations.entries()) {
+    const want = wanted[index];
+    if (edge?.from !== want.from || edge.to !== want.to || edge.type !== want.type || typeof edge.type !== 'string' || !RELATION_STATUSES.has(edge.status)) return missing('alignment_invalid');
+    const matched = items.get(edge.from).candidate_ids.length > 0 && items.get(edge.to).candidate_ids.length > 0;
+    if (matched === (edge.status === 'endpoint_unmatched_or_uncertain')) return missing('alignment_invalid');
   }
   return { ok: true, summary, items, expected };
 }
 
 function searchEvidence(disposition) {
-  const empty = { previewed: new Set(), fetched: new Set(), offered: new Set(), offers: 0, ids: true, offersKnown: true };
+  const empty = { previewed: new Set(), fetched: new Set(), offered: new Set(), offers: 0, ids: true, offersKnown: true, fetchedKnown: true, complete: true };
   if (disposition.disposition === 'ineligible_by_policy') return empty;
   const statuses = Array.isArray(disposition.search_statuses) ? disposition.search_statuses : [];
   const compact = statuses.filter(row => row?.surface === 'compact-records'), offers = statuses.filter(row => row?.surface === 'selected-link-offer');
-  const ids = compact.length > 0 && compact.every(row => Array.isArray(row.previewed_ids));
+  const records = statuses.filter(row => row?.surface === 'selected-record');
+  const isIds = value => Array.isArray(value) && value.every(id => typeof id === 'string' && id);
+  const ids = compact.length > 0 && compact.every(row => isIds(row.previewed_ids));
+  const offersKnown = compact.length > 0 && offers.every(row => isIds(row.candidate_ids));
+  // A fetch that was refused by a limit names no record; any other selected-record row without an id hides what was fetched.
+  const fetchedKnown = records.every(row => (typeof row.id === 'string' && row.id) || ['fetch_limit', 'fetch_budget_exceeded'].includes(row.status));
   const strings = values => values.filter(value => typeof value === 'string');
-  return { ids, offersKnown: compact.length > 0 && offers.every(row => Array.isArray(row.candidate_ids)), offers: offers.length,
+  return { ids, offersKnown, fetchedKnown, complete: ids && offersKnown && fetchedKnown, offers: offers.length,
     previewed: new Set(compact.flatMap(row => strings(row.previewed_ids ?? []))),
-    fetched: new Set(strings(statuses.filter(row => row?.surface === 'selected-record').map(row => row.id))),
+    fetched: new Set(strings(records.map(row => row.id))),
     offered: new Set(offers.flatMap(row => strings(row.candidate_ids ?? []))) };
 }
 
@@ -150,7 +161,8 @@ function linkEvidence(rows, search, disposition) {
   const link = rows.filter(row => LINK_METHODS.has(row.method));
   const begins = link.filter(row => row.method === 'beginLinks'), finishes = link.filter(row => row.method === 'finishLinks'), applies = link.filter(row => row.method === 'applyLinks');
   if (!rows.length && disposition.disposition !== 'ineligible_by_policy') return { state: 'unknown', reason: 'checkpoint_receipts_missing' };
-  if (!search.offers && !begins.length) return { state: 'none' };
+  // No link activity is a known zero only when the search statuses show that no offer was made; without them it is unknown.
+  if (!search.offers && !begins.length) return search.offersKnown ? { state: 'none' } : { state: 'unknown', reason: 'search_statuses_without_ids' };
   if (!begins.some(row => row.ok === true)) return { state: 'unknown', reason: begins.length ? 'link_call_failed' : 'link_receipts_missing' };
   if (finishes.some(row => row.ok !== true)) return { state: 'unknown', reason: 'link_call_failed' };
   const proposals = [], unresolved = [];
@@ -254,8 +266,10 @@ function funnel(gate, evidence) {
     }
     return { checkpoint_index: entry.index, through: entry.through, disposition: entry.disposition, counts, unavailable: reasons };
   });
-  const offerRows = rows.filter(row => evidence[row.checkpoint_index - 1].search.offers > 0);
-  if (offerRows.length && offerRows.every(row => row.unavailable.proposed === 'link_receipts_missing')) return missing('link_receipts_missing');
+  const reasons = new Set(evidence.map(entry => entry.link.state === 'unknown' ? entry.link.reason : null));
+  if (reasons.size === 1 && !reasons.has(null)) return missing([...reasons][0]);
+  // Without a single checkpoint whose link calls were recorded, no proposal, decision or applied count can be known.
+  if (!evidence.some(entry => entry.link.state === 'ok') && evidence.some(entry => entry.link.state === 'unknown' && entry.link.reason === 'link_receipts_missing')) return missing('link_receipts_missing');
   const totals = Object.fromEntries(FUNNEL_FIELDS.map(field => {
     const unknown = rows.filter(row => row.counts[field] === null).map(row => row.checkpoint_index);
     return [field, unknown.length ? { available: false, reason: 'checkpoints_unavailable', checkpoint_indices: unknown }
@@ -280,39 +294,43 @@ function pairReach(a, b, evidence) {
   if (prior.dated_by === 'first_snapshot' || later.dated_by === 'first_snapshot') return { ...base, ...missing('record_dated_by_first_snapshot') };
   if (prior.checkpoint_index === later.checkpoint_index) return { ...base, ...missing('endpoints_same_checkpoint') };
   const at = evidence[later.checkpoint_index - 1];
-  if (!at.search.ids) return { ...base, ...missing('search_statuses_without_ids') };
+  // Each surface that decides a stage must be recorded with ids; a missing one cannot be read as "not reached".
+  if (!at.search.complete) return { ...base, ...missing('search_statuses_without_ids') };
   let stage = at.search.previewed.has(prior.id) ? 1 : 0;
   if (at.search.fetched.has(prior.id)) stage = 2;
   if (at.search.offered.has(prior.id)) stage = 3;
-  let decision = null, lowerBound = false;
-  if (at.link.state === 'unknown') lowerBound = stage === 3;
-  else if (at.link.state === 'ok') {
+  let decision = null;
+  // An offered record may have been proposed or refused; unrecorded link calls leave that open, a record never offered cannot have been.
+  if (at.link.state === 'unknown' && stage === 3) return { ...base, ...missing(at.link.reason) };
+  if (at.link.state === 'ok') {
     const same = entry => (entry.from_id === prior.id && entry.to_id === later.id) || (entry.from_id === later.id && entry.to_id === prior.id);
     const proposed = at.link.proposals.filter(same), loose = at.link.unresolved.filter(same);
     if (proposed.length || loose.length) stage = 4;
     if (proposed.length) {
       decision = proposed.some(entry => entry.decision === 'accepted') ? 'accepted' : proposed.every(entry => entry.decision === 'refused') ? 'refused' : 'unknown';
       if (decision === 'refused') stage = 5;
-      if (decision === 'unknown') lowerBound = true;
+      if (decision === 'unknown') return { ...base, ...missing('reviewer_decision_unrecorded') };
     }
   }
-  return { ...base, available: true, furthest_stage: STAGES[stage], stage_is_lower_bound: lowerBound, reviewer_decision: decision };
+  return { ...base, available: true, furthest_stage: STAGES[stage], reviewer_decision: decision };
 }
 
-const PAIR_REASON_ORDER = ['record_dated_by_first_snapshot', 'endpoints_same_checkpoint', 'search_statuses_without_ids'];
+const PAIR_REASON_ORDER = ['record_dated_by_first_snapshot', 'endpoints_same_checkpoint', 'search_statuses_without_ids', 'reviewer_decision_unrecorded',
+  'checkpoint_receipts_missing', 'link_receipts_missing', 'link_call_failed', 'receipts_lack_link_fields'];
 
 function searchReach(edges, byId, evidence) {
   const failures = edges.filter(edge => edge.class === 'linking_failure');
   if (failures.length && failures.every(edge => [...edge.endpoints.from.candidate_ids, ...edge.endpoints.to.candidate_ids]
-    .every(id => !evidence[byId.get(id).checkpoint_index - 1].search.ids))) return missing('search_statuses_without_ids');
+    .every(id => !evidence[byId.get(id).checkpoint_index - 1].search.complete))) return missing('search_statuses_without_ids');
   const findings = failures.map(edge => {
     const pairs = [];
     for (const from of edge.endpoints.from.candidate_ids) for (const to of edge.endpoints.to.candidate_ids) if (from !== to) pairs.push(pairReach(byId.get(from), byId.get(to), evidence));
-    const usable = pairs.filter(pair => pair.available), head = { from: edge.from, to: edge.to, type: edge.type, pairs };
-    if (!usable.length) return { ...head, ...missing(PAIR_REASON_ORDER.find(reason => pairs.some(pair => pair.reason === reason)) ?? 'search_statuses_without_ids') };
-    const best = usable.reduce((top, pair) => STAGES.indexOf(pair.furthest_stage) > STAGES.indexOf(top.furthest_stage) ? pair : top);
-    return { ...head, available: true, furthest_stage: best.furthest_stage, stage_is_lower_bound: usable.some(pair => pair.stage_is_lower_bound) || usable.length < pairs.length,
-      levers: leversOf('search_reach') };
+    const head = { from: edge.from, to: edge.to, type: edge.type, pairs };
+    // One pair with unknown evidence leaves the furthest stage of the edge unknown: the other pairs could be behind it.
+    const blocked = PAIR_REASON_ORDER.find(reason => pairs.some(pair => pair.reason === reason));
+    if (blocked || !pairs.length) return { ...head, ...missing(blocked ?? 'search_statuses_without_ids') };
+    const best = pairs.reduce((top, pair) => STAGES.indexOf(pair.furthest_stage) > STAGES.indexOf(top.furthest_stage) ? pair : top);
+    return { ...head, available: true, furthest_stage: best.furthest_stage, levers: leversOf('search_reach') };
   });
   const stages = Object.fromEntries(STAGES.map(stage => [stage, findings.filter(row => row.available && row.furthest_stage === stage).length]));
   return { available: true, linking_failures: failures.length, findings, stage_counts: stages,
@@ -411,7 +429,7 @@ function bars(parent,items){const W=520,row=20,svg=el('svg:svg',{viewBox:'0 0 '+
   table(s,['checkpoint','offered','proposed','not reviewable','accepted','refused','applied','unavailable'],p.checkpoints.map(r=>[r.checkpoint_index,r.counts.offered,r.counts.proposed,r.counts.unresolved,r.counts.reviewer_accepted,r.counts.reviewer_refused,r.counts.applied,Object.entries(r.unavailable).map(([k,v])=>k+': '+v)]))}}
 {const p=D.search_reach,s=section('5. Search reach at write time',p);if(s){
   bars(s,Object.entries(p.stage_counts));
-  table(s,['from','to','type','furthest stage','lower bound','pairs'],p.findings.map(f=>[f.from,f.to,f.type,f.available?f.furthest_stage:'unavailable: '+f.reason,f.available?f.stage_is_lower_bound:null,f.pairs.map(x=>x.prior_id+' -> '+x.later_id+' ['+x.dating.prior+'/'+x.dating.later+']'+(x.available?'':' unavailable: '+x.reason))]))}}
+  table(s,['from','to','type','furthest stage','pairs'],p.findings.map(f=>[f.from,f.to,f.type,f.available?f.furthest_stage:'unavailable: '+f.reason,f.pairs.map(x=>x.prior_id+' -> '+x.later_id+' ['+x.dating.prior+'/'+x.dating.later+']'+(x.available?'':' unavailable: '+x.reason))]))}}
 {const s=el('section',{},main);el('h2',{text:'Levers'},s);el('p',{class:'muted',text:D.levers.note},s);
   table(s,['lever','findings','by class','classes unavailable'],D.levers.totals.map(l=>[l.lever,l.findings,Object.entries(l.by_class).map(([k,v])=>k+' '+v),l.unavailable_classes]))}
 {const s=el('section',{},main);el('h2',{text:'Provenance'},s);

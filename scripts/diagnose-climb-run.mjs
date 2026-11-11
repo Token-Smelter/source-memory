@@ -2,7 +2,7 @@
 // Local, deterministic and model-free: reads one development run through the hash-pinned readers and writes one JSON report and one HTML page.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { linkSync, lstatSync, readFileSync, realpathSync, unlinkSync } from 'node:fs';
+import { linkSync, lstatSync, readdirSync, readFileSync, realpathSync, unlinkSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CLIMB_RUN_SCHEMA, DEV_REFERENCES, assertDevelopmentSource, readDevReference, readPinned, refuseHoldoutPaths } from '../pi-extension/evaluation/climb.mjs';
@@ -109,6 +109,12 @@ function loadArtifacts(run, runDir, map) {
   const head = loadRun(join(runDir, 'REPORT.json'), run.report_sha256, map), chain = [{ original: run.run_dir, ...head }];
   if (head.seal.digest !== run.seal_sha256 || head.seal.spec.sourceSha256 !== run.source_sha256 || head.report.run_id !== run.run_id
     || JSON.stringify(head.graph) !== JSON.stringify(run.graph)) throw fail('run_export_mismatch');
+  // The journal is not in REPORT.json; the export pins its digest. loadRun already read it, so reopen it through the pinned reader.
+  if (!/^[a-f0-9]{64}$/.test(run.coverage_journal_sha256 ?? '')) throw fail('run_export_invalid');
+  if (head.journalSha256 !== run.coverage_journal_sha256) throw fail('run_export_mismatch');
+  const journals = readdirSync(runDir).filter(name => /^coverage-[a-f0-9]{64}\.jsonl$/.test(name));
+  if (journals.length !== 1) throw fail('coverage_journal_ambiguous');
+  readPinned(join(runDir, journals[0]), run.coverage_journal_sha256);
   for (let current = head; current.seal.spec.resume;) {
     const dirs = new Set(current.report.artifacts.checkpoint_snapshots.map(row => dirname(dirname(map(row.path)))));
     const prior = [...dirs].map(dir => { try { return JSON.parse(readFileSync(join(dir, 'REPORT.json'))); } catch { return null; } })

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import vm from 'node:vm';
@@ -49,6 +49,7 @@ function fixture() {
       edge('R10', 'R2', 'qualifies', NOT_OBSERVED), edge('R11', 'R4', 'depends_on', NOT_OBSERVED), edge('R5', 'R4', 'qualifies', NOT_OBSERVED),
       edge('R9', 'R1', 'supersedes', NOT_OBSERVED), edge('R6', 'R1', 'qualifies', UNMATCHED_EDGE), edge('R7', 'R2', 'depends_on', UNMATCHED_EDGE),
       edge('R8', 'R1', 'qualifies', UNMATCHED_EDGE), edge('R8', 'R6', 'contradicts', UNMATCHED_EDGE)] } };
+  reference.relations = alignment.summary.relations.map(({ from, to, type }) => ({ from, to, type }));
   const compact = previewed_ids => ({ surface: 'compact-records', status: 'ready', previewed_ids });
   const fetched = id => ({ surface: 'selected-record', id });
   const offer = candidate_ids => ({ surface: 'selected-link-offer', status: 'selected', candidate_ids });
@@ -140,7 +141,7 @@ test('search reach reports the furthest stage of the prior record per linking fa
   const pair = (prior, later, extra) => ({ prior_id: prior.id, later_id: later.id, prior_checkpoint_index: prior.cp, later_checkpoint_index: later.cp,
     dating: { prior: prior.dating ?? 'write_receipt', later: later.dating ?? 'write_receipt' }, ...extra });
   const c = (id, cp, dating) => ({ id, cp, dating });
-  const ok = (furthest_stage, reviewer_decision = null, stage_is_lower_bound = false) => ({ available: true, furthest_stage, stage_is_lower_bound, reviewer_decision });
+  const ok = (furthest_stage, reviewer_decision = null) => ({ available: true, furthest_stage, reviewer_decision });
   const finding = (from, to, type, pairs, { reviewer_decision: _decision, ...rest }) => ({ from, to, type, pairs, ...rest });
   const levers = ['compact search', 'ranking (cf. fusion probe)'];
   assert.deepEqual(search_reach, { available: true, linking_failures: 8, unavailable_findings: 2,
@@ -230,17 +231,77 @@ test('a missing or changed run artifact makes the receipt-based parts unavailabl
   assert.equal(artifactFailureReason(Object.assign(new Error('x'), { code: 'holdout_refused' })), null);
 });
 
-test('receipts without the link methods make the funnel unavailable and cap reach at the stage the data supports', () => {
+test('receipts without the link methods make the funnel unavailable and leave an offered record\'s reach unavailable, not a lower bound', () => {
   const report = diagnose(input => {
     input.artifacts.receiptRuns = [input.artifacts.receiptRuns[0].filter(row => !['beginLinks', 'finishLinks', 'applyLinks'].includes(row.method))];
     return input;
   });
   assert.deepEqual(report.link_funnel, UNAVAILABLE('link_receipts_missing'));
   const byEdge = Object.fromEntries(report.search_reach.findings.map(row => [`${row.from}>${row.to}`, row]));
-  // Offered is all the statuses show; a proposal or refusal cannot be ruled out, so the stage is only a lower bound.
-  assert.deepEqual([byEdge['R10>R1'].furthest_stage, byEdge['R10>R1'].stage_is_lower_bound, byEdge['R10>R2'].furthest_stage, byEdge['R10>R2'].stage_is_lower_bound],
-    ['offered_as_link_candidate', true, 'offered_as_link_candidate', true]);
-  assert.deepEqual([byEdge['R4>R1'].furthest_stage, byEdge['R4>R1'].stage_is_lower_bound], ['not_previewed', false]);
+  // Offered is all the statuses show; a proposal or refusal cannot be ruled out, so the stage is unknown. A record never offered cannot have been proposed.
+  assert.deepEqual([byEdge['R10>R1'].available, byEdge['R10>R1'].reason, byEdge['R10>R2'].available, byEdge['R10>R2'].reason, byEdge['R5>R3'].reason],
+    [false, 'link_receipts_missing', false, 'link_receipts_missing', 'link_receipts_missing']);
+  assert.deepEqual([byEdge['R4>R1'].furthest_stage, byEdge['R11>R4'].furthest_stage], ['not_previewed', 'fetched']);
+});
+
+test('receipts with no link methods and no search statuses leave the funnel unavailable instead of known zeros', () => {
+  const report = diagnose(input => {
+    input.artifacts.receiptRuns = [input.artifacts.receiptRuns[0].filter(row => !['beginLinks', 'finishLinks', 'applyLinks'].includes(row.method))];
+    for (const row of input.artifacts.report.coverage.dispositions) delete row.search_statuses;
+    return input;
+  });
+  assert.deepEqual(report.link_funnel, UNAVAILABLE('search_statuses_without_ids'));
+  assert.deepEqual(report.search_reach, UNAVAILABLE('search_statuses_without_ids'));
+  assert.equal(report.levers.totals.find(row => row.lever === 'offers').findings, 0);
+  assert.deepEqual(report.levers.totals.find(row => row.lever === 'offers').unavailable_classes, ['funnel']);
+});
+
+test('a checkpoint without any receipts, a failed link call and receipts lacking link fields are unavailable per checkpoint', () => {
+  const only = (report, index) => report.link_funnel.checkpoints[index];
+  const withReceipts = change => diagnose(input => { input.artifacts.receiptRuns = [change(input.artifacts.receiptRuns[0])]; return input; });
+  const missingCheckpoint = withReceipts(rows => rows.filter(row => row.checkpoint !== 'e3'));
+  assert.equal(only(missingCheckpoint, 2).counts.proposed, null);
+  assert.equal(only(missingCheckpoint, 2).unavailable.proposed, 'checkpoint_receipts_missing');
+  assert.deepEqual(missingCheckpoint.link_funnel.totals.proposed, { available: false, reason: 'checkpoints_unavailable', checkpoint_indices: [3] });
+  const failed = withReceipts(rows => rows.map(row => row.checkpoint === 'e4' && row.method === 'finishLinks' ? { checkpoint: 'e4', method: 'finishLinks', ok: false, code: 'request_failed', effect: 'none' } : row));
+  assert.equal(only(failed, 3).unavailable.proposed, 'link_call_failed');
+  assert.equal(only(failed, 3).counts.reviewer_accepted, null);
+  const lacking = withReceipts(rows => rows.map(row => row.checkpoint === 'e4' && row.method === 'finishLinks' ? { ...row, value: { operation_id: 'op4' } } : row));
+  assert.equal(only(lacking, 3).unavailable.proposed, 'receipts_lack_link_fields');
+  const reach = Object.fromEntries(lacking.search_reach.findings.map(row => [`${row.from}>${row.to}`, row]));
+  assert.deepEqual([reach['R10>R1'].available, reach['R10>R1'].reason, reach['R4>R1'].furthest_stage], [false, 'receipts_lack_link_fields', 'not_previewed']);
+  const noCheckpoint = Object.fromEntries(missingCheckpoint.search_reach.findings.map(row => [`${row.from}>${row.to}`, row]));
+  assert.deepEqual([noCheckpoint['R5>R3'].available, noCheckpoint['R5>R3'].reason], [false, 'checkpoint_receipts_missing']);
+});
+
+test('an alignment that omits, repeats or alters a reference edge is invalid, never a zero edge count', () => {
+  const edgesOf = change => diagnose(input => { change(input); return input; }).edge_gaps;
+  assert.deepEqual(edgesOf(input => { input.alignment.summary.relations = []; }), UNAVAILABLE('alignment_invalid'));
+  assert.deepEqual(edgesOf(input => { input.alignment.summary.relations = input.alignment.summary.relations.slice(1); }), UNAVAILABLE('alignment_invalid'));
+  assert.deepEqual(edgesOf(input => { input.alignment.summary.relations = [...input.alignment.summary.relations, input.alignment.summary.relations[0]]; }), UNAVAILABLE('alignment_invalid'));
+  assert.deepEqual(edgesOf(input => { input.alignment.summary.relations[1] = { ...input.alignment.summary.relations[1], to: 'R2' }; }), UNAVAILABLE('alignment_invalid'));
+  assert.deepEqual(edgesOf(input => { input.alignment.summary.relations[1] = { ...input.alignment.summary.relations[1], status: UNMATCHED_EDGE }; }), UNAVAILABLE('alignment_invalid'));
+  assert.deepEqual(edgesOf(input => { input.reference.relations.push({ from: 'R3', to: 'R2', type: 'supersedes' }); }), UNAVAILABLE('alignment_invalid'));
+  // An edge whose endpoint lies after the cutoff is not a reference edge for this run.
+  assert.equal(edgesOf(input => { input.reference.relations.push({ from: 'R3', to: 'R99', type: 'supersedes' }); }).counts.total, 13);
+});
+
+test('a fetch or offer without record ids makes the reach unavailable, not a definite stage', () => {
+  for (const surface of ['selected-record', 'selected-link-offer']) {
+    const report = diagnose(input => {
+      const three = input.artifacts.report.coverage.dispositions[2];
+      three.search_statuses = three.search_statuses.map(row => row.surface === surface ? { surface, status: 'ok' } : row);
+      return input;
+    });
+    const byEdge = Object.fromEntries(report.search_reach.findings.map(row => [`${row.from}>${row.to}`, row]));
+    // Edges whose later record was written at checkpoint 3 cannot say how far the prior record got.
+    assert.deepEqual([byEdge['R5>R2'].reason, byEdge['R5>R3'].reason, byEdge['R4>R1'].reason], Array(3).fill('search_statuses_without_ids'), surface);
+    assert.deepEqual([byEdge['R10>R1'].furthest_stage, byEdge['R11>R4'].furthest_stage], ['proposed', 'fetched']);
+    assert.equal(report.link_funnel.checkpoints[2].counts.offered, surface === 'selected-link-offer' ? null : 1);
+  }
+  // A fetch refused by a limit names no record and is not a missing id.
+  const limited = diagnose(input => { input.artifacts.report.coverage.dispositions[3].search_statuses.push({ surface: 'selected-record', status: 'fetch_limit' }); return input; });
+  assert.equal(limited.search_reach.findings.find(row => row.from === 'R10' && row.to === 'R1').furthest_stage, 'proposed');
 });
 
 test('a reviewer decision that was not recorded is unknown, not a refusal or an acceptance', () => {
@@ -253,7 +314,7 @@ test('a reviewer decision that was not recorded is unknown, not a refusal or an 
   assert.deepEqual(row.unavailable, { reviewer_accepted: 'reviewer_decision_unrecorded', reviewer_refused: 'reviewer_decision_unrecorded', applied: 'reviewer_decision_unrecorded' });
   assert.deepEqual(report.link_funnel.totals.applied, { available: false, reason: 'checkpoints_unavailable', checkpoint_indices: [4] });
   const refused = report.search_reach.findings.find(finding => finding.to === 'R2' && finding.from === 'R10');
-  assert.deepEqual([refused.furthest_stage, refused.stage_is_lower_bound, refused.pairs[0].reviewer_decision], ['proposed', true, 'unknown']);
+  assert.deepEqual([refused.available, refused.reason, refused.pairs[0].reason], [false, 'reviewer_decision_unrecorded', 'reviewer_decision_unrecorded']);
 });
 
 test('search statuses without record ids make reach unavailable and the offered count unknown', () => {
@@ -437,7 +498,8 @@ function buildWorld(base, { alignmentChange = value => value, resumed = false } 
   const reportBytes = Buffer.from(JSON.stringify(report));
   writeFileSync(join(runDir, 'REPORT.json'), reportBytes);
   const reportSha = sha(reportBytes), loaded = loadRun(join(runDir, 'REPORT.json'), reportSha);
-  const exported = runExport({ treatment: 'baseline-fiction', seal: loaded.seal, report: loaded.report, reportSha256: reportSha, graph: loaded.graph, answers: loaded.answers });
+  const exported = { ...runExport({ treatment: 'baseline-fiction', seal: loaded.seal, report: loaded.report, reportSha256: reportSha, graph: loaded.graph, answers: loaded.answers }),
+    coverage_journal_sha256: loaded.journalSha256 };
   const exportPath = join(climbDir, 'runs', `baseline-fiction--${DEV}.json`), exportBytes = Buffer.from(JSON.stringify(exported));
   writeFileSync(exportPath, exportBytes);
   const alignmentDir = join(climbDir, 'alignments', `baseline-fiction--${DEV}`);
@@ -446,7 +508,7 @@ function buildWorld(base, { alignmentChange = value => value, resumed = false } 
     summary: { cutoff: 2, items: [item('R1', STORED_RETURNED, ['c1']), item('R2', STORED_NOT_RETURNED, ['c2'])],
       relations: [edge('R2', 'R1', 'supersedes', NOT_OBSERVED)] } };
   writeFileSync(join(alignmentDir, 'ALIGNMENT.json'), JSON.stringify(alignmentChange(alignment)));
-  const reference = { schedule: ['e1', 'e2'], caption: 'fictional reference caption', records: [refRec('R1', 1), refRec('R2', 2)], relations: [] };
+  const reference = { schedule: ['e1', 'e2'], caption: 'fictional reference caption', records: [refRec('R1', 1), refRec('R2', 2)], relations: [{ from: 'R2', to: 'R1', type: 'supersedes' }] };
   const output = join(base, 'out');
   mkdirSync(output, { mode: 0o700 });
   chmodSync(output, 0o700);
@@ -547,6 +609,24 @@ test('a run export that no longer matches its run directory is a changed artifac
   const world = fresh(), snapshot = join(world.runDir, 'snapshots', 'e2.json');
   writeFileSync(snapshot, readFileSync(snapshot, 'utf8').replace('Fictional candidate c2.', 'Fictional candidate c2 changed.'));
   assert.deepEqual(run(world).report.search_reach, UNAVAILABLE('run_artifact_changed'));
+});
+
+test('a coverage journal that differs from the digest the export pins is a changed artifact, and a symlinked journal is refused', () => {
+  const changed = fresh(), journal = readdirSync(changed.runDir).find(name => name.startsWith('coverage-'));
+  writeFileSync(join(changed.runDir, journal), `${readFileSync(join(changed.runDir, journal), 'utf8')}\n`);
+  const report = run(changed).report;
+  assert.deepEqual([report.link_funnel, report.search_reach], [UNAVAILABLE('run_artifact_changed'), UNAVAILABLE('run_artifact_changed')]);
+  assert.equal(report.edge_gaps.available, true);
+  const linked = fresh(), path = join(linked.runDir, readdirSync(linked.runDir).find(name => name.startsWith('coverage-')));
+  const copy = `${path}.copy`;
+  writeFileSync(copy, readFileSync(path));
+  rmSync(path);
+  symlinkSync(copy, path);
+  assert.deepEqual(run(linked).report.link_funnel, UNAVAILABLE('run_artifact_invalid'));
+  const unpinned = fresh();
+  const { coverage_journal_sha256: _pin, ...rest } = unpinned.exported, bytes = Buffer.from(JSON.stringify(rest)), file = join(unpinned.climbDir, 'runs', 'unpinned.json');
+  writeFileSync(file, bytes);
+  assert.deepEqual(diagnoseClimbRun({ ...args(unpinned), exportPath: file, exportSha: sha(bytes) }, deps(unpinned)).report.link_funnel, UNAVAILABLE('run_artifact_invalid'));
 });
 
 test('a missing alignment, a partial alignment and a foreign export hash are reported unavailable through the CLI', () => {

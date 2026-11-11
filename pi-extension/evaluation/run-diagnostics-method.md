@@ -56,7 +56,10 @@ Verbatim from the evaluation owner. Levers attach by finding class; a finding on
 | `candidate_ids` for an uncertain verdict are dropped by `summarizeStage` | A candidate named only by an uncertain verdict is counted unaligned. |
 | Offers are the distiller's selected handles | `offered` counts distinct prior records in `selected-link-offer.candidate_ids`, not the packet's compared records; the packet can omit some for size. |
 | Proposals are those put to the reviewer | `proposed` is `proposals`; model links that failed validation are `unresolved` and counted separately. For reach, an unresolved link still counts as `proposed`. |
-| Reviewer decisions come from `applyLinks` | The decision is read from the response's `review.approved`. If that call failed or is absent, the decision is unknown, and reach reports a lower bound. |
+| Reviewer decisions come from `applyLinks` | The decision is read from the response's `review.approved`. If that call failed or is absent, the decision is unknown; a reach finding that would need it is unavailable (`reviewer_decision_unrecorded`, or the link-receipt reason), not a lower bound. |
+| Reach needs every search surface | A reach pair needs `previewed_ids`, a recorded `id` for every fetch and `candidate_ids` for every offer at that checkpoint; otherwise it is `search_statuses_without_ids`. A finding is available only when all its pairs are. |
+| Edge list must match the reference | The alignment's `relations` must equal the reference edges at or before the cutoff, in order; a missing, extra or inconsistent edge makes parts 1 to 3 and 5 `alignment_invalid`. |
+| The coverage journal is pinned by the export | `REPORT.json` does not pin it; the export's `coverage_journal_sha256` does, and the journal is read through `readPinned` against it. A difference is `run_artifact_changed`. |
 | Reach compares record IDs only | `not_previewed` means the record ID was not among the compact search's previewed IDs at that checkpoint; it does not say the search could never have found it. |
 | A pair is `proposed` when a proposal joins exactly those two records | Relation type is ignored; an accepted link of another type than the reference edge shows as `proposed` with `reviewer_decision: accepted`. |
 | A resumed checkpoint retried in a later run | The newest run in the chain with receipts for that checkpoint is used. |
@@ -72,7 +75,7 @@ Each part is `{available: true, …}` or `{available: false, reason}`. A finding
 | `reference_schedule_mismatch`, `reference_unavailable` | Reference ordinals do not name this run's checkpoints, or the pinned reference could not be read. Parts 1, 2a, 3, 5. |
 | `run_directory_missing`, `run_artifact_missing`, `run_artifact_changed`, `run_artifact_invalid` | Run directory or a pinned artifact is missing, changed (including an export that no longer matches its run) or fails a read check. Parts 4, 5. |
 | `checkpoint_receipts_missing`, `link_receipts_missing`, `link_call_failed`, `receipts_lack_link_fields`, `reviewer_decision_unrecorded` | Per checkpoint in part 4, and part 4 as a whole is `link_receipts_missing` when every checkpoint that made an offer lacks link receipts. |
-| `search_statuses_without_ids` | The statuses have no previewed or offered IDs. Offered count in part 4; part 5. |
+| `search_statuses_without_ids` | The statuses have no previewed, fetched or offered IDs, or no search statuses at all where link activity cannot be ruled out. Offered count and link state in part 4; part 5. |
 | `record_dated_by_first_snapshot` | A record's checkpoint is the first snapshot containing it, not a confirmed write receipt, so reach is not judged. The dating basis of both records is on every reach pair. |
 | `endpoints_same_checkpoint` | Both candidate records were written at one checkpoint; search reach does not apply. |
 | `candidate_only_duplicate_clusters_not_inferable` | Part 2b. |
