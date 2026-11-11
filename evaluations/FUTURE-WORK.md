@@ -10,7 +10,8 @@ flowchart LR
   Review --> Spot["Human spot-checks"]
   Spot --> Clean["Cleaned text"]
   Clean --> Label["Teacher panel labels cleaned text"]
-  Label --> Public["Published eval set"]
+  Label --> Filter["Question filter"]
+  Filter --> Public["Published eval set"]
   Raw --> Holdout["Private holdout, sealed"]
 ```
 
@@ -23,12 +24,12 @@ Clean first, then label: references and questions are produced on cleaned text, 
 | Detectors | Flag file paths, project and repository names, personal names, secrets and credentials, URLs and hostnames |
 | LLM rewrite | Replace flagged spans with consistent fictional stand-ins that keep the technical meaning |
 | Independent LLM review | A separate model reviews each rewritten file for residual identifying content and meaning loss |
-| Question filter | Drop any challenge question whose meaning did not survive cleaning |
+| Question filter | Drop any challenge question whose answer depends on content the rewrite removed or altered |
 | Human spot-checks | Sampled passages, not whole logs; a human cannot read every session end to end |
 
 ## Private holdout
 
-A sealed set of sessions never used for tuning. A treatment that gains on the published set but not on the holdout is overfitting to it. Holdout results are published only as aggregates.
+A sealed set of sessions never used for tuning. A treatment that gains on the published set but not on the holdout is overfitting to it. Holdout results are not published; only whether a published-set gain held on the holdout.
 
 ## Contributor rule
 
@@ -36,14 +37,14 @@ A change to any evaluated surface ships with an eval run that shows:
 
 | Requirement | Detail |
 |---|---|
-| No regression within the noise band | Against the current baseline, with pinned answerer and scorer models |
+| No drop larger than the noise band | Total and per session, against the current baseline, with pinned answerer and scorer models |
 | Repeated seeds where needed | When a result sits near the band edge |
 | Per-type non-regression | No existing record kind or relation type loses capture |
 | A valid run | No faults; spend ledger attached |
 
 ## Hosted runs
 
-Contributors should not need maintainers to fund every eval. Runs could execute on an evaluation platform (for example a Hugging Face or Databricks-style evaluation service), with the published set, pinned models and the scoring harness, billed to the contributor's account and reporting results in the standard format.
+Contributors should not need maintainers to fund every eval. Runs could execute on an evaluation platform (for example a Hugging Face or Databricks-style evaluation service), with the published set, pinned models and the scoring harness, billed to the contributor's account and reporting the same aggregate and per-type results the harness produces.
 
 ## Open questions
 

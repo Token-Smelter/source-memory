@@ -1,6 +1,6 @@
 # Evaluation methodology
 
-**A small distiller model (the student) is scored against reference memory graphs produced by a frontier multi-model labeling panel (the teacher), and by whether its records help a fixed answerer explain how things changed and why.** We optimise a program of surfaces around the student, not its weights, one pre-registered treatment at a time, and accept a change only when it beats a measured noise band without regressing any record or relation type. References are a model of the sessions, not the sessions themselves, so every score is agreement with a characterised map. Current numbers are in the [README](../README.md#evaluation-progress); harness interfaces are in [`pi-extension/evaluation/README.md`](../pi-extension/evaluation/README.md); planned work is in [FUTURE-WORK.md](./FUTURE-WORK.md).
+**A small distiller model (the student) is scored against reference memory graphs produced by a frontier multi-model labeling panel (the teacher), and by whether its records help a fixed answerer explain how things changed and why.** We optimise a program of surfaces around the student, not its weights, one pre-registered treatment at a time, and accept a change only when it beats a measured noise band without regressing any record or relation type. References are a model of the sessions, not the sessions themselves, so every score is agreement with a map, not with ground truth; label-quality figures for that map are not yet published. Current numbers are in the [README](../README.md#evaluation-progress); harness interfaces are in [`pi-extension/evaluation/README.md`](../pi-extension/evaluation/README.md); planned work is in [FUTURE-WORK.md](./FUTURE-WORK.md).
 
 ```mermaid
 flowchart LR
@@ -48,7 +48,7 @@ No model is fine-tuned. A treatment changes one or more of these surfaces and le
 
 ### Neuro-symbolic split
 
-The neural part extracts meaning; the symbolic part constrains what can be stored. Constraints are enforced by the store, so a treatment cannot relax them:
+The neural part extracts meaning; the symbolic part constrains what can be stored. Constraints are enforced by the store, so a treatment that changes prompts, tools or ranking cannot relax them. Adding a kind or relation type is a store-vocabulary change, judged by the same protocol:
 
 | Constraint | Effect |
 |---|---|
@@ -59,7 +59,7 @@ The neural part extracts meaning; the symbolic part constrains what can be store
 
 ## The map is not the territory
 
-References are a model of what happened, as human labels would be. They can miss records, split or merge differently than a careful human, and inherit shared biases of the panel. Label quality is therefore characterised and reported with results:
+References are a model of what happened, as human labels would be. They can miss records, split or merge differently than a careful human, and inherit shared biases of the panel. Label quality is characterised by the measures below; the figures are not yet published and spot audits are pending:
 
 | Label-quality measure | What it tells you |
 |---|---|
@@ -67,7 +67,7 @@ References are a model of what happened, as human labels would be. They can miss
 | Adjudication rate | Share of items the adjudicator had to resolve |
 | Spot audits | Human review of sampled reference items against source |
 
-A candidate score is agreement with this characterised map. A low score can mean the candidate is wrong, the reference is wrong, or both chose defensible but different granularity; failure diagnosis (below) separates these where it can.
+A candidate score is agreement with this map. A low score can mean the candidate is wrong, the reference is wrong, or both chose defensible but different granularity; failure diagnosis (below) separates these where it can.
 
 ## Functional test: change-history questions
 
@@ -91,11 +91,13 @@ flowchart TB
 
 | Arm | Answerer can see | Role |
 |---|---|---|
-| memory-only | Candidate records and relations, never full source text | Primary measure of what the student stored; it cannot fall back to full-text search |
+| memory-only (harness arm `candidate`) | Candidate records and relations, plus the evidence spans they cite; no search over source text | Primary measure of what the student stored; it cannot fall back to full-text search |
 | raw-only | Source text search | Diagnostic: how far plain retrieval gets |
 | combined | Product `recall` over turns, chunks and records | Diagnostic: the shipped retrieval path |
-| reference | The teacher's graph | Ceiling for a graph of this shape |
+| reference | The teacher's graph | Score of the teacher's graph: a target, not a hard ceiling |
 | empty | Nothing | Floor; detects answers from prior knowledge |
+
+The harness also has a `baseline` arm (a store derived from an empty start) and a `recall-chunks` diagnostic; see the [harness README](../pi-extension/evaluation/README.md). Neither is the "baseline v2.1" candidate reported in the README.
 
 The scorer counts requirements met and flags safety failures per case:
 
@@ -136,27 +138,27 @@ flowchart LR
 | Noise band | Measured from repeat runs with no change: about ±4 requirements per session, up to 10 in total. Gains inside the band are not gains |
 | Policy-suspect checks | A gain that comes with large over-retention (many more records than the reference, many unmatched) is flagged, not accepted |
 | Per-type non-regression | Adding a new kind or relation type, or changing guidance for one, must not reduce capture of existing types |
-| Faulted runs are invalid | A run with tool, provider or harness faults is discarded and rerun, never scored |
+| Faulted output is invalid | Output produced under tool, provider or harness faults is never scored; the run is rerun or resumed from its last clean checkpoint |
 | Spend ledgers | Every model call is metered against a sealed per-run budget |
 
 ## Per-loop failure diagnosis
 
-After each run, structural differences are mapped to the surface most likely responsible:
+After each run, structural differences are mapped to the surface most likely responsible. Matches between candidate and reference items are provisional, and an unmatched item does not prove its meaning is absent:
 
 | Symptom | Likely lever |
 |---|---|
-| Reference edge missing, both endpoints matched by candidate records | Linking: link offer, link review or relation guidance |
-| Reference edge missing because an endpoint is missing | Retention: the record was never written |
+| Reference edge missing, both endpoints provisionally matched by candidate records | Linking: link offer, link review or relation guidance |
+| Reference edge missing because an endpoint is missing | Retention (or alignment and granularity): no candidate record matched it |
 | Several candidate records match one reference record | Duplicates or over-splitting |
-| Candidate records match nothing in the reference | Over-retention or unsupported records |
+| Candidate records match nothing in the reference | Over-retention, unsupported records, or a reference miss |
 | Links offered but not proposed, or proposed but not accepted | Link funnel: offered → proposed → accepted shows where links are lost |
-| The earlier link target was never offered | Whether the target was reachable by search at that checkpoint |
+| The earlier link target was never offered | Search and ranking, or link-offer selection: was the target reachable by search at that checkpoint? |
 
 ## Data handling
 
 | Data | Where it lives |
 |---|---|
 | Development sessions | Used for public results; published only as structure and aggregates |
-| Private holdout | Sealed; not used for tuning; detects overfitting to development sessions |
+| Private holdout | Sealed; not used for tuning; detects overfitting to development sessions; results not published |
 | Real runs: transcripts, references, candidate stores, answers, scores | A private store outside this repository |
-| Published here | Structure-only charts (dots, arcs, checkpoint columns, no text) and aggregate counts |
+| Published here | Structure-only charts (dots, arcs, checkpoint columns; no session text, labels limited to Session A–C, checkpoint counts, row labels and the kind legend) and aggregate counts |
