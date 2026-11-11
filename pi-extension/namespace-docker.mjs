@@ -168,7 +168,7 @@ export function createNamespaceDocker({ execute = command, probe = probeDriver, 
     try { await execute(argv, { timeout: 5000 }); } catch (error) {
       const stderr = typeof error?.stderr === 'string' && error.stderr.length <= 4096 ? error.stderr.trim() : '';
       const proofs = volume ? [`Error response from daemon: get ${id}: no such volume`, `Error: No such volume: ${id}`]
-        : [`Error: No such object: ${id}`, `Error response from daemon: No such container: ${id}`];
+        : [`Error: No such object: ${id}`, `error: no such object: ${id}`, `Error response from daemon: No such container: ${id}`];
       missing = error?.code === 1 && !error.killed && !error.signal && proofs.includes(stderr);
       classification = missing ? 'missing' : inspectionFailure(error, '');
     }

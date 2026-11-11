@@ -349,6 +349,55 @@ for (const mode of ['unclassified absence', 'wrong missing ID', 'still present',
   });
 }
 
+for (const prefix of ['Error: No such object: ', 'error: no such object: ']) {
+  test(`cleanup accepts complete exact-ID absence: ${prefix.trim()}`, async () => {
+    const f = fixture({ fault(argv, { live }) {
+      if (dbRead(argv) && !live.has(DB)) throw daemonError(`${prefix}${DB}\n`);
+    } });
+    await f.docker.createDatabase();
+    await f.docker.removeContainer(DB);
+    assert.deepEqual(f.inspections('cleanup_absence').map(row => [row.id, row.phase, row.classification, row.attempt]),
+      [[DB, 'absence_proved', 'missing', 1]]);
+    assert.deepEqual(f.receipts.filter(row => row.phase === 'removed').map(row => row.id), [DB]);
+    assert.deepEqual(f.calls.filter(row => row.argv[0] === 'rm').map(row => row.argv), [['rm', '--force', DB]]);
+    assert.equal(f.calls.filter(row => dbRead(row.argv)).length, 3);
+    assert.deepEqual(f.sleeps, []);
+    await assert.rejects(f.docker.removeContainer(DB), { code: 'resource_not_owned' });
+  });
+
+  for (const [name, change] of [
+    ['wrong ID', error => { error.stderr = `${prefix}${FOREIGN}\n`; }],
+    ['truncated ID', error => { error.stderr = `${prefix}${DB.slice(0, -1)}\n`; }],
+    ['unlisted casing', error => { error.stderr = `ERROR: NO SUCH OBJECT: ${DB}\n`; }],
+    ['extra output before', error => { error.stderr = `unrelated output\n${error.stderr}`; }],
+    ['extra output after', error => { error.stderr += 'unrelated output\n'; }],
+    ['extra missing ID', error => { error.stderr += `${prefix}${FOREIGN}\n`; }],
+    ['permission denial', error => { error.stderr += 'permission denied\n'; }],
+    ['permission code', error => { error.code = 'EACCES'; }],
+    ['signal', error => { error.signal = 'SIGTERM'; }],
+    ['killed', error => { error.killed = true; }],
+    ['wrong exit', error => { error.code = 2; }],
+    ['zero exit', error => { error.code = 0; }],
+    ['string exit', error => { error.code = '1'; }],
+  ]) {
+    test(`cleanup rejects ${name} with ${prefix.trim()} without retry or removal receipt`, async () => {
+      const f = fixture({ fault(argv, { live }) {
+        if (!dbRead(argv) || live.has(DB)) return;
+        const error = daemonError(`${prefix}${DB}\n`);
+        change(error);
+        throw error;
+      } });
+      await f.docker.createDatabase();
+      await assert.rejects(f.docker.removeContainer(DB), { code: 'cleanup_unknown' });
+      assert.deepEqual(f.inspections('cleanup_absence').map(row => [row.id, row.phase, row.attempt]), [[DB, 'failed', 1]]);
+      assert.equal(f.receipts.some(row => ['removed', 'absence_proved'].includes(row.phase)), false);
+      assert.deepEqual(f.calls.filter(row => row.argv[0] === 'rm').map(row => row.argv), [['rm', '--force', DB]]);
+      assert.equal(f.calls.filter(row => dbRead(row.argv)).length, 3);
+      assert.deepEqual(f.sleeps, []);
+    });
+  }
+}
+
 test('transient cleanup inspection may retry but rm and absence proof remain single-shot', async () => {
   let enabled = false, reads = 0;
   const f = fixture({ fault(argv) { if (enabled && dbRead(argv) && ++reads === 1) throw transient(); } });

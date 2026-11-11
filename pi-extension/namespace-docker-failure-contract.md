@@ -39,6 +39,14 @@ The base `namespace-docker.mjs` `json()` wrapper collapses both execute and JSON
 
 Caller inspection cancellation does not cancel cleanup's independent inspection deadline or preempt removal. Removal still requires the owned exact ID and matching run label before a single rm. The single-shot absence read now requires exit 1 and a complete, exact-ID Docker missing-resource response; unrelated missing IDs, transient errors, permission failures and successful reads cannot prove absence. Only positive absence followed by the removal receipt releases ownership. Unknown stays unknown; no outer workflow deadline or reaper inference was added.
 
+## Owner smoke follow-up: exact absence grammar
+
+**The prior owner stock disposable smoke remains FAILED (`cleanup_unknown`), not a retroactive PASS.** The successor Task supplies complete stderr `error: no such object: <requested-64-hex-id>\n`. This identifies a cleanup `absent(['inspect', id])` grammar mismatch, not the historical M2 inspection cause or evidence of a transient fault. The fictional lowercase regression fails with `cleanup_unknown` before the fix.
+
+Container absence now additionally accepts exactly `error: no such object: ${id}` alongside the existing `Error: No such object: ${id}` and `Error response from daemon: No such container: ${id}`. Existing outer-whitespace trimming and the 4096-character bound remain unchanged; comparison is whole-string and exact-ID, not case-insensitive or substring matching. Exit status must still be numeric 1 with no kill or signal. Volume grammar, diagnostics, validation, retry bounds and single-shot mutations/absence reads are unchanged.
+
+The focused regressions cover both object-message variants with a trailing newline, and reject wrong/truncated IDs, unlisted casing, extra stderr before/after, another missing ID, permission denial, permission exit code, signal, killed process and non-1/non-numeric exits. Rejected proof emits no absence/removal receipt and does not retry. Tests use only invented in-memory resources; no paid calls or replay occur. No new Docker smoke result is claimed by this change.
+
 ## Validation boundary
 
 The focused fictional matrix covers transient-valid and transient-invalid identity/isolation, missing, malformed, permission, unclassified, exhaustion, deadline, cancellation, EXEC/mutation non-retry, fresh isolation reads and cleanup ownership/absence/receipts. It contacts no Docker daemon, model, live/pilot store, source snapshot or holdout.
