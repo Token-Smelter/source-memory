@@ -12,10 +12,10 @@ import { failureReply, main } from '../bin/memory.mjs';
 import { qualificationCodes } from './helpers/qualification-codes.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const SCOPES = ['q1', 'q2', 'q3', 'q4', 'q5', 'q5-other', 'q6', 'q7'];
+const SCOPES = ['q1', 'q2', 'q3', 'q3-far', 'q4', 'q5', 'q5-other', 'q6', 'q7'];
 
 // A loopback TCP relay to the disposable store whose open connections can be severed, as a network failure would.
-async function severableRelay(uri) {
+export async function severableRelay(uri) {
   const { hostname, port } = new URL(uri);
   const sockets = new Set();
   const server = createTcpServer(client => {
@@ -137,7 +137,7 @@ export async function runQualification(database, scratch) {
 
   try {
     for (const scope of SCOPES) await ok('base', 'init', scope);
-    for (const scope of ['q1', 'q2', 'q3', 'q4', 'q6', 'q7']) sources[scope] = (await ok('base', 'ingest', scope, fixtureTurn())).id;
+    for (const scope of ['q1', 'q2', 'q3', 'q3-far', 'q4', 'q6', 'q7']) sources[scope] = (await ok('base', 'ingest', scope, fixtureTurn())).id;
 
     await check('Q-SM-1 the same record id and normalized record twice give one record and success both times', async () => {
       const turn = sources.q1;
@@ -170,6 +170,7 @@ export async function runQualification(database, scratch) {
       const turn = sources.q3;
       await ok('base', 'enrich', 'q3', { records: [record('anchor', turn), record('anchor-two', turn)],
         relations: [relation('anchor-link', 'anchor', 'anchor-two', turn)] });
+      await ok('base', 'enrich', 'q3-far', { records: [record('far-action', sources['q3-far'], { kind: 'action' })], relations: [] });
       const baseline = await counts('q3');
       const companion = code => record(`companion-${code}`, turn);
       const enrich = (code, records, relations = []) => ({ command: 'enrich', code, input: { records: [companion(code), ...records], relations } });
@@ -204,12 +205,15 @@ export async function runQualification(database, scratch) {
         enrich('duplicate_relation', [], [relation('dup', 'anchor', 'anchor-two', turn), relation('dup', 'anchor', 'anchor-two', turn)]),
         enrich('invalid_relation', [], [relation('friends', 'anchor', 'anchor-two', turn, { type: 'befriends' })]),
         enrich('self_relation', [], [relation('loop', 'anchor', 'anchor', turn)]),
+        enrich('cross_scope_denied', [], [relation('to-hidden', 'anchor', { scope: 'q3-hidden', id: 'far-action' }, turn)]),
       ];
       const inTransaction = [
         enrich('evidence_unavailable', [record('ghost-evidence', `turn_${'0'.repeat(64)}`)]),
         enrich('invalid_evidence_span', [record('past-end', turn, { evidence: [{ turn, entry_id: 'u1', start: 0, end: 9999 }] })]),
         enrich('derived_is_not_original_evidence', [record('from-summary', turn, { evidence: [{ turn, entry_id: 'd1', start: 0, end: 8 }] })]),
         enrich('relation_endpoint_unavailable', [], [relation('to-ghost', 'anchor', 'ghost-record', turn)]),
+        enrich('relation_endpoint_unavailable', [], [relation('to-far-ghost', 'anchor', { scope: 'q3-far', id: 'ghost-record' }, turn)]),
+        enrich('relation_endpoint_digest_mismatch', [], [relation('to-far-changed', 'anchor', { scope: 'q3-far', id: 'far-action', expected_digest: '0'.repeat(64) }, turn)]),
         enrich('invalid_outcome_relation', [], [relation('not-outcome', 'anchor', 'anchor-two', turn, { type: 'outcome_of' })]),
         enrich('outcome_referent_required', [record('orphan-outcome', turn, { kind: 'outcome' })]),
         // The companion's MERGE runs before the conflicting one, so these also show an executed write rolling back.
@@ -232,6 +236,7 @@ export async function runQualification(database, scratch) {
         }
       }
       assert.deepEqual(await counts('q3'), baseline);
+      assert.equal((await ok('base', 'status', 'q3')).links, undefined, 'no cross-scope relation was stored');
       const anchor = (await show('q3', 'record', 'anchor')).reply.record;
       assert.equal(anchor.text, 'Teal shutters for the fictional lighthouse.');
       const unknownCommand = await cli(['remember', '--config', configs.base, '--scope', 'q3']);
