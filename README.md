@@ -414,6 +414,32 @@ The 768-d container held all 50,000 vectors and stopped cleanly; only the exact 
 
 Worst-case widening at 768d/10k: 9999 excluded nearest vectors plus one eligible far vector, one candidate, all 7 ANN rounds through 4096, ending truthfully partial. Ordinary median: 618.143 ms. Grouped median: 630.483 ms, including 7 legacy-parent reads. These are vector-stage costs, not whole-CLI latency guarantees.
 
+## Evaluation progress
+
+A small distiller model writes records and relations for three development sessions; a frontier labeling panel produces reference graphs for the same checkpoints, and a fixed answerer and scorer test whether the stored memory answers blinded change-history questions (105 requirements in total). Each chart shows, per session, the reference graph above the candidate graph: dots are records coloured by kind, arcs are relations, columns are checkpoints. Method: [evaluations/README.md](evaluations/README.md).
+
+![Reference versus T1 candidate graphs, Sessions A to C](evaluations/assets/structure-t1.svg)
+
+![Reference versus baseline v2.1 candidate graphs, Sessions A to C](evaluations/assets/structure-baseline-v2.1.svg)
+
+| Candidate | Requirements met (of 105) | Unsupported-claim / authority / scope failing cases |
+|---|---:|---:|
+| baseline v2.1 | 47 | 26 / 14 / 16 |
+| T1 (typed records & links) | 59 | 20 / 9 / 13 |
+| raw text search (diagnostic) | 71 | 9 / 7 / 7 |
+| combined recall (diagnostic) | 72 | 8 / 3 / 5 (T1 stores) |
+
+| Session | Reference records / relations | T1 records / relations |
+|---|---:|---:|
+| Session A | 105 / 126 | 48 / 3 |
+| Session B | 57 / 57 | 62 / 10 |
+| Session C | 103 / 92 | 138 / 9 |
+
+- References are model-adjudicated, not human ground truth.
+- T1 was not accepted under its pre-registered rule (over-retention flag).
+- Combined recall rarely surfaced records (ranking imbalance), so it does not measure record value.
+- Numbers are provisional and come from three development sessions.
+
 ## Limitations
 
 - Scope allowlists come from a local configuration file. They are an operator boundary, not isolation from other processes running as the same user. Do not expose the CLI as a network service.
