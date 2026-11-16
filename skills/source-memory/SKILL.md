@@ -12,7 +12,7 @@ compatibility: Node.js 22+, configured private Neo4j, and the source-memory CLI.
 
 Obtain the caller's explicit memory configuration path and authorized scope. Do not discover credentials, inspect environment dumps, scan session folders, or guess a database. The utility enforces the configuration's scope allowlists; a scope mentioned in conversation does not grant access. Do not initialize a database unless it is the caller's explicitly designated memory store.
 
-Use `--help` for command syntax. Every invocation requires `--config FILE --scope SCOPE`. JSON payloads enter through stdin or `--input FILE`; stdout contains JSON and stderr contains sanitized failures. See `../../README.md` for exact schemas and limitations. `--config` may be omitted when `SOURCE_MEMORY_CONFIG` is set.
+Use `--help` for command syntax. Every invocation requires `--config FILE --scope SCOPE`. JSON payloads enter through stdin or `--input FILE`; stdout contains JSON and stderr contains sanitized failures. See `../../docs/reference/cli.md` for exact schemas and limitations. `--config` may be omitted when `SOURCE_MEMORY_CONFIG` is set.
 
 ## Recall and inspect
 

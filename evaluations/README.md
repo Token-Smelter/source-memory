@@ -1,6 +1,6 @@
 # Evaluation methodology
 
-**A small distiller model (the student) is scored against reference memory graphs produced by a frontier multi-model labeling panel (the teacher), and by whether its records help a fixed answerer explain how things changed and why.** We optimise a program of surfaces around the student, not its weights, one pre-registered treatment at a time, and accept a change only when it beats a measured noise band without regressing any record or relation type. References are a model of the sessions, not the sessions themselves, so every score is agreement with a map, not with ground truth; label-quality figures for that map are not yet published. Current numbers are in the [README](../README.md#evaluation-progress); harness interfaces are in [`pi-extension/evaluation/README.md`](../pi-extension/evaluation/README.md); planned work is in [FUTURE-WORK.md](./FUTURE-WORK.md).
+**A small distiller model (the student) is scored against reference memory graphs produced by a frontier multi-model labeling panel (the teacher), and by whether its records help a fixed answerer explain how things changed and why.** We optimise a program of surfaces around the student, not its weights, one pre-registered treatment at a time, and accept a change only when it beats a measured noise band without regressing any record or relation type. References are a model of the sessions, not the sessions themselves, so every score is agreement with a map, not with ground truth; label-quality figures for that map are not yet published. Current numbers are in the [README](../docs/evaluation/results.md); harness interfaces are in [`pi-extension/evaluation/README.md`](../pi-extension/evaluation/README.md); planned work is in [FUTURE-WORK.md](./FUTURE-WORK.md).
 
 ```mermaid
 flowchart LR
@@ -29,7 +29,7 @@ flowchart LR
 | Answerer | A fixed model that answers challenge questions using only the tools its arm allows | Yes, pinned |
 | Scorer | A fixed model that grades answers against a scorer-only reference packet | Yes, pinned |
 
-The teacher's output is a typed graph per checkpoint: the same seven record kinds and five relation types the store accepts (see [Records and relations](../README.md#records-and-relations)).
+The teacher's output is a typed graph per checkpoint: the same seven record kinds and five relation types the store accepts (see [Records and relations](../docs/reference/cli.md#records-and-relations)).
 
 ### What is optimised: surfaces, not weights
 

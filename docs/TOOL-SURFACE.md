@@ -46,7 +46,7 @@ A caller concept that needs state transitions (open/closed, assigned, due) stays
 | Prepare a scope or subtree | `init` | built, with subtrees | exact scope or `S/**` (write grant) |
 | Keep the embedding model resident; warm the database read paths | `warm`; `warm --db v1` | built | exact scope |
 
-`recall`, `show` (every kind) and `list` accept `digests: true` (built): every record object gains `record_digest`, its stored hash or `null`, and the reply gains one top-level `store_identity`, the shape of `status.store` (NAMESPACING section 6; README "Record digests"). `status {capabilities: true}` adds `capabilities`.
+`recall`, `show` (every kind) and `list` accept `digests: true` (built): every record object gains `record_digest`, its stored hash or `null`, and the reply gains one top-level `store_identity`, the shape of `status.store` (NAMESPACING section 6; [CLI reference: Record digests](reference/cli.md#record-digests)). `status {capabilities: true}` adds `capabilities`.
 
 Only `recall`, `list`, `status` and `init` accept a selector; every other operation, including `sourceChunks`, `turnVectorStatus`, `recordVectorStatus` and `recordPresence`, refuses it `scope_denied` inside `authorize`, before any storage call. The extension transport (`pi-extension/memory-process.mjs`) serves one exact scope and refuses a selector at startup with `scope_unresolved`. Only `recall`, `list` and `show` (`bundle`, `units`, `following`) accept a set; every other operation, and every other `show` kind, refuses any array, even of one element, with `scope_denied` before any storage call.
 
