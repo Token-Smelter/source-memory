@@ -296,7 +296,7 @@ test('a link offer returns the packet bindings only when asked, and refuses any 
     const plain = await handlers.beginLinks(request);
     const bound = await handlers.beginLinks({ ...request, with_references: true });
     assert.deepEqual([Object.keys(plain).sort(), bound.references], [['packet', 'token'], references]);
-    for (const value of [false, 'yes', 1]) await assert.rejects(handlers.beginLinks({ ...request, with_references: value }), /invalid_input/);
+    for (const value of [false, 'yes', 1, null]) await assert.rejects(handlers.beginLinks({ ...request, with_references: value }), /invalid_input/);
     await handlers.cancelLinks({ token: plain.token });
     await handlers.cancelLinks({ token: bound.token });
   } finally { handlers.close(); }

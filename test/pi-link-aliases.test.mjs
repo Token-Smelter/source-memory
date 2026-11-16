@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTurnTools, LINK_ALIAS_MODES } from '../pi-extension/core.mjs';
 import { createPiDistiller } from '../pi-extension/pi-runtime.mjs';
+import { PassThrough } from 'node:stream';
+import { createMemoryClient } from '../pi-extension/memory-client.mjs';
+import { serve } from '../pi-extension/ndjson.mjs';
 import { compactResult } from './helpers/compact-fixture.mjs';
 import { approvingReviewer, baselineScripts, distillerSurface, surfaceMemory } from './helpers/distiller-surface.mjs';
 
@@ -143,13 +146,30 @@ test('handles outside the open offer still fail as before: unoffered, prior ids,
   assert.throws(() => tools.link({ from: first, to: priorHandles[0], type: 'supersedes', evidence: ['ref-000001'], support: 'explicit' }), /offer_unavailable/);
 });
 
-test('aliased links pass the proposal validator before they are kept; prior-to-prior links are refused now', async () => {
+test('only aliased links are validated when made; canonical-only links keep the deferred baseline check', async () => {
   const { tools, priorHandles, first } = await setup();
   await tools.offer(priorHandles);
   assert.throws(() => tools.link({ from: priorHandles[0], to: priorHandles[1], type: 'supersedes', evidence: ['ref-000001'], support: 'explicit' }), /link_endpoint_not_offered/);
   assert.deepEqual([tools.pendingLinks(), tools.stats().link_aliases.links_aliased], [null, 0]);
+  // Canonical labels only: a prior-to-prior link and one citing only earlier-turn evidence are deferred, as on the baseline.
+  tools.link({ from: 'r2', to: 'r3', type: 'supersedes', evidence: ['s0'], support: 'explicit' });
+  tools.link({ from: 'r0', to: 'r2', type: 'supersedes', evidence: ['s3'], support: 'explicit' });
+  // An aliased link is checked on its own, so the deferred ones do not refuse it; repeating a kept link is refused.
   tools.link({ from: first, to: priorHandles[1], type: 'supersedes', evidence: ['ref-000001'], support: 'explicit' });
-  assert.equal(pending(tools).length, 1);
+  assert.throws(() => tools.link({ from: first, to: priorHandles[1], type: 'supersedes', evidence: ['ref-000001'], support: 'explicit' }), /duplicate_link_proposal/);
+  assert.deepEqual([pending(tools).length, tools.stats().link_aliases.links_aliased], [3, 1]);
+});
+
+test('the client forwards the bindings request unchanged, so the Memory process can refuse a non-true value', async () => {
+  const inbound = new PassThrough(), outbound = new PassThrough(), stopped = new AbortController(), seen = [];
+  const server = serve({ input: inbound, output: outbound, signal: stopped.signal, handlers: {
+    async beginLinks(args) { seen.push(Object.hasOwn(args, 'with_references') ? args.with_references : 'absent'); return { token: 't', packet: {} }; } } });
+  const client = createMemoryClient({ input: outbound, output: inbound, timeoutMs: 1000 });
+  try {
+    for (const withReferences of [undefined, true, false, 'yes', 1, null]) await client.beginLinks('fiction', 'turn', ['record'], { withReferences });
+    await client.beginLinks('fiction', 'turn', ['record']);
+    assert.deepEqual(seen, ['absent', true, false, 'yes', 1, null, 'absent']);
+  } finally { client.close(); stopped.abort(); inbound.end(); outbound.end(); await server; }
 });
 
 test('without the treatment, held handles are refused exactly as before and no bindings are requested', async () => {

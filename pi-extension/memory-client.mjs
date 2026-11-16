@@ -45,7 +45,7 @@ export function createMemoryClient({ input, output, timeoutMs, indexTimeoutMs = 
     enrich: (scope, input, { trigger, signal } = {}) => call('enrich', { scope, input, trigger }, { signal }),
     beginLinks: (scope, turn, recordIds, { candidateHandles, withReferences, signal } = {}) => call('beginLinks',
       { scope, turn, record_ids: recordIds, ...(candidateHandles ? { candidate_handles: candidateHandles } : {}), review_contract: reviewContract,
-        ...(withReferences ? { with_references: true } : {}) }, { signal }),
+        ...(withReferences !== undefined ? { with_references: withReferences } : {}) }, { signal }),
     finishLinks: (token, output, route, options) => call('finishLinks', { token, output, route }, options),
     applyLinks: (token, review, options) => call('applyLinks', { token, review }, options),
     cancelLinks: (token, options) => call('cancelLinks', { token }, options),
