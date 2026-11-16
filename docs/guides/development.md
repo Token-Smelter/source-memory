@@ -27,4 +27,3 @@ Warm medians in milliseconds: one warmup, five measured samples, 64 candidates; 
 The 768-d container held all 50,000 vectors and stopped cleanly; only the exact scan failed its original transaction deadline, so no scan median/speedup is invented for that row. Quantization remains off for fidelity; the 50k off/on sample ranges overlap, with a small median difference. Both paths retain bounded exact cosine rescoring.
 
 Worst-case widening at 768d/10k: 9999 excluded nearest vectors plus one eligible far vector, one candidate, all 7 ANN rounds through 4096, ending truthfully partial. Ordinary median: 618.143 ms. Grouped median: 630.483 ms, including 7 legacy-parent reads. These are vector-stage costs, not whole-CLI latency guarantees.
-

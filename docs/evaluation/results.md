@@ -25,4 +25,3 @@ The retained baseline and T1 runs used Haiku, not Luna. M2 is incomplete. A smal
 - T1 was not accepted under its pre-registered rule (over-retention flag).
 - Combined recall rarely surfaced records (ranking imbalance), so it does not measure record value.
 - Numbers are provisional and come from three development sessions.
-
