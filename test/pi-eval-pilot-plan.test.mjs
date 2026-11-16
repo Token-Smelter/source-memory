@@ -35,6 +35,8 @@ test('fresh cited plan seals grounded scorer and leaves candidate and model rout
   const t2 = createCitedPilotPlan({ ...options, treatment: TREATMENTS.T2 }).spec.treatment;
   assert.deepEqual([t2.linkDecisions, Object.hasOwn(t2, 'guidance'), Object.hasOwn(t2, 'maxQuestions')], ['per-offered-record-v1', false, false]);
   assert.throws(() => createCitedPilotPlan({ ...options, treatment: { ...TREATMENTS.T2, linkDecisions: 'other' } }), /pilot_plan_invalid/);
+  const t2a = createCitedPilotPlan({ ...options, treatment: TREATMENTS.T2a }).spec.treatment;
+  assert.deepEqual([t2a.linkAliases, Object.hasOwn(t2a, 'linkDecisions'), Object.hasOwn(t2a, 'guidance')], ['current-turn-handles-v1', false, false]);
   assert.deepEqual([createCitedPilotPlan({ ...options, treatment: TREATMENTS.T1b }).spec.treatment.guidance, TREATMENTS.T1.guidance], ['typed-records-and-links-v3', 'typed-records-and-links-v2']);
   const model = createCitedPilotPlan({ ...options, treatment: TREATMENTS['M-DS'] }).spec;
   assert.deepEqual([model.budget.purposes.candidate.route, Object.keys(model.budget.routes).sort(), cited.budget.purposes.candidate.route],

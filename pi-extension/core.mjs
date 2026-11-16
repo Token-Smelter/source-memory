@@ -154,6 +154,12 @@ export async function distillThrough(session, throughEntryId, cursor, { allowInt
 /** Treatment T2: each offered prior record needs a link or an explicit no-relation decision before submit. */
 export const LINK_DECISION_MODES = ['per-offered-record-v1'];
 export const LINK_NONE_BASES = ['unrelated', 'related_not_stated'];
+/**
+ * Treatment T2a: the link step also accepts the handles the distiller already holds for records and spans in the open
+ * offer (its own new record ids, the offered search handles and its current-turn evidence labels), each resolved through
+ * the Memory process's own packet bindings to exactly one packet label; anything else fails closed.
+ */
+export const LINK_ALIAS_MODES = ['current-turn-handles-v1'];
 
 /**
  * Collects only the record and evidence handles offered by the current Memory comparison packet. With checkProposal, each
@@ -203,9 +209,10 @@ export const RETRIEVAL_MODES = ['search', 'oracle-catalog'];
 const SEARCH_SHAPE = { search: { channels: ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'], seeds: 48, pool: 64, bytes: 24000 },
   'oracle-catalog': { channels: ['catalog'], seeds: 256, pool: 256, bytes: 120000 } };
 export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [], requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate', retrieval = 'search',
-  maxQuestions = null, linkDecisions = null }) {
+  maxQuestions = null, linkDecisions = null, linkAliases = null }) {
   if (!RETRIEVAL_MODES.includes(retrieval)) throw fail('invalid_input');
   if (linkDecisions !== null && !LINK_DECISION_MODES.includes(linkDecisions)) throw fail('invalid_input');
+  if (linkAliases !== null && !LINK_ALIAS_MODES.includes(linkAliases)) throw fail('invalid_input');
   if (maxQuestions !== null && (!Number.isSafeInteger(maxQuestions) || maxQuestions < 0 || maxQuestions > 16)) throw fail('invalid_input');
   // One tools instance serves one source turn, so this set is the turn's distinct question records.
   const questionIds = new Set();
@@ -242,6 +249,62 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
   let choices = null;
   let choiceCount = 0;
   const decisions = linkDecisions && { offers: 0, required: 0, linked: 0, none_unrelated: 0, none_related_not_stated: 0 };
+  const aliasCounts = linkAliases && { offer_own_records: 0, links_aliased: 0, endpoint_own_record: 0, endpoint_offered_handle: 0, evidence_label: 0,
+    refused_not_in_packet: 0, refused_ambiguous: 0 };
+  // Alias bindings of the open offer; read only while choices (the same offer) exist.
+  let aliases = null;
+  const aliasesFor = (result, own, priorHandles) => {
+    const { packet, references: refs } = result;
+    const packetRecords = new Map(packet.records.map(row => [row.ref, row]));
+    const packetSources = new Set(packet.sources.map(row => row.ref));
+    const unique = values => new Set(values).size === values.length;
+    if (!refs || !Array.isArray(refs.records) || !Array.isArray(refs.sources) || refs.records.length !== packetRecords.size
+      || refs.sources.length !== packetSources.size || refs.records.some(row => !packetRecords.has(row?.ref) || typeof row.id !== 'string' || !row.id)
+      || refs.sources.some(row => !packetSources.has(row?.ref)) || !unique(refs.records.map(row => row.ref)) || !unique(refs.records.map(row => row.id))
+      || !unique(refs.sources.map(row => row.ref))) throw fail('offer_invalid');
+    const endpoints = new Map(), idToRef = new Map();
+    for (const { ref, id } of refs.records) {
+      const fresh = packetRecords.get(ref).newly_retained === true;
+      // The packet's new records must be exactly this turn's written records.
+      if (fresh !== recordIds.includes(id)) throw fail('offer_invalid');
+      idToRef.set(id, ref);
+      if (fresh) endpoints.set(id, ref);
+    }
+    if (recordIds.some(id => !endpoints.has(id))) throw fail('offer_invalid');
+    for (const handle of priorHandles) {
+      const ref = idToRef.get(compactHandles.get(handle));
+      if (ref && !packetRecords.get(ref).newly_retained) endpoints.set(handle, ref);
+    }
+    if (own.some(id => !endpoints.has(id))) throw fail('link_alias_not_in_packet');
+    const evidence = new Map();
+    for (const [label, span] of labels) {
+      const matches = refs.sources.filter(row => row.turn === receipt.id && row.entry_id === span.entry.id && row.start === span.start && row.end === span.end);
+      if (matches.length) evidence.set(label, matches.length === 1 ? matches[0].ref : null);
+    }
+    return { records: packetRecords, sources: packetSources, endpoints, evidence };
+  };
+  const resolveAliases = choice => {
+    if (!choice || typeof choice !== 'object') return { choice, used: null };
+    const used = { endpoint_own_record: 0, endpoint_offered_handle: 0, evidence_label: 0 };
+    const refuse = code => { aliasCounts[code === 'link_alias_ambiguous' ? 'refused_ambiguous' : 'refused_not_in_packet']++; throw fail(code); };
+    const endpoint = handle => {
+      if (typeof handle !== 'string' || aliases.records.has(handle)) return handle;
+      if (aliases.endpoints.has(handle)) { used[recordIds.includes(handle) ? 'endpoint_own_record' : 'endpoint_offered_handle']++; return aliases.endpoints.get(handle); }
+      if (recordIds.includes(handle)) refuse('link_alias_not_in_packet');
+      return handle;
+    };
+    const source = ref => {
+      if (typeof ref !== 'string' || aliases.sources.has(ref)) return ref;
+      if (aliases.evidence.has(ref)) {
+        if (aliases.evidence.get(ref) === null) refuse('link_alias_ambiguous');
+        used.evidence_label++;
+        return aliases.evidence.get(ref);
+      }
+      if (labels.has(ref)) refuse('link_alias_not_in_packet');
+      return ref;
+    };
+    return { choice: { ...choice, from: endpoint(choice.from), to: endpoint(choice.to), evidence: Array.isArray(choice.evidence) ? choice.evidence.map(source) : choice.evidence }, used };
+  };
   return {
     labels() { return [...labels].map(([ref, span]) => ({ ref, role: span.entry.role, text: span.entry.text.slice(span.start, span.end) })); },
     imageNotes() { return structuredClone(imageNotes); },
@@ -398,8 +461,11 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
     },
     async offer(handles = []) {
       if (!recordIds.length || typeof memory.beginLinks !== 'function') throw fail('offer_unavailable');
+      // With aliases, the turn's own records may be named; they are always in the packet, so they are checked, not forwarded.
+      const own = linkAliases && Array.isArray(handles) ? handles.filter(handle => recordIds.includes(handle) && !compactHandles.has(handle)) : [];
+      const priorHandles = own.length ? handles.filter(handle => !own.includes(handle)) : handles;
       if (!Array.isArray(handles) || handles.length > 32 || new Set(handles).size !== handles.length
-        || handles.some(handle => !compactHandles.has(handle))) throw fail('handle_not_offered');
+        || priorHandles.some(handle => !compactHandles.has(handle))) throw fail('handle_not_offered');
       if (offer && JSON.stringify(offerHandles) === JSON.stringify(handles)) return { token: offer.token, packet: offer.packet };
       if (offer && choiceCount) throw fail('offer_in_use');
       if (offer) {
@@ -408,7 +474,7 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
         finally { offer = null; offerHandles = null; choices = null; choiceCount = 0; }
       }
       let result;
-      try { result = await memory.beginLinks(scope, receipt.id, [...recordIds], { candidateHandles: handles }); }
+      try { result = await memory.beginLinks(scope, receipt.id, [...recordIds], { candidateHandles: priorHandles, ...(linkAliases ? { withReferences: true } : {}) }); }
       catch (problem) { incompleteSearch = true; throw problem; }
       if (!result?.token || !result.packet) { incompleteSearch = true; throw fail('offer_invalid'); }
       const retrieval = result.packet.retrieval ?? null;
@@ -420,20 +486,34 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       searchStatuses.push({ surface: 'selected-link-offer', status: retrieval?.status ?? 'offer',
         budget_omitted: retrieval?.budget_omitted ?? 0, omitted_prior_records: retrieval?.omitted_prior_records ?? 0,
         trigger_omitted: retrieval?.trigger_omissions?.length ?? 0,
-        trigger_context_omitted: retrieval?.trigger_omissions?.filter(row => row.reason === 'packet_budget').length ?? 0, candidate_ids: handles.map(handle => compactHandles.get(handle)) });
-      for (const handle of handles) linkCandidateIds.add(compactHandles.get(handle));
+        trigger_context_omitted: retrieval?.trigger_omissions?.filter(row => row.reason === 'packet_budget').length ?? 0, candidate_ids: priorHandles.map(handle => compactHandles.get(handle)) });
+      for (const handle of priorHandles) linkCandidateIds.add(compactHandles.get(handle));
+      if (linkAliases) {
+        try { aliases = aliasesFor(result, own, priorHandles); }
+        catch (problem) {
+          incompleteSearch = incompleteSearch || problem?.code === 'offer_invalid';
+          try { if (typeof memory.cancelLinks === 'function') await memory.cancelLinks(result.token); } catch {}
+          throw problem;
+        }
+        aliasCounts.offer_own_records += own.length;
+      }
       offer = result;
       offerHandles = [...handles];
-      choices = createLinkChoices(result.packet, { checkProposal: Boolean(decisions) });
+      choices = createLinkChoices(result.packet, { checkProposal: Boolean(decisions || linkAliases) });
       if (decisions) { decisions.offers++; decisions.required += choices.undecided().length; }
       return { token: offer.token, packet: offer.packet };
     },
     link(choice) {
       if (!choices) throw fail('offer_unavailable');
+      const { choice: resolved, used } = aliases ? resolveAliases(choice) : { choice, used: null };
       const owed = choices.undecided().length;
-      choices.add(choice);
+      choices.add(resolved);
       choiceCount++;
       if (decisions) decisions.linked += owed - choices.undecided().length;
+      if (used) {
+        for (const [key, count] of Object.entries(used)) aliasCounts[key] += count;
+        if (Object.values(used).some(Boolean)) aliasCounts.links_aliased++;
+      }
       return { status: 'pending_review' };
     },
     linkNone(handle, basis) {
@@ -451,6 +531,7 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
     },
     stats() { return { records: recordIds.length, searches, search_failed: searchFailed,
       incomplete_search: incompleteSearch, search_statuses: structuredClone(searchStatuses), returned_prior_ids: [...returnedPriorIds],
-      fetched_ids: [...fetchedIds], link_candidate_ids: [...linkCandidateIds], ...(decisions ? { link_decisions: { mode: linkDecisions, ...decisions } } : {}) }; },
+      fetched_ids: [...fetchedIds], link_candidate_ids: [...linkCandidateIds], ...(decisions ? { link_decisions: { mode: linkDecisions, ...decisions } } : {}),
+      ...(aliasCounts ? { link_aliases: { mode: linkAliases, ...aliasCounts } } : {}) }; },
   };
 }

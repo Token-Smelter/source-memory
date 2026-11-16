@@ -1,4 +1,4 @@
-import { createTurnTools, LINK_DECISION_MODES, LINK_NONE_BASES } from './core.mjs';
+import { createTurnTools, LINK_ALIAS_MODES, LINK_DECISION_MODES, LINK_NONE_BASES } from './core.mjs';
 import { retentionPolicy } from './policy.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -128,9 +128,10 @@ export const LINK_DECISION_REFUSALS = 2;
 
 /** Reopen one incremental private Pi file for each side branch while keeping its fixed session ID. */
 export async function createPiDistiller({ pi, incremental, workDir, model, modelRuntime, memory, scope, reviewer, budget, ensureIndexed, reviewMode = 'separate', createOptions = {}, retrieval = 'search', guidance = null,
-  maxQuestions = null, linkDecisions = null }) {
+  maxQuestions = null, linkDecisions = null, linkAliases = null }) {
   if (guidance !== null && !Object.hasOwn(DISTILLER_GUIDANCE, guidance)) throw fail('runtime_invalid');
   if (linkDecisions !== null && !LINK_DECISION_MODES.includes(linkDecisions)) throw fail('runtime_invalid');
+  if (linkAliases !== null && !LINK_ALIAS_MODES.includes(linkAliases)) throw fail('runtime_invalid');
   if (maxQuestions !== null && (!Number.isSafeInteger(maxQuestions) || maxQuestions < 0 || maxQuestions > 16)) throw fail('runtime_invalid');
   if (!pi?.SessionManager || typeof pi.createAgentSession !== 'function' || !incremental?.sessionId
     || typeof incremental.syncThrough !== 'function' || !workDir || !model) throw fail('runtime_invalid');
@@ -249,7 +250,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           sourceChunks = await memory.sourceChunks(scope, input.receipt.id);
         }
         currentTools = createTurnTools({ scope, turn: input.turn, receipt: input.receipt, memory, sourceChunks, requireSearch: true,
-          ensureIndexed, reviewer: boundedReviewer, reviewMode, retrieval, maxQuestions, linkDecisions });
+          ensureIndexed, reviewer: boundedReviewer, reviewMode, retrieval, maxQuestions, linkDecisions, linkAliases });
         breakpoint = null;
         submittedResult = null;
         submissionViolation = false;
@@ -285,6 +286,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
         // undecided_at_submit is null when the result came from the final text instead of memory_submit.
         const decisionStatus = stats.link_decisions ? [{ surface: 'link-decisions', ...stats.link_decisions, undecided_open: currentTools.undecidedLinks().length,
           undecided_at_submit: undecidedAtSubmit, submit_refusals: submitRefusals }] : [];
+        const aliasStatus = stats.link_aliases ? [{ surface: 'link-aliases', ...stats.link_aliases }] : [];
         if (!modelResult || Object.keys(modelResult).sort().join(',') !== 'reason,result'
           || !['done_with_writes', 'done_nothing_qualifies'].includes(modelResult.result)
           || typeof modelResult.reason !== 'string' || !modelResult.reason.trim() || Buffer.byteLength(modelResult.reason) > 1024) throw fail('disposition_invalid');
@@ -304,7 +306,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           link = { mode: reviewMode, receipt: await memory.applyLinks(pending.token, review) };
         }
         return { status: 'complete', disposition, model_result: modelResult.result, evaluation_reason: modelResult.reason, policy_sha256: policy.sha256,
-          search_limitations: { incomplete: stats.incomplete_search, statuses: [...stats.search_statuses, ...(windowed.status ? [windowed.status] : []), ...decisionStatus],
+          search_limitations: { incomplete: stats.incomplete_search, statuses: [...stats.search_statuses, ...(windowed.status ? [windowed.status] : []), ...decisionStatus, ...aliasStatus],
             returned_prior_ids: stats.returned_prior_ids, fetched_ids: stats.fetched_ids, link_candidate_ids: stats.link_candidate_ids,
             abstention_support: disposition === 'abstained' ? 'candidate_assessed_not_independently_verified' : null },
           usage: reply.usage ?? null, call_usage: budget?.receipts().slice(startReceipt) ?? [],

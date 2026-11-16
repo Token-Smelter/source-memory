@@ -169,8 +169,9 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
         if (shown?.turn?.source !== 'pi-memory') throw fail('source_invalid');
       }, () => memory.enrich(scope, normalized));
     },
-    async beginLinks({ scope, turn, record_ids, candidate_handles, review_contract }, { signal } = {}) {
+    async beginLinks({ scope, turn, record_ids, candidate_handles, review_contract, with_references }, { signal } = {}) {
       allowed(scope);
+      if (with_references !== undefined && with_references !== true) throw fail('invalid_input');
       if (signal?.aborted) throw fail('request_cancelled');
       let candidateRecordIds = null;
       if (candidate_handles !== undefined) {
@@ -195,7 +196,7 @@ export function createMemoryHandlers({ memory, scopes, linkModule = defaultLinks
       slot.work = Promise.resolve().then(() => linkModule.proposeMemoryLinks({ memory, scope, turn, record_ids,
         candidate_record_ids: candidateRecordIds, review_contract,
         signal: controller.signal, compare: async input => {
-          offered.resolve({ token, packet: input.packet });
+          offered.resolve({ token, packet: input.packet, ...(with_references ? { references: input.references } : {}) });
           return compare.promise;
         } }));
       slot.work.catch(problem => offered.reject(problem));

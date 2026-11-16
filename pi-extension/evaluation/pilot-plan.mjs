@@ -56,6 +56,8 @@ export const TREATMENTS = Object.freeze({
     product: true }),
   // A link-step treatment over the untreated baseline: no T1 guidance and no question cap.
   T2: Object.freeze({ id: 'T2', surface: 'link step: host-enforced decision per offered prior record', linkDecisions: 'per-offered-record-v1', product: true }),
+  // Also over the untreated baseline: the link step resolves handles the distiller already holds; prompt and tool text unchanged.
+  T2a: Object.freeze({ id: 'T2a', surface: 'link step: current-turn and offered handle aliases', linkAliases: 'current-turn-handles-v1', product: true }),
 });
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
 /** Runtime paths whose change can alter candidate behavior; each changed one must be named as reviewed. */
