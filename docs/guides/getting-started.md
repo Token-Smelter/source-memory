@@ -17,7 +17,7 @@ The container uses [`config/docker.json`](../../config/docker.json), which reach
 
 ## Quick start (host Node.js)
 
-Requires Node.js 22+ and a Neo4j 5.26+ server.
+Requires Node.js 22+ and a Neo4j 5.26+ server. The example configuration also points to a local Ollama `embeddinggemma` endpoint. If it is unavailable, source is still retained and lexical search can work, but indexing and vector recall may report failures or incomplete results. To use lexical search only, copy the example configuration and remove its `embedding` setting, then pass your copy with `--config`.
 
 ```sh
 npm ci

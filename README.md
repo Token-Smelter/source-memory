@@ -21,7 +21,7 @@ echo '{"query":"dashboard"}' | docker compose run --rm -T memory recall --scope 
 
 ![T1 reference and candidate memory graphs across checkpoints for sessions A, B and C](evaluations/assets/structure-t1.svg)
 
-**How to read:** each session shows the reference above the T1 candidate; columns are checkpoints, dots are records (colors indicate kind), and arcs are relationships. Dense stacks overlap, so this image is a structural overview, not a count chart. [Larger T1 chart](evaluations/assets/structure-t1.svg) · [Baseline chart](evaluations/assets/structure-baseline-v2.1.svg) · [Results and method](docs/evaluation/results.md). The record-kind color key is at the foot of the image; arc colors distinguish relation types.
+**How to read:** each session shows the reference above the T1 candidate; columns are checkpoints, dots are records (colors indicate kind), and arcs are relationships. Dense stacks overlap, so this image is a structural overview, not a count chart. [Larger T1 chart](evaluations/assets/structure-t1.svg) · [Baseline chart](evaluations/assets/structure-baseline-v2.1.svg) · [Results and method](docs/evaluation/results.md). The record-kind color key is at the foot of the image. Arcs encode relations; their color key is in [the results](docs/evaluation/results.md#reading-the-charts).
 
 These are provisional model annotations, not ground truth. The retained baseline and T1 runs used Haiku; T1 was rejected on retention and M2 remains incomplete. The three development sessions do not establish general performance.
 

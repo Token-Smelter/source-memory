@@ -1,5 +1,9 @@
 # Checkpoint comparison and results
 
+## Reading the charts
+
+Dots are records, colored by kind as shown in the image legend. Arcs represent relations: red = supersedes, green = qualifies, magenta = contradicts, purple = depends on, teal = outcome of. Faint, overlapping arcs and stacked dots make this a structural overview, not a way to count items. Checkpoint counts and graph structure are disclosed, but source text and identities are omitted.
+
 ## Evaluation progress
 
 The retained baseline and T1 runs used Haiku. M2 is incomplete. A small distiller model writes records and relations for three development sessions; a frontier labeling panel produces reference graphs for the same checkpoints, and a fixed answerer and scorer test whether the stored memory answers blinded change-history questions (105 requirements in total). Baseline v2.1 is the untreated distiller and T1 a treatment that changes only the distiller instructions; their rows below are the memory-only arm (records and relations with their cited evidence; no source search), while the diagnostic rows answer from source text or product recall. Each chart shows, per session, the reference graph above the candidate graph: dots are records coloured by kind, arcs are relations coloured by type, columns are checkpoints; links within one checkpoint draw over the dot stack. The first chart is baseline v2.1, the second T1. Method: [evaluation methodology](../../evaluations/README.md).
