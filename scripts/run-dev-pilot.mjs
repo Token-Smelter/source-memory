@@ -492,7 +492,8 @@ async function main() {
       progress.append({ type: 'embedding_warm', ...result });
     },
     async memoryFactory({ driver }) { return openDockerMemory({ containerId: driver, scope, configPath: '/scratch/config.json', intentDir: '/scratch/intents',
-      timeoutMs: 180000, indexTimeoutMs: 600000, offerTimeoutMs: 120000, onReceipt: event => memoryLog.append({ checkpoint: meta.checkpoint, ...event }) }); },
+      // A link offer lives from offer through review and apply; T2's decision rounds get the transport's maximum lifetime.
+      timeoutMs: 180000, indexTimeoutMs: 600000, offerTimeoutMs: treatment?.linkDecisions ? 180000 : 120000, onReceipt: event => memoryLog.append({ checkpoint: meta.checkpoint, ...event }) }); },
     async work({ memory, driver }) {
       const guarded = trackSnapshot(memory);
       journal = createCoverageJournal({ directory: dir, sessionKey: sourceKey });
@@ -533,6 +534,7 @@ async function main() {
         const session = await createSliceSession({ pi, source: sourceCopy, entries: rows, conversationId: source.conversation_id, workDir: piDir, scope,
           memory: guarded.client, modelId: exactRoute(model, candidateOrigin), reviewerId: exactRoute(reviewerModel), coverageJournal: journal,
           retrieval: treatment?.retrieval ?? 'search', guidance: treatment?.guidance ?? null, maxQuestions: treatment?.maxQuestions ?? null,
+          linkDecisions: treatment?.linkDecisions ?? null,
           budget: createInputBudget(Number.MAX_SAFE_INTEGER),
           imageArchive: createImageArchive({ directory: imageDir }),
           ensureIndexed: (client, selectedScope, state, options = {}) => ensureIndexed(client, selectedScope, state,
