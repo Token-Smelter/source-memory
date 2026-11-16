@@ -54,6 +54,8 @@ export const TREATMENTS = Object.freeze({
     maxQuestions: 1, capSource: Object.freeze({ repository: 'sourcerer', commit: 'ed9c0345862bfbe555e6342e363b820357039a21',
       semantics: 'at most N distinct question record ids per source turn, rejected on the host before write with memory_question_cap; no ranking, dropping, truncation or retyping' }),
     product: true }),
+  // A link-step treatment over the untreated baseline: no T1 guidance and no question cap.
+  T2: Object.freeze({ id: 'T2', surface: 'link step: host-enforced decision per offered prior record', linkDecisions: 'per-offered-record-v1', product: true }),
 });
 export const CITED_RESUME_TRANSITIONS = ['same-treatment-resume', 'default-path-code-transition'];
 /** Runtime paths whose change can alter candidate behavior; each changed one must be named as reviewed. */

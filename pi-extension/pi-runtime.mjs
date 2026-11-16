@@ -1,4 +1,4 @@
-import { createTurnTools } from './core.mjs';
+import { createTurnTools, LINK_DECISION_MODES, LINK_NONE_BASES } from './core.mjs';
 import { retentionPolicy } from './policy.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
@@ -123,10 +123,14 @@ export const DISTILLER_GUIDANCE = Object.freeze({
   'typed-records-and-links-v3': 'Record kinds: the retention test above decides what to record; this classifies each retained item and notes how the test applies to questions. decision = a choice adopted by someone entitled to make it; action = something done, or committed to be done, with who and what; outcome = the observed result of an action, decision or intention; intention = a plan or goal not yet decided; question = an open question that the ongoing work still needs answered and that would plausibly be lost if not remembered. Do not record a question asked and answered within the interval, a clarifying or rhetorical question, a step the assistant is about to check and resolves within the interval, or a question already held in memory; observation = a stated fact about the work, system or world. When a retained outcome results from an action shown in the interval, record the outcome with new_action so the action is retained with it; when it results from a prior action, decision or intention offered by your searches, record it with that action_handle. Routine actions and results that do not meet the retention test are not recorded. For retained items, prefer one record per distinct decision, action or outcome over one combined summary.\n\nLinks: after recording, offer the related prior handles found by your searches and propose a link only when the source states the relationship. supersedes = the new item replaces an earlier one on the same point ("Use port 8080" after "Use port 3000": the new item supersedes the old); not for additions. qualifies = the new item narrows or conditions an earlier one without replacing it ("Port 8080 only in staging"). contradicts = the two conflict and neither is stated to replace the other. depends_on = the new item holds only if the earlier one does ("Deploy after the schema migration"). outcome_of = an outcome produced by an action, decision or intention, created through the outcome path. Do not link on topic similarity or chronology alone.',
 });
 
+/** Refusals of memory_submit for owed link decisions before it is accepted with the omissions recorded; bounds tool rounds. */
+export const LINK_DECISION_REFUSALS = 2;
+
 /** Reopen one incremental private Pi file for each side branch while keeping its fixed session ID. */
 export async function createPiDistiller({ pi, incremental, workDir, model, modelRuntime, memory, scope, reviewer, budget, ensureIndexed, reviewMode = 'separate', createOptions = {}, retrieval = 'search', guidance = null,
-  maxQuestions = null }) {
+  maxQuestions = null, linkDecisions = null }) {
   if (guidance !== null && !Object.hasOwn(DISTILLER_GUIDANCE, guidance)) throw fail('runtime_invalid');
+  if (linkDecisions !== null && !LINK_DECISION_MODES.includes(linkDecisions)) throw fail('runtime_invalid');
   if (maxQuestions !== null && (!Number.isSafeInteger(maxQuestions) || maxQuestions < 0 || maxQuestions > 16)) throw fail('runtime_invalid');
   if (!pi?.SessionManager || typeof pi.createAgentSession !== 'function' || !incremental?.sessionId
     || typeof incremental.syncThrough !== 'function' || !workDir || !model) throw fail('runtime_invalid');
@@ -141,6 +145,8 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
   let breakpoint = null;
   let submittedResult = null;
   let submissionViolation = false;
+  let submitRefusals = 0;
+  let undecidedAtSubmit = null;
   const factory = api => {
     api.on('before_provider_request', event => {
       if (model.api !== 'anthropic-messages') return undefined;
@@ -161,13 +167,14 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
       { query: { type: 'string', minLength: 1, maxLength: 4000 }, kinds }, (tools, args) => tools.search(args.query, args.kinds));
     register('memory_fetch', 'Fetch full text and original-source evidence for one offered record id, plus immediate relation endpoint ids. At most 32 fetches per turn.',
       { handle: string }, (tools, args) => tools.fetch(args.handle));
-    register('memory_link_offer', 'After recording, select relevant record ids to obtain link and source handles for a reviewed link proposal.',
+    register('memory_link_offer', `After recording, select relevant record ids to obtain link and source handles for a reviewed link proposal.${linkDecisions ? ' Each prior record handle in decision_required then needs memory_link or memory_link_none.' : ''}`,
       { handles: { type: 'array', items: string, maxItems: 32, uniqueItems: true } }, async (tools, args) => {
         const offered = await tools.offer(args.handles), packet = offered.packet;
         const sources = packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? ''));
         return { records: packet.records.map(row => ({ handle: row.ref, kind: row.kind, snippet: row.text })),
           sources: sources.map(row => ({ handle: row.ref, role: row.role, trigger: row.trigger, snippet: row.text })),
-          image_sources_omitted: packet.sources.length - sources.length, retrieval: packet.retrieval };
+          image_sources_omitted: packet.sources.length - sources.length, retrieval: packet.retrieval,
+          ...(linkDecisions ? { decision_required: tools.undecidedLinks() } : {}) };
       });
     register('memory_record', `Record a proposed memory supported by current-turn reference labels. An outcome requires exactly one referent: an action_handle that memory_search offered on a prior action, decision or intention, or new_action with its own current evidence. A prior referent requires separate review before the atomic outcome_of commit.${maxQuestions === null ? '' : ' Excess NEW questions return an explicit cap error.'}`,
       { kind, text: { type: 'string', minLength: 1, maxLength: 16000 }, evidence_labels: evidenceLabels,
@@ -177,9 +184,17 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
     register('memory_link', 'Propose a link using handles from the current offer; this does not approve it.',
       { from: string, to: string, type: { type: 'string', enum: vocabulary.relationship_types }, evidence: evidenceLabels,
         support: { type: 'string', enum: ['explicit', 'ambiguous', 'unsupported', 'chronology_only'] } }, (tools, args) => tools.link(args));
-    register('memory_submit', 'Submit the final evaluation result and reason after all searches and writes.',
+    if (linkDecisions) register('memory_link_none', 'Decide that an offered prior record in decision_required has no relationship to this turn\'s new records that the source states: unrelated, or related_not_stated (related only by topic, time or implication). Use memory_link instead when the source states one.',
+      { handle: string, basis: { type: 'string', enum: LINK_NONE_BASES } }, (tools, args) => tools.linkNone(args.handle, args.basis));
+    register('memory_submit', `Submit the final evaluation result and reason after all searches and writes.${linkDecisions ? ' Refused while a decision_required handle has no memory_link or memory_link_none decision.' : ''}`,
       { result: { type: 'string', enum: ['done_with_writes', 'done_nothing_qualifies'] },
-        reason: { type: 'string', minLength: 1, maxLength: 1024 } }, (_tools, args) => {
+        reason: { type: 'string', minLength: 1, maxLength: 1024 } }, (tools, args) => {
+        const undecided = tools.undecidedLinks();
+        if (undecided.length && submitRefusals < LINK_DECISION_REFUSALS) {
+          submitRefusals++;
+          throw Object.assign(new Error(`link_decisions_missing: ${undecided.join(', ')} need memory_link or memory_link_none`), { code: 'link_decisions_missing' });
+        }
+        undecidedAtSubmit = undecided.length;
         submittedResult = structuredClone(args);
         return { status: 'submitted' };
       });
@@ -209,7 +224,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
         if (manager.getSessionId() !== sessionId) throw fail('session_identity_changed');
         manager.branch(input.throughEntryId);
         ({ session } = await pi.createAgentSession({ ...createOptions, cwd: workDir, agentDir: workDir, modelRuntime, model,
-          tools: ['memory_search', 'memory_fetch', 'memory_record', 'memory_link_offer', 'memory_link', 'memory_submit'], sessionManager: manager, ...(resourceLoader ? { resourceLoader } : {}) }));
+          tools: ['memory_search', 'memory_fetch', 'memory_record', 'memory_link_offer', 'memory_link', ...(linkDecisions ? ['memory_link_none'] : []), 'memory_submit'], sessionManager: manager, ...(resourceLoader ? { resourceLoader } : {}) }));
         if (session.sessionId !== sessionId || session.agent?.sessionId !== sessionId) throw fail('session_identity_changed');
         activeSession = session;
         // A distiller-side compaction would rebuild the context from Pi's own view and re-admit a withheld summary.
@@ -234,10 +249,12 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           sourceChunks = await memory.sourceChunks(scope, input.receipt.id);
         }
         currentTools = createTurnTools({ scope, turn: input.turn, receipt: input.receipt, memory, sourceChunks, requireSearch: true,
-          ensureIndexed, reviewer: boundedReviewer, reviewMode, retrieval, maxQuestions });
+          ensureIndexed, reviewer: boundedReviewer, reviewMode, retrieval, maxQuestions, linkDecisions });
         breakpoint = null;
         submittedResult = null;
         submissionViolation = false;
+        submitRefusals = 0;
+        undecidedAtSubmit = null;
         const policy = retentionPolicy();
         const dispositionInstruction = ' Return a processing disposition distinguishing committed writes, successful abstention, policy ineligibility, failure and uncertainty.';
         if (!policy.value.task_prefix.endsWith(dispositionInstruction)) throw fail('policy_artifact_changed');
@@ -265,6 +282,9 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
         const modelResult = submittedResult ?? parseFinalResult(text);
         if (submissionViolation) throw fail('disposition_invalid');
         const stats = currentTools.stats();
+        // undecided_at_submit is null when the result came from the final text instead of memory_submit.
+        const decisionStatus = stats.link_decisions ? [{ surface: 'link-decisions', ...stats.link_decisions, undecided_open: currentTools.undecidedLinks().length,
+          undecided_at_submit: undecidedAtSubmit, submit_refusals: submitRefusals }] : [];
         if (!modelResult || Object.keys(modelResult).sort().join(',') !== 'reason,result'
           || !['done_with_writes', 'done_nothing_qualifies'].includes(modelResult.result)
           || typeof modelResult.reason !== 'string' || !modelResult.reason.trim() || Buffer.byteLength(modelResult.reason) > 1024) throw fail('disposition_invalid');
@@ -284,7 +304,7 @@ export async function createPiDistiller({ pi, incremental, workDir, model, model
           link = { mode: reviewMode, receipt: await memory.applyLinks(pending.token, review) };
         }
         return { status: 'complete', disposition, model_result: modelResult.result, evaluation_reason: modelResult.reason, policy_sha256: policy.sha256,
-          search_limitations: { incomplete: stats.incomplete_search, statuses: windowed.status ? [...stats.search_statuses, windowed.status] : stats.search_statuses,
+          search_limitations: { incomplete: stats.incomplete_search, statuses: [...stats.search_statuses, ...(windowed.status ? [windowed.status] : []), ...decisionStatus],
             returned_prior_ids: stats.returned_prior_ids, fetched_ids: stats.fetched_ids, link_candidate_ids: stats.link_candidate_ids,
             abstention_support: disposition === 'abstained' ? 'candidate_assessed_not_independently_verified' : null },
           usage: reply.usage ?? null, call_usage: budget?.receipts().slice(startReceipt) ?? [],
