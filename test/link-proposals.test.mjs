@@ -140,10 +140,10 @@ for (const kind of KINDS) {
       endpoints: written.enrichment.relations.map(row => [row.from, row.to]),
       sameScopes: memory.calls.every(row => row.scope === SCOPE) && memory.writes.every(row => row.scope === SCOPE),
       compareContract: compareInput.contract, desiredOutput: compareInput.desired_output_bytes,
-      safetyCeiling: compareInput.output_bytes }, {
+      safetyCeiling: compareInput.output_bytes, bindings: canonical(compareInput.references) === canonical(result.references) }, {
       pending: { writes: 0, status: 'pending', semantic_truth: 'NOT_VERIFIED' }, kind, unchanged: true, append: [],
       endpoints: [['new', 'old']], sameScopes: true, compareContract: LINK_PROPOSAL_CONTRACT,
-      desiredOutput: 2048, safetyCeiling: 16384 });
+      desiredOutput: 2048, safetyCeiling: 16384, bindings: true });
   });
 }
 

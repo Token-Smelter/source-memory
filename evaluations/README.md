@@ -155,6 +155,11 @@ After each run, structural differences are mapped to the surface most likely res
 | Candidate records match nothing in the reference | Over-retention, unsupported records, or a reference miss |
 | Links offered but not proposed, or proposed but not accepted | Link funnel: offered → proposed → accepted shows where links are lost |
 | The earlier link target was never offered | Search and ranking, or link-offer selection: was the target reachable by search at that checkpoint? |
+| A link was attempted but the tool refused it | Link-step tool surface: count refused `memory_link` and `memory_link_offer` calls in the distiller session, deduplicated per intended pair |
+
+Two readings are easy to conflate:
+- **Found by search is not offered for linking.** In baseline v2.1, compact search had previewed the earlier endpoint in all 22 checkable linking failures, but the distiller offered it as a link candidate in only 10.
+- **The receipt funnel counts only links that passed the tool.** `memory_link` is host-local, so a call it refuses leaves no Memory receipt. In baseline v2.1, 42 of 56 `memory_link` calls were refused, 40 of them for a handle outside the open offer. Every link attempt was refused in 26 of the 39 checkpoints that attempted one. A refusal count is a symptom, not proof that a valid reference edge was lost: retries repeat, and most attempted pairs match no reference edge.
 
 ## Data handling
 

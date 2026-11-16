@@ -286,6 +286,22 @@ test('link offers admit only selected handles from the same trigger', async () =
   } finally { handlers.close(); }
 });
 
+test('a link offer returns the packet bindings only when asked, and refuses any other value', async () => {
+  const references = { records: [{ ref: 'r0', id: 'new' }], sources: [{ ref: 's0', turn: 'turn', entry_id: 'u', start: 0, end: 4 }] };
+  const linkModule = { async proposeMemoryLinks({ compare }) { await compare({ packet: { records: [], sources: [] }, references }); return {}; } };
+  const { handlers } = fixture({ count: 3, linkModule });
+  try {
+    const { bindings } = await handlers.searchCompact({ scope: 'fiction', trigger: 'turn', input });
+    const request = { scope: 'fiction', turn: 'turn', record_ids: ['new'], candidate_handles: [bindings[0].handle], review_contract: 'fiction' };
+    const plain = await handlers.beginLinks(request);
+    const bound = await handlers.beginLinks({ ...request, with_references: true });
+    assert.deepEqual([Object.keys(plain).sort(), bound.references], [['packet', 'token'], references]);
+    for (const value of [false, 'yes', 1, null]) await assert.rejects(handlers.beginLinks({ ...request, with_references: value }), /invalid_input/);
+    await handlers.cancelLinks({ token: plain.token });
+    await handlers.cancelLinks({ token: bound.token });
+  } finally { handlers.close(); }
+});
+
 test('uncited current-turn context omitted from a link offer is disclosed, while omitted prior memory stays incomplete', async () => {
   const offerWith = async retrieval => {
     const memory = { async searchCompact() { return compactResult({ records: [{ id: 'one', kind: 'decision', text: 'one' }] }); },

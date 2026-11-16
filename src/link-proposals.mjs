@@ -244,16 +244,17 @@ export async function proposeMemoryLinks({ memory, scope, turn, record_ids, cand
   }
   const packet = freeze(packetValue()), prompt = memoryLinkPrompt(packet);
   requireThat(Buffer.byteLength(prompt) <= LINK_PROPOSAL_LIMITS.prompt_bytes, 'link_mandatory_evidence_bound');
+  // The host's own bindings of packet labels to record ids and exact source spans; they are final once the packet is.
+  const spanRefs = new Map([...sourceMap].map(([key, ref]) => [ref, JSON.parse(key)]));
+  const references = { records: [...recordRefs].map(([ref, id]) => ({ ref, id })),
+    sources: [...spanRefs].map(([ref, span]) => ({ ref, ...span })) };
   active(signal);
-  const compared = await compare({ contract: LINK_PROPOSAL_CONTRACT, prompt, packet,
+  const compared = await compare({ contract: LINK_PROPOSAL_CONTRACT, prompt, packet, references: copy(references),
     desired_output_bytes: LINK_PROPOSAL_LIMITS.desired_output_bytes, output_bytes: LINK_PROPOSAL_LIMITS.output_bytes, signal });
   active(signal);
   requireThat(compared && typeof compared.text === 'string' && compared.route, 'link_comparison_receipt_required');
   const route = { provider: text(compared.route.provider, 96), model: text(compared.route.model, 96) };
   const checked = validateLinkProposals(compared.text, packet);
-  const spanRefs = new Map([...sourceMap].map(([key, ref]) => [ref, JSON.parse(key)]));
-  const references = { records: [...recordRefs].map(([ref, id]) => ({ ref, id })),
-    sources: [...spanRefs].map(([ref, span]) => ({ ref, ...span })) };
   const sortedPins = pins => [...pins].sort(([a], [b]) => compareKeys(a, b));
   const contextSha = digest({ contract: LINK_PROPOSAL_CONTRACT, scope, turn, newly_retained: [...record_ids].sort(),
     records: sortedPins(recordPins), turns: sortedPins(turnPins) });
