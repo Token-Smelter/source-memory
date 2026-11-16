@@ -150,20 +150,39 @@ export async function distillThrough(session, throughEntryId, cursor, { allowInt
   return { cursor: throughEntryId, turn_id: turn.turn_id, receipt, omissions, distillation: result };
 }
 
+/** Treatment T2: each offered prior record needs a link or an explicit no-relation decision before submit. */
+export const LINK_DECISION_MODES = ['per-offered-record-v1'];
+export const LINK_NONE_BASES = ['unrelated', 'related_not_stated'];
+
 /** Collects only the record and evidence handles offered by the current Memory comparison packet. */
 export function createLinkChoices(packet) {
   if (!packet || !Array.isArray(packet.records) || !Array.isArray(packet.sources)) throw fail('offer_invalid');
   const records = new Set(packet.records.map(row => row.ref));
+  const priors = new Set(packet.records.filter(row => !row.newly_retained).map(row => row.ref));
   const sources = new Set(packet.sources.filter(row => !/\[image sha256=[a-f0-9]{64} mime=/.test(row.text ?? '')).map(row => row.ref));
   const links = [];
+  // A prior record's decision is 'link' or a none basis; only the treatment can record a none basis.
+  const decided = new Map();
   return {
     add(link) {
       if (!link || !records.has(link.from) || !records.has(link.to) || link.from === link.to
         || !Array.isArray(link.evidence) || !link.evidence.length || !link.evidence.every(ref => sources.has(ref))) throw fail('handle_not_offered');
       if (!RELATIONS.includes(link.type) || !['explicit', 'ambiguous', 'unsupported', 'chronology_only'].includes(link.support)) throw fail('link_invalid');
       if (links.length >= 16 || link.evidence.length > 16 || new Set(link.evidence).size !== link.evidence.length) throw fail('link_invalid');
+      if ([link.from, link.to].some(ref => decided.has(ref) && decided.get(ref) !== 'link')) throw fail('link_decision_conflict');
       links.push({ from: link.from, to: link.to, type: link.type, evidence: [...link.evidence], support: link.support });
+      for (const ref of [link.from, link.to]) if (priors.has(ref)) decided.set(ref, 'link');
     },
+    /** Returns true when this call newly decides the record. */
+    none(ref, basis) {
+      if (!priors.has(ref)) throw fail('handle_not_offered');
+      if (!LINK_NONE_BASES.includes(basis)) throw fail('link_invalid');
+      const prior = decided.get(ref);
+      if (prior !== undefined && prior !== basis) throw fail('link_decision_conflict');
+      decided.set(ref, basis);
+      return prior === undefined;
+    },
+    undecided() { return [...priors].filter(ref => !decided.has(ref)); },
     output() { return JSON.stringify({ links }); },
   };
 }
@@ -174,8 +193,9 @@ export const RETRIEVAL_MODES = ['search', 'oracle-catalog'];
 const SEARCH_SHAPE = { search: { channels: ['turn_lexical', 'record_lexical', 'chunk_lexical', 'chunk_vector', 'record_vector'], seeds: 48, pool: 64, bytes: 24000 },
   'oracle-catalog': { channels: ['catalog'], seeds: 256, pool: 256, bytes: 120000 } };
 export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [], requireSearch = false, ensureIndexed, reviewer, reviewMode = 'separate', retrieval = 'search',
-  maxQuestions = null }) {
+  maxQuestions = null, linkDecisions = null }) {
   if (!RETRIEVAL_MODES.includes(retrieval)) throw fail('invalid_input');
+  if (linkDecisions !== null && !LINK_DECISION_MODES.includes(linkDecisions)) throw fail('invalid_input');
   if (maxQuestions !== null && (!Number.isSafeInteger(maxQuestions) || maxQuestions < 0 || maxQuestions > 16)) throw fail('invalid_input');
   // One tools instance serves one source turn, so this set is the turn's distinct question records.
   const questionIds = new Set();
@@ -211,6 +231,7 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
   let offerHandles = null;
   let choices = null;
   let choiceCount = 0;
+  const decisions = linkDecisions && { offers: 0, required: 0, linked: 0, none_unrelated: 0, none_related_not_stated: 0 };
   return {
     labels() { return [...labels].map(([ref, span]) => ({ ref, role: span.entry.role, text: span.entry.text.slice(span.start, span.end) })); },
     imageNotes() { return structuredClone(imageNotes); },
@@ -394,14 +415,25 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       offer = result;
       offerHandles = [...handles];
       choices = createLinkChoices(result.packet);
+      if (decisions) { decisions.offers++; decisions.required += choices.undecided().length; }
       return { token: offer.token, packet: offer.packet };
     },
     link(choice) {
       if (!choices) throw fail('offer_unavailable');
+      const owed = choices.undecided().length;
       choices.add(choice);
       choiceCount++;
+      if (decisions) decisions.linked += owed - choices.undecided().length;
       return { status: 'pending_review' };
     },
+    linkNone(handle, basis) {
+      if (!decisions) throw fail('link_decisions_disabled');
+      if (!choices) throw fail('offer_unavailable');
+      if (choices.none(handle, basis)) decisions[`none_${basis}`]++;
+      return { status: 'decided', undecided: choices.undecided() };
+    },
+    /** Offered prior records still owed a decision; always empty without the treatment. */
+    undecidedLinks() { return decisions && choices ? choices.undecided() : []; },
     pendingLinks() { return offer && choices && choiceCount ? { token: offer.token, output: choices.output() } : null; },
     async release() {
       try { if (offer && typeof memory.cancelLinks === 'function') await memory.cancelLinks(offer.token); }
@@ -409,6 +441,6 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
     },
     stats() { return { records: recordIds.length, searches, search_failed: searchFailed,
       incomplete_search: incompleteSearch, search_statuses: structuredClone(searchStatuses), returned_prior_ids: [...returnedPriorIds],
-      fetched_ids: [...fetchedIds], link_candidate_ids: [...linkCandidateIds] }; },
+      fetched_ids: [...fetchedIds], link_candidate_ids: [...linkCandidateIds], ...(decisions ? { link_decisions: { mode: linkDecisions, ...decisions } } : {}) }; },
   };
 }
