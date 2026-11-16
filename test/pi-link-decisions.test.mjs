@@ -2,24 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTurnTools, LINK_DECISION_MODES } from '../pi-extension/core.mjs';
 import { createPiDistiller } from '../pi-extension/pi-runtime.mjs';
-import { compactResult } from './helpers/compact-fixture.mjs';
+import { validateLinkProposals } from '../src/link-proposals.mjs';
+import { approvingReviewer, baselineScripts, distillerSurface, surfaceDigest, surfaceMemory, surfaceTurn } from './helpers/distiller-surface.mjs';
+
+// The baseline surface (prompt, tools, descriptions, schemas, every tool response and the run result, without and with a
+// reviewed link), computed on the code before T2 existed; any baseline change must update it knowingly.
+const BASELINE_SURFACE_SHA256 = '7494d26a2326ee311f3bd1d12e0acd4f97c05ddb646a2b73a11d1e3ce26219a6';
 
 const MODE = LINK_DECISION_MODES[0];
-const turn = { turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'Fictional choice replaces the earlier fictional choice.' }] };
-const retrieval = { status: 'selected', relationship_context_complete: false, completeness_guaranteed: false,
-  budget_omitted: 0, omitted_prior_records: 0, omitted_prior_spans: 0, trigger_omissions: [] };
-const packet = { records: [
-  { ref: 'r0', kind: 'decision', text: 'Fictional new choice.', newly_retained: true, evidence: ['s0'] },
-  { ref: 'r1', kind: 'decision', text: 'Fictional prior choice.', newly_retained: false, evidence: ['s1'] },
-  { ref: 'r2', kind: 'observation', text: 'Fictional prior fact.', newly_retained: false, evidence: ['s2'] }],
-sources: [{ ref: 's0', role: 'user', text: 'Fictional choice.', trigger: true }, { ref: 's1', role: 'user', text: 'Earlier.', trigger: false },
-  { ref: 's2', role: 'tool', text: 'Fact.', trigger: false }], retrieval };
-const memory = (calls = []) => ({
-  async searchCompact() { return compactResult({ records: [{ id: 'prior-1', kind: 'decision', text: 'Fictional prior choice.' },
-    { id: 'prior-2', kind: 'observation', text: 'Fictional prior fact.' }] }); },
-  async enrich() { return {}; }, async cancelLinks() { calls.push('cancel'); },
-  async beginLinks() { calls.push('offer'); return { token: `offer-${calls.length}`, packet: structuredClone(packet) }; } });
-const link = (to, type = 'supersedes') => ({ from: 'r0', to, type, evidence: ['s0'], support: 'explicit' });
+const turn = surfaceTurn;
+const memory = calls => surfaceMemory({ calls });
+const link = (to, type = 'supersedes', from = 'r0', evidence = ['s0']) => ({ from, to, type, evidence, support: 'explicit' });
 
 async function offered(linkDecisions = MODE, calls = []) {
   const tools = createTurnTools({ scope: 'fiction', turn, receipt: { id: 'turn' }, memory: memory(calls), linkDecisions });
@@ -81,28 +74,9 @@ test('without the treatment nothing changes: no decisions are owed, none is refu
   assert.throws(() => createTurnTools({ scope: 'fiction', turn, receipt: { id: 'turn' }, memory: memory(), linkDecisions: 'unknown' }), /invalid_input/);
 });
 
-async function distill(linkDecisions, script) {
-  const registered = new Map(), prompts = [], sessions = [];
-  const api = { on() {}, registerTool(tool) { registered.set(tool.name, tool); } };
-  class Loader { constructor(options) { this.options = options; } async reload() { this.options.extensionFactories[0](api); } }
-  const manager = { getSessionId: () => 'distiller-id', branch() {}, buildSessionContext: () => ({ messages: [] }) };
-  const call = async (name, args) => {
-    try { return { ok: JSON.parse((await registered.get(name).execute('id', args)).content[0].text) }; }
-    catch (error) { return { error: error.message }; }
-  };
-  const transcript = [];
-  const session = { sessionId: 'distiller-id', agent: { sessionId: 'distiller-id', state: {} }, messages: [], async prompt(text) {
-    prompts.push(text);
-    await script(async (name, args) => { const result = await call(name, args); transcript.push([name, result]); return result; });
-    this.messages = [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'Submitted.' }] }];
-  } };
-  const pi = { SessionManager: { open: () => manager }, SettingsManager: { inMemory: () => ({}) }, DefaultResourceLoader: Loader,
-    async createAgentSession(options) { sessions.push(options.tools); return { session }; } };
-  const runtime = await createPiDistiller({ pi, incremental: { sessionId: 'distiller-id', async syncThrough() { return { file: '/fiction/private' }; } },
-    workDir: '/fiction/work', model: {}, memory: memory(), scope: 'fiction', ...(linkDecisions === undefined ? {} : { linkDecisions }) });
-  const result = await runtime.run({ throughEntryId: 'a2', turn, receipt: { id: 'turn' } });
-  const descriptions = Object.fromEntries([...registered].map(([name, tool]) => [name, tool.description]));
-  return { result, prompt: prompts[0], tools: sessions[0], descriptions, transcript };
+async function distill(linkDecisions, script, extra = {}) {
+  const { runs, registry } = await distillerSurface(createPiDistiller, { options: linkDecisions === undefined ? {} : { linkDecisions }, scripts: [script], ...extra });
+  return { ...runs[0], descriptions: Object.fromEntries(registry.map(row => [row.name, row.description])) };
 }
 
 const writeAndOffer = async call => {
@@ -157,4 +131,46 @@ test('the refusal is bounded: after two refusals memory_submit is accepted and t
   assert.deepEqual(submits, ['refused', 'refused', 'submitted']);
   assert.deepEqual(result.search_limitations.statuses.at(-1), { surface: 'link-decisions', mode: MODE, offers: 1, required: 2,
     linked: 0, none_unrelated: 0, none_related_not_stated: 0, undecided_open: 2, undecided_at_submit: 2, submit_refusals: 2 });
+});
+
+test('with link decisions, a link the Memory process would refuse after submit is refused now and decides nothing', async () => {
+  const { tools } = await offered();
+  assert.throws(() => tools.link(link('r2', 'qualifies', 'r1')), /link_endpoint_not_offered/);
+  assert.throws(() => tools.link(link('r1', 'supersedes', 'r0', ['s1'])), /link_trigger_evidence_required/);
+  assert.throws(() => tools.link(link('r1', 'outcome_of')), /invalid_outcome_relation/);
+  assert.deepEqual([tools.undecidedLinks(), tools.pendingLinks(), tools.stats().link_decisions.linked], [['r1', 'r2'], null, 0]);
+  tools.link(link('r1'));
+  assert.throws(() => tools.link(link('r1')), /duplicate_link_proposal/);
+  assert.deepEqual(JSON.parse(tools.pendingLinks().output).links.length, 1);
+  // Without the treatment these choices are still deferred to the Memory process, as before.
+  const plain = (await offered(null)).tools;
+  plain.link(link('r2', 'qualifies', 'r1'));
+  plain.link(link('r1', 'supersedes', 'r0', ['s1']));
+  assert.equal(JSON.parse(plain.pendingLinks().output).links.length, 2);
+});
+
+test('the default surface is byte-identical to the baseline before T2, with and without a reviewed link', async () => {
+  const surface = await distillerSurface(createPiDistiller, { scripts: baselineScripts, reviewer: approvingReviewer });
+  assert.deepEqual([surface.runs[1].result.link.receipt.status, surfaceDigest(surface)], ['written', BASELINE_SURFACE_SHA256]);
+  const unset = await distillerSurface(createPiDistiller, { options: { linkDecisions: null }, scripts: baselineScripts, reviewer: approvingReviewer });
+  assert.equal(surfaceDigest(unset), BASELINE_SURFACE_SHA256);
+});
+
+test('a treated link is reviewed and applied through the real proposal validator, and each checkpoint resets its decisions', async () => {
+  const calls = [];
+  const linked = async call => {
+    await writeAndOffer(call);
+    await call('memory_link', link('r1'));
+    await call('memory_link_none', { handle: 'r2', basis: 'unrelated' });
+    await submit(call);
+  };
+  const refusing = async call => { await writeAndOffer(call); await submit(call); await submit(call); await call('memory_link_none', { handle: 'r1', basis: 'unrelated' });
+    await call('memory_link_none', { handle: 'r2', basis: 'unrelated' }); await submit(call); };
+  const { runs } = await distillerSurface(createPiDistiller, { options: { linkDecisions: MODE }, scripts: [refusing, linked, refusing],
+    memory: surfaceMemory({ calls, validate: validateLinkProposals }), reviewer: approvingReviewer });
+  const row = run => run.result.search_limitations.statuses.at(-1);
+  assert.deepEqual([runs[1].result.link.receipt, row(runs[1])], [{ status: 'written', approved: [0] }, { surface: 'link-decisions', mode: MODE, offers: 1,
+    required: 2, linked: 1, none_unrelated: 1, none_related_not_stated: 0, undecided_open: 0, undecided_at_submit: 0, submit_refusals: 0 }]);
+  assert.deepEqual([row(runs[0]), row(runs[2])].map(value => [value.submit_refusals, value.none_unrelated, value.undecided_at_submit]), [[2, 2, 0], [2, 2, 0]]);
+  assert.deepEqual(calls.filter(name => ['finish', 'apply'].includes(name)), ['finish', 'apply']);
 });

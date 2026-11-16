@@ -1,6 +1,7 @@
 import { digest, normalizeEnrichment, normalizeTurn, RELATIONS } from '../src/core.mjs';
 import { imageBlock } from './image-archive.mjs';
 import { evidenceSpansForEntry } from '../src/evidence-spans.mjs';
+import { validateLinkProposals } from '../src/link-proposals.mjs';
 
 const fail = code => Object.assign(new Error(code), { code });
 const finished = row => row?.message?.role === 'assistant' && !['error', 'aborted', 'toolUse'].includes(row.message.stopReason)
@@ -154,8 +155,12 @@ export async function distillThrough(session, throughEntryId, cursor, { allowInt
 export const LINK_DECISION_MODES = ['per-offered-record-v1'];
 export const LINK_NONE_BASES = ['unrelated', 'related_not_stated'];
 
-/** Collects only the record and evidence handles offered by the current Memory comparison packet. */
-export function createLinkChoices(packet) {
+/**
+ * Collects only the record and evidence handles offered by the current Memory comparison packet. With checkProposal, each
+ * link is also put through the Memory process's own proposal validator now, so a link that would fail after submit is a
+ * repairable tool error instead of a checkpoint failure, and never counts as a decision.
+ */
+export function createLinkChoices(packet, { checkProposal = false } = {}) {
   if (!packet || !Array.isArray(packet.records) || !Array.isArray(packet.sources)) throw fail('offer_invalid');
   const records = new Set(packet.records.map(row => row.ref));
   const priors = new Set(packet.records.filter(row => !row.newly_retained).map(row => row.ref));
@@ -170,7 +175,12 @@ export function createLinkChoices(packet) {
       if (!RELATIONS.includes(link.type) || !['explicit', 'ambiguous', 'unsupported', 'chronology_only'].includes(link.support)) throw fail('link_invalid');
       if (links.length >= 16 || link.evidence.length > 16 || new Set(link.evidence).size !== link.evidence.length) throw fail('link_invalid');
       if ([link.from, link.to].some(ref => decided.has(ref) && decided.get(ref) !== 'link')) throw fail('link_decision_conflict');
-      links.push({ from: link.from, to: link.to, type: link.type, evidence: [...link.evidence], support: link.support });
+      const value = { from: link.from, to: link.to, type: link.type, evidence: [...link.evidence], support: link.support };
+      if (checkProposal) {
+        try { validateLinkProposals(JSON.stringify({ links: [...links, value] }), packet); }
+        catch (error) { throw fail(error?.code ?? 'link_invalid'); }
+      }
+      links.push(value);
       for (const ref of [link.from, link.to]) if (priors.has(ref)) decided.set(ref, 'link');
     },
     /** Returns true when this call newly decides the record. */
@@ -414,7 +424,7 @@ export function createTurnTools({ scope, turn, receipt, memory, sourceChunks = [
       for (const handle of handles) linkCandidateIds.add(compactHandles.get(handle));
       offer = result;
       offerHandles = [...handles];
-      choices = createLinkChoices(result.packet);
+      choices = createLinkChoices(result.packet, { checkProposal: Boolean(decisions) });
       if (decisions) { decisions.offers++; decisions.required += choices.undecided().length; }
       return { token: offer.token, packet: offer.packet };
     },
