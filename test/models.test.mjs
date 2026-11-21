@@ -67,6 +67,42 @@ test('failed embeddings leave an ingested source retained', async t => {
   assert.deepEqual([retained.entries[0].text, result.retained, result.indexing.status], ['original', true, 'unavailable']);
 });
 
+test('a failed batch defers its members and later runs can index healthy rows', async t => {
+  const calls = [];
+  const url = await endpoint(t, async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const { input } = JSON.parse(body);
+    calls.push(input);
+    if (input.includes('poison')) res.writeHead(503).end();
+    else res.end(JSON.stringify({ data: input.map((_, index) => ({ index, embedding: [1, 0] })) }));
+  });
+  let now = 0;
+  const rows = new Map(Array.from({ length: 17 }, (_, i) => [i, { uid: i, text: i === 0 ? 'poison' : `healthy-${i}` }]));
+  const store = {
+    async pendingEmbeddings(scope, _key, limit) {
+      assert.equal(scope, 'test');
+      return [...rows.values()].map(row => ({ ...row, cooling: row.after > now }))
+        .sort((a, b) => a.cooling - b.cooling || Boolean(a.isolated) - Boolean(b.isolated) || a.uid - b.uid).slice(0, limit);
+    },
+    async deferEmbeddings(_scope, _key, uids, seconds) {
+      for (const uid of uids) Object.assign(rows.get(uid), { isolated: true, after: now + seconds });
+    },
+    async saveEmbeddings(_scope, _key, saved) { for (const row of saved) rows.delete(row.uid); },
+  };
+  const open = () => new Memory({ scopes: { write: ['test'] }, embedding: { url, model: 'fixture', dimensions: 2 } }, store);
+  assert.equal((await open().index('test', { limit: 16 })).reason, 'model_request_failed');
+  assert.equal(calls.length, 1, 'do not recurse on a slow batch');
+  assert.equal((await open().index('test', { limit: 16 })).reason, 'embedding_retry_deferred');
+  assert.deepEqual(calls.at(-1), ['healthy-16']);
+  now = 61;
+  assert.equal((await open().index('test', { limit: 16 })).reason, 'model_request_failed');
+  assert.deepEqual(calls.at(-1), ['poison']);
+  assert.equal((await open().index('test', { limit: 16 })).status, 'pending');
+  assert.deepEqual(calls.at(-1), ['healthy-1']);
+  assert.ok(rows.has(0), 'a deferred item is not indexed or deleted');
+});
+
 test('scope denial occurs before storage is accessed', async () => {
   const memory = new Memory({ scopes: { write: [], read: [] } }, { ingest: () => { throw new Error('storage touched'); } });
   await assert.rejects(memory.ingest('foreign', {}), { code: 'scope_denied' });

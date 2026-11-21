@@ -103,13 +103,33 @@ export class Memory {
       const pending = await this.store.pendingEmbeddings(scope, key, limit + 1);
       const selected = pending.slice(0, limit);
       let indexed = 0;
-      for (let offset = 0; offset < selected.length; offset += 16) {
-        const batch = selected.slice(offset, offset + 16);
-        const vectors = await embed(this.config.embedding, batch.map(row => row.text));
+      for (let offset = 0; offset < selected.length;) {
+        const first = selected[offset];
+        if (first.cooling) return { status: 'unavailable', reason: 'embedding_retry_deferred', source_retained: true, indexed, embedding_key: key };
+        const batch = [first];
+        offset++;
+        if (!first.isolated) {
+          while (batch.length < 16 && offset < selected.length && !selected[offset].isolated && !selected[offset].cooling) {
+            batch.push(selected[offset++]);
+          }
+        }
+        let vectors;
+        try {
+          vectors = await embed(this.config.embedding, batch.map(row => row.text));
+        } catch (error) {
+          const reason = safeCode(error);
+          if (['model_timeout', 'model_request_failed', 'invalid_embedding', 'invalid_embedding_response', 'model_response_too_large'].includes(reason)) {
+            // Do not multiply a slow request into synchronous retries. Future calls can index fresh items, then retry these singly.
+            await this.store.deferEmbeddings?.(scope, key, batch.map(row => row.uid), batch.length > 1 ? 60 : 300);
+          }
+          return { status: 'unavailable', reason, source_retained: true, ...(indexed ? { indexed } : {}) };
+        }
         await this.store.saveEmbeddings(scope, key, batch.map((row, index) => ({ uid: row.uid, vector: vectors[index] })));
         indexed += batch.length;
+        // One isolated request per invocation keeps the normal batching latency bound from turning into N model calls.
+        if (first.isolated) break;
       }
-      return { status: pending.length > limit ? 'pending' : 'ready', indexed, embedding_key: key };
+      return { status: pending.length > indexed ? 'pending' : 'ready', indexed, embedding_key: key };
     } catch (error) {
       return { status: 'unavailable', reason: safeCode(error), source_retained: true };
     }

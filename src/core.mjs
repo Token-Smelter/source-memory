@@ -172,18 +172,61 @@ export function normalizeTurn(input) {
   };
 }
 
+// Bound UTF-8 input independently of whitespace tokenization. This is not a model tokenizer limit.
+export const CHUNK_MAX_BYTES = 8192;
+
 export function chunkEntries(turn, size = 256, overlap = 32) {
   integer(size, 256, 8, 4096);
   integer(overlap, 32, 0, size - 1);
   const chunks = [];
   for (const entry of turn.entries) {
-    const words = [...entry.text.matchAll(/\S+/gu)];
-    for (let first = 0; first < words.length; first += size - overlap) {
-      const last = Math.min(first + size, words.length) - 1;
-      const start = words[first].index;
-      const end = words[last].index + words[last][0].length;
+    const words = [];
+    for (const match of entry.text.matchAll(/\S+/gu)) {
+      const word = match[0];
+      let start = match.index;
+      const bytes = Buffer.byteLength(word);
+      if (bytes <= CHUNK_MAX_BYTES) {
+        words.push({ start, end: start + word.length, bytes });
+        continue;
+      }
+      let end = start, partBytes = 0;
+      for (const character of word) {
+        const width = Buffer.byteLength(character);
+        if (partBytes + width > CHUNK_MAX_BYTES) {
+          words.push({ start, end, bytes: partBytes });
+          start = end;
+          partBytes = 0;
+        }
+        end += character.length;
+        partBytes += width;
+      }
+      words.push({ start, end, bytes: partBytes });
+    }
+    for (let first = 0; first < words.length;) {
+      let last = first;
+      let bytes = words[first].bytes;
+      while (last + 1 < words.length && last + 1 - first < size) {
+        const next = words[last + 1];
+        const sinceLast = Buffer.byteLength(entry.text.slice(words[last].end, next.start)) + next.bytes;
+        if (bytes + sinceLast > CHUNK_MAX_BYTES) break;
+        bytes += sinceLast;
+        last++;
+      }
+      const { start } = words[first];
+      const { end } = words[last];
       chunks.push({ entry_id: entry.id, role: entry.role, ordinal: chunks.length, start, end, text: entry.text.slice(start, end) });
       if (last === words.length - 1) break;
+      // Retain overlap only when it can fit at least one new segment; otherwise it repeats the same bytes.
+      let nextFirst = last + 1;
+      let windowBytes = words[nextFirst].bytes;
+      while (nextFirst > first + 1 && last + 1 - nextFirst < overlap) {
+        const previous = words[nextFirst - 1];
+        const extra = previous.bytes + Buffer.byteLength(entry.text.slice(previous.end, words[nextFirst].start));
+        if (windowBytes + extra > CHUNK_MAX_BYTES) break;
+        windowBytes += extra;
+        nextFirst--;
+      }
+      first = nextFirst;
     }
   }
   return chunks;
