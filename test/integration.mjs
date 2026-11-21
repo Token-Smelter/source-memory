@@ -104,6 +104,24 @@ export async function runIntegration(database, scratch) {
     await memory.init('demo');
     await memory.init('foreign');
     await memory.init('exclusion');
+    await check('failed vector batches remain pending without blocking fresh chunks in the same scope', async () => {
+      const scope = 'embedding-retry-fixture';
+      const fixture = new Memory({ ...config, scopes: { read: [scope], write: [scope] }, index_on_write: false }, memory.store);
+      await fixture.init(scope);
+      const original = await fixture.ingest(scope, turn('retry-first', 'A fictional older chunk.'));
+      modelDown = true;
+      try { assert.equal((await fixture.index(scope, { limit: 16 })).reason, 'model_request_failed'); }
+      finally { modelDown = false; }
+      await fixture.ingest(scope, turn('retry-second', 'A fictional new chunk.'));
+      const next = await fixture.index(scope, { limit: 16 });
+      assert.equal(next.reason, 'embedding_retry_deferred');
+      assert.equal(next.indexed, 1);
+      assert.equal((await fixture.status(scope)).unindexed, 1);
+      await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope,turn_uid:$turn})
+        SET c.embedding_retry_after=datetime() - duration({seconds:1})`, { scope, turn: original.id }));
+      assert.equal((await fixture.index(scope, { limit: 16 })).status, 'ready');
+      assert.equal((await fixture.status(scope)).unindexed, 0);
+    });
     await memory.init('modes');
     await memory.init('packing');
     await memory.init('follow');

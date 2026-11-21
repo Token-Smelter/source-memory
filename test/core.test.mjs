@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  authorize, canonical, chunkEntries, cosine, evidenceSpans, fuse, identity,
+  authorize, canonical, CHUNK_MAX_BYTES, chunkEntries, cosine, evidenceSpans, fuse, identity,
   lexicalQuery, normalizeEnrichment, normalizeTurn, sourceExcerpt, validateVector,
 } from '../src/core.mjs';
 
@@ -26,6 +26,18 @@ test('chunks retain entry roles, exact offsets, overlap and final short text', (
 
 test('invalid overlap is rejected instead of looping', () => {
   assert.throws(() => chunkEntries(turn(), 8, 8), { code: 'invalid_input' });
+});
+
+test('chunk bytes are bounded even for a huge word and a huge gap', () => {
+  const text = `A${'😀'.repeat(6000)}${' '.repeat(9000)}Z`;
+  const chunks = chunkEntries({ entries: [{ id: 'u', role: 'user', text }] });
+  assert.ok(chunks.length > 2);
+  for (const chunk of chunks) {
+    assert.equal(chunk.text, text.slice(chunk.start, chunk.end));
+    assert.ok(Buffer.byteLength(chunk.text) <= CHUNK_MAX_BYTES);
+    assert.doesNotMatch(chunk.text, /[\uD800-\uDFFF]/u);
+  }
+  assert.equal(chunks.map(chunk => chunk.text).join(''), text.replaceAll(' ', ''));
 });
 
 test('source identity differs across durable owners', () => {

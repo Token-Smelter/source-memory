@@ -435,14 +435,25 @@ export class Neo4jStore {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope
         AND (n.embedding_key IS NULL OR n.embedding_key <> $model)
-        RETURN n.uid AS uid, n.text AS text ORDER BY n.uid LIMIT $limit`, { scope, model, limit: neo4j.int(limit) });
-      return result.records.map(row => ({ uid: row.get('uid'), text: row.get('text') }));
+        WITH n, coalesce(n.embedding_retry_key=$model,false) AS isolated
+        WITH n, isolated, isolated AND coalesce(n.embedding_retry_after > datetime(),false) AS cooling
+        RETURN n.uid AS uid, CASE WHEN NOT cooling THEN n.text END AS text, isolated, cooling
+        ORDER BY cooling, isolated, n.uid LIMIT $limit`, { scope, model, limit: neo4j.int(limit) });
+      return result.records.map(row => ({ uid: row.get('uid'), text: row.get('text'), isolated: row.get('isolated'), cooling: row.get('cooling') }));
     });
+  }
+
+  async deferEmbeddings(scope, model, uids, seconds) {
+    return this.transaction('write', tx => tx.run(`UNWIND $uids AS uid MATCH (n {uid:uid,scope:$scope})
+      WHERE (n:SMChunk OR n:SMRecord) AND (n.embedding_key IS NULL OR n.embedding_key <> $model)
+      SET n.embedding_retry_key=$model, n.embedding_retry_after=datetime() + duration({seconds:$seconds})`,
+    { scope, model, uids, seconds: neo4j.int(seconds) }));
   }
 
   async saveEmbeddings(scope, model, rows) {
     return this.transaction('write', tx => tx.run(`UNWIND $rows AS row MATCH (n {uid:row.uid,scope:$scope})
-      WHERE n:SMChunk OR n:SMRecord SET n.embedding=row.vector, n.embedding_key=$model`, { scope, model, rows }));
+      WHERE n:SMChunk OR n:SMRecord SET n.embedding=row.vector, n.embedding_key=$model
+      REMOVE n.embedding_retry_key, n.embedding_retry_after`, { scope, model, rows }));
   }
 
   // The exclusion is applied before the limit, so excluded matches never take the place of eligible ones.
