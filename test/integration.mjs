@@ -1078,8 +1078,13 @@ export async function runIntegration(database, scratch) {
       assert.deepEqual([source.retained, source.indexing.status, recalled.status, recalled.bundles.length], [true, 'unavailable', 'degraded', 1]);
       modelDown = false;
     });
-    await check('index retries complete embeddings without another source occurrence', async () => {
+    await check('index retries complete embeddings after cooldown without another source occurrence', async () => {
       const before = (await memory.status('demo')).turns;
+      assert.equal((await memory.index('demo')).reason, 'embedding_retry_deferred');
+      // Advance only the disposable store's retry timestamp so the test need not sleep through the cooldown.
+      await memory.store.transaction('write', tx => tx.run(`MATCH (n {scope:'demo'})
+        WHERE (n:SMChunk OR n:SMRecord) AND n.embedding_retry_after IS NOT NULL
+        SET n.embedding_retry_after=datetime() - duration({seconds:1})`));
       const result = await memory.index('demo');
       const after = await memory.status('demo');
       assert.deepEqual([result.status, after.unindexed, after.turns], ['ready', 0, before]);
