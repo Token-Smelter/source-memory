@@ -43,7 +43,7 @@ test('predeclared census UID sets and counts match an independent graph oracle',
   assert.deepEqual(observed, fixture.cases.map(value => ({ name: value.name, expected: value.expected })));
 });
 
-test('census keeps full branch guards and unchanged model partitions for both kinds', async () => {
+test('census keeps full branch guards and counts absent vectors for both kinds', async () => {
   const queries = [];
   const store = Object.assign(Object.create(Neo4jStore.prototype), {
     transaction: async (_mode, action) => action({ run: async (query, parameters) => {
@@ -58,8 +58,8 @@ test('census keeps full branch guards and unchanged model partitions for both ki
     assert.match(query, /WHEN node:SMTurn AND NOT coalesce/u);
     assert.match(query, /WHEN node:SMChunk AND EXISTS/u);
     assert.match(query, /WHEN node:SMRecord AND \(NOT EXISTS/u);
-    assert.match(query, /count\(CASE WHEN node\.embedding_key=\$model THEN 1 END\) AS total/u);
-    assert.match(query, /count\(CASE WHEN node\.embedding_key IS NULL OR node\.embedding_key<>\$model THEN 1 END\) AS unindexed/u);
+    assert.match(query, /count\(CASE WHEN node\.embedding_key=\$model AND node\.embedding IS NOT NULL THEN 1 END\) AS total/u);
+    assert.match(query, /count\(CASE WHEN node\.embedding IS NULL OR node\.embedding_key IS NULL OR node\.embedding_key<>\$model THEN 1 END\) AS unindexed/u);
   }
 });
 

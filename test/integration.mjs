@@ -47,7 +47,9 @@ export async function runIntegration(database, scratch) {
     console.log(`PASS ${name}`);
   }
   let modelDown = false;
+  let modelCalls = 0;
   const model = createServer(async (req, res) => {
+    modelCalls++;
     let body = '';
     for await (const part of req) body += part;
     if (modelDown) { res.writeHead(503).end(); return; }
@@ -117,8 +119,18 @@ export async function runIntegration(database, scratch) {
       assert.deepEqual([result.status, result.reason, result.unembeddable], ['unavailable', 'embedding_unembeddable', 1]);
       const status = await fixture.status(scope);
       assert.deepEqual([status.unindexed, status.unembeddable], [1, 1]);
-      assert.equal((await fixture.index(scope)).indexed, 0);
+      const beforeRetry = modelCalls;
+      const terminal = await fixture.index(scope);
+      assert.deepEqual([terminal.status, terminal.reason, terminal.indexed, terminal.unembeddable],
+        ['unavailable', 'embedding_unembeddable', 0, 1]);
+      assert.equal(modelCalls, beforeRetry, 'terminal-only indexing sends no model request');
       assert.equal((await fixture.recall(scope, { query: 'fictional' })).channels.chunk_vector.status, 'partial');
+      // A current key left behind without a vector cannot satisfy the scope census.
+      await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope})
+        WHERE c.turn_uid <> $legacy REMOVE c.embedding`, { scope, legacy: legacy.id }));
+      assert.equal((await fixture.status(scope)).unindexed, 2);
+      const recovered = await fixture.index(scope);
+      assert.deepEqual([recovered.reason, recovered.indexed, recovered.unembeddable], ['embedding_unembeddable', 1, 1]);
       await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope,turn_uid:$turn}) SET c.text=$text`,
         { scope, turn: legacy.id, text: 'é'.repeat(4096) }));
       assert.equal((await fixture.status(scope)).unembeddable, undefined, 'changed text invalidates the marker');

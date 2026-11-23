@@ -524,7 +524,7 @@ export class Neo4jStore {
   async pendingEmbeddings(scope, model, limit) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope
-        AND (n.embedding_key IS NULL OR n.embedding_key <> $model)
+        AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
         AND NOT (n:SMChunk AND coalesce(n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text,false))
         WITH n, coalesce(n.embedding_retry_key=$model,false) AS isolated
         WITH n, isolated, isolated AND coalesce(n.embedding_retry_after > datetime(),false) AS cooling
@@ -540,14 +540,14 @@ export class Neo4jStore {
     const oversized = rows.filter(row => typeof row.text === 'string' && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
     // Match the measured text in the write and keep an exact comparison witness. An out-of-band text replacement is pending again.
     return this.transaction('write', tx => tx.run(`UNWIND $rows AS row MATCH (n:SMChunk {uid:row.uid,scope:$scope})
-      WHERE n.text=row.text AND (n.embedding_key IS NULL OR n.embedding_key <> $model)
+      WHERE n.text=row.text AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
       SET n.embedding_oversized_key=$model, n.embedding_oversized_cap=$cap, n.embedding_oversized_text=n.text`,
     { scope, model, rows: oversized, cap: CHUNK_MAX_BYTES }));
   }
 
   async deferEmbeddings(scope, model, uids, seconds, single = false) {
     return this.transaction('write', tx => tx.run(`UNWIND $uids AS uid MATCH (n {uid:uid,scope:$scope})
-      WHERE (n:SMChunk OR n:SMRecord) AND (n.embedding_key IS NULL OR n.embedding_key <> $model)
+      WHERE (n:SMChunk OR n:SMRecord) AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
       SET n.embedding_retry_single=$single OR coalesce(n.embedding_retry_key=$model AND n.embedding_retry_single,false),
           n.embedding_retry_key=$model, n.embedding_retry_after=datetime() + duration({seconds:$seconds})`,
     { scope, model, uids, seconds: neo4j.int(seconds), single }));
@@ -747,8 +747,8 @@ export class Neo4jStore {
       ELSE false END`;
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH ${match} ${eligibility}
-        RETURN count(CASE WHEN node.embedding_key=$model THEN 1 END) AS total,
-          count(CASE WHEN node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed`, { ...sel.params, model, exclude });
+        RETURN count(CASE WHEN node.embedding_key=$model AND node.embedding IS NOT NULL THEN 1 END) AS total,
+          count(CASE WHEN node.embedding IS NULL OR node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed`, { ...sel.params, model, exclude });
       return result.records[0].toObject();
     });
   }
@@ -989,9 +989,9 @@ export class Neo4jStore {
           count(CASE WHEN n:SMChunk THEN 1 END) AS chunks,
           count(CASE WHEN n:SMRecord THEN 1 END) AS records,
           count(CASE WHEN n:SMRelation THEN 1 END) AS relations,
-          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed,
+          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed,
           count(CASE WHEN n:SMChunk AND n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text
-            AND (n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unembeddable,
+            AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unembeddable,
           count(CASE WHEN n:SMLink THEN 1 END) AS links`,
         { ...sel.params, model: embeddingKey, cap: CHUNK_MAX_BYTES, exclude });
       // Links stored in the selection are counted apart from relations, and named only when there are any.

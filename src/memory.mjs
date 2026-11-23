@@ -104,7 +104,10 @@ export class Memory {
       const selected = pending.slice(0, limit);
       const oversized = selected.filter(row => !row.cooling && row.chunk && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
       const oversizedIds = new Set(oversized.map(row => row.uid));
-      if (oversized.length) await this.store.markOversizedChunks(scope, key, oversized.map(({ uid, text }) => ({ uid, text })));
+      if (oversized.length) {
+        requireThat(typeof this.store.markOversizedChunks === 'function', 'embedding_accounting_invalid');
+        await this.store.markOversizedChunks(scope, key, oversized.map(({ uid, text }) => ({ uid, text })));
+      }
       const eligible = selected.filter(row => !oversizedIds.has(row.uid));
       let indexed = 0;
       for (let offset = 0; offset < eligible.length;) {
