@@ -109,7 +109,8 @@ export class Memory {
           if (['model_timeout', 'model_request_failed', 'invalid_embedding', 'invalid_embedding_response', 'model_response_too_large'].includes(reason)) {
             // Split retries across invocations so a slow batch cannot multiply the caller's wait.
             const single = Boolean(first.isolated || batch.length === 1);
-            const delay = first.single ? 3600 : batch.length === 1 ? 300 : 60;
+            // A request failure, even for a singleton, need not be caused by its text.
+            const delay = batch.length === 1 ? 300 : 60;
             await this.store.deferEmbeddings?.(scope, key, batch.map(row => row.uid), delay, single);
           }
           return { status: 'unavailable', reason, source_retained: true, ...(indexed ? { indexed } : {}) };

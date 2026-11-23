@@ -106,7 +106,7 @@ test('a failed batch defers its members and later runs can index healthy rows', 
   for (let i = 0; i < 2; i++) assert.equal((await open().index('test', { limit: 16 })).indexed, 4);
   assert.equal((await open().index('test', { limit: 16 })).reason, 'model_request_failed');
   assert.deepEqual(calls.at(-1), ['poison']);
-  assert.equal(rows.get(0).after, now + 3600);
+  assert.equal(rows.get(0).after, now + 300, 'a singleton request failure may be an outage, not a poison row');
   assert.equal((await open().index('test', { limit: 16 })).indexed, 1);
   assert.deepEqual(calls.at(-1), ['healthy-1']);
   assert.ok(rows.has(0), 'a deferred item is not indexed or deleted');
