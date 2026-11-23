@@ -104,6 +104,18 @@ export async function runIntegration(database, scratch) {
     await memory.init('demo');
     await memory.init('foreign');
     await memory.init('exclusion');
+    await check('oversized legacy chunks stay unindexed without blocking eligible chunks', async () => {
+      const scope = 'embedding-legacy-size-fixture';
+      const fixture = new Memory({ ...config, scopes: { read: [scope], write: [scope] }, index_on_write: false }, memory.store);
+      await fixture.init(scope);
+      const legacy = await fixture.ingest(scope, turn('legacy-size', 'A fictional earlier chunk.'));
+      await fixture.ingest(scope, turn('new-size', 'A fictional new chunk.'));
+      await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope,turn_uid:$turn}) SET c.text=$text`,
+        { scope, turn: legacy.id, text: 'x'.repeat(8193) }));
+      const result = await fixture.index(scope, { limit: 16 });
+      assert.deepEqual([result.status, result.reason, result.indexed], ['unavailable', 'embedding_retry_deferred', 1]);
+      assert.equal((await fixture.status(scope)).unindexed, 1);
+    });
     await check('failed vector batches remain pending without blocking fresh chunks in the same scope', async () => {
       const scope = 'embedding-retry-fixture';
       const fixture = new Memory({ ...config, scopes: { read: [scope], write: [scope] }, index_on_write: false }, memory.store);

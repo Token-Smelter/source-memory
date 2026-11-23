@@ -83,10 +83,11 @@ test('a failed batch defers its members and later runs can index healthy rows', 
     async pendingEmbeddings(scope, _key, limit) {
       assert.equal(scope, 'test');
       return [...rows.values()].map(row => ({ ...row, cooling: row.after > now }))
-        .sort((a, b) => a.cooling - b.cooling || Boolean(a.isolated) - Boolean(b.isolated) || a.uid - b.uid).slice(0, limit);
+        .sort((a, b) => a.cooling - b.cooling || Boolean(a.isolated) - Boolean(b.isolated)
+          || Boolean(a.single) - Boolean(b.single) || a.uid - b.uid).slice(0, limit);
     },
-    async deferEmbeddings(_scope, _key, uids, seconds) {
-      for (const uid of uids) Object.assign(rows.get(uid), { isolated: true, after: now + seconds });
+    async deferEmbeddings(_scope, _key, uids, seconds, single) {
+      for (const uid of uids) Object.assign(rows.get(uid), { isolated: true, single, after: now + seconds });
     },
     async saveEmbeddings(_scope, _key, saved) { for (const row of saved) rows.delete(row.uid); },
   };
@@ -97,8 +98,16 @@ test('a failed batch defers its members and later runs can index healthy rows', 
   assert.deepEqual(calls.at(-1), ['healthy-16']);
   now = 61;
   assert.equal((await open().index('test', { limit: 16 })).reason, 'model_request_failed');
+  assert.deepEqual(calls.at(-1), ['poison', 'healthy-1', 'healthy-2', 'healthy-3']);
+  assert.equal((await open().index('test', { limit: 16 })).indexed, 4);
+  assert.deepEqual(calls.at(-1), ['healthy-4', 'healthy-5', 'healthy-6', 'healthy-7']);
+  now = 122;
+  // Drain the remaining small-group retries before retrying the isolated poison item.
+  for (let i = 0; i < 2; i++) assert.equal((await open().index('test', { limit: 16 })).indexed, 4);
+  assert.equal((await open().index('test', { limit: 16 })).reason, 'model_request_failed');
   assert.deepEqual(calls.at(-1), ['poison']);
-  assert.equal((await open().index('test', { limit: 16 })).status, 'pending');
+  assert.equal(rows.get(0).after, now + 3600);
+  assert.equal((await open().index('test', { limit: 16 })).indexed, 1);
   assert.deepEqual(calls.at(-1), ['healthy-1']);
   assert.ok(rows.has(0), 'a deferred item is not indexed or deleted');
 });

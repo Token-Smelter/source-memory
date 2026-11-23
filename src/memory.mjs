@@ -1,5 +1,5 @@
 import {
-  authorize, authorizeTarget, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
+  authorize, authorizeTarget, CHUNK_MAX_BYTES, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
   digest, normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, RECORD_KINDS, RECORD_STATUSES, requireThat, sourceExcerpt, text,
 } from './core.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
@@ -86,16 +86,20 @@ export class Memory {
       const limit = integer(input.limit, 256, 1, 2048);
       const pending = await this.store.pendingEmbeddings(scope, key, limit + 1);
       const selected = pending.slice(0, limit);
+      const oversized = selected.filter(row => !row.cooling && row.chunk && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
+      const oversizedIds = new Set(oversized.map(row => row.uid));
+      if (oversized.length) await this.store.deferEmbeddings(scope, key, [...oversizedIds], 3600, true);
+      const eligible = selected.filter(row => !oversizedIds.has(row.uid));
       let indexed = 0;
-      for (let offset = 0; offset < selected.length;) {
-        const first = selected[offset];
+      for (let offset = 0; offset < eligible.length;) {
+        const first = eligible[offset];
         if (first.cooling) return { status: 'unavailable', reason: 'embedding_retry_deferred', source_retained: true, indexed, embedding_key: key };
         const batch = [first];
         offset++;
-        if (!first.isolated) {
-          while (batch.length < 16 && offset < selected.length && !selected[offset].isolated && !selected[offset].cooling) {
-            batch.push(selected[offset++]);
-          }
+        const batchLimit = first.single ? 1 : first.isolated ? 4 : 16;
+        while (batch.length < batchLimit && offset < eligible.length && !eligible[offset].cooling
+            && Boolean(eligible[offset].isolated) === Boolean(first.isolated) && !eligible[offset].single) {
+          batch.push(eligible[offset++]);
         }
         let vectors;
         try {
@@ -103,15 +107,20 @@ export class Memory {
         } catch (error) {
           const reason = safeCode(error);
           if (['model_timeout', 'model_request_failed', 'invalid_embedding', 'invalid_embedding_response', 'model_response_too_large'].includes(reason)) {
-            // Do not multiply a slow request into synchronous retries. Future calls can index fresh items, then retry these singly.
-            await this.store.deferEmbeddings?.(scope, key, batch.map(row => row.uid), batch.length > 1 ? 60 : 300);
+            // Split retries across invocations so a slow batch cannot multiply the caller's wait.
+            const single = Boolean(first.isolated || batch.length === 1);
+            const delay = first.single ? 3600 : batch.length === 1 ? 300 : 60;
+            await this.store.deferEmbeddings?.(scope, key, batch.map(row => row.uid), delay, single);
           }
           return { status: 'unavailable', reason, source_retained: true, ...(indexed ? { indexed } : {}) };
         }
         await this.store.saveEmbeddings(scope, key, batch.map((row, index) => ({ uid: row.uid, vector: vectors[index] })));
         indexed += batch.length;
-        // One isolated request per invocation keeps the normal batching latency bound from turning into N model calls.
+        // One retry request per invocation protects the caller's indexing budget.
         if (first.isolated) break;
+      }
+      if (oversized.length && indexed === eligible.length && pending.length === selected.length) {
+        return { status: 'unavailable', reason: 'embedding_retry_deferred', source_retained: true, indexed, embedding_key: key };
       }
       return { status: pending.length > indexed ? 'pending' : 'ready', indexed, embedding_key: key };
     } catch (error) {
