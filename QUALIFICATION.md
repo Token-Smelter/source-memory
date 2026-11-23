@@ -131,6 +131,7 @@ Classes, for `ingest` and `enrich`:
 | `model_response_too_large` | post-commit | `localJson` during indexing |
 | `invalid_model_endpoint` | post-commit | `localEndpoint` during indexing |
 | `model_endpoint_must_be_loopback` | post-commit | `localEndpoint` during indexing |
+| `embedding_accounting_invalid` | post-commit | Indexing could not establish how many missing vectors remain retryable |
 | `embedding_model_mismatch` | post-commit | `embed` during indexing |
 | `invalid_embedding_response` | post-commit | `embed` during indexing |
 | `invalid_embedding` | post-commit | `validateVector` during indexing |

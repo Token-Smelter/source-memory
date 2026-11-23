@@ -104,7 +104,7 @@ export class Memory {
       const selected = pending.slice(0, limit);
       const oversized = selected.filter(row => !row.cooling && row.chunk && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
       const oversizedIds = new Set(oversized.map(row => row.uid));
-      if (oversized.length) await this.store.deferEmbeddings(scope, key, [...oversizedIds], 3600, true);
+      if (oversized.length) await this.store.markOversizedChunks(scope, key, oversized.map(({ uid, text }) => ({ uid, text })));
       const eligible = selected.filter(row => !oversizedIds.has(row.uid));
       let indexed = 0;
       for (let offset = 0; offset < eligible.length;) {
@@ -136,10 +136,17 @@ export class Memory {
         // One retry request per invocation protects the caller's indexing budget.
         if (first.isolated) break;
       }
-      if (oversized.length && indexed === eligible.length && pending.length === selected.length) {
-        return { status: 'unavailable', reason: 'embedding_retry_deferred', source_retained: true, indexed, embedding_key: key };
+      if (pending.length > indexed + oversized.length) return { status: 'pending', indexed, embedding_key: key };
+      if (typeof this.store.markOversizedChunks === 'function') {
+        // The bounded selection cannot prove drain. Check all current-key missing vectors, including cooling rows.
+        const { unindexed, unembeddable = 0 } = await this.store.status(scope, key);
+        requireThat(Number.isSafeInteger(unindexed) && Number.isSafeInteger(unembeddable)
+          && unembeddable >= 0 && unindexed >= unembeddable, 'embedding_accounting_invalid');
+        if (unindexed > unembeddable) return { status: 'pending', indexed, embedding_key: key };
+        if (unembeddable) return { status: 'unavailable', reason: 'embedding_unembeddable', source_retained: true,
+          indexed, embedding_key: key, unembeddable };
       }
-      return { status: pending.length > indexed ? 'pending' : 'ready', indexed, embedding_key: key };
+      return { status: 'ready', indexed, embedding_key: key };
     } catch (error) {
       return { status: 'unavailable', reason: safeCode(error), source_retained: true };
     }
