@@ -31,7 +31,7 @@ Every command prints one JSON object on stdout. Failures print `{"ok":false,"err
 | `init` | None | Create uniqueness constraints, scope full-text indexes, and native vector indexes when embedding is configured; for a nested scope or `S/**`, the shared tree indexes and the subtree's labels |
 | `ingest` | Turn envelope | Atomically retain exact source and its chunks; then embed unless `index_on_write` is false |
 | `enrich` | Records and relations | Validate source spans and endpoints; commit the whole bundle atomically |
-| `index` | Optional `{"limit":256}` | Embed missing or out-of-date chunks/records; defer failed batches and retry their items individually |
+| `index` | Optional `{"limit":256}` | Embed missing or out-of-date chunks and records; retry failed batches in smaller groups, then individually if needed |
 | `recall` | `{"query":"...", "limit":8}` plus bounds | Search turn/chunk/record lexical and chunk/record vector channels, fuse, rerank, expand relationships, return evidence bundles |
 | `recall` | Optional `mode`, `group:"conversation"`, `per_conversation`, `follow` | Echo a mode contract; opt into admission, atomic conversation units, and bounded folded following (below) |
 | `recall` | add `"exclude_conversations":[{"source":"...","conversation_id":"..."}]` (at most 16) | Rank without those conversations: their turns, chunks and records whose evidence lies only in them are dropped inside every channel before its limit, and their unindexed text does not make a channel partial. Records with other evidence stay. Turns stored before lineage properties existed are never excluded |
@@ -93,7 +93,7 @@ Roles: `user`, `assistant`, `tool`, `system`, `derived`. A `derived` entry (for 
 
 Identity is scope + `source` + `conversation_id` + `turn_id`. Identical retries return the same ID with `replayed: true`; different content under the same identity is refused (`source_identity_conflict`). A turn is retained and lexically searchable whether or not anything is ever extracted from it, and an embedding outage never rolls it back.
 
-Chunks are word windows inside a single entry, recorded with exact UTF-16 offsets. Each new chunk is capped at 8,192 UTF-8 bytes, even when a single whitespace-delimited word exceeds the cap. Long words split at Unicode code-point boundaries; overlap is shortened where needed. This is a byte bound, not a guarantee about a model's token count. Chunks are search handles; `show` returns the retained original rather than stitching chunks together. Existing turns and their chunks are not rewritten.
+Chunks are word windows inside a single entry, recorded with exact UTF-16 offsets. Each new chunk is capped at 8,192 UTF-8 bytes, even when a single whitespace-delimited word exceeds the cap. Long words split at Unicode code-point boundaries; overlap is shortened where needed. This is a byte bound, not a guarantee about a model's token count. Chunks are search handles; `show` returns the retained original rather than stitching chunks together. Existing turns and their chunks are not rewritten. Indexing defers legacy chunks above the byte cap without sending them to the embedder. They remain searchable by text and count as unindexed for vector recall.
 
 ### Records and relations
 
