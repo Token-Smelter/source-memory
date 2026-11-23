@@ -226,6 +226,10 @@ test('every post-commit code is reported inside an ok:true CLI reply after the w
     ['invalid_embedding_response', embedding('/short')],
     ['invalid_embedding', embedding('/bad-vector')],
     ['database_unavailable', embedding('/ok'), { async saveEmbeddings() { throw new TypeError('driver detail'); } }],
+    ['embedding_accounting_invalid', embedding('/ok'), {
+      async markOversizedChunks() { assert.fail('no oversized chunks'); },
+      async status() { return { unindexed: 0, unembeddable: 1 }; },
+    }],
   ];
   const exercised = new Set();
   for (const command of ['ingest', 'enrich']) {

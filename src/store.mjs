@@ -1,7 +1,7 @@
 import neo4j from 'neo4j-driver';
 import { passthrough } from './phase-diagnostic.mjs';
 import {
-  digest, identity, indexNames, integer, isNested, markStage, MemoryError, namespace, OUTCOME_REFERENT_KINDS, requireThat, scopePath, scopeTerm,
+  CHUNK_MAX_BYTES, digest, identity, indexNames, integer, isNested, markStage, MemoryError, namespace, OUTCOME_REFERENT_KINDS, requireThat, scopePath, scopeTerm,
   scopeTerms, sourceExcerpt, lexicalQuery, treeLayout,
 } from './core.mjs';
 
@@ -434,20 +434,30 @@ export class Neo4jStore {
   async pendingEmbeddings(scope, model, limit) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope
-        AND (n.embedding_key IS NULL OR n.embedding_key <> $model)
+        AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
+        AND NOT (n:SMChunk AND coalesce(n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text,false))
         WITH n, coalesce(n.embedding_retry_key=$model,false) AS isolated
         WITH n, isolated, isolated AND coalesce(n.embedding_retry_after > datetime(),false) AS cooling
         RETURN n.uid AS uid, CASE WHEN NOT cooling THEN n.text END AS text, n:SMChunk AS chunk,
           isolated, cooling, isolated AND coalesce(n.embedding_retry_single,false) AS single
-        ORDER BY cooling, isolated, single, n.uid LIMIT $limit`, { scope, model, limit: neo4j.int(limit) });
+        ORDER BY cooling, isolated, single, n.uid LIMIT $limit`, { scope, model, cap: CHUNK_MAX_BYTES, limit: neo4j.int(limit) });
       return result.records.map(row => ({ uid: row.get('uid'), text: row.get('text'), chunk: row.get('chunk'),
         isolated: row.get('isolated'), cooling: row.get('cooling'), single: row.get('single') }));
     });
   }
 
+  async markOversizedChunks(scope, model, rows) {
+    const oversized = rows.filter(row => typeof row.text === 'string' && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
+    // Match the measured text in the write and keep an exact comparison witness. An out-of-band text replacement is pending again.
+    return this.transaction('write', tx => tx.run(`UNWIND $rows AS row MATCH (n:SMChunk {uid:row.uid,scope:$scope})
+      WHERE n.text=row.text AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
+      SET n.embedding_oversized_key=$model, n.embedding_oversized_cap=$cap, n.embedding_oversized_text=n.text`,
+    { scope, model, rows: oversized, cap: CHUNK_MAX_BYTES }));
+  }
+
   async deferEmbeddings(scope, model, uids, seconds, single = false) {
     return this.transaction('write', tx => tx.run(`UNWIND $uids AS uid MATCH (n {uid:uid,scope:$scope})
-      WHERE (n:SMChunk OR n:SMRecord) AND (n.embedding_key IS NULL OR n.embedding_key <> $model)
+      WHERE (n:SMChunk OR n:SMRecord) AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
       SET n.embedding_retry_single=$single OR coalesce(n.embedding_retry_key=$model AND n.embedding_retry_single,false),
           n.embedding_retry_key=$model, n.embedding_retry_after=datetime() + duration({seconds:$seconds})`,
     { scope, model, uids, seconds: neo4j.int(seconds), single }));
@@ -456,7 +466,7 @@ export class Neo4jStore {
   async saveEmbeddings(scope, model, rows) {
     return this.transaction('write', tx => tx.run(`UNWIND $rows AS row MATCH (n {uid:row.uid,scope:$scope})
       WHERE n:SMChunk OR n:SMRecord SET n.embedding=row.vector, n.embedding_key=$model
-      REMOVE n.embedding_retry_key, n.embedding_retry_after, n.embedding_retry_single`, { scope, model, rows }));
+      REMOVE n.embedding_retry_key, n.embedding_retry_after, n.embedding_retry_single, n.embedding_oversized_key, n.embedding_oversized_cap, n.embedding_oversized_text`, { scope, model, rows }));
   }
 
   // The exclusion is applied before the limit, so excluded matches never take the place of eligible ones.
@@ -646,8 +656,8 @@ export class Neo4jStore {
       ELSE false END`;
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH ${match} ${eligibility}
-        RETURN count(CASE WHEN node.embedding_key=$model THEN 1 END) AS total,
-          count(CASE WHEN node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed`, { ...sel.params, model, exclude });
+        RETURN count(CASE WHEN node.embedding_key=$model AND node.embedding IS NOT NULL THEN 1 END) AS total,
+          count(CASE WHEN node.embedding IS NULL OR node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed`, { ...sel.params, model, exclude });
       return result.records[0].toObject();
     });
   }
@@ -810,9 +820,12 @@ export class Neo4jStore {
           count(CASE WHEN n:SMChunk THEN 1 END) AS chunks,
           count(CASE WHEN n:SMRecord THEN 1 END) AS records,
           count(CASE WHEN n:SMRelation THEN 1 END) AS relations,
-          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed`,
-        { ...sel.params, model: embeddingKey, exclude });
-      return result.records[0].toObject();
+          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed,
+          count(CASE WHEN n:SMChunk AND n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text
+            AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unembeddable`,
+        { ...sel.params, model: embeddingKey, cap: CHUNK_MAX_BYTES, exclude });
+      const { unembeddable, ...counts } = result.records[0].toObject();
+      return { ...counts, ...(unembeddable > 0 ? { unembeddable } : {}) };
     });
   }
 }
