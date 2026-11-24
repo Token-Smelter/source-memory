@@ -734,7 +734,7 @@ export class Neo4jStore {
     });
   }
 
-  async vectorCounts(scope, kind, model, exclude = []) {
+  async vectorCounts(scope, kind, model, exclude = [], includeCoverage = false) {
     const sel = selection(scope);
     const match = sel.tree ? `(node:${sel.members[kind]}) WHERE ${sel.where('node')} AND` : `(node:${sel.labels[kind]} {scope:$scope}) WHERE`;
     // WHERE accepts only true. Full-branch CASE guards preserve OR eligibility without assuming disjoint labels.
@@ -748,7 +748,10 @@ export class Neo4jStore {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH ${match} ${eligibility}
         RETURN count(CASE WHEN node.embedding_key=$model AND node.embedding IS NOT NULL THEN 1 END) AS total,
-          count(CASE WHEN node.embedding IS NULL OR node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed`, { ...sel.params, model, exclude });
+          count(CASE WHEN node.embedding IS NULL OR node.embedding_key IS NULL OR node.embedding_key<>$model THEN 1 END) AS unindexed${includeCoverage ? `,
+          count(CASE WHEN node:SMChunk AND node.embedding_oversized_key=$model AND node.embedding_oversized_cap=$cap
+            AND node.embedding_oversized_text=node.text AND (node.embedding IS NULL OR node.embedding_key IS NULL OR node.embedding_key<>$model)
+            THEN 1 END) AS unembeddable` : ''}`, { ...sel.params, model, exclude, ...(includeCoverage ? { cap: CHUNK_MAX_BYTES } : {}) });
       return result.records[0].toObject();
     });
   }

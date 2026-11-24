@@ -124,11 +124,25 @@ export async function runIntegration(database, scratch) {
       assert.deepEqual([terminal.status, terminal.reason, terminal.indexed, terminal.unembeddable],
         ['unavailable', 'embedding_unembeddable', 0, 1]);
       assert.equal(modelCalls, beforeRetry, 'terminal-only indexing sends no model request');
-      assert.equal((await fixture.recall(scope, { query: 'fictional' })).channels.chunk_vector.status, 'partial');
+      await waitForVectors(fixture, scope);
+      const plain = await fixture.recall(scope, { query: 'fictional' });
+      assert.equal(plain.channels.chunk_vector.status, 'partial');
+      assert.equal(plain.channels.chunk_vector.coverage, undefined);
+      const query = { query: 'fictional', vector_coverage: true };
+      const disclosed = await fixture.recall(scope, query, { seedsOnly: true });
+      assert.equal(disclosed.channels.chunk_vector.status, 'partial');
+      assert.equal(disclosed.channels.chunk_vector.reason, 'terminal_omission');
+      assert.deepEqual(disclosed.channels.chunk_vector.coverage, { indexed: 1, unembeddable: 1, pending: 0, total: 2 });
+      assert.deepEqual(disclosed.channels.record_vector.coverage, { indexed: 0, unembeddable: 0, pending: 0, total: 0 });
+      assert.equal((await fixture.recall(scope, query)).retrieval_complete, false);
       // A current key left behind without a vector cannot satisfy the scope census.
       await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope})
         WHERE c.turn_uid <> $legacy REMOVE c.embedding`, { scope, legacy: legacy.id }));
       assert.equal((await fixture.status(scope)).unindexed, 2);
+      const mixed = (await fixture.recall(scope, query, { seedsOnly: true })).channels.chunk_vector;
+      assert.equal(mixed.status, 'partial');
+      assert.notEqual(mixed.reason, 'terminal_omission');
+      assert.deepEqual(mixed.coverage, { indexed: 0, unembeddable: 1, pending: 1, total: 2 });
       const recovered = await fixture.index(scope);
       assert.deepEqual([recovered.reason, recovered.indexed, recovered.unembeddable], ['embedding_unembeddable', 1, 1]);
       await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope,turn_uid:$turn}) SET c.text=$text`,

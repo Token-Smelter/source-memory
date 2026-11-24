@@ -461,6 +461,7 @@ export class Memory {
   // `phases` is an opt-in marker sink (src/phase-diagnostic.mjs). Absent, recall makes exactly the calls it always made.
   async recall(scope, input, { phases = null, seedsOnly = false } = {}) {
     const target = authorizeSelection(this.config, scope);
+    requireThat(input.vector_coverage !== true || (typeof scope === 'string' && typeof target === 'string'), 'invalid_input');
     if (isScopeSet(target)) return this.recallSet(target.scopes, input, { phases, seedsOnly });
     // A one-element set is that exact scope: the same request, so the same reply.
     if (Array.isArray(scope)) return this.recall(target, input, { phases, seedsOnly });
@@ -484,7 +485,8 @@ export class Memory {
 
     const { bundles, budgetOmitted, groupedOutput } = await this.renderSeeds(scope, ranked, channels, omitted, options, trace,
       typeof target === 'string' ? null : target);
-    const unavailable = Object.values(availability).some(row => row.status === 'unavailable');
+    const unavailable = Object.values(availability).some(row => row.status === 'unavailable'
+      || (options.vectorCoverage && ['partial', 'pending'].includes(row.status)));
     return {
       scope, query: options.query,
       status: unavailable ? 'degraded' : budgetOmitted > 0 ? 'budget_limited' : bundles.length ? 'ready' : 'no_matches',
@@ -510,6 +512,7 @@ export class Memory {
    */
   async recallSet(set, input, { phases = null, seedsOnly = false } = {}) {
     const scopes = setScopes(this.config, { scopes: set });
+    requireThat(input.vector_coverage !== true, 'invalid_input');
     const trace = tracer(phases);
     const options = recallOptions(this.config, input);
     const { grouped, candidates, digests } = options;
@@ -641,8 +644,10 @@ export class Memory {
             let unindexed;
             let scan_truncated = false;
             // A root's ANN index is filtered after its top-k, so a small selection is scored exactly, inside the database.
-            const census = tree && vector_index === 'online' ? await this.store.vectorCounts(target, kind, key, exclude) : null;
-            if (census && census.total <= Math.min(this.treeScanLimit, vectorLimit)) {
+            const coverageRequested = options.vectorCoverage;
+            const census = (tree || coverageRequested) && vector_index === 'online'
+              ? await this.store.vectorCounts(target, kind, key, exclude, ...(coverageRequested ? [true] : [])) : null;
+            if (tree && census && census.total <= Math.min(this.treeScanLimit, vectorLimit)) {
               const scan = await this.store.treeVectorScan(target, kind, key, queryVector, grouped ? 0 : candidates, exclude,
                 ...digestArgs(digests && kind === 'record'));
               unindexed = census.unindexed;
@@ -666,6 +671,20 @@ export class Memory {
               scan_truncated, unindexed, embedding_key: key,
               ...(result.reason ? { reason: result.reason } : {}),
               ...(grouped && result.ran !== false ? { admitted_conversations: result.admitted_conversations, exhausted: result.exhausted } : {}) };
+            if (coverageRequested && census) {
+              const coverage = vectorCoverage(census);
+              // Counts are observations, not a whole-request snapshot. Refuse attribution when another observed cut disagrees.
+              const after = vectorCoverage(await this.store.vectorCounts(target, kind, key, exclude, true));
+              if (!coverage || !after || unindexed !== census.unindexed
+                  || Object.keys(coverage).some(name => coverage[name] !== after[name])) {
+                state.status = 'partial';
+                state.reason ??= 'vector_coverage_unverified';
+              } else {
+                state.coverage = coverage;
+                if (!result.partial && !scan_truncated && result.ran !== false && !state.reason
+                    && coverage.unembeddable > 0 && coverage.pending === 0) state.reason = 'terminal_omission';
+              }
+            }
             return { hits: result.hits, omitted: result.omitted ?? [], state };
           } catch (error) {
             return { hits: [], omitted: [], state: { status: 'unavailable', reason: safeCode(error) } };
@@ -998,6 +1017,9 @@ function recallOptions(config, input) {
   requireThat(mode === undefined || (typeof mode === 'string' && Object.hasOwn(MODE_CONTRACTS, mode)), 'invalid_input');
   requireThat(input.group === undefined || input.group === 'conversation', 'invalid_input');
   const grouped = input.group === 'conversation';
+  requireThat(input.vector_coverage === undefined || input.vector_coverage === false
+    || (input.vector_coverage === true && !grouped), 'invalid_input');
+  const vectorCoverage = input.vector_coverage === true;
   const perConversation = integer(input.per_conversation, 2, 1, 4);
   const follow = followingOptions(input.follow, grouped);
   const query = text(input.query, 4000);
@@ -1012,7 +1034,7 @@ function recallOptions(config, input) {
   // take the place of eligible ones, and its unindexed text does not hold the others back.
   const exclude = exclusions(input.exclude_conversations);
   const digests = digestsOption(input);
-  return { mode, grouped, perConversation, follow, query, candidates, limit, maxNodes, maxHops, maxChars, vectorLimit, exclude, digests };
+  return { mode, grouped, perConversation, follow, query, candidates, limit, maxNodes, maxHops, maxChars, vectorLimit, exclude, digests, vectorCoverage };
 }
 
 // The query is embedded at most once per request, however many index groups read vectors.
@@ -1021,12 +1043,21 @@ function queryEmbedder(config, query) {
   return () => vectors ??= embed(config.embedding, [query]);
 }
 
+function vectorCoverage(census) {
+  const { total: indexed, unindexed, unembeddable } = census ?? {};
+  const total = indexed + unindexed;
+  if (![indexed, unindexed, unembeddable, total].every(n => Number.isSafeInteger(n) && n >= 0) || unembeddable > unindexed) return null;
+  return { indexed, unembeddable, pending: unindexed - unembeddable, total };
+}
+
 // Nodes the tree indexes cannot see yet make every channel over that kind partial.
 function markPending(availability, pending) {
   for (const [name, kind] of Object.entries(CHANNEL_KINDS)) {
     const state = availability[name];
     if (!pending[kind] || !['ready', 'partial'].includes(state.status)) continue;
-    availability[name] = { ...state, status: 'partial', scope_tree_pending: pending[kind], ...(state.reason ? {} : { reason: 'scope_tree_pending' }) };
+    const { coverage: _coverage, ...rest } = state;
+    availability[name] = { ...rest, status: 'partial', scope_tree_pending: pending[kind],
+      ...(!state.reason || state.reason === 'terminal_omission' ? { reason: 'scope_tree_pending' } : {}) };
   }
 }
 
