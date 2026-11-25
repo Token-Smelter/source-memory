@@ -60,7 +60,8 @@ test('failed embeddings leave an ingested source retained', async t => {
   let retained = null;
   const store = {
     ingest: async (_scope, turn) => { retained = turn; return { id: 'source', retained: true }; },
-    pendingEmbeddings: async () => [{ uid: 'chunk', text: 'original' }],
+    pendingEmbeddings: async () => [{ uid: 'chunk', chunk: true }],
+    observeEmbeddings: async () => [{ uid: 'chunk', chunk: true, eligible: true, text: 'original', observed: { text: 'original' } }],
   };
   const memory = new Memory({ scopes: { write: ['test'], read: ['test'] }, embedding: { url, model: 'fixture', dimensions: 2 } }, store);
   const result = await memory.ingest('test', { source: 'fixture', conversation_id: 'c', turn_id: 't', entries: [{ id: 'u', role: 'user', text: 'original' }] });
@@ -82,14 +83,24 @@ test('a failed batch defers its members and later runs can index healthy rows', 
   const store = {
     async pendingEmbeddings(scope, _key, limit) {
       assert.equal(scope, 'test');
-      return [...rows.values()].map(row => ({ ...row, cooling: row.after > now }))
-        .sort((a, b) => a.cooling - b.cooling || Boolean(a.isolated) - Boolean(b.isolated)
-          || Boolean(a.single) - Boolean(b.single) || a.uid - b.uid).slice(0, limit);
+      return [...rows.values()].map(row => ({ uid: row.uid, isolated: Boolean(row.isolated), single: Boolean(row.single), cooling: row.after > now }))
+        .sort((a, b) => a.cooling - b.cooling || a.isolated - b.isolated || a.single - b.single || a.uid - b.uid).slice(0, limit);
     },
-    async deferEmbeddings(_scope, _key, uids, seconds, single) {
-      for (const uid of uids) Object.assign(rows.get(uid), { isolated: true, single, after: now + seconds });
+    async observeEmbeddings(_scope, _key, uids) {
+      return uids.filter(uid => rows.has(uid)).map(uid => {
+        const row = rows.get(uid);
+        return { uid, chunk: true, eligible: true, text: row.text, observed: { text: row.text },
+          isolated: Boolean(row.isolated), single: Boolean(row.single), cooling: row.after > now };
+      });
     },
-    async saveEmbeddings(_scope, _key, saved) { for (const row of saved) rows.delete(row.uid); },
+    async deferEmbeddings(_scope, _key, deferred, seconds, single) {
+      for (const { uid } of deferred) Object.assign(rows.get(uid), { isolated: true, single, after: now + seconds });
+      return { applied: deferred.length, refused: 0, uncertain: false };
+    },
+    async saveEmbeddings(_scope, _key, saved) {
+      for (const row of saved) rows.delete(row.uid);
+      return { applied: saved.length, refused: 0, uncertain: false };
+    },
   };
   const open = () => new Memory({ scopes: { write: ['test'] }, embedding: { url, model: 'fixture', dimensions: 2 } }, store);
   assert.equal((await open().index('test', { limit: 16 })).reason, 'model_request_failed');
@@ -110,6 +121,38 @@ test('a failed batch defers its members and later runs can index healthy rows', 
   assert.equal((await open().index('test', { limit: 16 })).indexed, 1);
   assert.deepEqual(calls.at(-1), ['healthy-1']);
   assert.ok(rows.has(0), 'a deferred item is not indexed or deleted');
+});
+
+test('only confirmed embedding writes count as progress and refused or uncertain writes never yield ready', async t => {
+  const url = await endpoint(t, async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    res.end(JSON.stringify({ data: JSON.parse(body).input.map((_, index) => ({ index, embedding: [1, 0] })) }));
+  });
+  const run = async outcome => {
+    const store = {
+      async pendingEmbeddings() { return [{ uid: 'a', chunk: true }, { uid: 'b', chunk: true }]; },
+      async observeEmbeddings(_scope, _key, uids) {
+        return uids.map(uid => ({ uid, chunk: true, eligible: true, text: { a: 'one', b: 'two' }[uid], observed: { text: { a: 'one', b: 'two' }[uid] } }));
+      },
+      async markOversizedChunks() { assert.fail('no oversized rows'); },
+      async status() { return { unindexed: 0, unembeddable: 0 }; },
+      async saveEmbeddings(_scope, _key, rows) {
+        assert.deepEqual(rows.map(row => [row.uid, row.observed.text]), [['a', 'one'], ['b', 'two']], 'writes carry the observed state');
+        return outcome;
+      },
+    };
+    return new Memory({ scopes: { write: ['test'] }, embedding: { url, model: 'fixture', dimensions: 2 } }, store).index('test');
+  };
+  const ready = await run({ applied: 2, refused: 0, uncertain: false });
+  assert.deepEqual([ready.status, ready.indexed, ready.stale, ready.unknown], ['ready', 2, undefined, undefined]);
+  const stale = await run({ applied: 1, refused: 1, uncertain: false });
+  assert.deepEqual([stale.status, stale.indexed, stale.stale, stale.unknown], ['pending', 1, 1, undefined]);
+  const unknown = await run({ applied: 0, refused: 2, uncertain: true });
+  assert.deepEqual([unknown.status, unknown.indexed, unknown.stale, unknown.unknown], ['pending', 0, undefined, 2]);
+  for (const invalid of [undefined, {}, { applied: 3, refused: -1 }, { applied: 1, refused: 0 }]) {
+    assert.deepEqual(await run(invalid), { status: 'unavailable', reason: 'embedding_accounting_invalid', source_retained: true });
+  }
 });
 
 test('scope denial occurs before storage is accessed', async () => {
