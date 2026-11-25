@@ -643,6 +643,7 @@ export class Memory {
             let result;
             let unindexed;
             let scan_truncated = false;
+            let scanCountMatches = true;
             // A root's ANN index is filtered after its top-k, so a small selection is scored exactly, inside the database.
             const coverageRequested = options.vectorCoverage;
             const census = (tree || coverageRequested) && vector_index === 'online'
@@ -651,6 +652,7 @@ export class Memory {
               const scan = await this.store.treeVectorScan(target, kind, key, queryVector, grouped ? 0 : candidates, exclude,
                 ...digestArgs(digests && kind === 'record'));
               unindexed = census.unindexed;
+              scanCountMatches = scan.uids.length === census.total;
               result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, scan.uids, candidates, perConversation, exclude)
                 : { hits: vectorHits(kind, scan.nodes, sel.named, digests) };
             } else if (vector_index === 'online') {
@@ -675,7 +677,7 @@ export class Memory {
               const coverage = vectorCoverage(census);
               // Counts are observations, not a whole-request snapshot. Refuse attribution when another observed cut disagrees.
               const after = vectorCoverage(await this.store.vectorCounts(target, kind, key, exclude, true));
-              if (!coverage || !after || unindexed !== census.unindexed
+              if (!coverage || !after || !scanCountMatches || unindexed !== census.unindexed
                   || Object.keys(coverage).some(name => coverage[name] !== after[name])) {
                 state.status = 'partial';
                 state.reason ??= 'vector_coverage_unverified';

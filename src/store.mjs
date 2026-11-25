@@ -823,8 +823,9 @@ export class Neo4jStore {
     const sel = selection(target);
     requireThat(sel.tree, 'invalid_input');
     return this.transaction('read', async tx => {
-      const result = await tx.run(`MATCH (n:${sel.members[kind]} {embedding_key:$model}) WHERE ${sel.where('n')} AND ${eligible('n')}
-        WITH n, vector.similarity.cosine(n.embedding, $vector) AS score ORDER BY score DESC, n.uid
+      const result = await tx.run(`MATCH (n:${sel.members[kind]} {embedding_key:$model}) WHERE ${sel.where('n')} AND n.embedding IS NOT NULL AND ${eligible('n')}
+        WITH n, vector.similarity.cosine(n.embedding, $vector) AS score WHERE score IS NOT NULL
+        WITH n, score ORDER BY score DESC, n.uid
         WITH collect({uid:n.uid, scope:n.scope, turn_uid:n.turn_uid, record_id:n.record_id, entry_id:n.entry_id, start:n.start, end:n.end,
           text:n.text${digests ? ', hash:n.hash' : ''}}) AS rows
         RETURN rows[..$limit] AS top, [row IN rows | row.uid] AS uids`, { ...sel.params, model, vector, exclude, limit: neo4j.int(limit) });
