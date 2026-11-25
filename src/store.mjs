@@ -47,6 +47,8 @@ const eligible = n => `(size($exclude) = 0
 
 // Above this many eligible tree vectors a read uses the shared ANN index; at or below it, an exact cosine scan.
 export const TREE_SCAN_LIMIT = 4096;
+// The most rows whose exact embedding state is hydrated or written at once: one work unit, the largest embedding batch.
+export const EMBEDDING_UNIT_MAX = 16;
 const TREE_BACKFILL = { batch: 1000, batches: 50 };
 // `list` orders a node written without `created_at` (by a writer other than this store) as this instant.
 const LIST_EPOCH = '0001-01-01T00:00:00Z';
@@ -117,6 +119,36 @@ async function writeLabels(tx, scope, kinds) {
   const terms = scopeTerms(scope);
   return Object.fromEntries(kinds.map(kind => [kind, { labels: path.length === 1 ? `${own(kind)}:${tree[kind.toLowerCase()]}` : tree[kind.toLowerCase()], terms }]));
 }
+
+// Everything an embedding decision is computed from: the embedded text, the vector the row has, and its retry and terminal
+// markers. A selected row's vector, deferral or terminal marker is written only while all of these still hold. The vector is
+// compared by value: a writer may replace a stale vector without changing its key, and that replacement must not be clobbered.
+// Numbers and temporals travel as their stored type plus exact Cypher strings: this driver reads integers as lossy JS numbers,
+// and a bare string would erase a type that decides eligibility (STRING "8192" is not the terminal cap; INTEGER or FLOAT is).
+const typedWitness = value => `CASE WHEN ${value} IS NULL THEN NULL ELSE [valueType(${value})]
+  + CASE WHEN ${value} IS :: LIST<ANY> THEN [x IN ${value} | toString(x)] ELSE [toString(${value})] END END`;
+// Rebuilds a scalar witness into a value that compares in Cypher exactly as the stored one did. Any other type stays the
+// witness list, which, like the stored value it stands for, never equals the integer cap and never orders against a datetime.
+const typedValue = witness => `CASE ${witness}[0] WHEN 'INTEGER NOT NULL' THEN toInteger(${witness}[1])
+  WHEN 'FLOAT NOT NULL' THEN toFloat(${witness}[1]) WHEN 'ZONED DATETIME NOT NULL' THEN datetime(${witness}[1]) ELSE ${witness} END`;
+const EMBEDDING_STATE = {
+  text: 'n.text', embedding_key: 'n.embedding_key', embedding: typedWitness('n.embedding'),
+  retry_key: 'n.embedding_retry_key', retry_after: typedWitness('n.embedding_retry_after'), retry_single: 'n.embedding_retry_single',
+  oversized_key: 'n.embedding_oversized_key', oversized_cap: typedWitness('n.embedding_oversized_cap'),
+  oversized_text: 'n.embedding_oversized_text',
+};
+// Embedding eligibility, written once over named fields so selection, the locked write and the census judge a stored node
+// and the observed state rebuilt from its witness by the same Cypher comparisons.
+const NODE_FIELDS = { embedding: 'n.embedding', key: 'n.embedding_key', text: 'n.text', oversizedKey: 'n.embedding_oversized_key',
+  cap: 'n.embedding_oversized_cap', oversizedText: 'n.embedding_oversized_text' };
+const observedFields = o => ({ embedding: `${o}.embedding`, key: `${o}.embedding_key`, text: `${o}.text`,
+  oversizedKey: `${o}.oversized_key`, cap: typedValue(`${o}.oversized_cap`), oversizedText: `${o}.oversized_text` });
+const missingVector = f => `(${f.embedding} IS NULL OR ${f.key} IS NULL OR ${f.key} <> $model)`;
+const oversizedTerminal = f => `coalesce(${f.oversizedKey}=$model AND ${f.cap}=$cap AND ${f.oversizedText}=${f.text},false)`;
+const OBSERVED_EMBEDDING_STATE = `{${Object.entries(EMBEDDING_STATE).map(([name, value]) => `${name}:${value}`).join(',')}}`;
+// Absent on both sides is a match; absent on one side is not.
+const UNCHANGED_EMBEDDING_STATE = Object.entries(EMBEDDING_STATE)
+  .map(([name, value]) => `coalesce(${value}=row.observed.${name}, ${value} IS NULL AND row.observed.${name} IS NULL)`).join(' AND ');
 
 export class Neo4jStore {
   constructor(config) {
@@ -521,42 +553,106 @@ export class Neo4jStore {
     });
   }
 
+  /**
+   * Discovery: identity, order and eligibility hints only ({uid, chunk, isolated, cooling, single}). No text, vector or
+   * other witness leaves the database here, so the page and its look-ahead row cost the same whatever the stored vectors
+   * hold. The hints only bound and order the work: every decision is taken again from observeEmbeddings.
+   */
   async pendingEmbeddings(scope, model, limit) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope
-        AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
-        AND NOT (n:SMChunk AND coalesce(n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text,false))
+        AND ${missingVector(NODE_FIELDS)} AND NOT (n:SMChunk AND ${oversizedTerminal(NODE_FIELDS)})
         WITH n, coalesce(n.embedding_retry_key=$model,false) AS isolated
-        WITH n, isolated, isolated AND coalesce(n.embedding_retry_after > datetime(),false) AS cooling
-        RETURN n.uid AS uid, CASE WHEN NOT cooling THEN n.text END AS text, n:SMChunk AS chunk,
-          isolated, cooling, isolated AND coalesce(n.embedding_retry_single,false) AS single
-        ORDER BY cooling, isolated, single, n.uid LIMIT $limit`, { scope, model, cap: CHUNK_MAX_BYTES, limit: neo4j.int(limit) });
-      return result.records.map(row => ({ uid: row.get('uid'), text: row.get('text'), chunk: row.get('chunk'),
-        isolated: row.get('isolated'), cooling: row.get('cooling'), single: row.get('single') }));
+        WITH n, isolated, isolated AND coalesce(n.embedding_retry_after > datetime(),false) AS cooling,
+          isolated AND coalesce(n.embedding_retry_single,false) AS single
+        RETURN n.uid AS uid, n:SMChunk AS chunk, isolated, cooling, single
+        ORDER BY cooling, isolated, single, n.uid LIMIT $limit`,
+      { scope, model, cap: CHUNK_MAX_BYTES, limit: neo4j.int(limit) });
+      return result.records.map(row => ({ uid: row.get('uid'), chunk: row.get('chunk'), isolated: row.get('isolated'),
+        cooling: row.get('cooling'), single: row.get('single') }));
     });
   }
 
-  async markOversizedChunks(scope, model, rows) {
-    const oversized = rows.filter(row => typeof row.text === 'string' && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
-    // Match the measured text in the write and keep an exact comparison witness. An out-of-band text replacement is pending again.
-    return this.transaction('write', tx => tx.run(`UNWIND $rows AS row MATCH (n:SMChunk {uid:row.uid,scope:$scope})
-      WHERE n.text=row.text AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
-      SET n.embedding_oversized_key=$model, n.embedding_oversized_cap=$cap, n.embedding_oversized_text=n.text`,
-    { scope, model, rows: oversized, cap: CHUNK_MAX_BYTES }));
+  /**
+   * Hydration of one work unit (at most EMBEDDING_UNIT_MAX rows): the exact, type-preserving state the write guard later
+   * compares. Under read committed, one statement may read a property more than once (a predicate can cache it before a
+   * later projection re-reads it), so this statement only projects each row's single `observed` map, and every decision
+   * (model input, eligibility, retry and oversize state) is derived from that map. Rows come back in the order asked;
+   * a row no longer present is omitted.
+   */
+  async observeEmbeddings(scope, model, uids) {
+    requireThat(Array.isArray(uids) && uids.length <= EMBEDDING_UNIT_MAX && uids.every(uid => typeof uid === 'string'),
+      'embedding_accounting_invalid');
+    if (!uids.length) return [];
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`UNWIND range(0, size($uids) - 1) AS position
+        MATCH (n {uid:$uids[position],scope:$scope}) WHERE n:SMChunk OR n:SMRecord
+        RETURN n.uid AS uid, n:SMChunk AS chunk, ${OBSERVED_EMBEDDING_STATE} AS observed ORDER BY position`, { scope, uids });
+      const rows = result.records.map(row => ({ uid: row.get('uid'), chunk: row.get('chunk'), observed: row.get('observed') }));
+      // Parameter-only: judged on Neo4j's clock and comparison rules from the witness alone, never re-reading the node.
+      // Eligibility asks only whether a vector exists, so the judgement carries that, not the vector's values.
+      const judged = await tx.run(`RETURN [row IN $rows | {
+          eligible: ${missingVector(observedFields('row.observed'))} AND NOT (row.chunk AND ${oversizedTerminal(observedFields('row.observed'))}),
+          cooling: coalesce(row.observed.retry_key=$model AND ${typedValue('row.observed.retry_after')} > datetime(),false)}] AS judged`,
+      { rows: rows.map(({ chunk, observed }) => ({ chunk, observed: { ...observed, embedding: observed.embedding === null ? null : true } })),
+        model, cap: CHUNK_MAX_BYTES });
+      const verdicts = judged.records[0].get('judged');
+      return rows.map(({ uid, chunk, observed }, index) => {
+        const { eligible, cooling } = verdicts[index];
+        const isolated = observed.retry_key === model;
+        return { uid, chunk, observed, eligible, isolated, cooling, single: isolated && observed.retry_single === true,
+          text: cooling ? null : observed.text };
+      });
+    });
   }
 
-  async deferEmbeddings(scope, model, uids, seconds, single = false) {
-    return this.transaction('write', tx => tx.run(`UNWIND $uids AS uid MATCH (n {uid:uid,scope:$scope})
-      WHERE (n:SMChunk OR n:SMRecord) AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
+  // Each write below takes `rows` as hydrated by observeEmbeddings ({uid, observed, ...}), at most EMBEDDING_UNIT_MAX of
+  // them, and applies only to a row that still carries exactly that observed state. Keep the stored comparison witness: an out-of-band text replacement is pending again.
+  async markOversizedChunks(scope, model, rows) {
+    const oversized = rows.filter(row => typeof row.observed?.text === 'string' && Buffer.byteLength(row.observed.text) > CHUNK_MAX_BYTES);
+    return this.#guardedEmbeddingWrite(scope, model, oversized, `WHERE n:SMChunk
+      SET n.embedding_oversized_key=$model, n.embedding_oversized_cap=$cap, n.embedding_oversized_text=n.text`);
+  }
+
+  async deferEmbeddings(scope, model, rows, seconds, single = false) {
+    return this.#guardedEmbeddingWrite(scope, model, rows, `
       SET n.embedding_retry_single=$single OR coalesce(n.embedding_retry_key=$model AND n.embedding_retry_single,false),
           n.embedding_retry_key=$model, n.embedding_retry_after=datetime() + duration({seconds:$seconds})`,
-    { scope, model, uids, seconds: neo4j.int(seconds), single }));
+    { seconds: neo4j.int(seconds), single });
   }
 
   async saveEmbeddings(scope, model, rows) {
-    return this.transaction('write', tx => tx.run(`UNWIND $rows AS row MATCH (n {uid:row.uid,scope:$scope})
-      WHERE n:SMChunk OR n:SMRecord SET n.embedding=row.vector, n.embedding_key=$model
-      REMOVE n.embedding_retry_key, n.embedding_retry_after, n.embedding_retry_single, n.embedding_oversized_key, n.embedding_oversized_cap, n.embedding_oversized_text`, { scope, model, rows }));
+    return this.#guardedEmbeddingWrite(scope, model, rows, `SET n.embedding=row.vector, n.embedding_key=$model
+      REMOVE n.embedding_retry_key, n.embedding_retry_after, n.embedding_retry_single, n.embedding_oversized_key, n.embedding_oversized_cap, n.embedding_oversized_text`);
+  }
+
+  /**
+   * A predicate read before a node's write lock can see a value another transaction replaces before this write lands, so the
+   * first statement only locks the selected rows (in uid order, so concurrent indexers queue rather than deadlock) and the
+   * second re-reads them under that lock. No lock is held across the model request: the request ran before this transaction.
+   * The re-read also requires the row to be still eligible (no current-key vector, no terminal marker), so a row another
+   * writer finished is refused rather than rewritten. `applied` rows therefore changed; `refused` rows no longer matched or
+   * were already done. After a driver retry a refusal may be this call's own earlier commit whose reply was lost, so it is
+   * `uncertain` rather than stale.
+   */
+  async #guardedEmbeddingWrite(scope, model, rows, apply, params = {}) {
+    if (!rows.length) return { applied: 0, refused: 0, uncertain: false };
+    requireThat(rows.length <= EMBEDDING_UNIT_MAX
+      && rows.every(row => typeof row.uid === 'string' && row.observed && typeof row.observed === 'object'), 'embedding_accounting_invalid');
+    const ordered = [...rows].sort((a, b) => (a.uid < b.uid ? -1 : a.uid > b.uid ? 1 : 0));
+    let attempts = 0;
+    const applied = await this.transaction('write', async tx => {
+      attempts += 1;
+      await tx.run(`UNWIND $rows AS row MATCH (n {uid:row.uid,scope:$scope}) WHERE n:SMChunk OR n:SMRecord
+        SET n.embedding_write_lock=true`, { scope, rows: ordered });
+      const result = await tx.run(`UNWIND $rows AS row MATCH (n {uid:row.uid,scope:$scope}) WHERE n:SMChunk OR n:SMRecord
+        REMOVE n.embedding_write_lock
+        WITH n, row WHERE ${missingVector(NODE_FIELDS)} AND NOT (n:SMChunk AND ${oversizedTerminal(NODE_FIELDS)})
+          AND ${UNCHANGED_EMBEDDING_STATE}
+        WITH n, row ${apply} RETURN count(n) AS applied`, { scope, model, cap: CHUNK_MAX_BYTES, rows: ordered, ...params });
+      return result.records[0].get('applied');
+    });
+    return { applied, refused: rows.length - applied, uncertain: attempts > 1 };
   }
 
   // The exclusion is applied before the limit, so excluded matches never take the place of eligible ones.
@@ -989,9 +1085,8 @@ export class Neo4jStore {
           count(CASE WHEN n:SMChunk THEN 1 END) AS chunks,
           count(CASE WHEN n:SMRecord THEN 1 END) AS records,
           count(CASE WHEN n:SMRelation THEN 1 END) AS relations,
-          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed,
-          count(CASE WHEN n:SMChunk AND n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text
-            AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unembeddable,
+          count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR ${missingVector(NODE_FIELDS)}) AND ${eligible('n')} THEN 1 END) AS unindexed,
+          count(CASE WHEN n:SMChunk AND ${oversizedTerminal(NODE_FIELDS)} AND ${missingVector(NODE_FIELDS)} AND ${eligible('n')} THEN 1 END) AS unembeddable,
           count(CASE WHEN n:SMLink THEN 1 END) AS links`,
         { ...sel.params, model: embeddingKey, cap: CHUNK_MAX_BYTES, exclude });
       // Links stored in the selection are counted apart from relations, and named only when there are any.

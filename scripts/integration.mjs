@@ -12,14 +12,16 @@ import { runNestedScopes } from '../test/nested-scopes.mjs';
 import { runList } from '../test/list-integration.mjs';
 import { runNamespacing } from '../test/namespacing-integration.mjs';
 import { runLinks } from '../test/links-integration.mjs';
+import { runEmbeddingRace } from '../test/embedding-race-integration.mjs';
 import { integrationResources } from './integration-resources.mjs';
 
 const exec = promisify(execFile);
-// `--suite qualification` runs only Q-SM-1…6, `--suite scopes` only the nested-scope checks and `--suite namespacing` only the
-// namespacing checks; the default runs the nested-scope, namespacing and integration checks and then the qualification.
+// `--suite qualification` runs only Q-SM-1…6, `--suite scopes` only the nested-scope checks, `--suite namespacing` only the
+// namespacing checks and `--suite embedding` only the embedding writeback race checks; the default runs the nested-scope,
+// namespacing, embedding race and integration checks and then the qualification.
 const suiteIndex = process.argv.indexOf('--suite');
 const suite = suiteIndex === -1 ? 'all' : process.argv[suiteIndex + 1];
-if (!['all', 'qualification', 'scopes', 'namespacing'].includes(suite)) throw new Error('--suite must be qualification, scopes or namespacing');
+if (!['all', 'qualification', 'scopes', 'namespacing', 'embedding'].includes(suite)) throw new Error('--suite must be qualification, scopes, namespacing or embedding');
 const runId = randomUUID();
 const name = `source-memory-test-${runId}`;
 const scratch = await mkdtemp(join(tmpdir(), 'source-memory-test-'));
@@ -80,6 +82,7 @@ try {
   // Nested scopes run first: the flat integration checks then also run beside existing root trees.
   if (['all', 'scopes'].includes(suite)) results = [...await runNestedScopes(database, scratch), ...await runList(database, scratch)];
   if (['all', 'namespacing'].includes(suite)) results = [...results, ...await runNamespacing(database, scratch), ...await runLinks(database, scratch)];
+  if (['all', 'embedding'].includes(suite)) results = [...results, ...await runEmbeddingRace(database)];
   if (suite === 'all') results = [...results, ...await runIntegration(database, scratch)];
   if (['all', 'qualification'].includes(suite)) results = [...results, ...await runQualification(database, scratch)];
 } catch (error) {

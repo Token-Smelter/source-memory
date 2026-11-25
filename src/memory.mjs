@@ -5,7 +5,7 @@ import {
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, embeddingIdentity, rerank } from './models.mjs';
 import { passthrough, scoped, tracer } from './phase-diagnostic.mjs';
-import { Neo4jStore, recordDigest, selection, TREE_SCAN_LIMIT } from './store.mjs';
+import { EMBEDDING_UNIT_MAX, Neo4jStore, recordDigest, selection, TREE_SCAN_LIMIT } from './store.mjs';
 
 const MODE_CONTRACTS = {
   evidence_advice: 'Evidence advice: prioritizes extracted claims that cite user spans; a cited user span may be a question, so this is not user assertion or authority. May return no relevant history. Omitted material may correct shown claims. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
@@ -97,29 +97,59 @@ export class Memory {
 
   async #indexPending(scope, input = {}) {
     if (!this.config.embedding) return { status: 'unconfigured', indexed: 0 };
+    // Progress counts only rows a write confirmed. A row that changed since discovery or hydration is `stale` and stays for
+    // the next selection; a refusal that may be this call's own lost-reply commit is `unknown`. Neither supports ready.
+    // Units commit one after another, so a failure in a later unit still reports what earlier units confirmed or refused;
+    // the failing operation itself contributes nothing.
+    let indexed = 0, marked = 0, stale = 0, unknown = 0;
+    const failed = reason => ({ status: 'unavailable', reason, source_retained: true, ...(indexed ? { indexed } : {}),
+      ...(stale ? { stale } : {}), ...(unknown ? { unknown } : {}) });
     try {
       const key = embeddingIdentity(this.config.embedding);
       const limit = integer(input.limit, 256, 1, 2048);
+      // Discovery carries identity and order hints only; the extra row is look-ahead for a drain claim.
       const pending = await this.store.pendingEmbeddings(scope, key, limit + 1);
       const selected = pending.slice(0, limit);
-      const oversized = selected.filter(row => !row.cooling && row.chunk && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
-      const oversizedIds = new Set(oversized.map(row => row.uid));
-      if (oversized.length) {
-        requireThat(typeof this.store.markOversizedChunks === 'function', 'embedding_accounting_invalid');
-        await this.store.markOversizedChunks(scope, key, oversized.map(({ uid, text }) => ({ uid, text })));
-      }
-      const eligible = selected.filter(row => !oversizedIds.has(row.uid));
-      let indexed = 0;
-      for (let offset = 0; offset < eligible.length;) {
-        const first = eligible[offset];
-        if (first.cooling) return { status: 'unavailable', reason: 'embedding_retry_deferred', source_retained: true, indexed, embedding_key: key };
-        const batch = [first];
+      const tally = (outcome, requested) => {
+        const { applied, refused, uncertain } = outcome ?? {};
+        requireThat(Number.isSafeInteger(applied) && applied >= 0 && applied <= requested && refused === requested - applied,
+          'embedding_accounting_invalid');
+        if (uncertain) unknown += refused; else stale += refused;
+        return applied;
+      };
+      const progress = () => ({ indexed, embedding_key: key, ...(stale ? { stale } : {}), ...(unknown ? { unknown } : {}) });
+      const sameClass = (hint, row) => ['cooling', 'isolated', 'single'].every(name => Boolean(hint[name]) === Boolean(row[name]));
+      // One work unit at a time: hydrate its exact state, decide from that observation, write, then let it go before the
+      // next unit is hydrated. At most EMBEDDING_UNIT_MAX witnesses are held, whatever the caller's limit.
+      for (let offset = 0; offset < selected.length;) {
+        const first = selected[offset];
+        const unit = [first];
         offset++;
-        const batchLimit = first.single ? 1 : first.isolated ? 4 : 16;
-        while (batch.length < batchLimit && offset < eligible.length && !eligible[offset].cooling
-            && Boolean(eligible[offset].isolated) === Boolean(first.isolated) && !eligible[offset].single) {
-          batch.push(eligible[offset++]);
+        const unitLimit = first.cooling || first.single ? 1 : first.isolated ? 4 : EMBEDDING_UNIT_MAX;
+        while (unit.length < unitLimit && offset < selected.length && !selected[offset].cooling
+            && Boolean(selected[offset].isolated) === Boolean(first.isolated) && !selected[offset].single) {
+          unit.push(selected[offset++]);
         }
+        const observed = await this.store.observeEmbeddings(scope, key, unit.map(row => row.uid));
+        requireThat(Array.isArray(observed) && observed.length <= unit.length, 'embedding_accounting_invalid');
+        const byUid = new Map(observed.map(row => [row.uid, row]));
+        // A row gone, finished or moved to another retry class since discovery is no longer in its discovered place in the
+        // order, so it is left for the next selection.
+        const current = unit.filter(hint => byUid.get(hint.uid)?.eligible === true && sameClass(hint, byUid.get(hint.uid)))
+          .map(hint => byUid.get(hint.uid));
+        stale += unit.length - current.length;
+        if (first.cooling) {
+          if (current.length) return { status: 'unavailable', reason: 'embedding_retry_deferred', source_retained: true, ...progress() };
+          continue;
+        }
+        const oversized = current.filter(row => row.chunk && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
+        if (oversized.length) {
+          requireThat(typeof this.store.markOversizedChunks === 'function', 'embedding_accounting_invalid');
+          marked += tally(await this.store.markOversizedChunks(scope, key, oversized.map(({ uid, observed }) => ({ uid, observed }))),
+            oversized.length);
+        }
+        const batch = current.filter(row => !oversized.includes(row));
+        if (!batch.length) continue;
         let vectors;
         try {
           vectors = await embed(this.config.embedding, batch.map(row => row.text));
@@ -130,28 +160,30 @@ export class Memory {
             const single = Boolean(first.isolated || batch.length === 1);
             // A request failure, even for a singleton, need not be caused by its text.
             const delay = batch.length === 1 ? 300 : 60;
-            await this.store.deferEmbeddings?.(scope, key, batch.map(row => row.uid), delay, single);
+            if (typeof this.store.deferEmbeddings === 'function') {
+              tally(await this.store.deferEmbeddings(scope, key, batch.map(({ uid, observed }) => ({ uid, observed })), delay, single), batch.length);
+            }
           }
-          return { status: 'unavailable', reason, source_retained: true, ...(indexed ? { indexed } : {}) };
+          return failed(reason);
         }
-        await this.store.saveEmbeddings(scope, key, batch.map((row, index) => ({ uid: row.uid, vector: vectors[index] })));
-        indexed += batch.length;
+        indexed += tally(await this.store.saveEmbeddings(scope, key,
+          batch.map((row, index) => ({ uid: row.uid, observed: row.observed, vector: vectors[index] }))), batch.length);
         // One retry request per invocation protects the caller's indexing budget.
         if (first.isolated) break;
       }
-      if (pending.length > indexed + oversized.length) return { status: 'pending', indexed, embedding_key: key };
+      if (stale || unknown || pending.length > indexed + marked) return { status: 'pending', ...progress() };
       if (typeof this.store.markOversizedChunks === 'function') {
         // The bounded selection cannot prove drain. Check all current-key missing vectors, including cooling rows.
         const { unindexed, unembeddable = 0 } = await this.store.status(scope, key);
         requireThat(Number.isSafeInteger(unindexed) && Number.isSafeInteger(unembeddable)
           && unembeddable >= 0 && unindexed >= unembeddable, 'embedding_accounting_invalid');
-        if (unindexed > unembeddable) return { status: 'pending', indexed, embedding_key: key };
+        if (unindexed > unembeddable) return { status: 'pending', ...progress() };
         if (unembeddable) return { status: 'unavailable', reason: 'embedding_unembeddable', source_retained: true,
-          indexed, embedding_key: key, unembeddable };
+          ...progress(), unembeddable };
       }
-      return { status: 'ready', indexed, embedding_key: key };
+      return { status: 'ready', ...progress() };
     } catch (error) {
-      return { status: 'unavailable', reason: safeCode(error), source_retained: true };
+      return failed(safeCode(error));
     }
   }
 
