@@ -10,14 +10,13 @@ import { runIntegration } from '../test/integration.mjs';
 import { runQualification } from '../test/qualification.mjs';
 import { runNestedScopes } from '../test/nested-scopes.mjs';
 import { runList } from '../test/list-integration.mjs';
+import { runEmbeddingRace } from '../test/embedding-race-integration.mjs';
 import { integrationResources } from './integration-resources.mjs';
 
 const exec = promisify(execFile);
-// `--suite qualification` runs only Q-SM-1…6 and `--suite scopes` only the nested-scope checks; the default runs the
-// integration checks, the nested-scope checks and then the qualification.
 const suiteIndex = process.argv.indexOf('--suite');
 const suite = suiteIndex === -1 ? 'all' : process.argv[suiteIndex + 1];
-if (!['all', 'qualification', 'scopes'].includes(suite)) throw new Error('--suite must be qualification or scopes');
+if (!['all', 'qualification', 'scopes', 'embedding'].includes(suite)) throw new Error('--suite must be qualification, scopes or embedding');
 const runId = randomUUID();
 const name = `source-memory-test-${runId}`;
 const scratch = await mkdtemp(join(tmpdir(), 'source-memory-test-'));
@@ -76,9 +75,10 @@ try {
   if (!ready) throw new Error('private Neo4j did not become ready');
   const database = { uri, auth: 'none', database: 'neo4j' };
   // Nested scopes run first: the flat integration checks then also run beside existing root trees.
-  if (suite !== 'qualification') results = [...await runNestedScopes(database, scratch), ...await runList(database, scratch)];
+  if (['all', 'scopes'].includes(suite)) results = [...await runNestedScopes(database, scratch), ...await runList(database, scratch)];
   if (suite === 'all') results = [...results, ...await runIntegration(database, scratch)];
-  if (suite !== 'scopes') results = [...results, ...await runQualification(database, scratch)];
+  if (['all', 'embedding'].includes(suite)) results = [...results, ...await runEmbeddingRace(database)];
+  if (['all', 'qualification'].includes(suite)) results = [...results, ...await runQualification(database, scratch)];
 } catch (error) {
   failure = { name: error.name, code: error.code ?? null, message: String(error.message).slice(0, 2000) };
   // Only this fixture's assertions/database are involved; no existing store or credentials are read.

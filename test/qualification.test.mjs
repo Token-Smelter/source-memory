@@ -35,9 +35,12 @@ function fakeStore({ pending = 0, onWrite = () => {} } = {}) {
     async ingest() { this.writes += 1; onWrite(); return { id: 'turn_fixture', replayed: false, retained: true }; },
     async enrich() { this.writes += 1; onWrite(); return { records: ['lighthouse-teal'], relations: [] }; },
     async pendingEmbeddings(_scope, _key, limit) {
-      return Array.from({ length: Math.min(pending, limit) }, (_, index) => ({ uid: `chunk_${index}`, text: `fictional ${index}` }));
+      return Array.from({ length: Math.min(pending, limit) }, (_, index) => ({ uid: `chunk_${index}`, chunk: true }));
     },
-    async saveEmbeddings() {},
+    async observeEmbeddings(_scope, _key, uids) {
+      return uids.map(uid => ({ uid, chunk: true, eligible: true, text: `fictional ${uid}`, observed: { text: `fictional ${uid}` } }));
+    },
+    async saveEmbeddings(_scope, _key, rows) { return { applied: rows.length, refused: 0, uncertain: false }; },
     async close() {},
   };
 }
@@ -229,14 +232,14 @@ test('every post-commit code is reported inside an ok:true CLI reply after the w
     ['embedding_accounting_invalid', embedding('/ok'), {
       async markOversizedChunks() { assert.fail('no oversized chunks'); },
       async status() { return { unindexed: 0, unembeddable: 1 }; },
-    }],
+    }, { indexed: 1 }],
   ];
   const exercised = new Set();
   for (const command of ['ingest', 'enrich']) {
-    for (const [code, settings, override] of cases) {
+    for (const [code, settings, override, progress] of cases) {
       const store = Object.assign(fakeStore({ pending: 1 }), override);
       const reply = await cliReply(t, command, config({ embedding: settings }), command === 'ingest' ? turn : enrichment, store);
-      assert.deepEqual([reply.ok, reply.indexing, store.writes], [true, { status: 'unavailable', reason: code, source_retained: true }, 1],
+      assert.deepEqual([reply.ok, reply.indexing, store.writes], [true, { status: 'unavailable', reason: code, source_retained: true, ...progress }, 1],
         `${command} ${code}`);
       exercised.add(code);
     }
