@@ -124,11 +124,25 @@ export async function runIntegration(database, scratch) {
       assert.deepEqual([terminal.status, terminal.reason, terminal.indexed, terminal.unembeddable],
         ['unavailable', 'embedding_unembeddable', 0, 1]);
       assert.equal(modelCalls, beforeRetry, 'terminal-only indexing sends no model request');
-      assert.equal((await fixture.recall(scope, { query: 'fictional' })).channels.chunk_vector.status, 'partial');
+      await waitForVectors(fixture, scope);
+      const plain = await fixture.recall(scope, { query: 'fictional' });
+      assert.equal(plain.channels.chunk_vector.status, 'partial');
+      assert.equal(plain.channels.chunk_vector.coverage, undefined);
+      const query = { query: 'fictional', vector_coverage: true };
+      const disclosed = await fixture.recall(scope, query, { seedsOnly: true });
+      assert.equal(disclosed.channels.chunk_vector.status, 'partial');
+      assert.equal(disclosed.channels.chunk_vector.reason, 'terminal_omission');
+      assert.deepEqual(disclosed.channels.chunk_vector.coverage, { indexed: 1, unembeddable: 1, pending: 0, total: 2 });
+      assert.deepEqual(disclosed.channels.record_vector.coverage, { indexed: 0, unembeddable: 0, pending: 0, total: 0 });
+      assert.equal((await fixture.recall(scope, query)).retrieval_complete, false);
       // A current key left behind without a vector cannot satisfy the scope census.
       await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope})
         WHERE c.turn_uid <> $legacy REMOVE c.embedding`, { scope, legacy: legacy.id }));
       assert.equal((await fixture.status(scope)).unindexed, 2);
+      const mixed = (await fixture.recall(scope, query, { seedsOnly: true })).channels.chunk_vector;
+      assert.equal(mixed.status, 'partial');
+      assert.notEqual(mixed.reason, 'terminal_omission');
+      assert.deepEqual(mixed.coverage, { indexed: 0, unembeddable: 1, pending: 1, total: 2 });
       const recovered = await fixture.index(scope);
       assert.deepEqual([recovered.reason, recovered.indexed, recovered.unembeddable], ['embedding_unembeddable', 1, 1]);
       await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope,turn_uid:$turn}) SET c.text=$text`,
@@ -136,6 +150,24 @@ export async function runIntegration(database, scratch) {
       assert.equal((await fixture.status(scope)).unembeddable, undefined, 'changed text invalidates the marker');
       assert.equal((await fixture.index(scope)).status, 'ready');
       assert.equal((await fixture.status(scope)).unindexed, 0);
+    });
+    await check('an exact nested vector scan does not let a keyed terminal gap displace a real hit', async () => {
+      const scope = 'coverage-fixture/nested';
+      const fixture = new Memory({ ...config, scopes: { read: [scope], write: [scope] }, index_on_write: false }, memory.store);
+      await fixture.init(scope);
+      const skipped = await fixture.ingest(scope, turn('nested-gap', 'A fictional old chunk.'));
+      const kept = await fixture.ingest(scope, turn('nested-vector', 'A fictional indexed chunk.'));
+      await waitForVectors(fixture, scope);
+      const key = embeddingIdentity(fixture.config.embedding);
+      await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope,turn_uid:$turn})
+        SET c.text=$text, c.embedding_key=$key`, { scope, turn: skipped.id, text: 'x'.repeat(8193), key }));
+      assert.equal((await fixture.index(scope)).reason, 'embedding_unembeddable');
+      const scan = await fixture.store.treeVectorScan(scope, 'chunk', key, [0, 1, 0], 1);
+      assert.deepEqual(scan.nodes.map(row => row.turn_uid), [kept.id]);
+      assert.equal(scan.uids.length, 1);
+      const channel = (await fixture.recall(scope, { query: 'fictional', candidates: 1, vector_coverage: true }, { seedsOnly: true })).channels.chunk_vector;
+      assert.equal(channel.reason, 'terminal_omission');
+      assert.deepEqual(channel.coverage, { indexed: 1, unembeddable: 1, pending: 0, total: 2 });
     });
     await check('failed vector batches remain pending without blocking fresh chunks in the same scope', async () => {
       const scope = 'embedding-retry-fixture';
