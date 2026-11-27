@@ -24,6 +24,26 @@ const retrievalStates = reply => Object.fromEntries(FIVE.map(name => [name, repl
 const turn = (conversation, id, text) => ({ source: 'nested-fixture', conversation_id: conversation, turn_id: id, lineage_root: true,
   entries: [{ id: `${id}-u`, role: 'user', text }] });
 
+const MANIFEST_PROPERTIES = ['chunk_policy', 'chunk_policy_digest', 'chunk_qualification', 'chunk_count', 'chunk_gap_count',
+  'chunk_manifest', 'chunk_manifest_digest', 'chunk_manifest_status'];
+
+// New first retains add a legacy-bytes/1 manifest to the turn and nothing else. Check it is there (or absent for the base
+// commit), then drop it so the remaining stored bytes compare with the base commit's.
+function withoutFirstRetainManifest(snapshot, expected) {
+  for (const node of snapshot.nodes.filter(row => row.labels.includes('SMTurn'))) {
+    if (expected) {
+      assert.equal(JSON.parse(node.properties.chunk_policy).policy, 'legacy-bytes/1');
+      assert.equal(node.properties.chunk_manifest_status, 'complete');
+      assert.equal(digest(node.properties.chunk_manifest), node.properties.chunk_manifest_digest);
+      assert.equal(JSON.parse(node.properties.chunk_manifest).chunks.length, node.properties.chunk_count);
+    } else {
+      assert.ok(MANIFEST_PROPERTIES.every(key => !(key in node.properties)), 'the base commit writes no manifest');
+    }
+    for (const key of MANIFEST_PROPERTIES) delete node.properties[key];
+  }
+  return snapshot;
+}
+
 /** An export-scope snapshot with its scope's name, labels and identities replaced by fixed tokens and `created_at` dropped. */
 function canonicalSnapshot(snapshot, scope) {
   // A record or relation hash covers its evidence turn ids, which name the scope; check it, then compare the body instead.
@@ -107,7 +127,7 @@ export async function runNestedScopes(database, scratch = null) {
             for (const scope of ['snapshot-base', 'snapshot-r1']) {
               const output = join(scratch, `${scope}.json`);
               await exportScope({ driver: upgraded.store.driver, scope, output, allowedDir: scratch });
-              snapshots.push(canonicalSnapshot(JSON.parse(await readFile(output, 'utf8')), scope));
+              snapshots.push(canonicalSnapshot(withoutFirstRetainManifest(JSON.parse(await readFile(output, 'utf8')), scope === 'snapshot-r1'), scope));
             }
             const at = [...snapshots[0]].findIndex((char, index) => char !== snapshots[1][index]);
             assert.ok(snapshots[0] === snapshots[1], `a flat scope written by r1 stores what the base commit stores; first difference: ${
