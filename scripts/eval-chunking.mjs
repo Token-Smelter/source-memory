@@ -5,6 +5,8 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { loadavg } from 'node:os';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -24,7 +26,7 @@ function options(argv) {
     const arg = argv[at];
     if (arg === '--experiment') values.flags.add('experiment');
     else if (arg === '--compare') values.compare = [argv[++at], argv[++at]];
-    else if (['--treatment', '--config', '--tokenizer', '--out'].includes(arg)) values[arg.slice(2)] = argv[++at];
+    else if (['--treatment', '--config', '--tokenizer', '--out', '--max-load5'].includes(arg)) values[arg.slice(2)] = argv[++at];
     else throw new Error(`unknown argument ${arg}`);
   }
   return values;
@@ -67,7 +69,10 @@ async function run(args) {
   const started = Date.now();
   const vectors = [];
   const texts = [...derived.chunks.map(chunk => chunk.text), ...corpus.queries.map(query => query.text)];
+  const maxLoad = Number(args['max-load5'] ?? Infinity);
   for (let offset = 0; offset < texts.length; offset += 16) {
+    // The host scheduler admits this run only below a load ceiling; wait between requests while it is exceeded.
+    while (loadavg()[1] > maxLoad) await sleep(15000);
     if (Date.now() - started > manifest.budget.max_seconds * 1000) throw new Error('budget: elapsed time exceeded; no result written');
     vectors.push(...await embed(embedding, texts.slice(offset, offset + 16)));
   }
