@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CHUNK_MAX_BYTES, chunkEntries, chunkEntriesTokenCapped, digest, normalizeTurn } from '../src/core.mjs';
@@ -173,8 +174,9 @@ test('legacy byte chunking is unchanged by the token path', () => {
 });
 
 const SERVED = { model: 'fixture', ollama_context_revision: 'fiction-rev-1' };
-const VERIFIED = sha256 => ({ [sha256]: { model: 'fixture', render: RENDER_CONTRACT, serving_revision: 'fiction-rev-1', context: 64,
-  parity_evidence_sha256: 'e'.repeat(64) } });
+const VERIFIED = (sha256, blob = `sha256:${'f'.repeat(64)}`) => ({ [sha256]: { model: 'fixture', served_blob: blob, render: RENDER_CONTRACT,
+  serving_revision: 'fiction-rev-1', context: 64, parity_evidence_sha256: 'e'.repeat(64) } });
+const blobOf = async path => `sha256:${createHash('sha256').update(await readFile(path)).digest('hex')}`;
 const served = (tokenizer, extra = {}) => ({ embedding: { ...SERVED, tokenizer, ...extra } });
 
 test('chunk policy: legacy without a tokenizer contract, refusal of a stray or invalid cap, 1920 by default', async t => {
@@ -212,7 +214,8 @@ test('a tokenizer digest verifies nothing unless the served model, rendering and
 test('no treatment is qualified until a reviewed evaluation lists its digest', () => {
   assert.deepEqual(QUALIFIED_TREATMENTS, {});
   const revision = DEFAULT_TREATMENT.serving_revision;
-  const entry = { model: 'embeddinggemma', render: RENDER_CONTRACT, serving_revision: revision, context: 2048, parity_evidence_sha256: 'e'.repeat(64) };
+  const entry = { model: 'embeddinggemma', served_blob: DEFAULT_TREATMENT.served_blob, render: RENDER_CONTRACT, serving_revision: revision,
+    context: 2048, parity_evidence_sha256: 'e'.repeat(64) };
   const verified = { [DEFAULT_TREATMENT.tokenizer_sha256]: entry };
   const embedding = { url: 'http://127.0.0.1:11434/v1/embeddings', model: 'embeddinggemma', dimensions: 768, ollama_context_revision: revision,
     tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } };
@@ -238,10 +241,13 @@ test('no treatment is qualified until a reviewed evaluation lists its digest', (
 test('an unusable tokenizer keeps the source and records a typed gap per nonblank entry', async t => {
   const path = await fixtureFile(t);
   const { sha256 } = await readGgufTokenizer(path);
+  const blob = await blobOf(path);
   const turn = turnOf('abcd abcd', '  ', 'cd');
   const cases = [
-    [{ gguf: '/nonexistent/fiction.gguf', sha256 }, VERIFIED(sha256), 'missing'],
-    [{ gguf: path, sha256: 'c'.repeat(64) }, VERIFIED('c'.repeat(64)), 'digest_mismatch'],
+    [{ gguf: '/nonexistent/fiction.gguf', sha256 }, VERIFIED(sha256, blob), 'missing'],
+    [{ gguf: path, sha256: 'c'.repeat(64) }, VERIFIED('c'.repeat(64), blob), 'digest_mismatch'],
+    // The tokenizer matches, but the file is not the verified served artifact.
+    [{ gguf: path, sha256 }, VERIFIED(sha256), 'digest_mismatch'],
     [{ gguf: path, sha256 }, {}, 'unverified'],
   ];
   for (const [tokenizer, verified, reason] of cases) {
@@ -251,7 +257,7 @@ test('an unusable tokenizer keeps the source and records a typed gap per nonblan
       { entry_id: 'e2', start: 0, end: 2, cause: 'tokenizer_unavailable', reason },
     ] }, reason);
   }
-  const ready = await deriveChunks(turn, chunkPolicy(served({ gguf: path, sha256 }, { chunk_token_cap: 21 }), VERIFIED(sha256)));
+  const ready = await deriveChunks(turn, chunkPolicy(served({ gguf: path, sha256 }, { chunk_token_cap: 21 }), VERIFIED(sha256, blob)));
   assert.deepEqual(ready.chunks.map(chunk => [chunk.entry_id, chunk.text, chunk.token_count]), [['e0', 'abcd abcd', 5], ['e2', 'cd', 3]]);
   const legacy = await deriveChunks(turn, chunkPolicy({}));
   assert.deepEqual(legacy.chunks.map(chunk => [chunk.text, chunk.token_count]), [['abcd abcd', null], ['cd', null]]);
