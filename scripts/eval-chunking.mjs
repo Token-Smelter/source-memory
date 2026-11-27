@@ -44,7 +44,8 @@ async function run(args) {
   const config = JSON.parse(await readFile(args.config, 'utf8'));
   const embedding = config.embedding;
   if (embedding?.model?.replace(/:latest$/u, '') !== manifest.embedder.model || new URL(embedding.url).pathname !== manifest.embedder.endpoint_path
-      || embedding.dimensions !== manifest.embedder.dimensions) {
+      || embedding.dimensions !== manifest.embedder.dimensions || (embedding.ollama_transport ?? 'openai_compat') !== manifest.embedder.transport
+      || embedding.allow_remote === true) {
     throw new Error('the embedding config does not match the sealed embedder');
   }
   if (basename(args.tokenizer) !== manifest.embedder.served_blob.replace(':', '-')) throw new Error('the tokenizer file is not the sealed served blob');
