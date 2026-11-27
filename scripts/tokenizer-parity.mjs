@@ -3,12 +3,15 @@
 // Each string goes alone to /api/embed with truncate:false. At or under the context the server's prompt_eval_count must equal
 // the local count; over it the server must refuse and the local count must exceed the context. A clipped count never passes.
 import { mkdir, writeFile } from 'node:fs/promises';
+import { loadavg } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { digest } from '../src/core.mjs';
 import { readGgufTokenizer, RENDER_CONTRACT, sentencePiece } from '../src/tokenizer.mjs';
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, index, all) => index % 2 ? pairs : [...pairs, [all[index].slice(2), all[index + 1]]], []));
 const CONTEXT = 2048;
+const CONTEXT_REFUSAL = 'the input length exceeds the context length';
 
 function fictionalStrings(counter) {
   const base = [
@@ -49,14 +52,20 @@ if (args['dry-run'] === 'true') {
   process.exit(0);
 }
 const rows = [];
+const maxLoad = Number(args['max-load5'] ?? Infinity);
 for (const text of strings) {
+  // The host scheduler admits this run only below a load ceiling; wait between requests while it is exceeded.
+  while (loadavg()[1] > maxLoad) await sleep(15000);
   const local = counter.count(text);
   const response = await fetch(`${args.url}/api/embed`, { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: args.model, input: text, truncate: false }), signal: AbortSignal.timeout(60000) });
   const body = await response.json().catch(() => null);
   const served = response.ok ? body?.prompt_eval_count ?? null : null;
-  const pass = local <= CONTEXT ? response.ok && served === local : response.status === 400 && local > CONTEXT;
-  rows.push({ text_sha256: digest(text), bytes: Buffer.byteLength(text), local, status: response.status, served, pass });
+  const error = response.ok ? null : typeof body?.error === 'string' ? body.error.slice(0, 200) : null;
+  // Only the server's own context refusal credits an over-context control; any other 400 (e.g. a cancelled wait) does not.
+  const pass = local <= CONTEXT ? response.ok && served === local
+    : response.status === 400 && error === CONTEXT_REFUSAL && local > CONTEXT;
+  rows.push({ text_sha256: digest(text), bytes: Buffer.byteLength(text), local, status: response.status, served, error, pass });
 }
 const report = { contract: 'source-memory.tokenizer-parity/1', render: RENDER_CONTRACT, tokenizer_sha256: spec.sha256, blob: args.blob,
   model: args.model, context: CONTEXT, at: new Date().toISOString(), strings: rows.length, failures: rows.filter(row => !row.pass).length,
