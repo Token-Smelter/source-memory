@@ -1,0 +1,31 @@
+{
+  "name": "default-v1",
+  "role": "default",
+  "reason": "The one supported chunk policy: exact rendered tokens at most 1920 and UTF-8 bytes at most 8192 per new chunk.",
+  "compare_to": "legacy-reference-v1",
+  "chunker": {
+    "policy": "token-capped/1",
+    "words": 256,
+    "overlap": 32,
+    "byte_cap": 8192,
+    "token_cap": 1920,
+    "render": "ollama-spm-raw-input/1",
+    "model": "embeddinggemma",
+    "context": 2048,
+    "tokenizer_sha256": "2e942f0ea32d8432a164585591b58632b48a78da0e2d1b0c315bb1f18725b698"
+  },
+  "embedder": {
+    "provider": "ollama",
+    "endpoint_path": "/v1/embeddings",
+    "model": "embeddinggemma",
+    "served_blob": "sha256:0800cbac9c2064dde519420e75e512a83cb360de3ad5df176185dc69652fc515",
+    "ollama_version": "0.21.0",
+    "num_ctx": 2048,
+    "context": 2048,
+    "dimensions": 768,
+    "truncation": "server truncates over-context input on this endpoint",
+    "render": "ollama-spm-raw-input/1",
+    "tokenizer_sha256": "2e942f0ea32d8432a164585591b58632b48a78da0e2d1b0c315bb1f18725b698"
+  },
+  "budget": { "max_inputs": 400, "max_seconds": 600 }
+}

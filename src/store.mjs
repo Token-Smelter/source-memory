@@ -774,6 +774,20 @@ export class Neo4jStore {
     });
   }
 
+  /**
+   * Derived-chunk gaps recorded at first retain on the selection's eligible turns. A gap is source no chunk represents; it is
+   * not a missing vector row, so it is counted apart from `unindexed` and never clears by indexing.
+   */
+  async derivedGaps(scope, exclude = []) {
+    const sel = selection(scope);
+    const match = sel.tree ? `(t:${sel.members.turn}) WHERE ${sel.where('t')} AND` : `(t:${sel.labels.turn} {scope:$scope}) WHERE`;
+    return this.transaction('read', async tx => {
+      const result = await tx.run(`MATCH ${match} t.chunk_gap_count > 0 AND (size($exclude) = 0 OR NOT ${excludedTurn('t')})
+        RETURN coalesce(sum(t.chunk_gap_count), 0) AS gaps`, { ...sel.params, exclude });
+      return result.records[0].get('gaps');
+    });
+  }
+
   async vectorCounts(scope, kind, model, exclude = []) {
     const sel = selection(scope);
     const match = sel.tree ? `(node:${sel.members[kind]}) WHERE ${sel.where('node')} AND` : `(node:${sel.labels[kind]} {scope:$scope}) WHERE`;
