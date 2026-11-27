@@ -25,6 +25,18 @@ async function immutableRead(reads, scope, kind, id, load) {
   return structuredClone(snapshot);
 }
 
+// The policy new turns are chunked under. Reported only when a token contract is configured, so a legacy status is unchanged.
+function configuredChunking(config, verified) {
+  if (config.embedding?.tokenizer === undefined && config.embedding?.chunk_token_cap === undefined) return {};
+  try {
+    const policy = chunkPolicy(config, verified);
+    return { chunking: { policy: policy.descriptor, policy_digest: policy.digest, qualification: policy.qualification,
+      tokenizer_verified: policy.descriptor.context !== null } };
+  } catch (error) {
+    return { chunking: { error: safeCode(error) } };
+  }
+}
+
 export class Memory {
   constructor(config, store = null) {
     this.config = config;
@@ -50,8 +62,7 @@ export class Memory {
       return { turn: normalizeTurn(input), policy: chunkPolicy(this.config, this.verifiedTokenizers) };
     });
     // The store derives chunks only on a first retain, so a replay keeps its first layout and never needs the tokenizer.
-    const verified = this.verifiedTokenizers;
-    const result = await this.store.ingest(scope, turn, () => deriveChunks(turn, policy, verified), policy);
+    const result = await this.store.ingest(scope, turn, () => deriveChunks(turn, policy), policy);
     return { ...result, indexing: await this.indexAfterWrite(scope) };
   }
 
@@ -140,8 +151,12 @@ export class Memory {
         requireThat(Number.isSafeInteger(unindexed) && Number.isSafeInteger(unembeddable)
           && unembeddable >= 0 && unindexed >= unembeddable, 'embedding_accounting_invalid');
         if (unindexed > unembeddable) return { status: 'pending', indexed, embedding_key: key };
+        // Source a first retain could not chunk has no row to index, so it never clears here and is never ready.
+        const gaps = typeof this.store.derivedGaps === 'function' ? await this.store.derivedGaps(scope) : 0;
+        requireThat(Number.isSafeInteger(gaps) && gaps >= 0, 'embedding_accounting_invalid');
         if (unembeddable) return { status: 'unavailable', reason: 'embedding_unembeddable', source_retained: true,
-          indexed, embedding_key: key, unembeddable };
+          indexed, embedding_key: key, unembeddable, ...(gaps ? { derived_gaps: gaps } : {}) };
+        if (gaps) return { status: 'unavailable', reason: 'derived_chunk_gaps', source_retained: true, indexed, embedding_key: key, derived_gaps: gaps };
       }
       return { status: 'ready', indexed, embedding_key: key };
     } catch (error) {
@@ -158,7 +173,9 @@ export class Memory {
     const tree = !selection(target).tree ? {} : { scope_tree: { pending: await this.store.treePending(target), indexes: await this.store.treeIndexStates(target) },
       ...(await this.store.legacyFlatIndex(target) ? { legacy_flat_index: true } : {}) };
     const context = embeddingContextContract(this.config.embedding);
+    const gaps = typeof this.store.derivedGaps === 'function' ? await this.store.derivedGaps(target) : 0;
     return { scope, ...(await this.store.status(target, key, ...(context ? [[], context] : []))), ...tree,
+      ...(gaps ? { derived_gaps: gaps } : {}), ...configuredChunking(this.config, this.verifiedTokenizers),
       // A changed database_id is another store, a changed record_contract another record contract: each needs a new binding.
       store: { ...(await this.store.identity()), record_contract: RECORD_CONTRACT },
       embedding: key ? { configured: true, model: this.config.embedding.model, key } : { configured: false },
@@ -497,8 +514,10 @@ export class Memory {
               result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, data.scanned, candidates, perConversation, exclude)
                 : { hits: vectorHits(kind, data.ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates), sel.subtree) };
             }
-            const state = { status: result.partial || scan_truncated || unindexed > 0 ? 'partial' : 'ready',
-              scan_truncated, unindexed, embedding_key: key,
+            // Chunk vectors cannot cover source a first retain recorded as a derived gap.
+            const gaps = kind === 'chunk' && typeof this.store.derivedGaps === 'function' ? await this.store.derivedGaps(target, exclude) : 0;
+            const state = { status: result.partial || scan_truncated || unindexed > 0 || gaps > 0 ? 'partial' : 'ready',
+              scan_truncated, unindexed, embedding_key: key, ...(gaps ? { derived_gaps: gaps } : {}),
               ...(result.reason ? { reason: result.reason } : {}),
               ...(grouped && result.ran !== false ? { admitted_conversations: result.admitted_conversations, exhausted: result.exhausted } : {}) };
             return { hits: result.hits, omitted: result.omitted ?? [], state };
