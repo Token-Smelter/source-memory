@@ -1,9 +1,10 @@
 import neo4j from 'neo4j-driver';
 import { passthrough } from './phase-diagnostic.mjs';
 import {
-  CHUNK_MAX_BYTES, digest, identity, indexNames, integer, isNested, markStage, MemoryError, namespace, OUTCOME_REFERENT_KINDS, requireThat, scopePath, scopeTerm,
+  canonical, CHUNK_MAX_BYTES, digest, identity, indexNames, integer, isNested, markStage, MemoryError, namespace, OUTCOME_REFERENT_KINDS, requireThat, scopePath, scopeTerm,
   scopeTerms, sourceExcerpt, lexicalQuery, treeLayout,
 } from './core.mjs';
+import { chunkManifest, TOKEN_POLICY } from './chunk-policy.mjs';
 
 const unwrap = node => node?.properties ?? null;
 const decodeTurn = props => props ? { id: props.uid, scope: props.scope, ...JSON.parse(props.body) } : null;
@@ -240,7 +241,11 @@ export class Neo4jStore {
     });
   }
 
-  async ingest(scope, turn, chunks) {
+  /**
+   * `derivation` is the legacy chunk array, or a function returning `{chunks, gaps}` that runs only on a first retain, inside
+   * the write transaction. With `policy`, the turn also stores its policy and first-retain manifest in that transaction.
+   */
+  async ingest(scope, turn, derivation, policy = null) {
     const uid = identity('turn', scope, turn.source, turn.conversation_id, turn.turn_id);
     // Lineage places a turn; it is not its content. A retry that now names a parent replays the turn first stored without one,
     // and the first stored placement stays (no backfill). Hashes written before this rule covered the whole envelope.
@@ -264,13 +269,35 @@ export class Neo4jStore {
       const existing = await tx.run('MATCH (t:SMTurn {uid:$uid}) RETURN t.chunked AS chunked', { uid });
       const replayed = existing.records[0].get('chunked') === true;
       if (!replayed) {
-        const rows = chunks.map(chunk => ({ ...chunk, uid: identity('chunk', scope, uid, chunk.ordinal), turn_uid: uid, scope,
-          ...(chunkLabels.terms === null ? {} : { scope_terms: chunkLabels.terms }) }));
+        // A transaction retry calls the derivation again; it is pure, so every attempt writes the same layout.
+        const derived = typeof derivation === 'function' ? await derivation() : { chunks: derivation, gaps: [] };
+        const tokenPolicy = policy?.descriptor.policy === TOKEN_POLICY;
+        const rows = derived.chunks.map(({ token_count: tokens, ...chunk }) => ({ ...chunk, uid: identity('chunk', scope, uid, chunk.ordinal), turn_uid: uid, scope,
+          ...(chunkLabels.terms === null ? {} : { scope_terms: chunkLabels.terms }),
+          ...(tokenPolicy ? { token_count: tokens, chunk_token_cap: policy.descriptor.token_cap,
+            tokenizer_sha256: policy.descriptor.tokenizer_sha256, chunk_qualification: policy.qualification } : {}) }));
         await tx.run(`MATCH (t:SMTurn {uid:$uid}) UNWIND $rows AS row
           CREATE (c:SMChunk:${chunkLabels.labels}) SET c = row CREATE (t)-[:SM_HAS_CHUNK]->(c)`, { uid, rows });
-        await tx.run('MATCH (t:SMTurn {uid:$uid}) SET t.chunked=true', { uid });
+        if (policy) {
+          const manifest = chunkManifest({ scope, turnUid: uid, turnHash: result.records[0].get('hash'), turn, policy,
+            chunks: rows.map((row, index) => ({ ...row, token_count: derived.chunks[index].token_count })), gaps: derived.gaps });
+          await tx.run(`MATCH (t:SMTurn {uid:$uid}) SET t.chunked=true, t.chunk_policy=$policy, t.chunk_policy_digest=$policyDigest,
+            t.chunk_qualification=$qualification, t.chunk_count=$chunks, t.chunk_gap_count=$gaps, t.chunk_manifest=$manifest,
+            t.chunk_manifest_digest=$manifestDigest, t.chunk_manifest_status=$status`, {
+            uid, policy: canonical(policy.descriptor), policyDigest: policy.digest, qualification: policy.qualification,
+            chunks: neo4j.int(rows.length), gaps: neo4j.int(derived.gaps.length), manifest: manifest?.body ?? null,
+            manifestDigest: manifest?.digest ?? null, status: manifest ? 'complete' : 'over_bound' });
+        } else {
+          await tx.run('MATCH (t:SMTurn {uid:$uid}) SET t.chunked=true', { uid });
+        }
       }
-      return { id: uid, replayed, retained: true };
+      // Report the layout first retained under a token policy; a legacy layout keeps the original reply.
+      const stored = (await tx.run(`MATCH (t:SMTurn {uid:$uid}) RETURN t.chunk_policy AS policy, t.chunk_policy_digest AS digest,
+        t.chunk_qualification AS qualification, t.chunk_count AS chunks, t.chunk_gap_count AS gaps`, { uid })).records[0];
+      const storedPolicy = stored.get('policy');
+      if (storedPolicy === null || JSON.parse(storedPolicy).policy !== TOKEN_POLICY) return { id: uid, replayed, retained: true };
+      return { id: uid, replayed, retained: true, chunking: { policy_digest: stored.get('digest'), qualification: stored.get('qualification'),
+        chunks: stored.get('chunks'), gaps: stored.get('gaps') } };
     });
   }
 

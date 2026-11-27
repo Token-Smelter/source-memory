@@ -84,6 +84,8 @@ export async function runQualification(database, scratch) {
     remote: await file({ ...base, neo4j: { ...database, uri: 'bolt://db.example.invalid:7687' } }),
     noPassword: await file({ ...base, neo4j: { ...database, auth: 'basic', password_env: 'SOURCE_MEMORY_QUALIFICATION_UNSET' } }),
     nullConfig: await file('null', true),
+    capWithoutTokenizer: await file({ ...base, embedding: { url: modelUrl('/down'), model: 'fixture', dimensions: 2, chunk_token_cap: 1920 } }),
+    badTokenizer: await file({ ...base, embedding: { url: modelUrl('/down'), model: 'fixture', dimensions: 2, tokenizer: { gguf: 'relative.gguf', sha256: 'x' } } }),
   };
 
   // Spawns one CLI process; `whileRunning` may kill it. reply is the stdout success line or the stderr failure line.
@@ -195,6 +197,8 @@ export async function runQualification(database, scratch) {
         { code: 'invalid_timestamp', command: 'ingest', input: { ...fixtureTurn(), turn_id: 't2', occurred_at: 'the day after the storm' } },
         { code: 'source_too_large', command: 'ingest', input: { ...fixtureTurn(), turn_id: 't2',
           entries: [{ id: 'a', role: 'user', text: 'a'.repeat(1_000_001) }, { id: 'b', role: 'user', text: 'b'.repeat(1_000_001) }] } },
+        { code: 'invalid_chunk_token_cap', command: 'ingest', config: 'capWithoutTokenizer', input: { ...fixtureTurn(), turn_id: 't2' } },
+        { code: 'invalid_chunk_tokenizer', command: 'ingest', config: 'badTokenizer', input: { ...fixtureTurn(), turn_id: 't2' } },
         { code: 'enrichment_too_large', command: 'enrich', input: { records: Array.from({ length: 129 }, (_, i) => record(`many-${i}`, turn)), relations: [] } },
         enrich('duplicate_record', [record('twice', turn), record('twice', turn)]),
         enrich('invalid_kind', [record('rumour', turn, { kind: 'rumour' })]),

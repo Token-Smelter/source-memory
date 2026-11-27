@@ -106,6 +106,8 @@ Classes, for `ingest` and `enrich`:
 | `invalid_role` | pre-commit-only | `normalizeTurn` |
 | `invalid_timestamp` | pre-commit-only | `normalizeTurn` |
 | `source_too_large` | pre-commit-only | `normalizeTurn` |
+| `invalid_chunk_token_cap` | pre-commit-only | `chunkPolicy` in `ingest`: a cap without `embedding.tokenizer`, or a cap that is not an integer from 1 to the verified context |
+| `invalid_chunk_tokenizer` | pre-commit-only | `chunkPolicy` in `ingest`: `embedding.tokenizer` is not `{gguf: absolute path, sha256: 64 hex}` |
 | `enrichment_too_large` | pre-commit-only | `normalizeEnrichment` |
 | `duplicate_record` | pre-commit-only | `normalizeEnrichment` |
 | `invalid_kind` | pre-commit-only | `normalizeEnrichment` |
