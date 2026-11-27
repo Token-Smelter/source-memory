@@ -210,11 +210,18 @@ test('a tokenizer digest verifies nothing unless the served model, rendering and
 
 test('no treatment is qualified until a reviewed evaluation lists its digest', () => {
   assert.deepEqual(QUALIFIED_TREATMENTS, []);
-  const policy = chunkPolicy({ embedding: { model: 'embeddinggemma', ollama_context_revision: 'r',
-    tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } } },
-  { [DEFAULT_TREATMENT.tokenizer_sha256]: { model: 'embeddinggemma', render: RENDER_CONTRACT, serving_revision: 'r', context: 2048 } });
+  const revision = DEFAULT_TREATMENT.serving_revision;
+  const entry = { model: 'embeddinggemma', render: RENDER_CONTRACT, serving_revision: revision, context: 2048 };
+  const policy = chunkPolicy({ embedding: { model: 'embeddinggemma', ollama_context_revision: revision,
+    tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } } }, { [DEFAULT_TREATMENT.tokenizer_sha256]: entry });
   assert.deepEqual(policy.descriptor, DEFAULT_TREATMENT);
   assert.equal(policy.qualification, 'unqualified');
+  // Another separately verified serving revision of the same tokenizer is another treatment, never sharing a qualification.
+  const other = chunkPolicy({ embedding: { model: 'embeddinggemma', ollama_context_revision: 'other-rev',
+    tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } } },
+  { [DEFAULT_TREATMENT.tokenizer_sha256]: { ...entry, serving_revision: 'other-rev' } });
+  assert.equal(other.descriptor.context, 2048);
+  assert.notEqual(other.digest, policy.digest);
 });
 
 test('an unusable tokenizer keeps the source and records a typed gap per nonblank entry', async t => {
