@@ -22,7 +22,7 @@ export function validateManifest(manifest) {
   if (!budget || !Number.isSafeInteger(budget.max_inputs) || budget.max_inputs < 1 || !Number.isSafeInteger(budget.max_seconds) || budget.max_seconds < 1) fail('budget');
   if (manifest.role === 'default' && canonical(chunker) !== canonical(DEFAULT_TREATMENT)) fail('the default row must be exactly DEFAULT_TREATMENT');
   if (manifest.role === 'reference' && chunker.policy !== LEGACY_POLICY) fail('the reference row is the legacy byte policy');
-  if (chunker.policy === TOKEN_POLICY && ['tokenizer_sha256', 'context', 'model', 'endpoint_path', 'transport', 'dimensions', 'provider']
+  if (chunker.policy === TOKEN_POLICY && ['tokenizer_sha256', 'served_blob', 'context', 'model', 'endpoint_path', 'transport', 'dimensions', 'provider']
     .some(key => chunker[key] !== embedder[key])) {
     fail('a token policy must name exactly the evaluated embedder deployment');
   }

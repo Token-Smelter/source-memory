@@ -1,5 +1,7 @@
 import { canonical, CHUNK_MAX_BYTES, chunkEntries, chunkEntriesTokenCapped, CHUNK_DERIVATION_MAX, digest, integer, requireThat }
   from './core.mjs';
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import { readGgufTokenizer, RENDER_CONTRACT, sentencePiece, TokenizerError } from './tokenizer.mjs';
 
 export const LEGACY_POLICY = 'legacy-bytes/1';
@@ -10,8 +12,9 @@ export const GAP_CAUSES = ['unsplittable_unit', 'tokenizer_unavailable', 'deriva
 
 // Tokenizer digests whose local counts were shown equal to the served rendering by a parity qualification, each bound to the
 // served model, rendering contract, owner serving revision and verified effective context it was qualified with, and the
-// parity report that showed it: { [sha256]: { model, render, serving_revision, context, parity_evidence_sha256 } }. Only a
-// reviewed qualification adds an entry.
+// parity report that showed it: { [sha256]: { model, served_blob: 'sha256:<hex>', render, serving_revision, context,
+// parity_evidence_sha256 } }. The configured GGUF must hash to served_blob before it is used. Only a reviewed qualification
+// adds an entry.
 export const VERIFIED_TOKENIZERS = Object.freeze({});
 
 const HEX64 = /^[0-9a-f]{64}$/u;
@@ -23,7 +26,8 @@ export function verifiedContract(verified, sha256, embedding) {
   const entry = Object.hasOwn(verified, sha256) ? verified[sha256] : null;
   return entry && entry.model === normalizedModel(embedding) && entry.render === RENDER_CONTRACT
     && typeof entry.serving_revision === 'string' && entry.serving_revision === embedding?.ollama_context_revision
-    && Number.isSafeInteger(entry.context) && entry.context > 0 && HEX64.test(entry.parity_evidence_sha256 ?? '') ? entry : null;
+    && Number.isSafeInteger(entry.context) && entry.context > 0 && HEX64.test(entry.parity_evidence_sha256 ?? '')
+    && /^sha256:[0-9a-f]{64}$/u.test(entry.served_blob ?? '') ? entry : null;
 }
 
 // The one supported treatment. A policy is qualified only if its descriptor digest is listed in QUALIFIED_TREATMENTS, which
@@ -35,6 +39,7 @@ export const DEFAULT_TREATMENT = Object.freeze({
   policy: TOKEN_POLICY, words: 256, overlap: 32, byte_cap: CHUNK_MAX_BYTES, token_cap: DEFAULT_CHUNK_TOKEN_CAP,
   render: RENDER_CONTRACT, model: 'embeddinggemma', context: 2048, serving_revision: DEFAULT_SERVING_REVISION,
   tokenizer_sha256: '2e942f0ea32d8432a164585591b58632b48a78da0e2d1b0c315bb1f18725b698',
+  served_blob: 'sha256:0800cbac9c2064dde519420e75e512a83cb360de3ad5df176185dc69652fc515',
   provider: 'ollama', endpoint_path: '/v1/embeddings', transport: 'openai_compat', dimensions: 768,
 });
 // Policy digest → the evaluation that qualified exactly that descriptor: { manifest_digest, eval_version, evidence_sha256 }.
@@ -75,7 +80,7 @@ export function chunkPolicy(config, verified = VERIFIED_TOKENIZERS) {
   requireThat(Number.isSafeInteger(cap) && cap >= 1 && cap <= (context ?? Number.MAX_SAFE_INTEGER), 'invalid_chunk_token_cap');
   const descriptor = { policy: TOKEN_POLICY, words, overlap, byte_cap: CHUNK_MAX_BYTES, token_cap: cap, render: RENDER_CONTRACT,
     model: normalizedModel(embedding), context, serving_revision: verifiedEntry?.serving_revision ?? null,
-    tokenizer_sha256: contract.sha256, ...deployment(embedding) };
+    tokenizer_sha256: contract.sha256, served_blob: verifiedEntry?.served_blob ?? null, ...deployment(embedding) };
   const policyDigest = digest(descriptor);
   // An unverified contract can never be qualified, whatever its digest.
   const qualified = context !== null && qualifiedBy(policyDigest) !== null;
@@ -85,21 +90,29 @@ export function chunkPolicy(config, verified = VERIFIED_TOKENIZERS) {
 
 const loaded = new Map();
 
+async function fileSha256(path) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return `sha256:${hash.digest('hex')}`;
+}
+
 // A verified counter for the policy, or the reason it cannot be had. Only successful loads are cached.
 async function counterFor(policy) {
+  // chunkPolicy took the context from a matching verified contract; without one it is null.
+  if (policy.descriptor.context === null) return { reason: 'unverified' };
   const { path, sha256 } = policy.tokenizer;
-  const key = `${sha256}\0${path}`;
+  const key = `${sha256}\0${policy.descriptor.served_blob}\0${path}`;
   if (!loaded.has(key)) {
     let spec;
     try { spec = await readGgufTokenizer(path); } catch (error) {
       return { reason: error instanceof TokenizerError ? error.reason : 'invalid' };
     }
     if (spec.sha256 !== sha256) return { reason: 'digest_mismatch' };
+    // The whole file must be the served artifact the contract was verified on, not merely carry its tokenizer or name.
+    try { if (await fileSha256(path) !== policy.descriptor.served_blob) return { reason: 'digest_mismatch' }; } catch { return { reason: 'missing' }; }
     try { loaded.set(key, sentencePiece(spec)); } catch { return { reason: 'invalid' }; }
   }
   const counter = loaded.get(key);
-  // chunkPolicy took the context from a matching verified contract; without one it is null.
-  if (policy.descriptor.context === null) return { reason: 'unverified' };
   if (counter.context_length !== null && policy.descriptor.token_cap > counter.context_length) return { reason: 'context_exceeded' };
   return { counter, context: policy.descriptor.context };
 }
