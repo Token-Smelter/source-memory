@@ -34,12 +34,17 @@ RETURN count(*) AS records_total, count(CASE WHEN ${missing} THEN 1 END) AS miss
   count(CASE WHEN n.embedding IS NULL AND n.embedding_key=$key THEN 1 END) AS same_key_missing_records`;
 export const CENSUS_TIMEOUT_MS = 15000;
 
-async function counts(tx, statement, params) {
+const chunkColumns = ['chunks_total', 'chunks_indexed', 'chunks_unindexed', 'terminal_byte', 'terminal_context',
+  'retry_marked', 'cooling', 'other', 'same_key_missing_chunks', 'turns_affected', 'missing_chunk_turn_binding'];
+const recordColumns = ['records_total', 'missing_record_vectors', 'same_key_missing_records'];
+
+async function counts(tx, statement, params, columns) {
   const result = await tx.run(statement, params);
   requireThat(result.records.length === 1 && result.summary.notifications.length === 0
     && !result.summary.counters.containsUpdates(), 'census_unverified');
   const row = result.records[0].toObject();
-  requireThat(Object.values(row).every(value => Number.isSafeInteger(value) && value >= 0), 'census_unverified');
+  requireThat(Object.keys(row).length === columns.length && columns.every(name => Object.hasOwn(row, name)
+    && Number.isSafeInteger(row[name]) && row[name] >= 0), 'census_unverified');
   return row;
 }
 
@@ -76,10 +81,16 @@ export async function indexCensus(config, scope, suppliedStore) {
       const tx = session.beginTransaction({ timeout: CENSUS_TIMEOUT_MS });
       try {
         const params = { scope, key, context, limit: neo4j.int(CENSUS_CAP + 1) };
-        const chunks = await counts(tx, chunk, params);
+        const chunks = await counts(tx, chunk, params, chunkColumns);
         requireThat(chunks.chunks_total <= CENSUS_CAP, 'census_over_bound');
-        const records = await counts(tx, record, { ...params, limit: neo4j.int(CENSUS_CAP - chunks.chunks_total + 1) });
+        requireThat(chunks.chunks_indexed + chunks.chunks_unindexed === chunks.chunks_total
+          && chunks.terminal_byte + chunks.terminal_context + chunks.retry_marked + chunks.other === chunks.chunks_unindexed
+          && chunks.cooling <= chunks.retry_marked && chunks.same_key_missing_chunks <= chunks.chunks_unindexed
+          && chunks.turns_affected + chunks.missing_chunk_turn_binding <= chunks.chunks_unindexed, 'census_unverified');
+        const records = await counts(tx, record, { ...params, limit: neo4j.int(CENSUS_CAP - chunks.chunks_total + 1) }, recordColumns);
         requireThat(chunks.chunks_total + records.records_total <= CENSUS_CAP, 'census_over_bound');
+        requireThat(records.same_key_missing_records <= records.missing_record_vectors
+          && records.missing_record_vectors <= records.records_total, 'census_unverified');
         const health = await indexHealth(tx, scope, config.embedding.dimensions);
         await tx.commit();
         return { ...chunks, ...records, ...health };

@@ -15,7 +15,7 @@ try {
     parts.push(chunk);
   }
   const config = JSON.parse(Buffer.concat(parts).toString('utf8'));
-  process.stderr.write('Read-only; bounded by a 15 s server transaction timeout, not a proven plan; may load the database for up to that long.\n');
+  process.stderr.write('Read-only; configured 15 s server transaction timeout, not a proven plan or hard wall-clock cutoff. Run at a quiet moment; the query may load the database while it runs.\n');
   const result = await indexCensus(config, scope);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 } catch (error) {
