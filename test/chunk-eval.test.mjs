@@ -94,6 +94,16 @@ test('scoring separates a hit on the stored chunk from evidence that the embedde
   assert.throws(() => compareRuns(reference, { ...candidate, corpus_digest: 'other' }), /cannot be compared/);
 });
 
+test('a gold span counts as fully represented only when one fully embedded chunk contains all of it', () => {
+  const corpus = { queries: [{ id: 'q', subset: 'dense', gold: { turn: 't', entry_id: 'e', start: 10, end: 20 } }] };
+  const counter = { count: text => text.length };
+  const score = chunks => scoreRun({ corpus, derived: { chunks, gaps: [] }, rankings: [[0]], context: 100, counter }).per_query[0];
+  const chunk = (start, end) => ({ turn: 't', entry_id: 'e', start, end, text: 'x'.repeat(end - start), tokens: end - start });
+  assert.equal(score([chunk(0, 11), chunk(19, 30)]).gold_fully_represented, false, 'two partial overlaps');
+  assert.equal(score([chunk(0, 20)]).gold_fully_represented, true);
+  assert.equal(score([chunk(0, 11)]).gold_covered, true);
+});
+
 test('ranking is exact cosine with a deterministic index tie-break', () => {
   assert.deepEqual(rank([[1, 0]], [[0, 1], [1, 0], [2, 0], [1, 1]], 3), [[1, 2, 3]]);
 });

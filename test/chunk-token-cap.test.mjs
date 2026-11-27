@@ -173,7 +173,8 @@ test('legacy byte chunking is unchanged by the token path', () => {
 });
 
 const SERVED = { model: 'fixture', ollama_context_revision: 'fiction-rev-1' };
-const VERIFIED = sha256 => ({ [sha256]: { model: 'fixture', render: RENDER_CONTRACT, serving_revision: 'fiction-rev-1', context: 64 } });
+const VERIFIED = sha256 => ({ [sha256]: { model: 'fixture', render: RENDER_CONTRACT, serving_revision: 'fiction-rev-1', context: 64,
+  parity_evidence_sha256: 'e'.repeat(64) } });
 const served = (tokenizer, extra = {}) => ({ embedding: { ...SERVED, tokenizer, ...extra } });
 
 test('chunk policy: legacy without a tokenizer contract, refusal of a stray or invalid cap, 1920 by default', async t => {
@@ -209,19 +210,29 @@ test('a tokenizer digest verifies nothing unless the served model, rendering and
 });
 
 test('no treatment is qualified until a reviewed evaluation lists its digest', () => {
-  assert.deepEqual(QUALIFIED_TREATMENTS, []);
+  assert.deepEqual(QUALIFIED_TREATMENTS, {});
   const revision = DEFAULT_TREATMENT.serving_revision;
-  const entry = { model: 'embeddinggemma', render: RENDER_CONTRACT, serving_revision: revision, context: 2048 };
-  const policy = chunkPolicy({ embedding: { model: 'embeddinggemma', ollama_context_revision: revision,
-    tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } } }, { [DEFAULT_TREATMENT.tokenizer_sha256]: entry });
+  const entry = { model: 'embeddinggemma', render: RENDER_CONTRACT, serving_revision: revision, context: 2048, parity_evidence_sha256: 'e'.repeat(64) };
+  const verified = { [DEFAULT_TREATMENT.tokenizer_sha256]: entry };
+  const embedding = { url: 'http://127.0.0.1:11434/v1/embeddings', model: 'embeddinggemma', dimensions: 768, ollama_context_revision: revision,
+    tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } };
+  const policy = chunkPolicy({ embedding }, verified);
   assert.deepEqual(policy.descriptor, DEFAULT_TREATMENT);
   assert.equal(policy.qualification, 'unqualified');
-  // Another separately verified serving revision of the same tokenizer is another treatment, never sharing a qualification.
-  const other = chunkPolicy({ embedding: { model: 'embeddinggemma', ollama_context_revision: 'other-rev',
-    tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } } },
-  { [DEFAULT_TREATMENT.tokenizer_sha256]: { ...entry, serving_revision: 'other-rev' } });
-  assert.equal(other.descriptor.context, 2048);
-  assert.notEqual(other.digest, policy.digest);
+  // Another serving revision, endpoint, transport or vector shape is another treatment, never sharing a qualification.
+  const variants = [
+    [{ ...embedding, ollama_context_revision: 'other-rev' }, { [DEFAULT_TREATMENT.tokenizer_sha256]: { ...entry, serving_revision: 'other-rev' } }],
+    [{ ...embedding, url: 'http://127.0.0.1:11434/api/embed' }, verified],
+    [{ ...embedding, ollama_transport: 'native_no_truncate' }, verified],
+    [{ ...embedding, dimensions: 256 }, verified],
+  ];
+  for (const [variant, trusted] of variants) {
+    const other = chunkPolicy({ embedding: variant }, trusted);
+    assert.equal(other.descriptor.context, 2048);
+    assert.notEqual(other.digest, policy.digest, JSON.stringify(variant));
+  }
+  assert.equal(chunkPolicy({ embedding }, { [DEFAULT_TREATMENT.tokenizer_sha256]: { ...entry, parity_evidence_sha256: undefined } })
+    .descriptor.context, null, 'a verified entry names its parity evidence');
 });
 
 test('an unusable tokenizer keeps the source and records a typed gap per nonblank entry', async t => {
