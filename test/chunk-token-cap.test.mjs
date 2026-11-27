@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CHUNK_MAX_BYTES, chunkEntries, chunkEntriesTokenCapped, digest, normalizeTurn } from '../src/core.mjs';
-import { readGgufTokenizer, sentencePiece, TokenizerError } from '../src/tokenizer.mjs';
+import { readGgufTokenizer, RENDER_CONTRACT, sentencePiece, TokenizerError } from '../src/tokenizer.mjs';
 import {
   chunkManifest, chunkPolicy, DEFAULT_TREATMENT, deriveChunks, LEGACY_POLICY, MANIFEST_CONTRACT, QUALIFIED_TREATMENTS, TOKEN_POLICY,
 } from '../src/chunk-policy.mjs';
@@ -172,7 +172,9 @@ test('legacy byte chunking is unchanged by the token path', () => {
     [[0, 0, 8192], [1, 8192, 9005], [2, 0, 39], [3, 28, 48]]);
 });
 
-const VERIFIED = sha256 => ({ [sha256]: { model: 'fixture', context: 64 } });
+const SERVED = { model: 'fixture', ollama_context_revision: 'fiction-rev-1' };
+const VERIFIED = sha256 => ({ [sha256]: { model: 'fixture', render: RENDER_CONTRACT, serving_revision: 'fiction-rev-1', context: 64 } });
+const served = (tokenizer, extra = {}) => ({ embedding: { ...SERVED, tokenizer, ...extra } });
 
 test('chunk policy: legacy without a tokenizer contract, refusal of a stray or invalid cap, 1920 by default', async t => {
   assert.deepEqual(chunkPolicy({}).descriptor, { policy: LEGACY_POLICY, words: 256, overlap: 32, byte_cap: CHUNK_MAX_BYTES });
@@ -188,16 +190,29 @@ test('chunk policy: legacy without a tokenizer contract, refusal of a stray or i
   assert.equal(configured.descriptor.model, 'embeddinggemma');
   assert.equal(configured.qualification, 'unqualified');
   for (const cap of [0, -1, 1.5, '1920', 65]) {
-    assert.throws(() => chunkPolicy({ embedding: { chunk_token_cap: cap, tokenizer: { gguf: '/f', sha256 } } }, VERIFIED(sha256)),
+    assert.throws(() => chunkPolicy(served({ gguf: '/f', sha256 }, { chunk_token_cap: cap }), VERIFIED(sha256)),
       { code: 'invalid_chunk_token_cap' }, String(cap));
   }
-  assert.equal(chunkPolicy({ embedding: { chunk_token_cap: 64, tokenizer: { gguf: '/f', sha256 } } }, VERIFIED(sha256)).descriptor.context, 64);
+  assert.equal(chunkPolicy(served({ gguf: '/f', sha256 }, { chunk_token_cap: 64 }), VERIFIED(sha256)).descriptor.context, 64);
+});
+
+test('a tokenizer digest verifies nothing unless the served model, rendering and serving revision also match', () => {
+  const sha256 = 'b'.repeat(64);
+  const entry = VERIFIED(sha256)[sha256];
+  const context = (verified, extra) => chunkPolicy(served({ gguf: '/f', sha256 }, { chunk_token_cap: 16, ...extra }), verified).descriptor.context;
+  assert.equal(context(VERIFIED(sha256)), 64);
+  assert.equal(context({ [sha256]: { context: 64 } }), null, 'digest and context alone');
+  assert.equal(context({ [sha256]: { ...entry, render: 'other/1' } }), null);
+  assert.equal(context(VERIFIED(sha256), { model: 'other' }), null);
+  assert.equal(context(VERIFIED(sha256), { ollama_context_revision: 'fiction-rev-2' }), null);
+  assert.equal(context(VERIFIED(sha256), { ollama_context_revision: undefined }), null);
 });
 
 test('no treatment is qualified until a reviewed evaluation lists its digest', () => {
   assert.deepEqual(QUALIFIED_TREATMENTS, []);
-  const policy = chunkPolicy({ embedding: { model: 'embeddinggemma', tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } } },
-    { [DEFAULT_TREATMENT.tokenizer_sha256]: { context: 2048 } });
+  const policy = chunkPolicy({ embedding: { model: 'embeddinggemma', ollama_context_revision: 'r',
+    tokenizer: { gguf: '/f', sha256: DEFAULT_TREATMENT.tokenizer_sha256 } } },
+  { [DEFAULT_TREATMENT.tokenizer_sha256]: { model: 'embeddinggemma', render: RENDER_CONTRACT, serving_revision: 'r', context: 2048 } });
   assert.deepEqual(policy.descriptor, DEFAULT_TREATMENT);
   assert.equal(policy.qualification, 'unqualified');
 });
@@ -212,13 +227,13 @@ test('an unusable tokenizer keeps the source and records a typed gap per nonblan
     [{ gguf: path, sha256 }, {}, 'unverified'],
   ];
   for (const [tokenizer, verified, reason] of cases) {
-    const derived = await deriveChunks(turn, chunkPolicy({ embedding: { chunk_token_cap: 21, tokenizer } }, verified), verified);
+    const derived = await deriveChunks(turn, chunkPolicy(served(tokenizer, { chunk_token_cap: 21 }), verified));
     assert.deepEqual(derived, { chunks: [], gaps: [
       { entry_id: 'e0', start: 0, end: 9, cause: 'tokenizer_unavailable', reason },
       { entry_id: 'e2', start: 0, end: 2, cause: 'tokenizer_unavailable', reason },
     ] }, reason);
   }
-  const ready = await deriveChunks(turn, chunkPolicy({ embedding: { chunk_token_cap: 21, tokenizer: { gguf: path, sha256 } } }, VERIFIED(sha256)), VERIFIED(sha256));
+  const ready = await deriveChunks(turn, chunkPolicy(served({ gguf: path, sha256 }, { chunk_token_cap: 21 }), VERIFIED(sha256)));
   assert.deepEqual(ready.chunks.map(chunk => [chunk.entry_id, chunk.text, chunk.token_count]), [['e0', 'abcd abcd', 5], ['e2', 'cd', 3]]);
   const legacy = await deriveChunks(turn, chunkPolicy({}));
   assert.deepEqual(legacy.chunks.map(chunk => [chunk.text, chunk.token_count]), [['abcd abcd', null], ['cd', null]]);
@@ -263,4 +278,21 @@ test('Memory.ingest derives only when the store calls back, so a replay never lo
   assert.deepEqual(calls, [TOKEN_POLICY, TOKEN_POLICY]);
   await assert.rejects(new Memory({ ...config, embedding: { chunk_token_cap: 10 } }, store).ingest('first', input),
     error => error.code === 'invalid_chunk_token_cap' && error.stage === 'before_write');
+});
+
+test('index never reports ready while derived gaps exist, and does not count them as missing vector rows', async () => {
+  const store = {
+    async pendingEmbeddings() { return []; },
+    async markOversizedChunks() {},
+    async status() { return { unindexed: 0 }; },
+    gaps: 2,
+    async derivedGaps() { return this.gaps; },
+  };
+  const config = { scopes: { write: ['fiction'], read: ['fiction'] },
+    embedding: { url: 'http://127.0.0.1:9/v1/embeddings', model: 'fixture', dimensions: 2 } };
+  const memory = new Memory(config, store);
+  const reply = await memory.index('fiction');
+  assert.deepEqual([reply.status, reply.reason, reply.derived_gaps, reply.source_retained], ['unavailable', 'derived_chunk_gaps', 2, true]);
+  store.gaps = 0;
+  assert.equal((await memory.index('fiction')).status, 'ready');
 });

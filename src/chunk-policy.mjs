@@ -8,9 +8,20 @@ export const MANIFEST_CONTRACT = 'source-memory.chunk-manifest/1';
 export const DEFAULT_CHUNK_TOKEN_CAP = 1920;
 export const GAP_CAUSES = ['unsplittable_unit', 'tokenizer_unavailable', 'derivation_bound_exceeded'];
 
-// Tokenizer digests whose local counts were shown equal to the served rendering by a parity qualification. Only a reviewed
-// qualification adds an entry; `context` is the verified effective context of that serving contract.
+// Tokenizer digests whose local counts were shown equal to the served rendering by a parity qualification, each bound to the
+// served model, rendering contract, owner serving revision and verified effective context it was qualified with:
+// { [sha256]: { model, render, serving_revision, context } }. Only a reviewed qualification adds an entry.
 export const VERIFIED_TOKENIZERS = Object.freeze({});
+
+const normalizedModel = embedding => typeof embedding?.model === 'string' ? embedding.model.replace(/:latest$/u, '') : null;
+
+/** The verified contract for this tokenizer and serving configuration, or null: a digest alone verifies nothing. */
+export function verifiedContract(verified, sha256, embedding) {
+  const entry = Object.hasOwn(verified, sha256) ? verified[sha256] : null;
+  return entry && entry.model === normalizedModel(embedding) && entry.render === RENDER_CONTRACT
+    && typeof entry.serving_revision === 'string' && entry.serving_revision === embedding?.ollama_context_revision
+    && Number.isSafeInteger(entry.context) && entry.context > 0 ? entry : null;
+}
 
 // The one supported treatment. A policy is qualified only if its descriptor digest is listed in QUALIFIED_TREATMENTS, which
 // only a reviewed evaluation of exactly that descriptor adds to. Any other valid policy is recorded as unqualified.
@@ -39,11 +50,11 @@ export function chunkPolicy(config, verified = VERIFIED_TOKENIZERS) {
   }
   requireThat(contract && typeof contract === 'object' && typeof contract.gguf === 'string' && contract.gguf.startsWith('/')
     && contract.gguf.length <= 4096 && typeof contract.sha256 === 'string' && HEX64.test(contract.sha256), 'invalid_chunk_tokenizer');
-  const context = verified[contract.sha256]?.context ?? null;
+  const context = verifiedContract(verified, contract.sha256, embedding)?.context ?? null;
   const cap = embedding.chunk_token_cap ?? DEFAULT_CHUNK_TOKEN_CAP;
   requireThat(Number.isSafeInteger(cap) && cap >= 1 && cap <= (context ?? Number.MAX_SAFE_INTEGER), 'invalid_chunk_token_cap');
   const descriptor = { policy: TOKEN_POLICY, words, overlap, byte_cap: CHUNK_MAX_BYTES, token_cap: cap, render: RENDER_CONTRACT,
-    model: typeof embedding.model === 'string' ? embedding.model.replace(/:latest$/u, '') : null, context,
+    model: normalizedModel(embedding), context,
     tokenizer_sha256: contract.sha256 };
   const policyDigest = digest(descriptor);
   return { descriptor, digest: policyDigest, qualification: QUALIFIED_TREATMENTS.includes(policyDigest) ? 'qualified' : 'unqualified',
@@ -53,7 +64,7 @@ export function chunkPolicy(config, verified = VERIFIED_TOKENIZERS) {
 const loaded = new Map();
 
 // A verified counter for the policy, or the reason it cannot be had. Only successful loads are cached.
-async function counterFor(policy, verified) {
+async function counterFor(policy) {
   const { path, sha256 } = policy.tokenizer;
   const key = `${sha256}\0${path}`;
   if (!loaded.has(key)) {
@@ -65,22 +76,22 @@ async function counterFor(policy, verified) {
     try { loaded.set(key, sentencePiece(spec)); } catch { return { reason: 'invalid' }; }
   }
   const counter = loaded.get(key);
-  const entry = verified[sha256];
-  if (!entry) return { reason: 'unverified' };
+  // chunkPolicy took the context from a matching verified contract; without one it is null.
+  if (policy.descriptor.context === null) return { reason: 'unverified' };
   if (counter.context_length !== null && policy.descriptor.token_cap > counter.context_length) return { reason: 'context_exceeded' };
-  return { counter, context: entry.context };
+  return { counter, context: policy.descriptor.context };
 }
 
 /**
  * Derives the chunks and gaps of a new turn under `policy`. It never throws for an unusable tokenizer: the source is kept and
  * each nonblank entry becomes a typed gap. Only a first retain calls it, so a replay never needs the tokenizer.
  */
-export async function deriveChunks(turn, policy, verified = VERIFIED_TOKENIZERS) {
+export async function deriveChunks(turn, policy) {
   const { words, overlap } = policy.descriptor;
   if (policy.descriptor.policy === LEGACY_POLICY) {
     return { chunks: chunkEntries(turn, words, overlap).map(chunk => ({ ...chunk, token_count: null })), gaps: [] };
   }
-  const resolved = await counterFor(policy, verified);
+  const resolved = await counterFor(policy);
   if (!resolved.counter) {
     return { chunks: [], gaps: turn.entries.filter(entry => /\S/u.test(entry.text))
       .map(entry => ({ entry_id: entry.id, start: 0, end: entry.text.length, cause: 'tokenizer_unavailable', reason: resolved.reason })) };
