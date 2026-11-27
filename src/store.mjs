@@ -431,16 +431,17 @@ export class Neo4jStore {
     });
   }
 
-  async pendingEmbeddings(scope, model, limit) {
+  async pendingEmbeddings(scope, model, limit, context = null) {
     return this.transaction('read', async tx => {
       const result = await tx.run(`MATCH (n) WHERE (n:SMChunk OR n:SMRecord) AND n.scope=$scope
         AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
-        AND NOT (n:SMChunk AND coalesce(n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text,false))
+        AND NOT (n:SMChunk AND (coalesce(n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text,false)
+          OR coalesce(n.embedding_rejected_context=$context AND n.embedding_rejected_text=n.text,false)))
         WITH n, coalesce(n.embedding_retry_key=$model,false) AS isolated
         WITH n, isolated, isolated AND coalesce(n.embedding_retry_after > datetime(),false) AS cooling
         RETURN n.uid AS uid, CASE WHEN NOT cooling THEN n.text END AS text, n:SMChunk AS chunk,
           isolated, cooling, isolated AND coalesce(n.embedding_retry_single,false) AS single
-        ORDER BY cooling, isolated, single, n.uid LIMIT $limit`, { scope, model, cap: CHUNK_MAX_BYTES, limit: neo4j.int(limit) });
+        ORDER BY cooling, isolated, single, n.uid LIMIT $limit`, { scope, model, cap: CHUNK_MAX_BYTES, context, limit: neo4j.int(limit) });
       return result.records.map(row => ({ uid: row.get('uid'), text: row.get('text'), chunk: row.get('chunk'),
         isolated: row.get('isolated'), cooling: row.get('cooling'), single: row.get('single') }));
     });
@@ -455,6 +456,14 @@ export class Neo4jStore {
     { scope, model, rows: oversized, cap: CHUNK_MAX_BYTES }));
   }
 
+  async markContextRejectedChunk(scope, model, context, { uid, text }) {
+    return this.transaction('write', tx => tx.run(`MATCH (n:SMChunk {uid:$uid,scope:$scope})
+      SET n.embedding_context_lock=true
+      WITH n REMOVE n.embedding_context_lock
+      WITH n WHERE n.text=$text AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
+      SET n.embedding_rejected_context=$context, n.embedding_rejected_text=$text`, { scope, model, context, uid, text }));
+  }
+
   async deferEmbeddings(scope, model, uids, seconds, single = false) {
     return this.transaction('write', tx => tx.run(`UNWIND $uids AS uid MATCH (n {uid:uid,scope:$scope})
       WHERE (n:SMChunk OR n:SMRecord) AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model)
@@ -466,7 +475,7 @@ export class Neo4jStore {
   async saveEmbeddings(scope, model, rows) {
     return this.transaction('write', tx => tx.run(`UNWIND $rows AS row MATCH (n {uid:row.uid,scope:$scope})
       WHERE n:SMChunk OR n:SMRecord SET n.embedding=row.vector, n.embedding_key=$model
-      REMOVE n.embedding_retry_key, n.embedding_retry_after, n.embedding_retry_single, n.embedding_oversized_key, n.embedding_oversized_cap, n.embedding_oversized_text`, { scope, model, rows }));
+      REMOVE n.embedding_retry_key, n.embedding_retry_after, n.embedding_retry_single, n.embedding_oversized_key, n.embedding_oversized_cap, n.embedding_oversized_text, n.embedding_rejected_context, n.embedding_rejected_text`, { scope, model, rows }));
   }
 
   // The exclusion is applied before the limit, so excluded matches never take the place of eligible ones.
@@ -807,7 +816,7 @@ export class Neo4jStore {
   }
 
   // `unindexed` counts only what a recall with this exclusion could return.
-  async status(scope, embeddingKey = null, exclude = []) {
+  async status(scope, embeddingKey = null, exclude = [], context = null) {
     const sel = selection(scope);
     return this.transaction('read', async tx => {
       // A tree selection seeks each label's scope index; the flat query is the one it always was.
@@ -821,9 +830,10 @@ export class Neo4jStore {
           count(CASE WHEN n:SMRecord THEN 1 END) AS records,
           count(CASE WHEN n:SMRelation THEN 1 END) AS relations,
           count(CASE WHEN (n:SMChunk OR n:SMRecord) AND ($model IS NULL OR n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unindexed,
-          count(CASE WHEN n:SMChunk AND n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text
+          count(CASE WHEN n:SMChunk AND ((n.embedding_oversized_key=$model AND n.embedding_oversized_cap=$cap AND n.embedding_oversized_text=n.text)
+            OR (n.embedding_rejected_context=$context AND n.embedding_rejected_text=n.text))
             AND (n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $model) AND ${eligible('n')} THEN 1 END) AS unembeddable`,
-        { ...sel.params, model: embeddingKey, cap: CHUNK_MAX_BYTES, exclude });
+        { ...sel.params, model: embeddingKey, cap: CHUNK_MAX_BYTES, exclude, context });
       const { unembeddable, ...counts } = result.records[0].toObject();
       return { ...counts, ...(unembeddable > 0 ? { unembeddable } : {}) };
     });

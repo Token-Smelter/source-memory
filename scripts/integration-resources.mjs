@@ -34,7 +34,7 @@ export function integrationResources({ runId, execute, record }) {
       }
       emit({ kind: 'container', phase: 'planned', id: name });
       let created;
-      try { created = await cmd(['create', '--name', name, '--label', label, '--publish', '127.0.0.1::7687', '--memory', '1536m', '--cpus', '2',
+      try { created = await cmd(['create', '--name', name, '--label', label, '--publish', '127.0.0.1::7687', '--memory', '2048m', '--cpus', '2',
         '--mount', `type=volume,src=${data},dst=/data`, '--mount', `type=volume,src=${logs},dst=/logs`,
         '--env', 'NEO4J_AUTH=none', '--env', 'NEO4J_server_memory_heap_initial__size=512m',
         '--env', 'NEO4J_server_memory_heap_max__size=512m', '--env', 'NEO4J_server_memory_pagecache_size=128m', 'neo4j:5.26.14-community']); }

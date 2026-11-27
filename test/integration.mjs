@@ -54,7 +54,11 @@ export async function runIntegration(database, scratch) {
     for await (const part of req) body += part;
     if (modelDown) { res.writeHead(503).end(); return; }
     const input = JSON.parse(body);
-    if (req.url === '/embed') {
+    if (req.url === '/v1/embeddings' && input.input.includes('Fictional rejected chunk.')) {
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: {
+        type: 'invalid_request_error', message: 'the input length exceeds the context length',
+      } }));
+    } else if (req.url === '/embed' || req.url === '/v1/embeddings') {
       const vector = value => /aubergine|purple/i.test(value) ? [0, 1, 0] : /amber/i.test(value) ? [-1, 0, 0] : /blue/i.test(value) ? [1, 0, 0]
         : /04:00/.test(value) ? [0, -1, 1] : /quartz/i.test(value) ? [0, -1, 0] : [0, 0, 1];
       res.end(JSON.stringify({ model: input.model, data: input.input.map((value, index) => ({ index,
@@ -134,6 +138,29 @@ export async function runIntegration(database, scratch) {
       await fixture.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope,turn_uid:$turn}) SET c.text=$text`,
         { scope, turn: legacy.id, text: 'é'.repeat(4096) }));
       assert.equal((await fixture.status(scope)).unembeddable, undefined, 'changed text invalidates the marker');
+      assert.equal((await fixture.index(scope)).status, 'ready');
+      assert.equal((await fixture.status(scope)).unindexed, 0);
+    });
+    await check('an isolated Ollama context rejection marks only unchanged missing chunks and stays incomplete', async () => {
+      const scope = 'embedding-context-fixture';
+      const embedding = { url: `${url}/v1/embeddings`, model: 'embeddinggemma', dimensions: 3, ollama_context_revision: 'fixture-v1' };
+      const cfg = { ...config, embedding, scopes: { read: [scope], write: [scope] }, index_on_write: false };
+      const fixture = new Memory(cfg, memory.store);
+      const revised = new Memory({ ...cfg, embedding: { ...embedding, ollama_context_revision: 'fixture-v2' } }, memory.store);
+      await fixture.init(scope);
+      await fixture.ingest(scope, turn('rejected', 'Fictional rejected chunk.'));
+      assert.equal((await fixture.index(scope)).reason, 'model_request_failed', 'fresh singleton has no terminal authority');
+      await fixture.store.transaction('write', tx => tx.run(`MATCH (n:SMChunk {scope:$scope})
+        SET n.embedding_retry_after=datetime()-duration({seconds:1})`, { scope }));
+      assert.equal((await fixture.index(scope)).status, 'pending');
+      const beforeRetry = modelCalls;
+      const terminal = await fixture.index(scope);
+      assert.deepEqual([terminal.status, terminal.reason, terminal.unembeddable], ['unavailable', 'embedding_unembeddable', 1]);
+      assert.equal(modelCalls, beforeRetry);
+      assert.deepEqual([(await fixture.status(scope)).unindexed, (await fixture.status(scope)).unembeddable], [1, 1]);
+      assert.equal((await revised.status(scope)).unembeddable, undefined);
+      await fixture.store.transaction('write', tx => tx.run(`MATCH (n:SMChunk {scope:$scope}) SET n.text='Fictional replacement.'`, { scope }));
+      assert.equal((await fixture.status(scope)).unembeddable, undefined);
       assert.equal((await fixture.index(scope)).status, 'ready');
       assert.equal((await fixture.status(scope)).unindexed, 0);
     });
