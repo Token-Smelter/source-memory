@@ -1,7 +1,8 @@
 import {
-  authorize, authorizeTarget, CHUNK_MAX_BYTES, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
+  authorize, authorizeTarget, CHUNK_MAX_BYTES, cosine, fuse, identity, integer, markStage, MemoryError,
   digest, normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, RECORD_KINDS, RECORD_STATUSES, requireThat, sourceExcerpt, text,
 } from './core.mjs';
+import { chunkPolicy, deriveChunks, VERIFIED_TOKENIZERS } from './chunk-policy.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, EmbeddingContextRejection, embeddingContextContract, embeddingIdentity, rerank } from './models.mjs';
 import { passthrough, scoped, tracer } from './phase-diagnostic.mjs';
@@ -30,6 +31,8 @@ export class Memory {
     this.store = store ?? new Neo4jStore(config.neo4j);
     // Largest tree selection scored by exact scan rather than its root's ANN index; tests lower it.
     this.treeScanLimit = TREE_SCAN_LIMIT;
+    // Tokenizers trusted for token-capped chunking; tests substitute fictional ones.
+    this.verifiedTokenizers = VERIFIED_TOKENIZERS;
   }
 
   async close() { await this.store.close(); }
@@ -42,14 +45,13 @@ export class Memory {
   }
 
   async ingest(scope, input) {
-    const { turn, chunks } = beforeWrite(() => {
+    const { turn, policy } = beforeWrite(() => {
       authorize(this.config, scope, 'write');
-      const turn = normalizeTurn(input);
-      const size = integer(this.config.chunking?.words, 256, 8, 4096);
-      const overlap = integer(this.config.chunking?.overlap, Math.min(32, size - 1), 0, size - 1);
-      return { turn, chunks: chunkEntries(turn, size, overlap) };
+      return { turn: normalizeTurn(input), policy: chunkPolicy(this.config, this.verifiedTokenizers) };
     });
-    const result = await this.store.ingest(scope, turn, chunks);
+    // The store derives chunks only on a first retain, so a replay keeps its first layout and never needs the tokenizer.
+    const verified = this.verifiedTokenizers;
+    const result = await this.store.ingest(scope, turn, () => deriveChunks(turn, policy, verified), policy);
     return { ...result, indexing: await this.indexAfterWrite(scope) };
   }
 

@@ -1,0 +1,109 @@
+import { canonical, CHUNK_MAX_BYTES, chunkEntries, chunkEntriesTokenCapped, CHUNK_DERIVATION_MAX, digest, integer, requireThat }
+  from './core.mjs';
+import { readGgufTokenizer, RENDER_CONTRACT, sentencePiece, TokenizerError } from './tokenizer.mjs';
+
+export const LEGACY_POLICY = 'legacy-bytes/1';
+export const TOKEN_POLICY = 'token-capped/1';
+export const MANIFEST_CONTRACT = 'source-memory.chunk-manifest/1';
+export const DEFAULT_CHUNK_TOKEN_CAP = 1920;
+export const GAP_CAUSES = ['unsplittable_unit', 'tokenizer_unavailable', 'derivation_bound_exceeded'];
+
+// Tokenizer digests whose local counts were shown equal to the served rendering by a parity qualification. Only a reviewed
+// qualification adds an entry; `context` is the verified effective context of that serving contract.
+export const VERIFIED_TOKENIZERS = Object.freeze({});
+
+// The one supported treatment. A policy is qualified only if its descriptor digest is listed in QUALIFIED_TREATMENTS, which
+// only a reviewed evaluation of exactly that descriptor adds to. Any other valid policy is recorded as unqualified.
+export const DEFAULT_TREATMENT = Object.freeze({
+  policy: TOKEN_POLICY, words: 256, overlap: 32, byte_cap: CHUNK_MAX_BYTES, token_cap: DEFAULT_CHUNK_TOKEN_CAP,
+  render: RENDER_CONTRACT, model: 'embeddinggemma', context: 2048,
+  tokenizer_sha256: '2e942f0ea32d8432a164585591b58632b48a78da0e2d1b0c315bb1f18725b698',
+});
+export const QUALIFIED_TREATMENTS = Object.freeze([]);
+
+const HEX64 = /^[0-9a-f]{64}$/u;
+
+/**
+ * The chunk policy a configuration selects, without any file access. Without `embedding.tokenizer` it is the legacy byte
+ * policy and makes no token claim; a cap without that contract is refused. With it, the cap defaults to 1920.
+ */
+export function chunkPolicy(config, verified = VERIFIED_TOKENIZERS) {
+  const words = integer(config.chunking?.words, 256, 8, 4096);
+  const overlap = integer(config.chunking?.overlap, Math.min(32, words - 1), 0, words - 1);
+  const embedding = config.embedding;
+  const contract = embedding?.tokenizer;
+  if (contract === undefined) {
+    requireThat(embedding?.chunk_token_cap === undefined, 'invalid_chunk_token_cap');
+    const descriptor = { policy: LEGACY_POLICY, words, overlap, byte_cap: CHUNK_MAX_BYTES };
+    return { descriptor, digest: digest(descriptor), qualification: null, tokenizer: null };
+  }
+  requireThat(contract && typeof contract === 'object' && typeof contract.gguf === 'string' && contract.gguf.startsWith('/')
+    && contract.gguf.length <= 4096 && typeof contract.sha256 === 'string' && HEX64.test(contract.sha256), 'invalid_chunk_tokenizer');
+  const context = verified[contract.sha256]?.context ?? null;
+  const cap = embedding.chunk_token_cap ?? DEFAULT_CHUNK_TOKEN_CAP;
+  requireThat(Number.isSafeInteger(cap) && cap >= 1 && cap <= (context ?? Number.MAX_SAFE_INTEGER), 'invalid_chunk_token_cap');
+  const descriptor = { policy: TOKEN_POLICY, words, overlap, byte_cap: CHUNK_MAX_BYTES, token_cap: cap, render: RENDER_CONTRACT,
+    model: typeof embedding.model === 'string' ? embedding.model.replace(/:latest$/u, '') : null, context,
+    tokenizer_sha256: contract.sha256 };
+  const policyDigest = digest(descriptor);
+  return { descriptor, digest: policyDigest, qualification: QUALIFIED_TREATMENTS.includes(policyDigest) ? 'qualified' : 'unqualified',
+    tokenizer: { path: contract.gguf, sha256: contract.sha256 } };
+}
+
+const loaded = new Map();
+
+// A verified counter for the policy, or the reason it cannot be had. Only successful loads are cached.
+async function counterFor(policy, verified) {
+  const { path, sha256 } = policy.tokenizer;
+  const key = `${sha256}\0${path}`;
+  if (!loaded.has(key)) {
+    let spec;
+    try { spec = await readGgufTokenizer(path); } catch (error) {
+      return { reason: error instanceof TokenizerError ? error.reason : 'invalid' };
+    }
+    if (spec.sha256 !== sha256) return { reason: 'digest_mismatch' };
+    try { loaded.set(key, sentencePiece(spec)); } catch { return { reason: 'invalid' }; }
+  }
+  const counter = loaded.get(key);
+  const entry = verified[sha256];
+  if (!entry) return { reason: 'unverified' };
+  if (counter.context_length !== null && policy.descriptor.token_cap > counter.context_length) return { reason: 'context_exceeded' };
+  return { counter, context: entry.context };
+}
+
+/**
+ * Derives the chunks and gaps of a new turn under `policy`. It never throws for an unusable tokenizer: the source is kept and
+ * each nonblank entry becomes a typed gap. Only a first retain calls it, so a replay never needs the tokenizer.
+ */
+export async function deriveChunks(turn, policy, verified = VERIFIED_TOKENIZERS) {
+  const { words, overlap } = policy.descriptor;
+  if (policy.descriptor.policy === LEGACY_POLICY) {
+    return { chunks: chunkEntries(turn, words, overlap).map(chunk => ({ ...chunk, token_count: null })), gaps: [] };
+  }
+  const resolved = await counterFor(policy, verified);
+  if (!resolved.counter) {
+    return { chunks: [], gaps: turn.entries.filter(entry => /\S/u.test(entry.text))
+      .map(entry => ({ entry_id: entry.id, start: 0, end: entry.text.length, cause: 'tokenizer_unavailable', reason: resolved.reason })) };
+  }
+  return chunkEntriesTokenCapped(turn, words, overlap, resolved.counter, policy.descriptor.token_cap);
+}
+
+/**
+ * The immutable first-retain record of what was derived for one turn. Offsets are UTF-16 into the unchanged entry; no source
+ * text is copied. Null when the derivation exceeds the bound, which only a legacy policy can produce.
+ */
+export function chunkManifest({ scope, turnUid, turnHash, turn, policy, chunks, gaps }) {
+  if (chunks.length + gaps.length > CHUNK_DERIVATION_MAX) return null;
+  const entries = new Map(turn.entries.map(entry => [entry.id, entry.text]));
+  const manifest = {
+    contract: MANIFEST_CONTRACT, scope, turn_uid: turnUid, turn_hash: turnHash,
+    policy: policy.descriptor, policy_digest: policy.digest, qualification: policy.qualification,
+    chunks: chunks.map(chunk => ({ uid: chunk.uid, ordinal: chunk.ordinal, entry_id: chunk.entry_id, start: chunk.start, end: chunk.end,
+      text_sha256: digest(chunk.text), token_count: chunk.token_count })),
+    gaps: gaps.map(gap => ({ entry_id: gap.entry_id, start: gap.start, end: gap.end, cause: gap.cause,
+      text_sha256: digest(entries.get(gap.entry_id).slice(gap.start, gap.end)),
+      ...(gap.reason === undefined ? {} : { reason: gap.reason }) })),
+  };
+  const body = canonical(manifest);
+  return { body, digest: digest(body) };
+}
