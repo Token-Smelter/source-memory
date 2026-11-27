@@ -6,6 +6,8 @@ import { Memory } from '../src/memory.mjs';
 import { embeddingContextContract } from '../src/models.mjs';
 
 const rejection = { error: { type: 'invalid_request_error', message: 'the input length exceeds the context length' } };
+const malformedWire = Buffer.concat([Buffer.from('{"junk":"'), Buffer.from([0xff]),
+  Buffer.from(`","error":${JSON.stringify(rejection.error)}}`)]);
 const fixture = { uid: 'fixture', text: 'Fictional input', chunk: true, isolated: true, single: true };
 
 for (const [name, rows, status, body, optIn, terminal] of [
@@ -15,13 +17,14 @@ for (const [name, rows, status, body, optIn, terminal] of [
   ['fresh singleton', [{ ...fixture, isolated: false, single: false }], 400, rejection, true, false],
   ['batch', [fixture, { ...fixture, uid: 'other' }].map(row => ({ ...row, single: false })), 400, rejection, true, false],
   ['unexpected status', [fixture], 500, rejection, true, false],
+  ['malformed UTF-8 with exact error fields', [fixture], 400, malformedWire, true, false],
   ['generic error', [fixture], 400, { error: { message: rejection.error.message } }, true, false],
   ['oversized error envelope', [fixture], 400, { ...rejection, pad: 'x'.repeat(1024) }, true, false],
 ]) {
   test(`Ollama context result: ${name}`, async t => {
     const server = createServer((req, res) => {
       req.resume();
-      res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+      res.writeHead(status, { 'content-type': 'application/json' }).end(Buffer.isBuffer(body) ? body : JSON.stringify(body));
     });
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');

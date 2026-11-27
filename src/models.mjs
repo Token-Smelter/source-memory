@@ -28,7 +28,7 @@ export async function localJson(endpoint, body, timeout = 10000, allowRemote = f
         chunks.push(chunk);
       }
       let error;
-      try { error = JSON.parse(Buffer.concat(chunks).toString('utf8'))?.error; } catch { /* Unknown response stays retryable. */ }
+      try { error = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)))?.error; } catch { /* Unknown response stays retryable. */ }
       if (!signal.aborted && error?.type === 'invalid_request_error' && error.message === 'the input length exceeds the context length') {
         throw new EmbeddingContextRejection();
       }
