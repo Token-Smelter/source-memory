@@ -29,7 +29,8 @@ export async function localJson(endpoint, body, timeout = 10000, allowRemote = f
       }
       let error;
       try { error = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)))?.error; } catch { /* Unknown response stays retryable. */ }
-      if (!signal.aborted && error?.type === 'invalid_request_error' && error.message === 'the input length exceeds the context length') {
+      const rejection = classifyContext === 'native' ? error : error?.type === 'invalid_request_error' ? error.message : null;
+      if (!signal.aborted && rejection === 'the input length exceeds the context length') {
         throw new EmbeddingContextRejection();
       }
     }
@@ -53,22 +54,42 @@ export function embeddingIdentity(config) {
   return digest({ endpoint: localEndpoint(config.url, config.allow_remote), model: text(config.model, 256), dimensions: integer(config.dimensions, undefined, 1, 4096) });
 }
 
+function nativeOllamaEndpoint(config) {
+  if (config.ollama_transport === undefined) return null;
+  requireThat(config.ollama_transport === 'native_no_truncate' && config.allow_remote !== true
+    && /^embeddinggemma(?::latest)?$/.test(config.model), 'invalid_model_endpoint');
+  const url = new URL(localEndpoint(config.url));
+  requireThat(url.protocol === 'http:' && url.pathname === '/v1/embeddings', 'invalid_model_endpoint');
+  // The configured URL continues to name the existing vector space. Selection requires vector parity.
+  url.pathname = '/api/embed';
+  return url.toString();
+}
+
 export function embeddingContextContract(config) {
   if (typeof config?.ollama_context_revision !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(config.ollama_context_revision)
       || !/^embeddinggemma(?::latest)?$/.test(config.model) || config.allow_remote === true) return null;
   const url = new URL(localEndpoint(config.url));
   if (url.protocol !== 'http:' || url.pathname !== '/v1/embeddings') return null;
-  return digest(['ollama-openai-context-rejection/1', embeddingIdentity(config), config.ollama_context_revision]);
+  const contract = nativeOllamaEndpoint(config) ? 'ollama-native-no-truncate-context-rejection/1' : 'ollama-openai-context-rejection/1';
+  return digest([contract, embeddingIdentity(config), config.ollama_context_revision]);
 }
 
 export async function embed(config, texts, { isolatedChunk = false } = {}) {
   requireThat(config, 'embedding_unconfigured');
   embeddingIdentity(config);
+  const native = nativeOllamaEndpoint(config);
   const vectors = [];
   for (let offset = 0; offset < texts.length; offset += 16) {
     const input = texts.slice(offset, offset + 16);
-    const classify = isolatedChunk && texts.length === 1 && Boolean(embeddingContextContract(config));
-    const result = await localJson(config.url, { model: config.model, input }, config.timeout_ms, config.allow_remote, classify);
+    const classify = isolatedChunk && texts.length === 1 && embeddingContextContract(config) ? (native ? 'native' : 'compat') : false;
+    const result = await localJson(native ?? config.url, { model: config.model, input, ...(native ? { truncate: false } : {}) },
+      config.timeout_ms, config.allow_remote, classify);
+    if (native) {
+      requireThat(result?.model === config.model, 'embedding_model_mismatch');
+      requireThat(Array.isArray(result.embeddings) && result.embeddings.length === input.length, 'invalid_embedding_response');
+      vectors.push(...result.embeddings.map(vector => validateVector(vector, config.dimensions)));
+      continue;
+    }
     requireThat(!result.model || result.model === config.model, 'embedding_model_mismatch');
     requireThat(Array.isArray(result.data) && result.data.length === input.length, 'invalid_embedding_response');
     const rows = [...result.data].sort((a, b) => a.index - b.index);
