@@ -3,7 +3,7 @@ import {
   digest, normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, RECORD_KINDS, RECORD_STATUSES, requireThat, sourceExcerpt, text,
 } from './core.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
-import { embed, embeddingIdentity, rerank } from './models.mjs';
+import { embed, EmbeddingContextRejection, embeddingContextContract, embeddingIdentity, rerank } from './models.mjs';
 import { passthrough, scoped, tracer } from './phase-diagnostic.mjs';
 import { Neo4jStore, selection, TREE_SCAN_LIMIT } from './store.mjs';
 
@@ -84,7 +84,8 @@ export class Memory {
     try {
       const key = embeddingIdentity(this.config.embedding);
       const limit = integer(input.limit, 256, 1, 2048);
-      const pending = await this.store.pendingEmbeddings(scope, key, limit + 1);
+      const context = embeddingContextContract(this.config.embedding);
+      const pending = await this.store.pendingEmbeddings(scope, key, limit + 1, ...(context ? [context] : []));
       const selected = pending.slice(0, limit);
       const oversized = selected.filter(row => !row.cooling && row.chunk && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
       const oversizedIds = new Set(oversized.map(row => row.uid));
@@ -104,10 +105,17 @@ export class Memory {
             && Boolean(eligible[offset].isolated) === Boolean(first.isolated) && !eligible[offset].single) {
           batch.push(eligible[offset++]);
         }
+        const isolatedChunk = Boolean(context && first.chunk && first.isolated && first.single && batch.length === 1);
         let vectors;
         try {
-          vectors = await embed(this.config.embedding, batch.map(row => row.text));
+          vectors = await embed(this.config.embedding, batch.map(row => row.text), { isolatedChunk });
         } catch (error) {
+          if (isolatedChunk && error instanceof EmbeddingContextRejection) {
+            requireThat(typeof this.store.markContextRejectedChunk === 'function', 'embedding_accounting_invalid');
+            await this.store.markContextRejectedChunk(scope, key, context, { uid: first.uid, text: first.text });
+            // The conditional write may have refused a changed row. Only a later scope census can settle coverage.
+            return { status: 'pending', indexed, embedding_key: key };
+          }
           const reason = safeCode(error);
           if (['model_timeout', 'model_request_failed', 'invalid_embedding', 'invalid_embedding_response', 'model_response_too_large'].includes(reason)) {
             // Split retries across invocations so a slow batch cannot multiply the caller's wait.
@@ -126,7 +134,7 @@ export class Memory {
       if (pending.length > indexed + oversized.length) return { status: 'pending', indexed, embedding_key: key };
       if (typeof this.store.markOversizedChunks === 'function') {
         // The bounded selection cannot prove drain. Check all current-key missing vectors, including cooling rows.
-        const { unindexed, unembeddable = 0 } = await this.store.status(scope, key);
+        const { unindexed, unembeddable = 0 } = await this.store.status(scope, key, ...(context ? [[], context] : []));
         requireThat(Number.isSafeInteger(unindexed) && Number.isSafeInteger(unembeddable)
           && unembeddable >= 0 && unindexed >= unembeddable, 'embedding_accounting_invalid');
         if (unindexed > unembeddable) return { status: 'pending', indexed, embedding_key: key };
@@ -147,7 +155,8 @@ export class Memory {
     const errors = Object.fromEntries(catalog.filter(entry => entry.reason).map(entry => [entry.kind, entry.reason]));
     const tree = !selection(target).tree ? {} : { scope_tree: { pending: await this.store.treePending(target), indexes: await this.store.treeIndexStates(target) },
       ...(await this.store.legacyFlatIndex(target) ? { legacy_flat_index: true } : {}) };
-    return { scope, ...(await this.store.status(target, key)), ...tree,
+    const context = embeddingContextContract(this.config.embedding);
+    return { scope, ...(await this.store.status(target, key, ...(context ? [[], context] : []))), ...tree,
       // A changed database_id is another store, a changed record_contract another record contract: each needs a new binding.
       store: { ...(await this.store.identity()), record_contract: RECORD_CONTRACT },
       embedding: key ? { configured: true, model: this.config.embedding.model, key } : { configured: false },

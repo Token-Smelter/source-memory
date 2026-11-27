@@ -10,12 +10,29 @@ export function localEndpoint(value, allowRemote = false) {
   return url.toString();
 }
 
-export async function localJson(endpoint, body, timeout = 10000, allowRemote = false) {
+export class EmbeddingContextRejection extends Error {}
+
+export async function localJson(endpoint, body, timeout = 10000, allowRemote = false, classifyContext = false) {
   const url = localEndpoint(endpoint, allowRemote);
   const signal = AbortSignal.timeout(integer(timeout, 10000, 1, 120000));
   try {
     const response = await fetch(url, { method: 'POST', redirect: 'error', signal,
       headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    if (!response.ok && classifyContext && response.status === 400 && response.body
+        && /^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')) {
+      const chunks = [];
+      let bytes = 0;
+      for await (const chunk of response.body) {
+        bytes += chunk.length;
+        requireThat(bytes <= 1024, 'model_request_failed');
+        chunks.push(chunk);
+      }
+      let error;
+      try { error = JSON.parse(Buffer.concat(chunks).toString('utf8'))?.error; } catch { /* Unknown response stays retryable. */ }
+      if (!signal.aborted && error?.type === 'invalid_request_error' && error.message === 'the input length exceeds the context length') {
+        throw new EmbeddingContextRejection();
+      }
+    }
     requireThat(response.ok, 'model_request_failed');
     const chunks = [];
     let bytes = 0;
@@ -26,7 +43,7 @@ export async function localJson(endpoint, body, timeout = 10000, allowRemote = f
     }
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch (error) {
-    if (error instanceof MemoryError) throw error;
+    if (error instanceof MemoryError || error instanceof EmbeddingContextRejection) throw error;
     throw new MemoryError(signal.aborted ? 'model_timeout' : 'model_request_failed');
   }
 }
@@ -36,13 +53,22 @@ export function embeddingIdentity(config) {
   return digest({ endpoint: localEndpoint(config.url, config.allow_remote), model: text(config.model, 256), dimensions: integer(config.dimensions, undefined, 1, 4096) });
 }
 
-export async function embed(config, texts) {
+export function embeddingContextContract(config) {
+  if (typeof config?.ollama_context_revision !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(config.ollama_context_revision)
+      || !/^embeddinggemma(?::latest)?$/.test(config.model) || config.allow_remote === true) return null;
+  const url = new URL(localEndpoint(config.url));
+  if (url.protocol !== 'http:' || url.pathname !== '/v1/embeddings') return null;
+  return digest(['ollama-openai-context-rejection/1', embeddingIdentity(config), config.ollama_context_revision]);
+}
+
+export async function embed(config, texts, { isolatedChunk = false } = {}) {
   requireThat(config, 'embedding_unconfigured');
   embeddingIdentity(config);
   const vectors = [];
   for (let offset = 0; offset < texts.length; offset += 16) {
     const input = texts.slice(offset, offset + 16);
-    const result = await localJson(config.url, { model: config.model, input }, config.timeout_ms, config.allow_remote);
+    const classify = isolatedChunk && texts.length === 1 && Boolean(embeddingContextContract(config));
+    const result = await localJson(config.url, { model: config.model, input }, config.timeout_ms, config.allow_remote, classify);
     requireThat(!result.model || result.model === config.model, 'embedding_model_mismatch');
     requireThat(Array.isArray(result.data) && result.data.length === input.length, 'invalid_embedding_response');
     const rows = [...result.data].sort((a, b) => a.index - b.index);
