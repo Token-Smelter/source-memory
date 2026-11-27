@@ -15,10 +15,13 @@ try {
     parts.push(chunk);
   }
   const config = JSON.parse(Buffer.concat(parts).toString('utf8'));
+  process.stderr.write('Read-only; bounded by a 15 s server transaction timeout, not a proven plan; may load the database for up to that long.\n');
   const result = await indexCensus(config, scope);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 } catch (error) {
   const code = error instanceof MemoryError ? error.code : 'census_unavailable';
-  process.stderr.write(`${JSON.stringify({ error: code })}\n`);
+  const timedOut = ['Neo.ClientError.Transaction.TransactionTimedOut', 'Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration',
+    'Neo.TransientError.Transaction.TransactionTimedOut'].includes(error?.code);
+  process.stderr.write(timedOut ? 'unknown: timed out\n' : `${JSON.stringify({ error: code })}\n`);
   process.exitCode = 1;
 }

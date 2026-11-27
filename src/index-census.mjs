@@ -1,7 +1,7 @@
 import neo4j from 'neo4j-driver';
 import { authorize, isNested, requireThat } from './core.mjs';
 import { embeddingContextContract, embeddingIdentity } from './models.mjs';
-import { Neo4jStore } from './store.mjs';
+import { Neo4jStore, selection } from './store.mjs';
 
 export const CENSUS_CAP = 4096;
 const health = { online: 1, populating: 2, missing: 3, failed: 4, incompatible: 5, unavailable: 6 };
@@ -32,45 +32,35 @@ const record = `MATCH (n:SMRecord {scope:$scope}) USING INDEX SEEK n:SMRecord(sc
 WITH n LIMIT $limit
 RETURN count(*) AS records_total, count(CASE WHEN ${missing} THEN 1 END) AS missing_record_vectors,
   count(CASE WHEN n.embedding IS NULL AND n.embedding_key=$key THEN 1 END) AS same_key_missing_records`;
-export const censusStatements = Object.freeze({ SMChunk: chunk, SMRecord: record });
-const operations = new Set(['ProduceResults', 'EagerAggregation', 'Projection', 'Limit', 'NodeIndexSeek',
-  'Apply', 'Optional', 'Filter', 'Argument', 'NodeUniqueIndexSeek', 'CacheProperties']);
+export const CENSUS_TIMEOUT_MS = 15000;
 
-export function hasBoundedScopeSeek(summary, label) {
-  if (!summary?.plan || !Array.isArray(summary.notifications) || summary.notifications.length) return false;
-  const stack = [[summary.plan, false, false, false, null]];
-  let scopeSeeks = 0, turnSeeks = 0;
-  while (stack.length) {
-    const [node, bounded, afterApply, filtered, parent] = stack.pop();
-    const op = node.operatorType?.split('@')[0];
-    if (!operations.has(op) || !Array.isArray(node.children)) return false;
-    if (op === 'CacheProperties' && !(label === 'SMChunk' && parent === 'Projection'
-        && afterApply && node.children.length === 1 && node.children[0].operatorType?.split('@')[0] === 'Limit'
-        && node.arguments?.Details === 'cache[n.embedding], cache[n.embedding_key]')) return false;
-    if (op === 'NodeIndexSeek') {
-      if (!bounded || filtered || node.children.length || node.arguments?.Details !== `RANGE INDEX n:${label}(scope) WHERE scope = $scope`) return false;
-      scopeSeeks++;
-    }
-    if (op === 'NodeUniqueIndexSeek') {
-      if (node.children.length || !/^UNIQUE (?:RANGE INDEX )?t:SMTurn\(uid\) WHERE uid = (?:n\.turn_uid|cache\[n\.turn_uid\])$/.test(node.arguments?.Details ?? '')) return false;
-      turnSeeks++;
-    }
-    if (op === 'Apply' ? node.children.length !== 2 : node.children.length > 1) return false;
-    stack.push(...node.children.map(child => [child, bounded || (op === 'Limit' && (label === 'SMRecord' || afterApply)),
-      afterApply || op === 'Apply', filtered || op === 'Filter', op]));
-  }
-  return scopeSeeks === 1 && turnSeeks === (label === 'SMChunk' ? 1 : 0);
-}
-
-async function counts(tx, statement, label, params) {
-  const explained = await tx.run(`EXPLAIN ${statement}`, params);
-  requireThat(hasBoundedScopeSeek(explained.summary, label), 'census_plan_unverified');
+async function counts(tx, statement, params) {
   const result = await tx.run(statement, params);
   requireThat(result.records.length === 1 && result.summary.notifications.length === 0
     && !result.summary.counters.containsUpdates(), 'census_unverified');
   const row = result.records[0].toObject();
   requireThat(Object.values(row).every(value => Number.isSafeInteger(value) && value >= 0), 'census_unverified');
   return row;
+}
+
+async function indexHealth(tx, scope, dimensions) {
+  const sel = selection(scope);
+  const names = { chunk: sel.names.vectorChunks, record: sel.names.vectorRecords };
+  const result = await tx.run(`SHOW INDEXES YIELD name,type,state,labelsOrTypes,properties,options
+    WHERE name IN $names RETURN name,type,state,labelsOrTypes,properties,options`, { names: Object.values(names) });
+  requireThat(result.records.length <= 2 && !result.summary.notifications.length
+    && !result.summary.counters.containsUpdates(), 'census_unverified');
+  const rows = result.records.map(row => row.toObject());
+  return Object.fromEntries(Object.entries(names).map(([kind, name]) => {
+    const row = rows.find(candidate => candidate.name === name);
+    const index = row?.options?.indexConfig;
+    const state = !row ? 'missing' : row.type !== 'VECTOR' || row.labelsOrTypes?.length !== 1
+      || row.labelsOrTypes[0] !== sel.labels[kind] || row.properties?.length !== 1 || row.properties[0] !== 'embedding'
+      || String(index?.['vector.similarity_function']).toLowerCase() !== 'cosine'
+      || Number(index?.['vector.dimensions']) !== dimensions || index?.['vector.quantization.enabled'] !== false
+      ? 'incompatible' : row.state === 'ONLINE' ? 'online' : row.state === 'POPULATING' ? 'populating' : 'failed';
+    return [`${kind}_index_health`, health[state]];
+  }));
 }
 
 export async function indexCensus(config, scope, suppliedStore) {
@@ -82,25 +72,18 @@ export async function indexCensus(config, scope, suppliedStore) {
   const store = suppliedStore ?? new Neo4jStore(config.neo4j);
   try {
     const session = store.driver.session({ database: store.database, defaultAccessMode: neo4j.session.READ });
-    let result;
     try {
-      const tx = session.beginTransaction({ timeout: 15000 });
+      const tx = session.beginTransaction({ timeout: CENSUS_TIMEOUT_MS });
       try {
         const params = { scope, key, context, limit: neo4j.int(CENSUS_CAP + 1) };
-        const chunks = await counts(tx, chunk, 'SMChunk', params);
+        const chunks = await counts(tx, chunk, params);
         requireThat(chunks.chunks_total <= CENSUS_CAP, 'census_over_bound');
-        const records = await counts(tx, record, 'SMRecord', { ...params, limit: neo4j.int(CENSUS_CAP - chunks.chunks_total + 1) });
+        const records = await counts(tx, record, { ...params, limit: neo4j.int(CENSUS_CAP - chunks.chunks_total + 1) });
         requireThat(chunks.chunks_total + records.records_total <= CENSUS_CAP, 'census_over_bound');
-        result = { ...chunks, ...records };
+        const health = await indexHealth(tx, scope, config.embedding.dimensions);
         await tx.commit();
+        return { ...chunks, ...records, ...health };
       } finally { await tx.close(); }
     } finally { await session.close(); }
-    for (const kind of ['chunk', 'record']) {
-      let state;
-      try { state = await store.vectorIndexStatus(scope, kind, config.embedding.dimensions); }
-      catch (error) { state = error?.code?.startsWith('vector_index_') ? 'incompatible' : 'unavailable'; }
-      result[`${kind}_index_health`] = health[state] ?? 0;
-    }
-    return result;
   } finally { if (!suppliedStore) await store.close(); }
 }

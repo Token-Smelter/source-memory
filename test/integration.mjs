@@ -9,8 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { Memory } from '../src/memory.mjs';
 import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
 import { embeddingContextContract, embeddingIdentity } from '../src/models.mjs';
-import neo4j from 'neo4j-driver';
-import { CENSUS_CAP, censusStatements, indexCensus } from '../src/index-census.mjs';
+import { CENSUS_CAP, indexCensus } from '../src/index-census.mjs';
 import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
 import { runLiveSmoke } from './live-smoke.mjs';
 import { createDerivedAdapter, searchDerived, resolveDerived } from '../pi-extension/derived-retrieval.mjs';
@@ -132,23 +131,10 @@ export async function runIntegration(database, scratch) {
           (:SMChunk {scope:'foreign',text:$large}), (:SMRecord {scope:$scope,embedding_key:$key})`,
       { scope, turn: parent.id, key, context, large: 'x'.repeat(8193) }));
       const calls = modelCalls;
-      try {
-        assert.deepEqual(await counts(), { chunks_total: 5, chunks_indexed: 1, chunks_unindexed: 4, terminal_byte: 1,
-          terminal_context: 1, retry_marked: 1, cooling: 1, other: 1, same_key_missing_chunks: 1,
-          turns_affected: 1, missing_chunk_turn_binding: 1, records_total: 1, missing_record_vectors: 1,
-          same_key_missing_records: 1, chunk_index_health: 1, record_index_health: 1 });
-      } catch (error) {
-        if (error.code === 'census_plan_unverified') {
-          await memory.store.transaction('read', async tx => {
-            for (const [label, statement] of Object.entries(censusStatements)) {
-              const { summary } = await tx.run(`EXPLAIN ${statement}`, { scope, key, context, limit: neo4j.int(CENSUS_CAP + 1) });
-              const shape = node => ({ operator: node.operatorType, details: node.arguments?.Details, children: node.children.map(shape) });
-              console.error(JSON.stringify({ label, notifications: summary.notifications.map(row => row.code), plan: shape(summary.plan) }));
-            }
-          });
-        }
-        throw error;
-      }
+      assert.deepEqual(await counts(), { chunks_total: 5, chunks_indexed: 1, chunks_unindexed: 4, terminal_byte: 1,
+        terminal_context: 1, retry_marked: 1, cooling: 1, other: 1, same_key_missing_chunks: 1,
+        turns_affected: 1, missing_chunk_turn_binding: 1, records_total: 1, missing_record_vectors: 1,
+        same_key_missing_records: 1, chunk_index_health: 1, record_index_health: 1 });
       assert.equal(modelCalls, calls);
       await memory.store.transaction('write', tx => tx.run(`UNWIND range(1,$cap) AS i CREATE (:SMRecord {scope:$scope})`, { scope, cap: CENSUS_CAP }));
       await assert.rejects(counts(), { code: 'census_over_bound' });
