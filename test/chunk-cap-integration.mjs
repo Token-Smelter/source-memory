@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import neo4j from 'neo4j-driver';
 import { Memory } from '../src/memory.mjs';
@@ -64,7 +65,8 @@ export async function runChunkCap(database, scratch) {
   const gguf = join(scratch, 'cap-fiction.gguf');
   await writeFile(gguf, ggufTokenizerFile(fictionalVocabulary()));
   const { sha256 } = await readGgufTokenizer(gguf);
-  const verified = { [sha256]: { model: 'cap-fixture', render: RENDER_CONTRACT, serving_revision: 'cap-rev-1', context: 64,
+  const blob = `sha256:${createHash('sha256').update(await readFile(gguf)).digest('hex')}`;
+  const verified = { [sha256]: { model: 'cap-fixture', served_blob: blob, render: RENDER_CONTRACT, serving_revision: 'cap-rev-1', context: 64,
     parity_evidence_sha256: 'e'.repeat(64) } };
   const server = await embeddingServer();
   const base = { neo4j: database, scopes: { read: SCOPES, write: SCOPES }, index_on_write: false };
