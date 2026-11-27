@@ -9,9 +9,12 @@ export const DEFAULT_CHUNK_TOKEN_CAP = 1920;
 export const GAP_CAUSES = ['unsplittable_unit', 'tokenizer_unavailable', 'derivation_bound_exceeded'];
 
 // Tokenizer digests whose local counts were shown equal to the served rendering by a parity qualification, each bound to the
-// served model, rendering contract, owner serving revision and verified effective context it was qualified with:
-// { [sha256]: { model, render, serving_revision, context } }. Only a reviewed qualification adds an entry.
+// served model, rendering contract, owner serving revision and verified effective context it was qualified with, and the
+// parity report that showed it: { [sha256]: { model, render, serving_revision, context, parity_evidence_sha256 } }. Only a
+// reviewed qualification adds an entry.
 export const VERIFIED_TOKENIZERS = Object.freeze({});
+
+const HEX64 = /^[0-9a-f]{64}$/u;
 
 const normalizedModel = embedding => typeof embedding?.model === 'string' ? embedding.model.replace(/:latest$/u, '') : null;
 
@@ -20,7 +23,7 @@ export function verifiedContract(verified, sha256, embedding) {
   const entry = Object.hasOwn(verified, sha256) ? verified[sha256] : null;
   return entry && entry.model === normalizedModel(embedding) && entry.render === RENDER_CONTRACT
     && typeof entry.serving_revision === 'string' && entry.serving_revision === embedding?.ollama_context_revision
-    && Number.isSafeInteger(entry.context) && entry.context > 0 ? entry : null;
+    && Number.isSafeInteger(entry.context) && entry.context > 0 && HEX64.test(entry.parity_evidence_sha256 ?? '') ? entry : null;
 }
 
 // The one supported treatment. A policy is qualified only if its descriptor digest is listed in QUALIFIED_TREATMENTS, which
@@ -32,10 +35,23 @@ export const DEFAULT_TREATMENT = Object.freeze({
   policy: TOKEN_POLICY, words: 256, overlap: 32, byte_cap: CHUNK_MAX_BYTES, token_cap: DEFAULT_CHUNK_TOKEN_CAP,
   render: RENDER_CONTRACT, model: 'embeddinggemma', context: 2048, serving_revision: DEFAULT_SERVING_REVISION,
   tokenizer_sha256: '2e942f0ea32d8432a164585591b58632b48a78da0e2d1b0c315bb1f18725b698',
+  provider: 'ollama', endpoint_path: '/v1/embeddings', transport: 'openai_compat', dimensions: 768,
 });
-export const QUALIFIED_TREATMENTS = Object.freeze([]);
+// Policy digest → the evaluation that qualified exactly that descriptor: { manifest_digest, eval_version, evidence_sha256 }.
+export const QUALIFIED_TREATMENTS = Object.freeze({});
 
-const HEX64 = /^[0-9a-f]{64}$/u;
+// The deployment a token count is claimed for. A different endpoint, transport or vector shape is a different treatment.
+function deployment(embedding) {
+  let path = null;
+  try { path = new URL(embedding.url).pathname; } catch { /* An invalid URL is refused when embedding is used. */ }
+  return { provider: embedding.allow_remote === true ? 'remote' : 'ollama', endpoint_path: path,
+    transport: embedding.ollama_transport ?? 'openai_compat', dimensions: Number.isSafeInteger(embedding.dimensions) ? embedding.dimensions : null };
+}
+
+const qualifiedBy = policyDigest => {
+  const entry = Object.hasOwn(QUALIFIED_TREATMENTS, policyDigest) ? QUALIFIED_TREATMENTS[policyDigest] : null;
+  return entry && HEX64.test(entry.manifest_digest ?? '') && HEX64.test(entry.evidence_sha256 ?? '') ? entry : null;
+};
 
 /**
  * The chunk policy a configuration selects, without any file access. Without `embedding.tokenizer` it is the legacy byte
@@ -59,9 +75,11 @@ export function chunkPolicy(config, verified = VERIFIED_TOKENIZERS) {
   requireThat(Number.isSafeInteger(cap) && cap >= 1 && cap <= (context ?? Number.MAX_SAFE_INTEGER), 'invalid_chunk_token_cap');
   const descriptor = { policy: TOKEN_POLICY, words, overlap, byte_cap: CHUNK_MAX_BYTES, token_cap: cap, render: RENDER_CONTRACT,
     model: normalizedModel(embedding), context, serving_revision: verifiedEntry?.serving_revision ?? null,
-    tokenizer_sha256: contract.sha256 };
+    tokenizer_sha256: contract.sha256, ...deployment(embedding) };
   const policyDigest = digest(descriptor);
-  return { descriptor, digest: policyDigest, qualification: QUALIFIED_TREATMENTS.includes(policyDigest) ? 'qualified' : 'unqualified',
+  // An unverified contract can never be qualified, whatever its digest.
+  const qualified = context !== null && qualifiedBy(policyDigest) !== null;
+  return { descriptor, digest: policyDigest, qualification: qualified ? 'qualified' : 'unqualified',
     tokenizer: { path: contract.gguf, sha256: contract.sha256 } };
 }
 
