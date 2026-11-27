@@ -25,9 +25,12 @@ export function verifiedContract(verified, sha256, embedding) {
 
 // The one supported treatment. A policy is qualified only if its descriptor digest is listed in QUALIFIED_TREATMENTS, which
 // only a reviewed evaluation of exactly that descriptor adds to. Any other valid policy is recorded as unqualified.
+// The serving revision names the served blob, Ollama release and effective context the default is qualified against; an owner
+// opts in by setting embedding.ollama_context_revision to it.
+export const DEFAULT_SERVING_REVISION = 'ollama-0.21.0-embeddinggemma-0800cbac-ctx2048';
 export const DEFAULT_TREATMENT = Object.freeze({
   policy: TOKEN_POLICY, words: 256, overlap: 32, byte_cap: CHUNK_MAX_BYTES, token_cap: DEFAULT_CHUNK_TOKEN_CAP,
-  render: RENDER_CONTRACT, model: 'embeddinggemma', context: 2048,
+  render: RENDER_CONTRACT, model: 'embeddinggemma', context: 2048, serving_revision: DEFAULT_SERVING_REVISION,
   tokenizer_sha256: '2e942f0ea32d8432a164585591b58632b48a78da0e2d1b0c315bb1f18725b698',
 });
 export const QUALIFIED_TREATMENTS = Object.freeze([]);
@@ -50,11 +53,12 @@ export function chunkPolicy(config, verified = VERIFIED_TOKENIZERS) {
   }
   requireThat(contract && typeof contract === 'object' && typeof contract.gguf === 'string' && contract.gguf.startsWith('/')
     && contract.gguf.length <= 4096 && typeof contract.sha256 === 'string' && HEX64.test(contract.sha256), 'invalid_chunk_tokenizer');
-  const context = verifiedContract(verified, contract.sha256, embedding)?.context ?? null;
+  const verifiedEntry = verifiedContract(verified, contract.sha256, embedding);
+  const context = verifiedEntry?.context ?? null;
   const cap = embedding.chunk_token_cap ?? DEFAULT_CHUNK_TOKEN_CAP;
   requireThat(Number.isSafeInteger(cap) && cap >= 1 && cap <= (context ?? Number.MAX_SAFE_INTEGER), 'invalid_chunk_token_cap');
   const descriptor = { policy: TOKEN_POLICY, words, overlap, byte_cap: CHUNK_MAX_BYTES, token_cap: cap, render: RENDER_CONTRACT,
-    model: normalizedModel(embedding), context,
+    model: normalizedModel(embedding), context, serving_revision: verifiedEntry?.serving_revision ?? null,
     tokenizer_sha256: contract.sha256 };
   const policyDigest = digest(descriptor);
   return { descriptor, digest: policyDigest, qualification: QUALIFIED_TREATMENTS.includes(policyDigest) ? 'qualified' : 'unqualified',

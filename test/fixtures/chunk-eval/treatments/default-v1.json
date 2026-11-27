@@ -12,6 +12,7 @@
     "render": "ollama-spm-raw-input/1",
     "model": "embeddinggemma",
     "context": 2048,
+    "serving_revision": "ollama-0.21.0-embeddinggemma-0800cbac-ctx2048",
     "tokenizer_sha256": "2e942f0ea32d8432a164585591b58632b48a78da0e2d1b0c315bb1f18725b698"
   },
   "embedder": {
