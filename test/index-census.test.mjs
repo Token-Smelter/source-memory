@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import neo4j from 'neo4j-driver';
-import { CENSUS_TIMEOUT_MS, indexCensus } from '../src/index-census.mjs';
+import { CENSUS_TIMEOUT_MS, checkCensusNotifications, indexCensus } from '../src/index-census.mjs';
 
 const config = { scopes: { read: ['fictional'] }, embedding: {
   url: 'http://127.0.0.1:9/v1/embeddings', model: 'fixture', dimensions: 3,
@@ -56,6 +56,17 @@ test('census refuses missing aliases, extra numeric columns and inconsistent cou
     assert.equal(calls.includes('commit'), false);
     assert.equal(calls.includes('health'), false);
   }
+});
+
+test('only missing optional marker property warnings are accepted', () => {
+  const code = 'Neo.ClientNotification.Statement.UnknownPropertyKeyWarning';
+  const warning = name => ({ code, description: `Property unavailable (the missing property name is: ${name})` });
+  const keys = new Set();
+  checkCensusNotifications([warning('embedding_oversized_key'), warning('embedding_retry_after')], keys);
+  assert.deepEqual([...keys], ['embedding_oversized_key', 'embedding_retry_after']);
+  assert.throws(() => checkCensusNotifications([warning('embedding_key')], keys), { code: 'census_unverified', notification: code });
+  assert.throws(() => checkCensusNotifications([{ ...warning('embedding_retry_after'), code: 'Neo.ClientNotification.Schema.HintWarning' }], keys),
+    { code: 'census_unverified', notification: 'Neo.ClientNotification.Schema.HintWarning' });
 });
 
 test('census does not return partial counts if the health read times out', async () => {

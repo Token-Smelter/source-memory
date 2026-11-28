@@ -1,5 +1,5 @@
 import neo4j from 'neo4j-driver';
-import { authorize, isNested, requireThat } from './core.mjs';
+import { authorize, isNested, MemoryError, requireThat } from './core.mjs';
 import { embeddingContextContract, embeddingIdentity } from './models.mjs';
 import { Neo4jStore, selection } from './store.mjs';
 
@@ -38,10 +38,26 @@ const chunkColumns = ['chunks_total', 'chunks_indexed', 'chunks_unindexed', 'ter
   'retry_marked', 'cooling', 'other', 'same_key_missing_chunks', 'turns_affected', 'missing_chunk_turn_binding'];
 const recordColumns = ['records_total', 'missing_record_vectors', 'same_key_missing_records'];
 
-async function counts(tx, statement, params, columns) {
+const optionalProperties = new Set(['embedding_oversized_key', 'embedding_oversized_cap', 'embedding_oversized_text',
+  'embedding_rejected_context', 'embedding_rejected_text', 'embedding_retry_key', 'embedding_retry_after', 'embedding_retry_single']);
+
+export function checkCensusNotifications(notifications, unknownKeys) {
+  requireThat(Array.isArray(notifications), 'census_unverified');
+  for (const note of notifications) {
+    const key = /\(the missing property name is: ([a-z_]+)\)\s*$/.exec(note.description ?? '')?.[1];
+    if (note.code === 'Neo.ClientNotification.Statement.UnknownPropertyKeyWarning' && optionalProperties.has(key)) unknownKeys.add(key);
+    else {
+      const error = new MemoryError('census_unverified');
+      error.notification = typeof note.code === 'string' && /^Neo\.ClientNotification(?:\.[a-zA-Z0-9]+){2,4}$/.test(note.code) ? note.code : 'unknown';
+      throw error;
+    }
+  }
+}
+
+async function counts(tx, statement, params, columns, unknownKeys) {
   const result = await tx.run(statement, params);
-  requireThat(result.records.length === 1 && result.summary.notifications.length === 0
-    && !result.summary.counters.containsUpdates(), 'census_unverified');
+  checkCensusNotifications(result.summary.notifications, unknownKeys);
+  requireThat(result.records.length === 1 && !result.summary.counters.containsUpdates(), 'census_unverified');
   const row = result.records[0].toObject();
   requireThat(Object.keys(row).length === columns.length && columns.every(name => Object.hasOwn(row, name)
     && Number.isSafeInteger(row[name]) && row[name] >= 0), 'census_unverified');
@@ -68,7 +84,7 @@ async function indexHealth(tx, scope, dimensions) {
   }));
 }
 
-export async function indexCensus(config, scope, suppliedStore) {
+export async function indexCensus(config, scope, suppliedStore, unknownKeys = new Set()) {
   authorize(config, scope);
   requireThat(!isNested(scope) && config.scopes.read.includes(scope), 'scope_denied');
   const key = embeddingIdentity(config.embedding);
@@ -81,14 +97,20 @@ export async function indexCensus(config, scope, suppliedStore) {
       const tx = session.beginTransaction({ timeout: CENSUS_TIMEOUT_MS });
       try {
         const params = { scope, key, context, limit: neo4j.int(CENSUS_CAP + 1) };
-        const chunks = await counts(tx, chunk, params, chunkColumns);
-        requireThat(chunks.chunks_total <= CENSUS_CAP, 'census_over_bound');
+        const chunks = await counts(tx, chunk, params, chunkColumns, unknownKeys);
+        if (chunks.chunks_total > CENSUS_CAP) {
+          await tx.commit();
+          return { rows_at_least: CENSUS_CAP + 1, cap_reached: 1 };
+        }
         requireThat(chunks.chunks_indexed + chunks.chunks_unindexed === chunks.chunks_total
           && chunks.terminal_byte + chunks.terminal_context + chunks.retry_marked + chunks.other === chunks.chunks_unindexed
           && chunks.cooling <= chunks.retry_marked && chunks.same_key_missing_chunks <= chunks.chunks_unindexed
           && chunks.turns_affected + chunks.missing_chunk_turn_binding <= chunks.chunks_unindexed, 'census_unverified');
-        const records = await counts(tx, record, { ...params, limit: neo4j.int(CENSUS_CAP - chunks.chunks_total + 1) }, recordColumns);
-        requireThat(chunks.chunks_total + records.records_total <= CENSUS_CAP, 'census_over_bound');
+        const records = await counts(tx, record, { ...params, limit: neo4j.int(CENSUS_CAP - chunks.chunks_total + 1) }, recordColumns, unknownKeys);
+        if (chunks.chunks_total + records.records_total > CENSUS_CAP) {
+          await tx.commit();
+          return { rows_at_least: CENSUS_CAP + 1, cap_reached: 1 };
+        }
         requireThat(records.same_key_missing_records <= records.missing_record_vectors
           && records.missing_record_vectors <= records.records_total, 'census_unverified');
         const health = await indexHealth(tx, scope, config.embedding.dimensions);
