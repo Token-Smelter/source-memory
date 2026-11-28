@@ -25,7 +25,6 @@ try {
   const unknownKeys = new Set();
   const result = await indexCensus(config, scope, undefined, unknownKeys);
   if (unknownKeys.size) process.stderr.write(`Unknown optional property keys: ${[...unknownKeys].sort().join(', ')}\n`);
-  if (result.cap_reached === 1) process.stderr.write(`At least ${result.rows_at_least} rows; cap reached. No complete census.\n`);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 } catch (error) {
   const code = error instanceof MemoryError ? (error.notification ? `census_unverified: notification ${error.notification}` : error.code) : 'census_unavailable';

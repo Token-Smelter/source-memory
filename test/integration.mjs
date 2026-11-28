@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { Memory } from '../src/memory.mjs';
 import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
 import { embeddingContextContract, embeddingIdentity } from '../src/models.mjs';
-import { CENSUS_CAP, indexCensus } from '../src/index-census.mjs';
+import { indexCensus } from '../src/index-census.mjs';
 import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
 import { runLiveSmoke } from './live-smoke.mjs';
 import { createDerivedAdapter, searchDerived, resolveDerived } from '../pi-extension/derived-retrieval.mjs';
@@ -140,8 +140,11 @@ export async function runIntegration(database, scratch) {
         turns_affected: 1, missing_chunk_turn_binding: 1, records_total: 1, missing_record_vectors: 1,
         same_key_missing_records: 1, chunk_index_health: 1, record_index_health: 1 });
       assert.equal(modelCalls, calls);
-      await memory.store.transaction('write', tx => tx.run(`UNWIND range(1,$cap) AS i CREATE (:SMRecord {scope:$scope})`, { scope, cap: CENSUS_CAP }));
-      assert.deepEqual(await counts(), { rows_at_least: CENSUS_CAP + 1, cap_reached: 1 });
+      await memory.store.transaction('write', tx => tx.run(`UNWIND range(1,4097) AS i CREATE (:SMRecord {scope:$scope})`, { scope }));
+      const large = await counts();
+      assert.deepEqual([large.records_total, large.missing_record_vectors, large.terminal_byte, large.terminal_context, large.cooling],
+        [4098, 4098, 1, 1, 1]);
+      assert.equal(Object.hasOwn(large, 'cap_reached'), false);
     });
     await check('oversized legacy chunks stay unindexed without blocking eligible chunks', async () => {
       const scope = 'embedding-legacy-size-fixture';
