@@ -92,6 +92,8 @@ function faultyDriver(driver, { loseCommitReply = false, failClose = false }) {
   };
 }
 
+const staged = input => stage({ approvedFrozen: input.frozen?.frozen_digest, ...input });
+
 const replan = (plan, change) => {
   const { frozen_digest: _f, ...frozenBody } = change(structuredClone(plan.frozen));
   const frozen = { ...frozenBody, frozen_digest: digest(canonical(frozenBody)) };
@@ -120,7 +122,7 @@ export async function runOneTurnRepair(database, scratch) {
   const driver = memory.store.driver;
   const key = embeddingIdentity(embedding);
   assert.equal(key, embeddingIdentity(config.embedding), 'the repair writes in the scope\'s existing vector space');
-  const handles = { driver, database: database.database };
+  const handles = { driver, database: database.database, expectedStore: await memory.store.identity() };
   const using = { ...handles, config: repairConfig, verified };
   // Awkward boundaries: combining marks, emoji and CJK inside the long entry.
   const big = `${words(2600)} e\u0301e\u0301 \u{1F469}\u200D\u{1F4BB} ${words(1400)} \u65e5\u672c\u8a9e ${words(2350, 'cd')} quartzlantern ${words(50, 'cd')}`;
@@ -148,6 +150,20 @@ export async function runOneTurnRepair(database, scratch) {
 
     await check('R1 freeze binds exactly three vectorless oversized rows of a pre-manifest turn and refuses anything else', async () => {
       await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key, expectedTargets: 2 }), { code: 'repair_target_changed' });
+      await assert.rejects(freeze({ ...handles, expectedStore: { ...handles.expectedStore, database_id: 'another-store' }, scope: SCOPE, turnUid,
+        embeddingKey: key }), { code: 'repair_store_mismatch' });
+      // A partial layout witness is not a pre-manifest turn.
+      await run(driver, 'MATCH (t:SMTurn {uid:$turn}) SET t.chunk_count = 3', { turn: turnUid });
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key }), { code: 'repair_turn_has_manifest' });
+      await run(driver, 'MATCH (t:SMTurn {uid:$turn}) REMOVE t.chunk_count', { turn: turnUid });
+      // A stated end past the entry would be clamped by a slice; it is refused.
+      await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_2'}) SET c.end = c.end + 5");
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key }), { code: 'repair_target_changed' });
+      await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_2'}) SET c.end = c.end - 5");
+      // Negative zero cannot survive the JSON inverse, so a target carrying it is refused.
+      await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_1'}) SET c.weight = -0.0");
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key }), { code: 'repair_unsupported_property' });
+      await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_1'}) REMOVE c.weight");
       await assert.rejects(freeze({ ...handles, scope: OTHER, turnUid: manifested.id, embeddingKey: key }), { code: 'repair_turn_has_manifest' });
       // A chunk linked from the turn but bound to another scope is refused before its content is read.
       await run(driver, `MATCH (t:SMTurn {uid:$turn}) CREATE (c:SMChunk {uid:'chunk_foreign', scope:$other, turn_uid:$turn, text:'foreign'})
@@ -166,15 +182,15 @@ export async function runOneTurnRepair(database, scratch) {
 
     await check('R2 stage covers each target exactly under the cap, within budget, with an exact served count per singleton', async () => {
       faults.miscount = true;
-      await assert.rejects(stage({ frozen, config: repairConfig, verified, budget: BUDGET }), { code: 'repair_count_mismatch' });
+      await assert.rejects(staged({ frozen, config: repairConfig, verified, budget: BUDGET }), { code: 'repair_count_mismatch' });
       faults.miscount = false;
-      await assert.rejects(stage({ frozen, config: repairConfig, verified, budget: { ...BUDGET, max_pieces: 2 } }), { code: 'repair_budget_exceeded' });
-      await assert.rejects(stage({ frozen, config: { ...repairConfig, embedding: { ...embedding, ollama_transport: undefined } }, verified, budget: BUDGET }),
+      await assert.rejects(staged({ frozen, config: repairConfig, verified, budget: { ...BUDGET, max_pieces: 2 } }), { code: 'repair_budget_exceeded' });
+      await assert.rejects(staged({ frozen, config: { ...repairConfig, embedding: { ...embedding, ollama_transport: undefined } }, verified, budget: BUDGET }),
         { code: 'repair_transport_required' });
-      await assert.rejects(stage({ frozen, config: { ...repairConfig, embedding: { ...embedding, chunk_token_cap: 2000 } }, verified, budget: BUDGET }),
+      await assert.rejects(staged({ frozen, config: { ...repairConfig, embedding: { ...embedding, chunk_token_cap: 2000 } }, verified, budget: BUDGET }),
         { code: 'repair_treatment_mismatch' });
-      await assert.rejects(stage({ frozen: { ...frozen, scope: 'tampered' }, config: repairConfig, verified, budget: BUDGET }), { code: 'repair_frozen_invalid' });
-      plan = await stage({ frozen, config: repairConfig, verified, budget: BUDGET });
+      await assert.rejects(staged({ frozen: { ...frozen, scope: 'tampered' }, config: repairConfig, verified, budget: BUDGET }), { code: 'repair_frozen_invalid' });
+      plan = await staged({ frozen, config: repairConfig, verified, budget: BUDGET });
       for (const { old_uid: oldUid, nodes } of plan.replacements) {
         const target = frozen.targets.find(item => item.uid === oldUid).state.properties;
         let reached = Number(target.start.value);
@@ -195,7 +211,7 @@ export async function runOneTurnRepair(database, scratch) {
       assert.equal((await apply({ ...using, plan })).error, 'repair_preimage_changed');
       await memory.index(SCOPE, { limit: 2048 });
       frozen = await freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key });
-      plan = await stage({ frozen, config: repairConfig, verified, budget: BUDGET });
+      plan = await staged({ frozen, config: repairConfig, verified, budget: BUDGET });
       const elsewhere = replan(plan, copy => ({ ...copy, store: { ...copy.store, database_id: 'another-store' } }));
       assert.equal((await apply({ ...using, plan: elsewhere })).error, 'repair_store_mismatch');
       assert.equal((await reconcile({ ...handles, plan: elsewhere })).state, 'other_store');

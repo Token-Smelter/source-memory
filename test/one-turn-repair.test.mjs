@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { canonical, digest, MemoryError } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
 import { readGgufTokenizer, RENDER_CONTRACT, sentencePiece } from '../src/tokenizer.mjs';
-import { apply, inverse, readSnapshot, REPAIR_CONTRACT, stage, writeOnce } from '../src/one-turn-repair.mjs';
+import { apply, classify, inverse, readSnapshot, REPAIR_CONTRACT, stage, writeOnce } from '../src/one-turn-repair.mjs';
 import { fictionalVocabulary, ggufTokenizerFile } from './helpers/gguf-fixture.mjs';
 
 const words = count => Array.from({ length: count }, () => 'abcd').join(' ');
@@ -44,6 +44,9 @@ function frozenRecord(key) {
   return { ...frozen, frozen_digest: digest(canonical(frozen)) };
 }
 
+// The owner approves exactly the frozen record staged; tests that need another approval pass `approvedFrozen` themselves.
+const staged = input => stage({ approvedFrozen: input.frozen?.frozen_digest, ...input });
+
 const counting = counter => async (endpoint, body) => ({ model: body.model, embeddings: [[1, 2]], prompt_eval_count: counter.count(body.input) });
 
 test('stage re-derives the target to exact coverage under the cap and embeds each piece alone with an exact served count', async t => {
@@ -52,7 +55,7 @@ test('stage re-derives the target to exact coverage under the cap and embeds eac
   const frozen = frozenRecord(key);
   const calls = [];
   const request = async (endpoint, body) => { calls.push({ endpoint, body }); return counting(counter)(endpoint, body); };
-  const plan = await stage({ frozen, config, verified, budget: BUDGET, request });
+  const plan = await staged({ frozen, config, verified, budget: BUDGET, request });
   const pieces = plan.replacements[0].nodes;
   assert.ok(pieces.length >= 3);
   assert.ok(calls.every(call => call.endpoint.endsWith('/api/embed') && call.body.truncate === false && typeof call.body.input === 'string'));
@@ -75,7 +78,7 @@ test('stage re-derives the target to exact coverage under the cap and embeds eac
   assert.equal(planDigest, digest(canonical(body)));
   // A served count that differs from the local count stops the stage; nothing is retried.
   let tries = 0;
-  await assert.rejects(stage({ frozen, config, verified, budget: BUDGET,
+  await assert.rejects(staged({ frozen, config, verified, budget: BUDGET,
     request: async (endpoint, b) => { tries++; return { model: b.model, embeddings: [[1, 2]], prompt_eval_count: 1 }; } }), { code: 'repair_count_mismatch' });
   assert.equal(tries, 1);
 });
@@ -86,6 +89,7 @@ test('stage refuses before sending any text when the budget, frozen record, key,
   const request = async () => { throw new Error('must not embed'); };
   const cases = [
     [{ frozen: frozenRecord(key), budget: { max_pieces: 2, max_seconds: 60 } }, 'repair_budget_exceeded'],
+    [{ frozen: frozenRecord(key), approvedFrozen: 'f'.repeat(64) }, 'repair_frozen_not_approved'],
     [{ frozen: frozenRecord(key), budget: undefined }, 'invalid_input'],
     [{ frozen: { ...frozenRecord(key), scope: 'other' } }, 'repair_frozen_invalid'],
     [{ frozen: frozenRecord('f'.repeat(64)) }, 'repair_key_mismatch'],
@@ -94,13 +98,13 @@ test('stage refuses before sending any text when the budget, frozen record, key,
     [{ frozen: frozenRecord(key), config: { ...config, embedding: { ...config.embedding, chunk_token_cap: 2000 } } }, 'repair_treatment_mismatch'],
   ];
   for (const [input, code] of cases) {
-    await assert.rejects(stage({ config, verified, budget: BUDGET, request, ...input }), { code }, code);
+    await assert.rejects(staged({ config, verified, budget: BUDGET, request, ...input }), { code }, code);
   }
 });
 
 test('apply and inverse refuse a tampered plan or another treatment before opening any session', async t => {
   const { config, verified, counter } = await fixture(t);
-  const plan = await stage({ frozen: frozenRecord(embeddingIdentity(config.embedding)), config, verified, budget: BUDGET, request: counting(counter) });
+  const plan = await staged({ frozen: frozenRecord(embeddingIdentity(config.embedding)), config, verified, budget: BUDGET, request: counting(counter) });
   const noWrites = { session: () => { throw new Error('must not open a session'); } };
   for (const step of [apply, inverse]) {
     await assert.rejects(step({ driver: noWrites, database: 'neo4j', config, verified, plan: { ...plan, policy_digest: 'x' } }), { code: 'repair_plan_invalid' });
@@ -154,22 +158,68 @@ test('the command refuses an unknown step or a duplicate, missing or unknown opt
   }
 });
 
-test('the command refuses an unapproved plan, and any write while an earlier attempt is unsettled, before touching a store', async t => {
+test('the plan-bound journal admits one attempt at a time and holds every write until an unsettled attempt is disposed', async t => {
   const { dir, config, verified, counter } = await fixture(t);
-  const plan = await stage({ frozen: frozenRecord(embeddingIdentity(config.embedding)), config, verified, budget: BUDGET, request: counting(counter) });
-  const paths = { config: join(dir, 'config.json'), plan: join(dir, 'plan.json'), log: join(dir, 'attempts.jsonl') };
-  // No database is configured: reaching the store would fail differently.
-  await writeFile(paths.config, JSON.stringify({ ...config, neo4j: { uri: 'bolt://127.0.0.1:1', auth: 'none' } }));
+  const plan = await staged({ frozen: frozenRecord(embeddingIdentity(config.embedding)), config, verified, budget: BUDGET, request: counting(counter) });
+  const journalDir = join(dir, 'journal');
+  const paths = { config: join(dir, 'config.json'), plan: join(dir, 'plan.json'), copy: join(dir, 'copy-of-plan.json') };
+  const journal = join(journalDir, plan.plan_digest);
+  // The built-in trust table does not verify the fictional tokenizer, so each attempt is refused before any write.
+  await writeFile(paths.config, JSON.stringify({ ...config, repair_journal_dir: journalDir, neo4j: { uri: 'bolt://127.0.0.1:1', auth: 'none' } }));
   await writeFile(paths.plan, JSON.stringify(plan));
-  const step = (approved, log = paths.log) => invoke(['apply', '--config', paths.config, '--plan', paths.plan, '--approved-plan', approved,
-    '--quiescence-ref', 'owner-ref-1', '--attempt-log', log]);
+  await writeFile(paths.copy, JSON.stringify(plan));
+  const step = (approved, planPath = paths.plan) => invoke(['apply', '--config', paths.config, '--plan', planPath, '--approved-plan', approved,
+    '--custody-ref', 'owner-custody-1', '--quiescence-ref', 'owner-quiet-1']);
+  const dispose = attempt => invoke(['dispose', '--config', paths.config, '--plan', paths.plan, '--attempt', String(attempt),
+    '--state', 'preimage', '--ref', 'owner-ref-2']);
   assert.deepEqual(JSON.parse((await step('f'.repeat(64))).stderr), { ok: false, error: 'repair_plan_not_approved' });
-  await writeFile(paths.log, `${JSON.stringify({ plan_digest: plan.plan_digest, step: 'apply', outcome: 'started' })}\n`);
+  assert.deepEqual(JSON.parse((await step(plan.plan_digest)).stderr), { ok: false, error: 'repair_tokenizer_unverified' });
+  const settled = JSON.parse(await readFile(join(journal, 'attempt-1.outcome.json'), 'utf8'));
+  assert.equal(settled.outcome, 'refused', 'a refusal before any write settles its attempt');
+  // A crash after an attempt started leaves it without an outcome; it holds every later write, from any copy of the plan.
+  await writeFile(join(journal, 'attempt-2.json'), '{}');
   assert.deepEqual(JSON.parse((await step(plan.plan_digest)).stderr), { ok: false, error: 'repair_disposition_required' });
-  await writeFile(paths.log, `${JSON.stringify({ plan_digest: plan.plan_digest, step: 'apply', outcome: 'unknown' })}\n`);
-  assert.deepEqual(JSON.parse((await step(plan.plan_digest)).stderr), { ok: false, error: 'repair_disposition_required' });
-  const disposed = await invoke(['dispose', '--plan', paths.plan, '--attempt-log', paths.log, '--state', 'postimage', '--ref', 'owner-ref-2']);
-  assert.equal(JSON.parse(disposed.stdout).state, 'postimage');
-  const log = (await readFile(paths.log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  assert.deepEqual(log.map(entry => entry.outcome), ['unknown', 'disposed']);
+  assert.deepEqual(JSON.parse((await step(plan.plan_digest, paths.copy)).stderr), { ok: false, error: 'repair_disposition_required' },
+    'the journal is keyed by the plan, not the file path');
+  assert.deepEqual(JSON.parse((await dispose(1)).stderr), { ok: false, error: 'repair_attempt_not_unsettled' }, 'a settled attempt');
+  assert.deepEqual(JSON.parse((await dispose(9)).stderr), { ok: false, error: 'repair_attempt_not_unsettled' }, 'no such attempt');
+  assert.equal(JSON.parse((await dispose(2)).stdout).attempt, 2);
+  assert.deepEqual(JSON.parse((await dispose(2)).stderr), { ok: false, error: 'repair_attempt_not_unsettled' }, 'disposed only once');
+  await step(plan.plan_digest);
+  assert.ok(JSON.parse(await readFile(join(journal, 'attempt-3.json'), 'utf8')).attempt === 3, 'the next attempt starts after the disposition');
+});
+
+test('freeze refuses a configuration that grants only write, before opening any store', async t => {
+  const { dir, config } = await fixture(t);
+  const path = join(dir, 'write-only.json');
+  await writeFile(path, JSON.stringify({ ...config, scopes: { read: [], write: ['fixture'] }, neo4j: { uri: 'bolt://127.0.0.1:1', auth: 'none' } }));
+  const result = await invoke(['freeze', '--config', path, '--store-id', 'store-1', '--scope', 'fixture', '--turn', 't', '--out', join(dir, 'f.json')]);
+  assert.deepEqual(JSON.parse(result.stderr), { ok: false, error: 'scope_denied' });
+});
+
+test('a stage that would finish after its deadline is refused, and the deadline starts at entry', async t => {
+  const { config, verified, counter } = await fixture(t);
+  let now = 0;
+  const slow = async (endpoint, body) => { now += 25_000; return counting(counter)(endpoint, body); };
+  await assert.rejects(staged({ frozen: frozenRecord(embeddingIdentity(config.embedding)), config, verified, budget: { max_pieces: 64, max_seconds: 60 },
+    request: slow, clock: () => now }), { code: 'repair_budget_exceeded' });
+});
+
+test('a plan for another store is refused before any lock or content read, and classified without reading content', async t => {
+  const { config, verified, counter } = await fixture(t);
+  const plan = await staged({ frozen: frozenRecord(embeddingIdentity(config.embedding)), config, verified, budget: BUDGET, request: counting(counter) });
+  const record = fields => ({ get: name => fields[name] });
+  const queries = [];
+  const tx = { run: async query => { queries.push(query); return { records: [record({ id: 'another-store', name: 'neo4j' })] }; },
+    commit: async () => {}, rollback: async () => {} };
+  const driver = { session: () => ({ beginTransaction: () => tx, close: async () => {} }) };
+  for (const step of [apply, inverse]) {
+    queries.length = 0;
+    const result = await step({ driver, database: 'neo4j', config, verified, plan });
+    assert.deepEqual([result.outcome, result.error], ['rolled_back', 'repair_store_mismatch']);
+    assert.deepEqual(queries, ['CALL db.info() YIELD id, name RETURN id, name'], 'only the store identity was read');
+  }
+  queries.length = 0;
+  assert.equal(await classify(tx, plan), 'other_store');
+  assert.equal(queries.length, 1);
 });

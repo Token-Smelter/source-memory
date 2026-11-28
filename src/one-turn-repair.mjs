@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import neo4j from 'neo4j-driver';
 import { canonical, CHUNK_MAX_BYTES, digest, identity, MemoryError, normalizeTurn, requireThat, validateVector } from './core.mjs';
 import { chunkPolicy, DEFAULT_CHUNK_TOKEN_CAP, deriveChunks, TOKEN_POLICY } from './chunk-policy.mjs';
@@ -13,7 +14,8 @@ export const REPAIR_TARGETS = 3;
 const SAFE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 const PROPERTY_TYPES = ['STRING', 'BOOLEAN', 'INTEGER', 'FLOAT', 'ZONED DATETIME', 'LIST<FLOAT>', 'LIST<INTEGER>', 'LIST<STRING>'];
 // Properties a first retain under a chunk policy writes; a turn carrying any of them has a manifest this repair would break.
-const MANIFEST_PROPERTIES = ['chunk_policy', 'chunk_policy_digest', 'chunk_manifest', 'chunk_manifest_digest', 'chunk_manifest_status'];
+const MANIFEST_PROPERTIES = ['chunk_policy', 'chunk_policy_digest', 'chunk_qualification', 'chunk_count', 'chunk_gap_count',
+  'chunk_manifest', 'chunk_manifest_digest', 'chunk_manifest_status'];
 
 // The property's type with nullability annotations removed, e.g. `LIST<FLOAT NOT NULL> NOT NULL` -> `LIST<FLOAT>`.
 const baseType = type => String(type).replaceAll(' NOT NULL', '');
@@ -23,10 +25,12 @@ function nodeState(labels, typed) {
   const properties = {};
   for (const { k, t, v } of typed) {
     const type = baseType(t);
-    requireThat(SAFE_NAME.test(k) && PROPERTY_TYPES.includes(type), 'repair_unsupported_property');
-    // JSON keeps every finite double exactly; a non-finite one could not be restored, so it is refused before any write.
-    requireThat(type !== 'FLOAT' || Number.isFinite(v), 'repair_unsupported_property');
-    requireThat(type !== 'LIST<FLOAT>' || (Array.isArray(v) && v.every(Number.isFinite)), 'repair_unsupported_property');
+    // `__proto__` would not survive as an own property of a plain object, so it is refused like any unsupported state.
+    requireThat(SAFE_NAME.test(k) && k !== '__proto__' && !Object.hasOwn(properties, k) && PROPERTY_TYPES.includes(type), 'repair_unsupported_property');
+    // JSON keeps every finite double exactly except negative zero; a value JSON cannot carry is refused before any write.
+    const exactFloat = x => Number.isFinite(x) && !Object.is(x, -0);
+    requireThat(type !== 'FLOAT' || exactFloat(v), 'repair_unsupported_property');
+    requireThat(type !== 'LIST<FLOAT>' || (Array.isArray(v) && v.every(exactFloat)), 'repair_unsupported_property');
     properties[k] = { type, value: v };
   }
   requireThat(labels.every(label => SAFE_NAME.test(label)), 'repair_unsupported_label');
@@ -34,12 +38,19 @@ function nodeState(labels, typed) {
 }
 const stateDigest = state => digest(canonical(state));
 const value = (state, key) => state.properties[key]?.value;
-// A numeric property as a JS number; offsets and ordinals are far inside the safe range, anything else is refused.
+// A stored integer offset or ordinal as a JS number: an INTEGER (held as a decimal string) or an integral FLOAT, nonnegative
+// and safe. Any other type or value is refused rather than coerced.
 const numeric = (state, key) => {
-  const n = Number(value(state, key));
+  const property = state.properties[key];
+  requireThat(property && ['INTEGER', 'FLOAT'].includes(property.type), 'repair_target_changed');
+  const n = property.type === 'INTEGER' ? (/^\d{1,16}$/u.test(property.value) ? Number(property.value) : NaN) : property.value;
   requireThat(Number.isSafeInteger(n) && n >= 0, 'repair_target_changed');
   return n;
 };
+
+// A UTF-16 offset that does not split a surrogate pair.
+const boundary = (text, at) => at === 0 || at === text.length
+  || !(/[\uD800-\uDBFF]/u.test(text[at - 1]) && /[\uDC00-\uDFFF]/u.test(text[at]));
 
 // Values are returned in a lossless form: integers as decimal strings (the store driver would round large ones), datetimes as
 // ISO strings with their zone.
@@ -55,10 +66,22 @@ const TYPED = node => `[k IN keys(${node}) | {k: k, t: valueType(${node}[k]), v:
  * The fingerprint detects count-changing writes in the scope; it does not detect a same-count update of another row, so
  * writer quiescence remains a hard external requirement of the owner, not something this check provides.
  */
-export async function readSnapshot(tx, scope, turnUid, embeddingKey) {
+export async function storeIdentity(tx) {
   const info = (await tx.run('CALL db.info() YIELD id, name RETURN id, name')).records;
   requireThat(info.length === 1, 'repair_target_changed');
-  const store = { system: 'neo4j', database_id: info[0].get('id'), database: info[0].get('name') };
+  return { system: 'neo4j', database_id: info[0].get('id'), database: info[0].get('name') };
+}
+
+/**
+ * Refuses inside the transaction, before any lock or content read, unless it runs on the expected physical store. A wrong
+ * store is therefore never locked or read beyond its identity.
+ */
+export async function requireStore(tx, expected) {
+  requireThat(canonical(await storeIdentity(tx)) === canonical(expected), 'repair_store_mismatch');
+}
+
+export async function readSnapshot(tx, scope, turnUid, embeddingKey) {
+  const store = await storeIdentity(tx);
   const turns = await tx.run(`MATCH (t:SMTurn {uid:$turn, scope:$scope}) RETURN labels(t) AS labels, ${TYPED('t')} AS typed`, { scope, turn: turnUid });
   requireThat(turns.records.length === 1, 'repair_target_changed');
   const turn = nodeState(turns.records[0].get('labels'), turns.records[0].get('typed'));
@@ -123,9 +146,12 @@ async function readOnly(driver, database, work) {
  * without a current-key vector: exactly `expectedTargets`, each over CHUNK_MAX_BYTES, with only the turn's property-free
  * link, equal to its source span, and together every chunk in the scope without a current-key vector.
  */
-export async function freeze({ driver, database, scope, turnUid, embeddingKey, expectedTargets = REPAIR_TARGETS }) {
+export async function freeze({ driver, database, expectedStore, scope, turnUid, embeddingKey, expectedTargets = REPAIR_TARGETS }) {
   requireThat(expectedTargets === REPAIR_TARGETS, 'repair_target_changed');
+  requireThat(typeof expectedStore?.database_id === 'string' && typeof expectedStore.database === 'string', 'invalid_input');
   return readOnly(driver, database, async tx => {
+    // The owner names the intended store; another one is refused before any target is read.
+    await requireStore(tx, { system: 'neo4j', database_id: expectedStore.database_id, database: expectedStore.database });
     const snapshot = await readSnapshot(tx, scope, turnUid, embeddingKey);
     requireThat(MANIFEST_PROPERTIES.every(key => !(key in snapshot.turn.properties)), 'repair_turn_has_manifest');
     requireThat(snapshot.fingerprint.records_without_current_vector === 0, 'repair_target_changed');
@@ -140,8 +166,13 @@ export async function freeze({ driver, database, scope, turnUid, embeddingKey, e
       requireThat(onlyTurnLink(chunk), 'repair_unsupported_link');
       requireThat(value(chunk.state, 'embedding') === undefined, 'repair_target_changed');
       requireThat(typeof text === 'string' && Buffer.byteLength(text) > CHUNK_MAX_BYTES, 'repair_target_changed');
-      requireThat(entry && entry.role === value(chunk.state, 'role')
-        && entry.text.slice(numeric(chunk.state, 'start'), numeric(chunk.state, 'end')) === text, 'repair_target_changed');
+      requireThat(entry && entry.role === value(chunk.state, 'role'), 'repair_target_changed');
+      // The stated interval itself must be valid: in bounds, the exact text length, on code-point boundaries. A slice would
+      // clamp an out-of-range end instead.
+      const start = numeric(chunk.state, 'start');
+      const end = numeric(chunk.state, 'end');
+      requireThat(start < end && end <= entry.text.length && end - start === text.length
+        && boundary(entry.text, start) && boundary(entry.text, end) && entry.text.slice(start, end) === text, 'repair_target_changed');
     }
     requireThat(new Set(targets.map(chunk => chunk.uid)).size === targets.length, 'repair_target_changed');
     // Replacements take new ordinals above every existing one: unique integers, so no sibling is renumbered and the
@@ -184,17 +215,23 @@ function coversExactly(pieces, length) {
 }
 
 /**
- * Stages the replacements: each target's exact text is re-derived under the verified token policy and must be covered
- * exactly by its pieces. Within `budget` ({max_pieces, max_seconds}, checked before any text is sent), each piece is embedded
- * alone through the native no-truncate transport, and the served count must equal the local count, with no retry.
- * Replacement IDs are new and collision-free, and ordinals are new integers above every existing one.
+ * Stages the replacements for the frozen record whose digest the owner approved. Each target's exact text is re-derived under
+ * the verified token policy and must be covered exactly by its pieces. One monotonic `budget` ({max_pieces, max_seconds})
+ * starts at entry: the piece count, sizes and ordinal range are checked before any text is sent, each call gets at most
+ * the remaining time, and a plan finished after the deadline is refused. The deadline is a completion cutoff; it does not
+ * preempt local work or the model server. Each piece is embedded alone through the native no-truncate transport, and the
+ * served count must equal the local count, with no retry. Replacement IDs are new and collision-free, and ordinals are new
+ * integers above every existing one.
  */
-export async function stage({ frozen, config, verified, budget, request = localJson, clock = () => Date.now() }) {
+export async function stage({ frozen, approvedFrozen, config, verified, budget, request = localJson, clock = () => performance.now() }) {
+  const started = clock();
   requireThat(frozen?.contract === REPAIR_CONTRACT, 'invalid_input');
   requireThat(Number.isSafeInteger(budget?.max_pieces) && budget.max_pieces > 0 && Number.isSafeInteger(budget.max_seconds)
     && budget.max_seconds > 0, 'invalid_input');
+  const deadline = started + budget.max_seconds * 1000;
   const { frozen_digest: frozenDigest, ...body } = frozen;
   requireThat(digest(canonical(body)) === frozenDigest, 'repair_frozen_invalid');
+  requireThat(approvedFrozen === frozenDigest, 'repair_frozen_not_approved');
   const { policy, key, endpoint } = repairTreatment(config, verified);
   requireThat(key === frozen.embedding_key, 'repair_key_mismatch');
   const embedding = config.embedding;
@@ -212,16 +249,18 @@ export async function stage({ frozen, config, verified, budget, request = localJ
   }
   const total = derivations.reduce((sum, item) => sum + item.pieces.length, 0);
   requireThat(total <= budget.max_pieces, 'repair_budget_exceeded');
-  const deadline = clock() + budget.max_seconds * 1000;
+  requireThat(Number.isSafeInteger(frozen.ordinal_ceiling) && Number.isSafeInteger(frozen.ordinal_ceiling + total), 'repair_derivation_gap');
   let ordinal = frozen.ordinal_ceiling;
   const replacements = [];
   for (const { target, pieces } of derivations) {
     const start = numeric(target.state, 'start');
     const nodes = [];
     for (const [part, piece] of pieces.entries()) {
-      requireThat(clock() < deadline, 'repair_budget_exceeded');
+      const remaining = Math.floor(deadline - clock());
+      requireThat(remaining > 0, 'repair_budget_exceeded');
       const result = await request(endpoint, { model: embedding.model, input: piece.text, truncate: false },
-        Math.max(1, Math.min(embedding.timeout_ms ?? 30_000, deadline - clock())));
+        Math.min(embedding.timeout_ms ?? 30_000, remaining));
+      requireThat(clock() < deadline, 'repair_budget_exceeded');
       requireThat(result?.model === embedding.model && Array.isArray(result.embeddings) && result.embeddings.length === 1, 'invalid_embedding_response');
       // The served input must be exactly what was counted locally; a different count means the contract does not hold.
       requireThat(result.prompt_eval_count === piece.token_count, 'repair_count_mismatch');
@@ -245,6 +284,8 @@ export async function stage({ frozen, config, verified, budget, request = localJ
   const postimage = { store: frozen.store, turn_digest: frozen.preimage.turn_digest, siblings_digest: frozen.preimage.siblings_digest, fingerprint,
     created: created.map(node => ({ uid: node.uid, links: TURN_LINK, digest: stateDigest(node.state) })).sort((a, b) => a.uid.localeCompare(b.uid)) };
   requireThat(new Set(created.map(node => node.uid)).size === created.length, 'repair_derivation_gap');
+  // A plan completed after the deadline is not accepted.
+  requireThat(clock() < deadline, 'repair_budget_exceeded');
   const plan = { contract: REPAIR_CONTRACT, frozen_digest: frozenDigest, frozen, policy_digest: policy.digest, embedding_key: key,
     budget, replacements, postimage };
   return { ...plan, plan_digest: digest(canonical(plan)) };
@@ -335,8 +376,9 @@ function verifyPlan(plan) {
 /** Classifies the live state against the plan, in the caller's transaction: other_store, preimage, postimage or neither. */
 export async function classify(tx, plan) {
   const { scope, turn_uid: turnUid, embedding_key: key, preimage } = plan.frozen;
+  // The store is checked first, so another store's content is never read.
+  if (!same(await storeIdentity(tx), plan.frozen.store)) return 'other_store';
   const snapshot = await readSnapshot(tx, scope, turnUid, key);
-  if (!same(snapshot.store, plan.frozen.store)) return 'other_store';
   const targetUids = plan.frozen.targets.map(target => target.uid);
   const createdUids = plan.postimage.created.map(node => node.uid);
   const before = bindings(snapshot, targetUids);
@@ -363,6 +405,7 @@ export async function apply({ driver, database, plan, config, verified }) {
   requireTreatment(plan, config, verified);
   const { scope, turn_uid: turnUid } = plan.frozen;
   const result = await writeOnce(driver, database, async tx => {
+    await requireStore(tx, plan.frozen.store);
     await lock(tx, scope, turnUid, plan.frozen.targets.map(target => target.uid));
     await requireState(tx, plan, 'preimage', 'repair_preimage_changed');
     await deleteVerified(tx, scope, turnUid, plan.frozen.targets.map(target => target.uid));
@@ -378,6 +421,7 @@ export async function inverse({ driver, database, plan, config, verified }) {
   requireTreatment(plan, config, verified);
   const { scope, turn_uid: turnUid } = plan.frozen;
   const result = await writeOnce(driver, database, async tx => {
+    await requireStore(tx, plan.frozen.store);
     await lock(tx, scope, turnUid, plan.postimage.created.map(node => node.uid));
     await requireState(tx, plan, 'postimage', 'repair_postimage_changed');
     await deleteVerified(tx, scope, turnUid, plan.postimage.created.map(node => node.uid));
