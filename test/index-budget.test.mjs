@@ -16,20 +16,26 @@ async function embedder(t, plan = () => ({})) {
     const { input } = JSON.parse(body);
     const index = calls.length;
     calls.push(input);
-    const { delay = 0, advance = 0 } = plan(index, input);
+    const { delay = 0, advance = 0, reject = false, fail = false } = plan(index, input);
     clock.now += advance;
     if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    if (fail) return res.writeHead(503).end();
+    if (reject) {
+      return res.writeHead(400, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'the input length exceeds the context length' } }));
+    }
     if (!res.destroyed) res.end(JSON.stringify({ data: input.map((value, i) => ({ index: i, embedding: [value.length, 1] })) }));
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(() => new Promise(done => { server.closeAllConnections(); server.close(done); }));
-  return { calls, clock, url: `http://127.0.0.1:${server.address().port}/embed` };
+  return { calls, clock, url: `http://127.0.0.1:${server.address().port}/v1/embeddings` };
 }
 
 // A store of chunk rows that answers the index step's calls and logs them in order. Saves and deferrals are confirmed in full
 // unless `saveOutcome` says otherwise; `onStatus` and `onSave` run inside those calls.
-function fakeStore(rows, { saveOutcome, onSave = () => {}, onStatus = () => {}, onSelect = () => {}, onObserve = () => {}, gaps = 0, statusOf } = {}) {
+function fakeStore(rows, { saveOutcome, onSave = () => {}, onStatus = () => {}, onSelect = () => {}, onObserve = () => {}, gaps = 0, statusOf,
+  markOutcome, onMark = () => {}, deferOutcome } = {}) {
   const log = [];
   const find = uid => rows.find(row => row.uid === uid);
   const hint = row => ({ uid: row.uid, chunk: true, isolated: Boolean(row.isolated), cooling: false, single: Boolean(row.single) });
@@ -55,7 +61,12 @@ function fakeStore(rows, { saveOutcome, onSave = () => {}, onStatus = () => {}, 
     async deferEmbeddings(_scope, _key, items, delay, single) {
       log.push(['defer', items.map(item => item.uid), delay, single]);
       for (const item of items) find(item.uid).deferred = true;
-      return { applied: items.length, refused: 0 };
+      return deferOutcome?.(items) ?? { applied: items.length, refused: 0 };
+    },
+    async markContextRejectedChunk(_scope, _key, _context, item) {
+      log.push(['context', item.uid]);
+      await onMark();
+      return markOutcome?.() ?? { applied: 1, refused: 0 };
     },
     async markOversizedChunks(_scope, _key, items) { log.push(['oversized']); return { applied: items.length, refused: 0 }; },
     async status() {
@@ -219,6 +230,35 @@ test('under a budget a refused save is stale, not credited, and a saved step wit
   assert.deepEqual([reply.status, reply.indexed, reply.stale, reply.partial], ['pending', 1, 1, undefined]);
   const gapped = await memoryWith(fixture, fakeStore(rowsOf(2), { gaps: 1 }), { index_budget_ms: 10_000 }).index('s');
   assert.deepEqual([gapped.status, gapped.reason, gapped.indexed, gapped.derived_gaps], ['unavailable', 'derived_chunk_gaps', 2, 1]);
+});
+
+test('under a budget an unresolved context mark or deferral write takes precedence, and a late confirmed context mark yields', async t => {
+  const context = { model: 'embeddinggemma', ollama_context_revision: 'fixture-v1' };
+  const isolatedSingle = () => rowsOf(1, { isolated: true, single: true });
+  const uncertainOutcome = () => ({ applied: 0, refused: 1, uncertain: true });
+  const rejecting = await embedder(t, () => ({ reject: true }));
+  // An uncertain context mark: explicit unknown under a budget; unbudgeted, today's pending with its unknown count.
+  const unknownMark = await memoryWith(rejecting, fakeStore(isolatedSingle(), { markOutcome: uncertainOutcome }), { ...context, index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([unknownMark.status, unknownMark.reason, unknownMark.unknown, unknownMark.partial], ['unavailable', 'embedding_write_unknown', 1, undefined]);
+  const plainMark = await memoryWith(rejecting, fakeStore(isolatedSingle(), { markOutcome: uncertainOutcome }), context).index('s');
+  assert.deepEqual([plainMark.status, plainMark.unknown], ['pending', 1]);
+  // A confirmed context mark that settles after the deadline yields explicitly; before it, today's pending.
+  const lateMark = fakeStore(isolatedSingle(), { onMark: () => { rejecting.clock.now += 120_000; } });
+  const late = await memoryWith(rejecting, lateMark, { ...context, index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([late.status, late.partial?.reason, lateMark.log.filter(([kind]) => kind === 'context').length], ['pending', 'index_budget_exhausted', 1]);
+  rejecting.clock.now = 0;
+  const onTime = await memoryWith(rejecting, fakeStore(isolatedSingle()), { ...context, index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([onTime.status, onTime.partial], ['pending', undefined]);
+  // An uncertain deferral of a failed request: explicit unknown under a budget, not the request failure; confirmed, the failure.
+  const failing = await embedder(t, () => ({ fail: true }));
+  const unknownDefer = await memoryWith(failing, fakeStore(rowsOf(2), { deferOutcome: items => ({ applied: 0, refused: items.length, uncertain: true }) }),
+    { index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([unknownDefer.status, unknownDefer.reason, unknownDefer.unknown], ['unavailable', 'embedding_write_unknown', 2]);
+  const confirmedDefer = await memoryWith(failing, fakeStore(rowsOf(2)), { index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([confirmedDefer.status, confirmedDefer.reason], ['unavailable', 'model_request_failed']);
+  const plainDefer = await memoryWith(failing, fakeStore(rowsOf(2), { deferOutcome: items => ({ applied: 0, refused: items.length, uncertain: true }) })).index('s');
+  assert.deepEqual([plainDefer.status, plainDefer.reason, plainDefer.unknown], ['unavailable', 'model_request_failed', 2], 'unbudgeted is unchanged');
+  assert.equal(failing.calls.length, 3, 'one request per step, nothing after the unresolved write');
 });
 
 test('an isolated group still ends the step after one request under a budget', async t => {

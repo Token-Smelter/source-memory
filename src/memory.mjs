@@ -209,6 +209,8 @@ export class Memory {
             requireThat(typeof this.store.markContextRejectedChunk === 'function', 'embedding_accounting_invalid');
             tally(await this.store.markContextRejectedChunk(scope, key, context,
               { uid: candidate.uid, observed: candidate.observed }), 1);
+            if (deadline !== null && unknown) return uncertain();
+            if (deadline !== null && remaining() <= 0) return exhausted();
             return { status: 'pending', ...progress() };
           }
           const reason = safeCode(error);
@@ -221,6 +223,8 @@ export class Memory {
             const delay = batch.length === 1 ? 300 : 60;
             if (typeof this.store.deferEmbeddings === 'function') {
               tally(await this.store.deferEmbeddings(scope, key, batch.map(({ uid, observed }) => ({ uid, observed })), delay, single, ...(context ? [context] : [])), batch.length);
+              // An unresolved deferral write takes precedence over the request failure it was recording.
+              if (deadline !== null && unknown) return uncertain();
             }
           }
           return failed(reason);
