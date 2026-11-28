@@ -104,6 +104,10 @@ test('one monotonic budget covers every read and the processing, and a late resu
   now = 0;
   const slowPage = memoryReader(rows, { page: () => { now += 61_000; } });
   assert.equal((await countOverContext({ policy, reader: slowPage, caps: CAPS, clock })).reason, 'cap_seconds');
+  // A page that arrives just before the deadline is not processed past it: the clock is read between rows.
+  let ticks = 0;
+  const rowClock = () => (ticks++ > 6 ? 61_000 : 0);
+  assert.equal((await countOverContext({ policy, reader: memoryReader(rows), caps: { ...CAPS, page_size: 10 }, clock: rowClock })).reason, 'cap_seconds');
 });
 
 test('every failure and malformed row yields incomplete with neither totals nor progress', async t => {
@@ -130,13 +134,21 @@ test('the store reader refuses an unreadable or ambiguous vector state instead o
     session: () => ({ beginTransaction: () => ({ run: async () => ({ records: records.map(fields => ({ get: name => fields[name] })) }),
       commit: async () => {}, isOpen: () => false, rollback: async () => {} }), close: async () => {} }),
   });
-  const read = records => neo4jChunkReader(fakeDriver(records), 'neo4j', 'fiction', 'key-1').page(null, 10, 1000);
-  assert.deepEqual((await read([{ uid: 'a', text: 'x', kind: 'list', key: 'key-1' }, { uid: 'b', text: 'y', kind: 'list', key: 'old' },
+  const reader = records => neo4jChunkReader(fakeDriver(records), 'neo4j', 'fiction', 'key-1', 2);
+  const read = records => reader(records).page(null, 10, 1000);
+  assert.deepEqual((await read([{ uid: 'a', text: 'x', kind: 'valid', key: 'key-1' }, { uid: 'b', text: 'y', kind: 'valid', key: 'old' },
     { uid: 'c', text: 'z', kind: 'none', key: null }])).map(item => item.current_vector), [true, false, false]);
-  for (const bad of [{ kind: 'other', key: 'key-1' }, { kind: 'list', key: null }, { kind: 'none', key: 7 }]) {
+  // An invalid vector at the current key (wrong type, dimension or values) is refused, never counted as current.
+  for (const bad of [{ kind: 'invalid', key: 'key-1' }, { kind: 'valid', key: null }, { kind: 'none', key: 7 }]) {
     await assert.rejects(read([{ uid: 'a', text: 'x', ...bad }]), { code: 'count_failed' }, JSON.stringify(bad));
   }
-  await assert.rejects(neo4jChunkReader(fakeDriver([]), 'neo4j', 'fiction', 'key-1').total(0), { code: 'count_failed' });
+  await assert.rejects(reader([]).total(0), { code: 'count_failed' });
+  // The total is exactly one numeric count row; a missing, null or extra row is refused rather than read as zero.
+  for (const records of [[], [{ n: null }], [{ n: 3 }, { n: 3 }], [{ n: -1 }], [{ n: '3' }]]) {
+    await assert.rejects(reader(records).total(1000), { code: 'count_failed' }, JSON.stringify(records));
+  }
+  assert.equal(await reader([{ n: 3 }]).total(1000), 3);
+  assert.throws(() => neo4jChunkReader(fakeDriver([]), 'neo4j', 'fiction', 'key-1', 0), { code: 'count_failed' });
 });
 
 test('an unverified tokenizer contract yields incomplete without reading the store', async t => {

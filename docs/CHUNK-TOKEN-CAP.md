@@ -51,7 +51,7 @@ A gap is source that no chunk represents, not a missing vector row. `status` rep
 
 `scripts/over-context-count.mjs` is an owner-only, read-only count of one exact scope's stored chunks under today's verified contract. It needs the owner's grant to read that scope's text. It reports `within_cap`, `over_cap_within_context` and over-context chunks split into `with_current_vector` and `without_current_vector`, plus a histogram and excess tokens. It reports no identifiers, spans or text.
 
-Every cap is required: rows, fetched text bytes, pages, page size of at most 500, seconds and the transaction timeout. Any cap, failure or changed total gives `incomplete` with no totals. Pages are separate snapshots, not one cut. An over-context chunk with a current vector has *unknown fidelity*: the count does not establish what an earlier writer sent, nor that its vector was truncated.
+Every cap is required: rows, fetched text bytes, pages, page size of at most 500, seconds and the transaction timeout. Any cap, failure or changed total gives `incomplete` with no totals. The seconds cap is a completion cutoff, not a hard elapsed or transfer limit. Tokenizer verification finishes before it is checked, each query stops at its transaction timeout (at most the time remaining), and no result is produced after the cutoff. Page size and page count bound the rows returned, not bytes or database work. Only a stored vector of the configured dimensions, with finite, not-all-zero values, counts as a vector. An invalid one is refused. Pages are separate snapshots, not one cut. An over-context chunk with a current vector has *unknown fidelity*: the count does not establish what an earlier writer sent, nor that its vector was truncated.
 
 ## Evaluation
 

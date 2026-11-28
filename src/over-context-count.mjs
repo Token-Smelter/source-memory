@@ -34,9 +34,11 @@ const incomplete = reason => ({ contract: OVER_CONTEXT_COUNT, status: 'incomplet
 /**
  * Counts one exact scope's stored chunks against the token cap and the context, through `reader`:
  * `{ total(timeoutMs): Promise<number>, page(after, limit, timeoutMs): Promise<[{uid, text, current_vector}]> }`.
- * One monotonic budget of max_seconds covers tokenizer verification, both totals, every page and all processing; each read
- * gets at most the remaining budget, and a pass that ends late is refused. Pages are separate snapshots. Any cap, read
- * failure, malformed row, unverified contract or changed total yields `incomplete`. Identifiers and texts never leave.
+ * max_seconds is a completion cutoff on one monotonic clock, not a hard elapsed or transfer limit. Tokenizer verification
+ * cannot be interrupted and is checked when it completes (it reads one ~620 MB artifact). Each query is stopped by its
+ * transaction timeout, which is at most the time remaining. The deadline is checked after every read and between rows,
+ * and no result is produced after it. Pages are separate snapshots. Any cap, read failure, malformed row, unverified
+ * contract or changed total yields `incomplete`. Identifiers and texts never leave.
  */
 export async function countOverContext({ policy, reader, caps: input, clock = () => performance.now() }) {
   const caps = countCaps(input);
@@ -64,8 +66,10 @@ export async function countOverContext({ policy, reader, caps: input, clock = ()
     let page;
     try { page = await reader.page(after, caps.page_size, timeout()); } catch { return incomplete('read_failed'); }
     pages++;
+    if (remaining() <= 0) return incomplete('cap_seconds');
     if (!Array.isArray(page) || page.length > caps.page_size) return incomplete('read_failed');
     for (const row of page) {
+      if (remaining() <= 0) return incomplete('cap_seconds');
       if (typeof row?.uid !== 'string' || typeof row.text !== 'string' || typeof row.current_vector !== 'boolean'
           || (after !== null && row.uid <= after)) return incomplete('read_failed');
       after = row.uid;
@@ -101,25 +105,34 @@ export async function countOverContext({ policy, reader, caps: input, clock = ()
     chunks: rows, exactly_counted: exactlyCounted, ...counts,
     over_context_histogram: histogram,
     excess_tokens: { sum: excess, denominator_tokens: overContextTokens },
-    // Text bytes received after fetching; network transfer and database work are not measured, only bounded by page size,
-    // page count and each transaction's timeout.
-    post_fetch_text_bytes: fetchedBytes, transfer_and_database_work: 'not_measured',
+    // Text bytes received after fetching. Page size and page count bound the rows returned, not bytes, seek or sort work;
+    // network transfer and database work are neither measured nor bounded beyond each query's timeout.
+    post_fetch_text_bytes: fetchedBytes, transfer_and_database_work: 'not_measured', time_cap: 'completion_cutoff',
     pages, totals: { before: totalBefore, after: totalAfter },
   };
 }
 
-// The stored vector state of one row: current under this key, or not. An unreadable or ambiguous state is refused.
+// The stored vector state of one row: current under this key, or not. Invalid or ambiguous data is refused.
 function currentVector(kind, key, embeddingKey) {
   if (kind === 'none') {
     requireThat(key === null || typeof key === 'string', 'count_failed');
     return false;
   }
-  requireThat(kind === 'list' && typeof key === 'string', 'count_failed');
+  requireThat(kind === 'valid' && typeof key === 'string', 'count_failed');
   return key === embeddingKey;
 }
 
+// The library's vector invariant (validateVector in core.mjs), checked inside the database so only the state is returned:
+// a list of exactly `dimensions` finite numbers, not all zero.
+const VECTOR_STATE = `CASE WHEN c.embedding IS NULL THEN 'none'
+  WHEN (valueType(c.embedding) STARTS WITH 'LIST<FLOAT' OR valueType(c.embedding) STARTS WITH 'LIST<INTEGER')
+    AND size(c.embedding) = $dimensions AND all(x IN c.embedding WHERE x = x AND x < 1.0e308 AND x > -1.0e308)
+    AND any(x IN c.embedding WHERE x <> 0) THEN 'valid'
+  ELSE 'invalid' END`;
+
 /** A reader over one exact scope's `SMChunk` rows. It returns text and a current-key flag, never vectors. No read retries. */
-export function neo4jChunkReader(driver, database, scope, embeddingKey) {
+export function neo4jChunkReader(driver, database, scope, embeddingKey, dimensions) {
+  requireThat(Number.isSafeInteger(dimensions) && dimensions > 0, 'count_failed');
   const run = async (query, params, timeout) => {
     requireThat(Number.isSafeInteger(timeout) && timeout > 0, 'count_failed');
     const session = driver.session({ database, defaultAccessMode: neo4j.session.READ });
@@ -136,13 +149,16 @@ export function neo4jChunkReader(driver, database, scope, embeddingKey) {
   return {
     async total(timeout) {
       const result = await run('MATCH (c:SMChunk {scope:$scope}) RETURN count(c) AS n', { scope }, timeout);
-      return Number(result.records[0].get('n'));
+      requireThat(result.records.length === 1, 'count_failed');
+      const value = result.records[0].get('n');
+      const n = neo4j.isInt(value) ? value.toNumber() : value;
+      requireThat(Number.isSafeInteger(n) && n >= 0, 'count_failed');
+      return n;
     },
     async page(after, limit, timeout) {
       const result = await run(`MATCH (c:SMChunk {scope:$scope}) WHERE $after IS NULL OR c.uid > $after
-        RETURN c.uid AS uid, c.text AS text, c.embedding_key AS key,
-          CASE WHEN c.embedding IS NULL THEN 'none' WHEN valueType(c.embedding) STARTS WITH 'LIST' THEN 'list' ELSE 'other' END AS kind
-        ORDER BY c.uid LIMIT $limit`, { scope, after, limit: neo4j.int(limit) }, timeout);
+        RETURN c.uid AS uid, c.text AS text, c.embedding_key AS key, ${VECTOR_STATE} AS kind
+        ORDER BY c.uid LIMIT $limit`, { scope, after, limit: neo4j.int(limit), dimensions: neo4j.int(dimensions) }, timeout);
       return result.records.map(record => ({ uid: record.get('uid'), text: record.get('text'),
         current_vector: currentVector(record.get('kind'), record.get('key'), embeddingKey) }));
     },
@@ -165,7 +181,7 @@ export async function runOverContextCount({ config, scope, caps, openStore, cloc
     requireThat(['token_cap', 'context', 'tokenizer_sha256', 'served_blob', 'render', 'model']
       .every(key => policy.descriptor[key] === DEFAULT_TREATMENT[key]), 'count_contract_mismatch');
     store = await openStore(config.neo4j);
-    const reader = neo4jChunkReader(store.driver, store.database, exact, embeddingIdentity(config.embedding));
+    const reader = neo4jChunkReader(store.driver, store.database, exact, embeddingIdentity(config.embedding), config.embedding.dimensions);
     const report = await countOverContext({ policy, reader, caps: limits, ...(clock ? { clock } : {}) });
     const closing = store;
     store = null;
