@@ -141,6 +141,12 @@ async function verifiedArtifact(path) {
   }
 }
 
+/**
+ * The exact token counter of a verified token policy, or `{reason}` when the contract or served artifact does not verify.
+ * Counts are of a text's rendered input under today's verified contract; they say nothing about what an earlier writer sent.
+ */
+export const verifiedCounter = policy => policy.descriptor.policy === TOKEN_POLICY ? counterFor(policy) : Promise.resolve({ reason: 'unverified' });
+
 // A verified counter for the policy, or the reason it cannot be had. Only successful loads are cached.
 async function counterFor(policy) {
   // chunkPolicy took the context from a matching verified contract; without one it is null.

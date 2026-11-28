@@ -7,7 +7,9 @@ import { join } from 'node:path';
 import neo4j from 'neo4j-driver';
 import { Memory } from '../src/memory.mjs';
 import { chunkEntries, digest, identity, normalizeTurn } from '../src/core.mjs';
-import { LEGACY_POLICY, MANIFEST_CONTRACT, TOKEN_POLICY } from '../src/chunk-policy.mjs';
+import { chunkPolicy, LEGACY_POLICY, MANIFEST_CONTRACT, TOKEN_POLICY } from '../src/chunk-policy.mjs';
+import { embeddingIdentity } from '../src/models.mjs';
+import { countOverContext, neo4jChunkReader } from '../src/over-context-count.mjs';
 import { readGgufTokenizer, RENDER_CONTRACT } from '../src/tokenizer.mjs';
 import { fictionalVocabulary, ggufTokenizerFile } from './helpers/gguf-fixture.mjs';
 
@@ -178,6 +180,51 @@ export async function runChunkCap(database, scratch) {
         const count = await session.run('MATCH (t:SMTurn {scope:$scope}) WHERE t.chunk_manifest IS NOT NULL RETURN count(t) AS n', { scope: 'cap-history' });
         assert.equal(neo4j.isInt(count.records[0].get('n')) ? count.records[0].get('n').toNumber() : count.records[0].get('n'), 0);
       } finally { await session.close(); }
+    });
+
+    await check('C7 the owner count reads one scope through the store and classifies vectors without exposing rows', async () => {
+      const policy = chunkPolicy(capped.config, verified);
+      const key = embeddingIdentity(embedding);
+      const caps = { max_rows: 100, max_text_bytes: 1_000_000, max_pages: 20, page_size: 2, max_seconds: 60, transaction_timeout_ms: 10_000 };
+      const reader = scope => neo4jChunkReader(driver, database.database, scope, key, embedding.dimensions);
+      const capped21 = await countOverContext({ policy, reader: reader('cap'), caps });
+      assert.equal(capped21.status, 'complete');
+      assert.equal(capped21.chunks, capped21.within_cap, 'chunks derived under cap 21 all fit it');
+      const before = await countOverContext({ policy, reader: reader('cap-legacy'), caps });
+      assert.equal(before.status, 'complete');
+      assert.ok(before.chunks > 0 && before.over_context_without_current_vector === before.chunks, 'legacy 256-word chunks exceed context 64');
+      await capped.index('cap-legacy');
+      const after = await countOverContext({ policy, reader: reader('cap-legacy'), caps });
+      assert.deepEqual([after.over_context_with_current_vector, after.over_context_without_current_vector], [before.chunks, 0]);
+      assert.ok(!JSON.stringify(after).includes('abcd') && !JSON.stringify(after).includes('chunk_'), 'no text or identifier in the report');
+      assert.equal((await countOverContext({ policy, reader: reader('cap-legacy'), caps: { ...caps, max_pages: 1 } })).reason, 'cap_pages');
+      const session = driver.session();
+      try {
+        // A numeric vector under another key is stale, whatever its dimensions.
+        await session.run(`MATCH (c:SMChunk {scope:'cap-legacy'}) WITH c ORDER BY c.uid LIMIT 1 SET c.embedding=[1.0, 2.0, 3.0], c.embedding_key='stale-key'`);
+        const stale = await countOverContext({ policy, reader: reader('cap-legacy'), caps });
+        assert.deepEqual([stale.status, stale.over_context_with_current_vector, stale.over_context_without_current_vector], ['complete', before.chunks - 1, 1]);
+        // A wrong-dimension vector at the current key is refused, not counted as current.
+        await session.run(`MATCH (c:SMChunk {scope:'cap-legacy'}) WITH c ORDER BY c.uid LIMIT 1 SET c.embedding_key=$key`, { key });
+      } finally { await session.close(); }
+      assert.deepEqual(await countOverContext({ policy, reader: reader('cap-legacy'), caps }),
+        { contract: 'source-memory.over-context-count/1', status: 'incomplete', reason: 'read_failed' });
+      // The database classifier itself: the largest finite double is a current vector, as the writer accepts it; NaN and
+      // infinities are refused. Values are bound as parameters so the floats are exact.
+      const setFirst = vector => {
+        const write = driver.session();
+        return write.run(`MATCH (c:SMChunk {scope:'cap-legacy'}) WITH c ORDER BY c.uid LIMIT 1 SET c.embedding=$vector, c.embedding_key=$key`,
+          { vector, key }).finally(() => write.close());
+      };
+      await setFirst([Number.MAX_VALUE, 0]);
+      const extreme = await countOverContext({ policy, reader: reader('cap-legacy'), caps });
+      assert.deepEqual([extreme.status, extreme.over_context_with_current_vector], ['complete', before.chunks]);
+      await setFirst([-Number.MAX_VALUE, 0]);
+      assert.equal((await countOverContext({ policy, reader: reader('cap-legacy'), caps })).status, 'complete');
+      for (const vector of [[Number.POSITIVE_INFINITY, 0], [Number.NEGATIVE_INFINITY, 1], [Number.NaN, 1], [0, 0]]) {
+        await setFirst(vector);
+        assert.equal((await countOverContext({ policy, reader: reader('cap-legacy'), caps })).reason, 'read_failed', String(vector));
+      }
     });
   } finally {
     await capped.close();

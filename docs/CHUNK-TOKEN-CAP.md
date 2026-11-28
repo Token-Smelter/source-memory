@@ -47,6 +47,16 @@ On a first retain, in the same transaction as the turn:
 
 A gap is source that no chunk represents, not a missing vector row. `status` reports `derived_gaps`. `index` returns `unavailable` with reason `derived_chunk_gaps` rather than `ready`, and the recall `chunk_vector` channel is `partial` with `derived_gaps`.
 
+## Counting stored chunks over the context
+
+`scripts/over-context-count.mjs --config --scope --embedding-key --caps` is an owner-only, read-only count of one expressly granted scope's stored chunks under today's verified contract. Each option is required exactly once.
+
+It runs only for the complete default treatment and only when the configured embedding key equals the pinned `--embedding-key`; both are checked before any content is read. It needs the owner's grant to read that scope's text.
+
+It reports `within_cap`, `over_cap_within_context` and over-context chunks split into `with_current_vector` and `without_current_vector`, plus a histogram and excess tokens. A current vector must have the configured dimensions and finite, not-all-zero values; a numeric list under another key is stale. It reports no scope name, identifiers, spans, URL or text; `invocation_sha256` binds the scope, key, caps and policy for the owner's private record.
+
+Every cap is required: rows, fetched text bytes, pages, page size of at most 500, seconds and the transaction timeout. Any cap, failure or changed total gives `incomplete` with no totals. The seconds cap is a completion cutoff, not a hard elapsed or transfer limit. Tokenizer verification finishes before it is checked, each query stops at its transaction timeout (at most the time remaining), and no result is produced after the cutoff. Page size and page count bound the rows returned, not bytes or database work. Only a stored vector of the configured dimensions, with finite, not-all-zero values, counts as a vector. An invalid one is refused. Pages are separate snapshots, not one cut. An over-context chunk with a current vector has *unknown fidelity*: the count does not establish what an earlier writer sent, nor that its vector was truncated.
+
 ## Evaluation
 
 `scripts/eval-chunking.mjs` runs one sealed row of a star matrix: the default `default-v1` and the frozen `legacy-reference-v1` reference, plus explicit, unqualified `--experiment` rows. It scores against gold source spans in a fictional corpus and reports two things separately: that the stored chunk was hit, and that the needle was actually embedded. `--compare` applies the predeclared gates.
