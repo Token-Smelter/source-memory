@@ -13,8 +13,9 @@
 // The journal is keyed by the plan digest, so a moved or copied plan file finds the same journal. A different journal
 // directory or host does not, which is why custody stays an external gate.
 //
-// Private files are written 0600, fsynced, with their directory entry fsynced too, and never overwritten. Stdout carries
-// digests only.
+// Private files are written 0600, fsynced, with their directory entry fsynced too, and never overwritten. Stdout carries no
+// content: digests, counts and outcomes, plus, on freeze only, the observed store ID and selected turn UID. The freeze
+// receipt is therefore private to the custodian and is never collected into a shared report.
 //   freeze    --config C --store-id ID --scope S --out FROZEN   (selects the one turn; its receipt names it, for the custodian)
 //   stage     --config C --frozen FROZEN --approved-frozen DIGEST --max-pieces N --max-seconds N --out PLAN
 //   apply     --config C --plan PLAN --approved-plan DIGEST --custody-ref REF --quiescence-ref REF

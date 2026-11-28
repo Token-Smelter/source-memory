@@ -268,7 +268,9 @@ export async function stage({ frozen, approvedFrozen, config, verified, budget, 
     derivations.push({ target, pieces: derived.chunks });
   }
   const total = derivations.reduce((sum, item) => sum + item.pieces.length, 0);
-  requireThat(total <= budget.max_pieces, 'repair_budget_exceeded');
+  // A piece count over the cap is its own refusal: unchanged bytes derive the same count again, so it is never the time
+  // budget's one permitted re-run.
+  requireThat(total <= budget.max_pieces, 'repair_piece_cap_exceeded');
   requireThat(Number.isSafeInteger(frozen.ordinal_ceiling) && Number.isSafeInteger(frozen.ordinal_ceiling + total), 'repair_derivation_gap');
   let ordinal = frozen.ordinal_ceiling;
   const replacements = [];

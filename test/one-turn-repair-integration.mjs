@@ -202,7 +202,7 @@ export async function runOneTurnRepair(database, scratch) {
       faults.miscount = true;
       await assert.rejects(staged({ frozen, config: repairConfig, verified, budget: BUDGET }), { code: 'repair_count_mismatch' });
       faults.miscount = false;
-      await assert.rejects(staged({ frozen, config: repairConfig, verified, budget: { ...BUDGET, max_pieces: 2 } }), { code: 'repair_budget_exceeded' });
+      await assert.rejects(staged({ frozen, config: repairConfig, verified, budget: { ...BUDGET, max_pieces: 2 } }), { code: 'repair_piece_cap_exceeded' });
       await assert.rejects(staged({ frozen, config: { ...repairConfig, embedding: { ...embedding, ollama_transport: undefined } }, verified, budget: BUDGET }),
         { code: 'repair_transport_required' });
       await assert.rejects(staged({ frozen, config: { ...repairConfig, embedding: { ...embedding, chunk_token_cap: 2000 } }, verified, budget: BUDGET }),

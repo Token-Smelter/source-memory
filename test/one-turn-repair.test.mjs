@@ -88,7 +88,7 @@ test('stage refuses before sending any text when the budget, frozen record, key,
   const key = embeddingIdentity(config.embedding);
   const request = async () => { throw new Error('must not embed'); };
   const cases = [
-    [{ frozen: frozenRecord(key), budget: { max_pieces: 2, max_seconds: 60 } }, 'repair_budget_exceeded'],
+    [{ frozen: frozenRecord(key), budget: { max_pieces: 2, max_seconds: 60 } }, 'repair_piece_cap_exceeded'],
     [{ frozen: frozenRecord(key), approvedFrozen: 'f'.repeat(64) }, 'repair_frozen_not_approved'],
     [{ frozen: frozenRecord(key), budget: undefined }, 'invalid_input'],
     [{ frozen: { ...frozenRecord(key), scope: 'other' } }, 'repair_frozen_invalid'],
