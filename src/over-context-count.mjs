@@ -170,7 +170,8 @@ export function neo4jChunkReader(driver, database, scope, embeddingKey, dimensio
  * served blob), so a run is exactly the stated measurement. The store is closed before any result is returned; a failed
  * close is a failure. Returns `{ok:true, report}` or `{ok:false, error}` with a closed error code.
  */
-export async function runOverContextCount({ config, scope, caps, openStore, clock }) {
+export async function runOverContextCount({ config, scope, caps, openStore, clock = () => performance.now() }) {
+  const started = clock();
   let store = null;
   try {
     requireThat(typeof scope === 'string', 'scope_required');
@@ -178,15 +179,18 @@ export async function runOverContextCount({ config, scope, caps, openStore, cloc
     const limits = countCaps(caps);
     const policy = chunkPolicy(config);
     requireThat(policy.descriptor.policy === TOKEN_POLICY, 'token_policy_required');
-    requireThat(['token_cap', 'context', 'tokenizer_sha256', 'served_blob', 'render', 'model']
+    // Dimensions, provider and endpoint path fix the embedding key the current-vector split is measured against.
+    requireThat(['token_cap', 'context', 'tokenizer_sha256', 'served_blob', 'render', 'model', 'dimensions', 'provider', 'endpoint_path']
       .every(key => policy.descriptor[key] === DEFAULT_TREATMENT[key]), 'count_contract_mismatch');
     store = await openStore(config.neo4j);
     const reader = neo4jChunkReader(store.driver, store.database, exact, embeddingIdentity(config.embedding), config.embedding.dimensions);
-    const report = await countOverContext({ policy, reader, caps: limits, ...(clock ? { clock } : {}) });
+    const report = await countOverContext({ policy, reader, caps: limits, clock });
     const closing = store;
     store = null;
     await closing.close();
-    return { ok: true, report: { scope: exact, caps: limits, ...report } };
+    // Closing the store is inside the same cutoff: a pass that only finishes cleanup late is not reported complete.
+    const late = clock() - started > limits.max_seconds * 1000;
+    return { ok: true, report: { scope: exact, caps: limits, ...(late ? { contract: OVER_CONTEXT_COUNT, status: 'incomplete', reason: 'cap_seconds' } : report) } };
   } catch (error) {
     if (store) await store.close().catch(() => {});
     return { ok: false, error: error instanceof MemoryError && COUNT_ERRORS.includes(error.code) ? error.code : 'count_failed' };
