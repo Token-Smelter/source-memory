@@ -133,7 +133,7 @@ export async function runOneTurnRepair(database, scratch) {
       frozen = await freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key, expectedTargets: 3 });
       plan = await stage({ frozen, config: { ...config, embedding }, verified });
       const before = await readSnapshotFor(driver, database, frozen);
-      assert.equal((await apply({ ...handles, plan })).outcome, 'committed');
+      await expectCommitted(apply({ ...handles, plan }), driver, database, plan);
       assert.equal((await reconcile({ ...handles, plan })).state, 'postimage');
       const after = await readSnapshotFor(driver, database, frozen);
       assert.equal(JSON.stringify(after.turn), JSON.stringify(before.turn), 'the turn is byte-identical');
@@ -149,7 +149,7 @@ export async function runOneTurnRepair(database, scratch) {
     });
 
     await check('R4 inverse restores the exact frozen preimage, typed properties included, and refuses when not at the postimage', async () => {
-      assert.equal((await inverse({ ...handles, plan })).outcome, 'committed');
+      await expectCommitted(inverse({ ...handles, plan }), driver, database, plan);
       assert.equal((await reconcile({ ...handles, plan })).state, 'preimage');
       const restored = await readSnapshotFor(driver, database, frozen);
       const targets = restored.chunks.filter(chunk => chunk.uid.startsWith('chunk_planted_'));
@@ -160,8 +160,8 @@ export async function runOneTurnRepair(database, scratch) {
       assert.deepEqual(await memory.show(SCOPE, { kind: 'record', id: 'r2' }), recordBefore);
       assert.equal((await inverse({ ...handles, plan })).error, 'repair_postimage_changed');
       // Apply again from the restored preimage works: the inverse is exact enough to replay the same plan.
-      assert.equal((await apply({ ...handles, plan })).outcome, 'committed');
-      assert.equal((await inverse({ ...handles, plan })).outcome, 'committed');
+      await expectCommitted(apply({ ...handles, plan }), driver, database, plan);
+      await expectCommitted(inverse({ ...handles, plan }), driver, database, plan);
       assert.equal((await classifyFor(driver, database, plan)), 'preimage');
     });
   } finally {
@@ -169,6 +169,18 @@ export async function runOneTurnRepair(database, scratch) {
     await server.close();
   }
   return results;
+}
+
+// On a refused step, say which binding differs, so a failed rehearsal is diagnosable without reading any store by hand.
+async function expectCommitted(step, driver, database, plan) {
+  const result = await step;
+  if (result.outcome === 'committed') return;
+  const snapshot = await readSnapshotFor(driver, database, plan.frozen);
+  const uids = snapshot.chunks.map(chunk => chunk.uid);
+  assert.fail(`${result.step} ${result.outcome} ${result.error}: fingerprint ${JSON.stringify(snapshot.fingerprint)} vs pre ${
+    JSON.stringify(plan.frozen.preimage.fingerprint)} post ${JSON.stringify(plan.postimage.fingerprint)}; targets present ${
+    plan.frozen.targets.filter(target => uids.includes(target.uid)).length}; created present ${
+    plan.postimage.created.filter(node => uids.includes(node.uid)).length}`);
 }
 
 async function readSnapshotFor(driver, database, frozen) {
