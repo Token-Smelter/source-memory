@@ -21,9 +21,16 @@ flowchart LR
 | `embedding.chunk_token_cap` | Positive integer, at most the verified context. Default 1920 when `embedding.tokenizer` is set. A cap without a tokenizer, or out of range, is refused (`invalid_chunk_token_cap`) before any write. |
 | `embedding.ollama_context_revision` | Must equal the verified contract's serving revision. The default is `ollama-0.21.0-embeddinggemma-0800cbac-ctx2048`. |
 
-A tokenizer is trusted only through `VERIFIED_TOKENIZERS` in `src/chunk-policy.mjs`. An entry binds the digest to the served model, the rendering contract (`ollama-spm-raw-input/1`: raw input plus BOS and EOS, with special-token strings split first), the serving revision and the effective context. Only a reviewed parity qualification (`scripts/tokenizer-parity.mjs`) adds one. Until then a configured contract yields `tokenizer_unavailable` gaps with reason `unverified`.
+A tokenizer is trusted only through `VERIFIED_TOKENIZERS` in `src/chunk-policy.mjs`. An entry binds the digest to the served model, the rendering contract (`ollama-spm-raw-input/1`: raw input plus BOS and EOS, with special-token strings split first), the serving revision and the effective context. Only a reviewed parity qualification (`scripts/tokenizer-parity.mjs`) adds one. Any other contract yields `tokenizer_unavailable` gaps with reason `unverified`. The configured GGUF must hash to the entry's `served_blob`. That proves the local file only; that the running endpoint serves that blob and transport is the owner's attestation through `ollama_context_revision`.
 
-Only a policy whose descriptor digest is listed in `QUALIFIED_TREATMENTS` is `qualified`, and only a reviewed evaluation of exactly that descriptor adds it. Every other valid policy is stamped `unqualified` on its turns and chunks.
+Only a policy whose descriptor digest is listed in `QUALIFIED_TREATMENTS` is `qualified`, and only a reviewed evaluation of exactly that descriptor adds it. Every other valid policy is stamped `unqualified` on its turns and chunks. The descriptor includes cap, chunker settings, tokenizer, served blob, rendering, serving revision, endpoint path, transport and dimensions.
+
+| Table | Entry | Evidence |
+|---|---|---|
+| `VERIFIED_TOKENIZERS` | `2e942f0e…b698`: embeddinggemma, blob `sha256:0800cbac…c515`, Ollama 0.21.0, context 2048 | Parity report `dd421cb8…0de2`: 185 exact counts and 3 exact native refusals on 188 fictional strings |
+| `QUALIFIED_TREATMENTS` | `07d6ab7d…d1a0` (`DEFAULT_TREATMENT`: cap 1920, `/v1/embeddings`, `openai_compat`, 768 dimensions) | Sealed `default-v1` run against `legacy-reference-v1`, comparison `8621f250…f8e1`: embedded recall@5 13/13 against 4/13, every gold span fully represented, no query lost |
+
+To use the qualified default, set `embedding.tokenizer` to that blob and digest and `embedding.ollama_context_revision` to `ollama-0.21.0-embeddinggemma-0800cbac-ctx2048`, and leave `chunk_token_cap` unset. The native no-truncate transport, any other cap and any other model are unqualified until they have their own evaluated row.
 
 ## What is stored
 

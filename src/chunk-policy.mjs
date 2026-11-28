@@ -15,7 +15,17 @@ export const GAP_CAUSES = ['unsplittable_unit', 'tokenizer_unavailable', 'deriva
 // parity report that showed it: { [sha256]: { model, served_blob: 'sha256:<hex>', render, serving_revision, context,
 // parity_evidence_sha256 } }. The configured GGUF must hash to served_blob before it is used. Only a reviewed qualification
 // adds an entry.
-export const VERIFIED_TOKENIZERS = Object.freeze({});
+// The served-blob check proves the local file only; that the running endpoint serves this blob and transport is the owner's
+// attestation through the serving revision.
+export const VERIFIED_TOKENIZERS = Object.freeze({
+  // Parity on 27 Nov 2026: 188 fictional strings, 185 exact counts including 1919-1921 and 2040-2050, and 3 exact native
+  // context refusals, against Ollama 0.21.0 serving this blob through /api/embed with truncate:false.
+  '2e942f0ea32d8432a164585591b58632b48a78da0e2d1b0c315bb1f18725b698': Object.freeze({
+    model: 'embeddinggemma', served_blob: 'sha256:0800cbac9c2064dde519420e75e512a83cb360de3ad5df176185dc69652fc515',
+    render: 'ollama-spm-raw-input/1', serving_revision: 'ollama-0.21.0-embeddinggemma-0800cbac-ctx2048', context: 2048,
+    parity_evidence_sha256: 'dd421cb87fd7b6c408e8515db1cdd6424d865579f5508e1aa10b380daa250de2',
+  }),
+});
 
 const HEX64 = /^[0-9a-f]{64}$/u;
 
@@ -43,7 +53,14 @@ export const DEFAULT_TREATMENT = Object.freeze({
   provider: 'ollama', endpoint_path: '/v1/embeddings', transport: 'openai_compat', dimensions: 768,
 });
 // Policy digest → the evaluation that qualified exactly that descriptor: { manifest_digest, eval_version, evidence_sha256 }.
-export const QUALIFIED_TREATMENTS = Object.freeze({});
+export const QUALIFIED_TREATMENTS = Object.freeze({
+  // default-v1 against legacy-reference-v1, sealed at 9c4c411f on 28 Nov 2026 (UTC): every gold span fully represented,
+  // embedded recall@5 13/13 against 4/13 (dense 9/9 against 0/9), no query lost. Exact cosine on a fictional corpus only.
+  '07d6ab7d1e557244a845889e3628e69d8965948b8dfd5264050b7f9940e3d1a0': Object.freeze({
+    manifest_digest: '9c4e33a3d8e0c8cf2497b579ad3b7c15b4d90199395f423e2455babe2047006e', eval_version: 'source-memory.chunk-eval/1',
+    evidence_sha256: '8621f250a8e71dbe6dd1df0893e89720b5c58e1e0960806b691321dfe384f8e1',
+  }),
+});
 
 // The deployment a token count is claimed for. A different endpoint, transport or vector shape is a different treatment.
 function deployment(embedding) {
