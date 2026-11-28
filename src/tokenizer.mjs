@@ -99,47 +99,52 @@ export async function readGgufTokenizer(path) {
   let handle;
   try { handle = await open(path, 'r'); } catch { throw new TokenizerError('missing'); }
   try {
-    const reader = new Reader(handle);
-    await reader.need(4);
-    check(reader.buffer.toString('latin1', 0, 4) === 'GGUF');
-    reader.offset = 4;
-    const version = await reader.u32();
-    check(version === 2 || version === 3);
-    await reader.u64();
-    const kvCount = await reader.u64();
-    const meta = {};
-    const hash = createHash('sha256').update('source-memory.gguf-tokenizer/1\0');
-    const raw = {};
-    for (let i = 0; i < kvCount; i++) {
-      const key = await reader.string();
-      const type = await reader.u32();
-      const start = reader.offset;
-      const value = await reader.value(type);
-      if (TOKENIZER_KEYS.includes(key)) raw[key] = { type, bytes: reader.buffer.subarray(start, reader.offset) };
-      if (TOKENIZER_KEYS.includes(key) || key === 'general.architecture' || key.endsWith('.context_length')) meta[key] = value;
-    }
-    for (const key of TOKENIZER_KEYS) {
-      hash.update(`${key}\0`);
-      if (raw[key]) hash.update(`${raw[key].type}\0`).update(raw[key].bytes);
-      hash.update('\0');
-    }
-    const architecture = meta['general.architecture'];
-    return {
-      model: meta['tokenizer.ggml.model'] ?? null,
-      architecture: architecture ?? null,
-      context_length: architecture ? meta[`${architecture}.context_length`] ?? null : null,
-      tokens: meta['tokenizer.ggml.tokens'],
-      scores: meta['tokenizer.ggml.scores'],
-      types: meta['tokenizer.ggml.token_type'],
-      bos: meta['tokenizer.ggml.bos_token_id'],
-      eos: meta['tokenizer.ggml.eos_token_id'],
-      add_bos: meta['tokenizer.ggml.add_bos_token'] ?? true,
-      add_eos: meta['tokenizer.ggml.add_eos_token'] ?? false,
-      sha256: hash.digest('hex'),
-    };
+    return await readGgufTokenizerFrom(handle);
   } finally {
     await handle.close();
   }
+}
+
+/** As readGgufTokenizer, from an already open file handle the caller owns, so other checks can bind the same open file. */
+export async function readGgufTokenizerFrom(handle) {
+  const reader = new Reader(handle);
+  await reader.need(4);
+  check(reader.buffer.toString('latin1', 0, 4) === 'GGUF');
+  reader.offset = 4;
+  const version = await reader.u32();
+  check(version === 2 || version === 3);
+  await reader.u64();
+  const kvCount = await reader.u64();
+  const meta = {};
+  const hash = createHash('sha256').update('source-memory.gguf-tokenizer/1\0');
+  const raw = {};
+  for (let i = 0; i < kvCount; i++) {
+    const key = await reader.string();
+    const type = await reader.u32();
+    const start = reader.offset;
+    const value = await reader.value(type);
+    if (TOKENIZER_KEYS.includes(key)) raw[key] = { type, bytes: reader.buffer.subarray(start, reader.offset) };
+    if (TOKENIZER_KEYS.includes(key) || key === 'general.architecture' || key.endsWith('.context_length')) meta[key] = value;
+  }
+  for (const key of TOKENIZER_KEYS) {
+    hash.update(`${key}\0`);
+    if (raw[key]) hash.update(`${raw[key].type}\0`).update(raw[key].bytes);
+    hash.update('\0');
+  }
+  const architecture = meta['general.architecture'];
+  return {
+    model: meta['tokenizer.ggml.model'] ?? null,
+    architecture: architecture ?? null,
+    context_length: architecture ? meta[`${architecture}.context_length`] ?? null : null,
+    tokens: meta['tokenizer.ggml.tokens'],
+    scores: meta['tokenizer.ggml.scores'],
+    types: meta['tokenizer.ggml.token_type'],
+    bos: meta['tokenizer.ggml.bos_token_id'],
+    eos: meta['tokenizer.ggml.eos_token_id'],
+    add_bos: meta['tokenizer.ggml.add_bos_token'] ?? true,
+    add_eos: meta['tokenizer.ggml.add_eos_token'] ?? false,
+    sha256: hash.digest('hex'),
+  };
 }
 
 // Max-heap on (score, then leftmost), the order Ollama's merge queue pops in.

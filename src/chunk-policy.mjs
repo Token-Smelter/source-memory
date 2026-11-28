@@ -1,8 +1,9 @@
 import { canonical, CHUNK_MAX_BYTES, chunkEntries, chunkEntriesTokenCapped, CHUNK_DERIVATION_MAX, digest, integer, requireThat }
   from './core.mjs';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { readGgufTokenizer, RENDER_CONTRACT, sentencePiece, TokenizerError } from './tokenizer.mjs';
+import { open } from 'node:fs/promises';
+import { embeddingContextContract } from './models.mjs';
+import { readGgufTokenizerFrom, RENDER_CONTRACT, sentencePiece, TokenizerError } from './tokenizer.mjs';
 
 export const LEGACY_POLICY = 'legacy-bytes/1';
 export const TOKEN_POLICY = 'token-capped/1';
@@ -31,10 +32,23 @@ const HEX64 = /^[0-9a-f]{64}$/u;
 
 const normalizedModel = embedding => typeof embedding?.model === 'string' ? embedding.model.replace(/:latest$/u, '') : null;
 
+/**
+ * The deployment a token count is claimed for, resolved by the same no-I/O rules the embedding transport applies: a local
+ * Ollama context contract with a valid loopback endpoint, model, serving revision and transport. Anything the transport would
+ * refuse or not classify resolves to null fields and can be neither verified nor qualified.
+ */
+function deployment(embedding) {
+  let resolved = false;
+  try { resolved = embeddingContextContract(embedding) !== null; } catch { /* Refused by the transport rules. */ }
+  if (!resolved) return { provider: null, endpoint_path: null, transport: null, dimensions: null };
+  return { provider: 'ollama', endpoint_path: new URL(embedding.url).pathname, transport: embedding.ollama_transport ?? 'openai_compat',
+    dimensions: embedding.dimensions };
+}
+
 /** The verified contract for this tokenizer and serving configuration, or null: a digest alone verifies nothing. */
 export function verifiedContract(verified, sha256, embedding) {
   const entry = Object.hasOwn(verified, sha256) ? verified[sha256] : null;
-  return entry && entry.model === normalizedModel(embedding) && entry.render === RENDER_CONTRACT
+  return entry && deployment(embedding).provider === 'ollama' && entry.model === normalizedModel(embedding) && entry.render === RENDER_CONTRACT
     && typeof entry.serving_revision === 'string' && entry.serving_revision === embedding?.ollama_context_revision
     && Number.isSafeInteger(entry.context) && entry.context > 0 && HEX64.test(entry.parity_evidence_sha256 ?? '')
     && /^sha256:[0-9a-f]{64}$/u.test(entry.served_blob ?? '') ? entry : null;
@@ -61,14 +75,6 @@ export const QUALIFIED_TREATMENTS = Object.freeze({
     evidence_sha256: '8621f250a8e71dbe6dd1df0893e89720b5c58e1e0960806b691321dfe384f8e1',
   }),
 });
-
-// The deployment a token count is claimed for. A different endpoint, transport or vector shape is a different treatment.
-function deployment(embedding) {
-  let path = null;
-  try { path = new URL(embedding.url).pathname; } catch { /* An invalid URL is refused when embedding is used. */ }
-  return { provider: embedding.allow_remote === true ? 'remote' : 'ollama', endpoint_path: path,
-    transport: embedding.ollama_transport ?? 'openai_compat', dimensions: Number.isSafeInteger(embedding.dimensions) ? embedding.dimensions : null };
-}
 
 const qualifiedBy = policyDigest => {
   const entry = Object.hasOwn(QUALIFIED_TREATMENTS, policyDigest) ? QUALIFIED_TREATMENTS[policyDigest] : null;
@@ -105,12 +111,34 @@ export function chunkPolicy(config, verified = VERIFIED_TOKENIZERS) {
     tokenizer: { path: contract.gguf, sha256: contract.sha256 } };
 }
 
+// Counters verified in this process, keyed by tokenizer digest, served blob and path. A file replaced after its counter was
+// verified is not read again here; the counter in use is the one whose bytes were verified, and a new process verifies again.
 const loaded = new Map();
 
-async function fileSha256(path) {
-  const hash = createHash('sha256');
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
-  return `sha256:${hash.digest('hex')}`;
+const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+
+// Parses the tokenizer and hashes the whole file through one open handle, and refuses if the file changed between the two.
+async function verifiedArtifact(path) {
+  let handle;
+  try { handle = await open(path, 'r'); } catch { return { reason: 'missing' }; }
+  try {
+    const before = await handle.stat();
+    const spec = await readGgufTokenizerFrom(handle);
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(1 << 20);
+    for (let position = 0; ;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    if (!sameFile(before, await handle.stat())) return { reason: 'invalid' };
+    return { spec, blob: `sha256:${hash.digest('hex')}` };
+  } catch (error) {
+    return { reason: error instanceof TokenizerError ? error.reason : 'invalid' };
+  } finally {
+    await handle.close();
+  }
 }
 
 // A verified counter for the policy, or the reason it cannot be had. Only successful loads are cached.
@@ -120,14 +148,12 @@ async function counterFor(policy) {
   const { path, sha256 } = policy.tokenizer;
   const key = `${sha256}\0${policy.descriptor.served_blob}\0${path}`;
   if (!loaded.has(key)) {
-    let spec;
-    try { spec = await readGgufTokenizer(path); } catch (error) {
-      return { reason: error instanceof TokenizerError ? error.reason : 'invalid' };
-    }
-    if (spec.sha256 !== sha256) return { reason: 'digest_mismatch' };
+    const artifact = await verifiedArtifact(path);
+    if (!artifact.spec) return { reason: artifact.reason };
+    if (artifact.spec.sha256 !== sha256) return { reason: 'digest_mismatch' };
     // The whole file must be the served artifact the contract was verified on, not merely carry its tokenizer or name.
-    try { if (await fileSha256(path) !== policy.descriptor.served_blob) return { reason: 'digest_mismatch' }; } catch { return { reason: 'missing' }; }
-    try { loaded.set(key, sentencePiece(spec)); } catch { return { reason: 'invalid' }; }
+    if (artifact.blob !== policy.descriptor.served_blob) return { reason: 'digest_mismatch' };
+    try { loaded.set(key, sentencePiece(artifact.spec)); } catch { return { reason: 'invalid' }; }
   }
   const counter = loaded.get(key);
   if (counter.context_length !== null && policy.descriptor.token_cap > counter.context_length) return { reason: 'context_exceeded' };
