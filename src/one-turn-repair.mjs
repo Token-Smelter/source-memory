@@ -42,17 +42,19 @@ export async function readSnapshot(tx, scope, turnUid, embeddingKey) {
     RETURN c.uid AS uid, labels(c) AS labels, ${TYPED('c')} AS typed, COUNT { (c)--() } AS links ORDER BY c.uid`, { scope, turn: turnUid });
   const chunks = rows.records.map(record => ({ uid: record.get('uid'), links: Number(record.get('links')),
     state: nodeState(record.get('labels'), record.get('typed')) }));
-  const counts = (await tx.run(`CALL {
-      MATCH (n:SMTurn {scope:$scope}) RETURN 'turns' AS kind, count(n) AS n
-      UNION ALL MATCH (n:SMChunk {scope:$scope}) RETURN 'chunks' AS kind, count(n) AS n
-      UNION ALL MATCH (n:SMChunk {scope:$scope}) WHERE n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $key
-        RETURN 'chunks_without_current_vector' AS kind, count(n) AS n
-      UNION ALL MATCH (n:SMRecord {scope:$scope}) RETURN 'records' AS kind, count(n) AS n
-      UNION ALL MATCH (n:SMRecord {scope:$scope}) WHERE n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $key
-        RETURN 'records_without_current_vector' AS kind, count(n) AS n
-      UNION ALL MATCH (n:SMRelation {scope:$scope}) RETURN 'relations' AS kind, count(n) AS n
-    } RETURN kind, n`, { scope, key: embeddingKey })).records;
-  const fingerprint = Object.fromEntries(counts.map(record => [record.get('kind'), Number(record.get('n'))]));
+  // Each count is its own ungrouped aggregate, so a zero is a row and every key is always present.
+  const missing = 'n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $key';
+  const [counts] = (await tx.run(`CALL { MATCH (n:SMTurn {scope:$scope}) RETURN count(n) AS turns }
+    CALL { MATCH (n:SMChunk {scope:$scope}) RETURN count(n) AS chunks }
+    CALL { MATCH (n:SMChunk {scope:$scope}) WHERE ${missing} RETURN count(n) AS chunks_without_current_vector }
+    CALL { MATCH (n:SMRecord {scope:$scope}) RETURN count(n) AS records }
+    CALL { MATCH (n:SMRecord {scope:$scope}) WHERE ${missing} RETURN count(n) AS records_without_current_vector }
+    CALL { MATCH (n:SMRelation {scope:$scope}) RETURN count(n) AS relations }
+    RETURN turns, chunks, chunks_without_current_vector, records, records_without_current_vector, relations`,
+  { scope, key: embeddingKey })).records;
+  const fingerprint = Object.fromEntries(['turns', 'chunks', 'chunks_without_current_vector', 'records', 'records_without_current_vector', 'relations']
+    .map(kind => [kind, Number(counts.get(kind))]));
+  requireThat(Object.values(fingerprint).every(Number.isSafeInteger), 'repair_target_changed');
   return { turn, chunks, fingerprint };
 }
 
