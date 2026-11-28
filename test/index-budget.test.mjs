@@ -29,7 +29,7 @@ async function embedder(t, plan = () => ({})) {
 
 // A store of chunk rows that answers the index step's calls and logs them in order. Saves and deferrals are confirmed in full
 // unless `saveOutcome` says otherwise; `onStatus` and `onSave` run inside those calls.
-function fakeStore(rows, { saveOutcome, onSave = () => {}, onStatus = () => {}, onSelect = () => {}, gaps = 0 } = {}) {
+function fakeStore(rows, { saveOutcome, onSave = () => {}, onStatus = () => {}, onSelect = () => {}, onObserve = () => {}, gaps = 0, statusOf } = {}) {
   const log = [];
   const find = uid => rows.find(row => row.uid === uid);
   const hint = row => ({ uid: row.uid, chunk: true, isolated: Boolean(row.isolated), cooling: false, single: Boolean(row.single) });
@@ -42,6 +42,7 @@ function fakeStore(rows, { saveOutcome, onSave = () => {}, onStatus = () => {}, 
     },
     async observeEmbeddings(_scope, _key, uids) {
       log.push(['observe', uids]);
+      await onObserve(uids);
       return uids.map(find).filter(row => row && !row.vector).map(row => ({ ...hint(row), text: row.text, observed: { text: row.text }, eligible: true }));
     },
     async saveEmbeddings(_scope, _key, items) {
@@ -60,9 +61,9 @@ function fakeStore(rows, { saveOutcome, onSave = () => {}, onStatus = () => {}, 
     async status() {
       log.push(['status']);
       await onStatus();
-      return { unindexed: rows.filter(row => !row.vector).length, unembeddable: 0 };
+      return statusOf?.() ?? { unindexed: rows.filter(row => !row.vector).length, unembeddable: 0 };
     },
-    async derivedGaps() { return gaps; },
+    async derivedGaps() { log.push(['gaps']); return gaps; },
     async close() {},
   };
 }
@@ -143,18 +144,64 @@ test('an admitted save is awaited past the deadline and credited, but no readine
   const reply = await memory.index('s');
   assert.deepEqual([reply.status, reply.indexed, reply.partial?.reason], ['pending', 2, 'index_budget_exhausted']);
   assert.ok(later.now > 3000 && !store.log.some(([kind]) => kind === 'status'), 'the save finished after the deadline; no drain check began');
-  // A drain check that itself ends after the deadline cannot earn ready either.
+  // A drain read that ends after the deadline cannot earn ready, and starts no further drain read.
   const slowStatus = fakeStore(rowsOf(2), { onStatus: () => { fixture.clock.now += 10_000; } });
   fixture.clock.now = 0;
   const second = await memoryWith(fixture, slowStatus, { index_budget_ms: 3000 }).index('s');
   assert.deepEqual([second.status, second.indexed, second.partial?.reason], ['pending', 2, 'index_budget_exhausted']);
+  assert.deepEqual(slowStatus.log.slice(-1), [['status']], 'derivedGaps is not called after a status read that crossed the deadline');
+});
+
+test('a save that ends past the deadline with rows still selected yields explicitly, not as ordinary pending', async t => {
+  const fixture = await embedder(t);
+  const store = fakeStore(rowsOf(3), { onSave: () => { fixture.clock.now += 5000; } });
+  const reply = await memoryWith(fixture, store, { index_budget_ms: 3000, index_batch: 2 }).index('s', { limit: 2 });
+  assert.deepEqual([reply.status, reply.indexed, reply.partial?.reason, fixture.calls.length], ['pending', 2, 'index_budget_exhausted', 1]);
+});
+
+test('a status read that crosses the deadline yields over a backlog, keeps a terminal-only refusal, and starts no gap read', async t => {
+  const fixture = await embedder(t);
+  const late = statusOf => fakeStore(rowsOf(1), { statusOf, onStatus: () => { fixture.clock.now += 10_000; } });
+  for (const [statusOf, expected] of [[() => ({ unindexed: 3, unembeddable: 0 }), ['pending', 'index_budget_exhausted', undefined]],
+    [() => ({ unindexed: 2, unembeddable: 1 }), ['pending', 'index_budget_exhausted', undefined]],
+    [() => ({ unindexed: 1, unembeddable: 1 }), ['unavailable', undefined, 'embedding_unembeddable']]]) {
+    fixture.clock.now = 0;
+    const store = late(statusOf);
+    const reply = await memoryWith(fixture, store, { index_budget_ms: 3000 }).index('s');
+    assert.deepEqual([reply.status, reply.partial?.reason, reply.reason], expected, JSON.stringify(statusOf()));
+    assert.ok(!store.log.some(([kind]) => kind === 'gaps'), 'no derived-gap read after the deadline');
+  }
+});
+
+test('under a budget an uncertain save ends the step at once as an explicit failure, not a budget partial, keeping earlier saves', async t => {
+  const fixture = await embedder(t);
+  let saves = 0;
+  const store = fakeStore(rowsOf(6), { saveOutcome: items => (++saves === 2 ? { applied: 0, refused: items.length, uncertain: true } : undefined) });
+  const reply = await memoryWith(fixture, store, { index_budget_ms: 60_000, index_batch: 2 }).index('s');
+  assert.deepEqual([reply.status, reply.reason, reply.indexed, reply.unknown, reply.partial, fixture.calls.length],
+    ['unavailable', 'embedding_write_unknown', 2, 2, undefined, 2], 'the third group is never sent');
 });
 
 test('an uncertain save is never credited and a refused row stays for the next selection, under a budget', async t => {
   const fixture = await embedder(t);
   const store = fakeStore(rowsOf(2), { saveOutcome: items => ({ applied: 0, refused: items.length, uncertain: true }) });
   const reply = await memoryWith(fixture, store, { index_budget_ms: 10_000 }).index('s');
-  assert.deepEqual([reply.status, reply.indexed, reply.unknown, reply.partial], ['pending', 0, 2, undefined]);
+  assert.deepEqual([reply.status, reply.reason, reply.unknown, reply.partial], ['unavailable', 'embedding_write_unknown', 2, undefined]);
+  // Unbudgeted, the same outcome stays today's pending with its unknown count.
+  const plain = await memoryWith(fixture, fakeStore(rowsOf(2), { saveOutcome: items => ({ applied: 0, refused: items.length, uncertain: true }) })).index('s');
+  assert.deepEqual([plain.status, plain.indexed, plain.unknown], ['pending', 0, 2]);
+});
+
+test('hydration that crosses the admission floor sends nothing, and a short configured timeout is used when time remains', async t => {
+  const fixture = await embedder(t);
+  // Admitted at 3,000 ms left; hydration then takes 2,500, leaving 500, under the floor.
+  const store = fakeStore(rowsOf(2), { onObserve: () => { fixture.clock.now += 2500; } });
+  const reply = await memoryWith(fixture, store, { index_budget_ms: 3000 }).index('s');
+  assert.deepEqual([reply.status, reply.indexed, reply.partial?.reason, fixture.calls.length], ['pending', 0, 'index_budget_exhausted', 0]);
+  assert.ok(!store.log.some(([kind]) => kind === 'save' || kind === 'defer'));
+  // A configured timeout under the floor is valid while the step has time: the call is sent with that timeout.
+  const short = await memoryWith(fixture, fakeStore(rowsOf(2)), { index_budget_ms: 60_000, timeout_ms: 500 }).index('s');
+  assert.deepEqual([short.status, short.indexed, fixture.calls.length], ['ready', 2, 1]);
 });
 
 test('with no usable request time left after selection, nothing is sent', async t => {
@@ -184,7 +231,8 @@ test('a budget that cannot admit a call, a batch out of range or an invalid time
   const fixture = await embedder(t);
   for (const [embedding, reason] of [[{ index_budget_ms: 1999 }, 'invalid_index_budget'], [{ index_budget_ms: 600_001 }, 'invalid_index_budget'],
     [{ index_budget_ms: '3000' }, 'invalid_index_budget'], [{ index_batch: 0 }, 'invalid_index_batch'], [{ index_batch: 17 }, 'invalid_index_batch'],
-    [{ index_budget_ms: 3000, timeout_ms: 0 }, 'invalid_model_timeout'], [{ index_budget_ms: 3000, timeout_ms: 120_001 }, 'invalid_model_timeout']]) {
+    [{ index_budget_ms: 3000, timeout_ms: 0 }, 'invalid_model_timeout'], [{ index_budget_ms: 3000, timeout_ms: 120_001 }, 'invalid_model_timeout'],
+    [{ index_budget_ms: 3000, timeout_ms: null }, 'invalid_model_timeout']]) {
     const reply = await memoryWith(fixture, fakeStore(rowsOf(2)), embedding).index('s');
     assert.deepEqual([reply.status, reply.reason], ['unavailable', reason], JSON.stringify(embedding));
   }

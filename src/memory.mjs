@@ -25,7 +25,8 @@ function indexLimits(embedding) {
   const { index_budget_ms: budget, index_batch: batch } = embedding;
   requireThat(budget === undefined || (Number.isSafeInteger(budget) && budget >= INDEX_BUDGET_MIN_MS && budget <= 600_000), 'invalid_index_budget');
   requireThat(batch === undefined || (Number.isSafeInteger(batch) && batch >= 1 && batch <= EMBEDDING_UNIT_MAX), 'invalid_index_batch');
-  const timeout = embedding.timeout_ms ?? 10_000;
+  // Only an absent timeout takes the transport's default; an explicit null is validated like any other value.
+  const timeout = embedding.timeout_ms === undefined ? 10_000 : embedding.timeout_ms;
   requireThat(budget === undefined || (Number.isSafeInteger(timeout) && timeout >= 1 && timeout <= 120_000), 'invalid_model_timeout');
   return { budget: budget ?? null, batch: batch ?? EMBEDDING_UNIT_MAX, timeout };
 }
@@ -150,6 +151,10 @@ export class Memory {
       const sameClass = (hint, row) => ['cooling', 'isolated', 'single'].every(name => Boolean(hint[name]) === Boolean(row[name]));
       // Still pending, so no consumer reads it as ready; saved rows are no longer pending, so the next step continues.
       const exhausted = () => ({ status: 'pending', ...progress(), partial: { reason: 'index_budget_exhausted', budget_ms: limits.budget } });
+      // Under a budget an uncertain write ends the step at once as an explicit failure with its `unknown` count and earlier
+      // confirmed progress: it is neither a budget cut nor ordinary pending work, so a caller that loops on `pending` does not
+      // retry it, and no later work runs before it is surfaced.
+      const uncertain = () => failed('embedding_write_unknown');
       // One work unit at a time: hydrate its exact state, decide from that observation, write, then let it go before the
       // next unit is hydrated. At most EMBEDDING_UNIT_MAX witnesses are held, whatever the caller's limit.
       for (let offset = 0; offset < selected.length;) {
@@ -176,9 +181,12 @@ export class Memory {
         }
         const oversized = current.filter(row => row.chunk && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
         if (oversized.length) {
+          // A hydration that ran past the deadline starts no marker write either.
+          if (deadline !== null && remaining() <= 0) return exhausted();
           requireThat(typeof this.store.markOversizedChunks === 'function', 'embedding_accounting_invalid');
           marked += tally(await this.store.markOversizedChunks(scope, key, oversized.map(({ uid, observed }) => ({ uid, observed })), ...(context ? [context] : [])),
             oversized.length);
+          if (deadline !== null && unknown) return uncertain();
         }
         const batch = current.filter(row => !oversized.includes(row));
         if (!batch.length) continue;
@@ -186,8 +194,11 @@ export class Memory {
         const isolatedChunk = Boolean(context && batch.length === 1 && candidate.chunk && candidate.isolated && candidate.single);
         // Under a budget each call gets at most the time remaining. Whether this request was shortened is decided here, at
         // dispatch, so a later deadline cannot excuse a failure within the full configured timeout.
-        const callTimeout = deadline === null ? null : Math.min(limits.timeout, remaining());
-        if (callTimeout !== null && callTimeout < 1) return exhausted();
+        // Hydration and any marker write were awaited since admission, so the floor is checked again here, on the same one
+        // sampled remainder the request's timeout is taken from.
+        const left = deadline === null ? null : remaining();
+        if (left !== null && left < INDEX_ADMISSION_FLOOR_MS) return exhausted();
+        const callTimeout = left === null ? null : Math.min(limits.timeout, left);
         const shortened = callTimeout !== null && callTimeout < limits.timeout;
         const embedding = callTimeout === null ? this.config.embedding : { ...this.config.embedding, timeout_ms: callTimeout };
         let vectors;
@@ -216,17 +227,25 @@ export class Memory {
         }
         indexed += tally(await this.store.saveEmbeddings(scope, key,
           batch.map((row, index) => ({ uid: row.uid, observed: row.observed, vector: vectors[index] })), ...(context ? [context] : [])), batch.length);
+        if (deadline !== null && unknown) return uncertain();
         // One retry request per invocation protects the caller's indexing budget.
         if (first.isolated) break;
       }
-      if (stale || unknown || pending.length > indexed + marked) return { status: 'pending', ...progress() };
-      // No drain check starts after the deadline, and none finished after it can claim readiness.
+      // A step that reached its deadline yields explicitly, with its stale count, rather than as ordinary pending a caller
+      // could meet with another budget at once. No drain check starts after it, and none finished after it claims readiness.
       if (deadline !== null && remaining() <= 0) return exhausted();
+      if (stale || unknown || pending.length > indexed + marked) return { status: 'pending', ...progress() };
       if (typeof this.store.markOversizedChunks === 'function') {
         // The bounded selection cannot prove drain. Check all current-key missing vectors, including cooling rows.
         const { unindexed, unembeddable = 0 } = await this.store.status(scope, key, ...(context ? [[], context] : []));
         requireThat(Number.isSafeInteger(unindexed) && Number.isSafeInteger(unembeddable)
           && unembeddable >= 0 && unindexed >= unembeddable, 'embedding_accounting_invalid');
+        // Each drain read is admitted only before the deadline; one that ended after it yields with the budget partial, unless
+        // all it found is a terminal refusal, which a budget cut must not hide.
+        if (deadline !== null && remaining() <= 0) {
+          return unembeddable && unindexed === unembeddable
+            ? { status: 'unavailable', reason: 'embedding_unembeddable', source_retained: true, ...progress(), unembeddable } : exhausted();
+        }
         if (unindexed > unembeddable) return { status: 'pending', ...progress() };
         // Source a first retain could not chunk has no row to index, so it never clears here and is never ready.
         const gaps = typeof this.store.derivedGaps === 'function' ? await this.store.derivedGaps(scope) : 0;
