@@ -8,7 +8,8 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Memory } from '../src/memory.mjs';
 import { cosine, identity, indexNames, namespace } from '../src/core.mjs';
-import { embeddingIdentity } from '../src/models.mjs';
+import { embeddingContextContract, embeddingIdentity } from '../src/models.mjs';
+import { CENSUS_CAP, indexCensus } from '../src/index-census.mjs';
 import { createMemoryHandlers } from '../pi-extension/memory-process.mjs';
 import { runLiveSmoke } from './live-smoke.mjs';
 import { createDerivedAdapter, searchDerived, resolveDerived } from '../pi-extension/derived-retrieval.mjs';
@@ -110,6 +111,34 @@ export async function runIntegration(database, scratch) {
     await memory.init('demo');
     await memory.init('foreign');
     await memory.init('exclusion');
+    await check('owner index census uses bounded exact-scope seeks and returns only numeric aggregates', async () => {
+      const scope = 'owner-census-fixture';
+      const embedding = { url: `${url}/v1/embeddings`, model: 'embeddinggemma', dimensions: 3, ollama_context_revision: 'fixture-v1' };
+      const cfg = { ...config, embedding, scopes: { read: [scope], write: [scope] }, index_on_write: false };
+      const fixture = new Memory(cfg, memory.store);
+      const counts = () => indexCensus(cfg, scope, memory.store);
+      await fixture.init(scope);
+      // The earlier nested-scope suite provisions the exact-scope range indexes.
+      await memory.store.transaction('read', tx => tx.run('CALL db.awaitIndexes(30)'));
+      const parent = await fixture.ingest(scope, turn('census', 'Fictional retained source.'));
+      const key = embeddingIdentity(embedding), context = embeddingContextContract(embedding);
+      await memory.store.transaction('write', tx => tx.run(`MATCH (c:SMChunk {scope:$scope,turn_uid:$turn})
+        SET c.embedding_key=$key, c.embedding=[1.0,0.0,0.0]
+        CREATE (:SMChunk {scope:$scope,turn_uid:$turn,text:$large,embedding_oversized_text:$large,embedding_oversized_key:$key,embedding_oversized_cap:8192}),
+          (:SMChunk {scope:$scope,turn_uid:$turn,text:'context fixture',embedding_rejected_text:'context fixture',embedding_rejected_context:$context}),
+          (:SMChunk {scope:$scope,turn_uid:$turn,text:'cooling fixture',embedding_retry_key:$key,embedding_retry_after:datetime()+duration({minutes:5})}),
+          (:SMChunk {scope:$scope,text:'unknown binding',embedding_key:$key}),
+          (:SMChunk {scope:'foreign',text:$large}), (:SMRecord {scope:$scope,embedding_key:$key})`,
+      { scope, turn: parent.id, key, context, large: 'x'.repeat(8193) }));
+      const calls = modelCalls;
+      assert.deepEqual(await counts(), { chunks_total: 5, chunks_indexed: 1, chunks_unindexed: 4, terminal_byte: 1,
+        terminal_context: 1, retry_marked: 1, cooling: 1, other: 1, same_key_missing_chunks: 1,
+        turns_affected: 1, missing_chunk_turn_binding: 1, records_total: 1, missing_record_vectors: 1,
+        same_key_missing_records: 1, chunk_index_health: 1, record_index_health: 1 });
+      assert.equal(modelCalls, calls);
+      await memory.store.transaction('write', tx => tx.run(`UNWIND range(1,$cap) AS i CREATE (:SMRecord {scope:$scope})`, { scope, cap: CENSUS_CAP }));
+      await assert.rejects(counts(), { code: 'census_over_bound' });
+    });
     await check('oversized legacy chunks stay unindexed without blocking eligible chunks', async () => {
       const scope = 'embedding-legacy-size-fixture';
       const fixture = new Memory({ ...config, scopes: { read: [scope], write: [scope] }, index_on_write: false }, memory.store);
