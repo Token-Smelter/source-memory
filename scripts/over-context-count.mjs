@@ -3,9 +3,10 @@
 // that scope's text and the owner's pinned embedding key.
 //   node scripts/over-context-count.mjs --config owner.json --scope SCOPE --embedding-key KEY --caps caps.json
 // caps.json: {max_rows, max_text_bytes, max_pages, page_size (<= 500), max_seconds, transaction_timeout_ms}, all required.
-// Transport: the count makes no model call, so `embedding.ollama_transport` does not change its result. KEY is derived from
-// the embedding url, model and dimensions only; set the transport (`native_no_truncate`) exactly as the deployment does, and
-// pass the key that deployment writes.
+// The count makes no model call. Two separate requirements apply. (1) The config must resolve to exactly the default
+// treatment, whose descriptor includes the transport `openai_compat`: leave `embedding.ollama_transport` unset. Any other
+// transport, including `native_no_truncate`, is refused as count_contract_mismatch before the store is opened. (2) KEY must
+// equal the key derived from the embedding url, model and dimensions; the transport does not enter it.
 import { readFile } from 'node:fs/promises';
 import { runOverContextCount } from '../src/over-context-count.mjs';
 import { Neo4jStore } from '../src/store.mjs';
