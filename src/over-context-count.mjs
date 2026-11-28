@@ -123,14 +123,16 @@ function currentVector(kind, key) {
   return kind === 'current';
 }
 
-// Classified inside the database so no vector values are returned. Under the current key a vector must satisfy the library
-// invariant (validateVector in core.mjs): exactly `dimensions` finite numbers, not all zero. A numeric list under another key
-// is stale and need not have the current dimensions. Anything else is invalid.
+// Classified inside the database so no vector values are returned. Under the current key a vector must meet the writer's
+// check (validateVector in core.mjs): exactly `dimensions` finite numbers, not all zero. Finite is tested against the
+// inclusive extremes of a double, which admits every finite value and refuses NaN and both infinities. A numeric list under
+// another key is stale and need not have the current dimensions. Anything else is invalid.
 const VECTOR_STATE = `CASE WHEN c.embedding IS NULL THEN 'none'
   WHEN NOT (valueType(c.embedding) STARTS WITH 'LIST<FLOAT' OR valueType(c.embedding) STARTS WITH 'LIST<INTEGER')
     OR size(c.embedding) = 0 THEN 'invalid'
   WHEN c.embedding_key = $key THEN CASE WHEN size(c.embedding) = $dimensions
-    AND all(x IN c.embedding WHERE x = x AND x < 1.0e308 AND x > -1.0e308) AND any(x IN c.embedding WHERE x <> 0)
+    AND all(x IN c.embedding WHERE x >= -1.7976931348623157e308 AND x <= 1.7976931348623157e308)
+    AND any(x IN c.embedding WHERE x <> 0)
     THEN 'current' ELSE 'invalid' END
   ELSE 'stale' END`;
 
@@ -197,9 +199,10 @@ export async function runOverContextCount({ config, scope, embeddingKey, caps, o
     const closing = store;
     store = null;
     await closing.close();
-    const late = clock() > deadline;
-    const accepted = late ? { contract: OVER_CONTEXT_COUNT, status: 'incomplete', reason: 'cap_seconds' }
-      : report.status === 'complete' ? { ...report, elapsed_ms: Math.round(clock() - started) } : report;
+    // One clock sample after the close decides acceptance and the reported elapsed time.
+    const closedAt = clock();
+    const accepted = closedAt > deadline ? { contract: OVER_CONTEXT_COUNT, status: 'incomplete', reason: 'cap_seconds' }
+      : report.status === 'complete' ? { ...report, elapsed_ms: Math.round(closedAt - started) } : report;
     return { ok: true, report: { invocation_sha256: digest({ scope: exact, embedding_key: key, caps: limits, policy_digest: policy.digest }),
       caps: limits, ...accepted } };
   } catch (error) {

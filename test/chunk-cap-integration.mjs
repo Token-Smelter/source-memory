@@ -209,6 +209,22 @@ export async function runChunkCap(database, scratch) {
       } finally { await session.close(); }
       assert.deepEqual(await countOverContext({ policy, reader: reader('cap-legacy'), caps }),
         { contract: 'source-memory.over-context-count/1', status: 'incomplete', reason: 'read_failed' });
+      // The database classifier itself: the largest finite double is a current vector, as the writer accepts it; NaN and
+      // infinities are refused. Values are bound as parameters so the floats are exact.
+      const setFirst = vector => {
+        const write = driver.session();
+        return write.run(`MATCH (c:SMChunk {scope:'cap-legacy'}) WITH c ORDER BY c.uid LIMIT 1 SET c.embedding=$vector, c.embedding_key=$key`,
+          { vector, key }).finally(() => write.close());
+      };
+      await setFirst([Number.MAX_VALUE, 0]);
+      const extreme = await countOverContext({ policy, reader: reader('cap-legacy'), caps });
+      assert.deepEqual([extreme.status, extreme.over_context_with_current_vector], ['complete', before.chunks]);
+      await setFirst([-Number.MAX_VALUE, 0]);
+      assert.equal((await countOverContext({ policy, reader: reader('cap-legacy'), caps })).status, 'complete');
+      for (const vector of [[Number.POSITIVE_INFINITY, 0], [Number.NEGATIVE_INFINITY, 1], [Number.NaN, 1], [0, 0]]) {
+        await setFirst(vector);
+        assert.equal((await countOverContext({ policy, reader: reader('cap-legacy'), caps })).reason, 'read_failed', String(vector));
+      }
     });
   } finally {
     await capped.close();
