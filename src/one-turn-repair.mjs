@@ -278,4 +278,3 @@ export async function reconcile({ driver, database, plan }) {
     finally { if (tx.isOpen()) await tx.rollback().catch(() => {}); }
   } finally { await session.close(); }
 }
-
