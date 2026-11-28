@@ -116,7 +116,7 @@ const remoteRow = async () => {
   const identity = { provider: 'vertex', model: 'gemini-embedding-001', destination: 'fixture-location', dimensions: 64,
     task_pair: ['RETRIEVAL_DOCUMENT', 'RETRIEVAL_QUERY'], auto_truncate: false, representation: 'fixture' };
   return { ...base, name: 'vertex-fixture', role: 'experiment', embedder: { provider: 'vertex', model: 'gemini-embedding-001', dimensions: 64,
-    context: 2048, full_input_witness: 'adapter', identity } };
+    context: 2048, full_input_witness: 'adapter', identity, adapter: { module: 'src/vertex-embedding.mjs', git_blob: 'a'.repeat(40) } } };
 };
 
 test('an adapter-witnessed embedder is only an experiment over a token chunker, with an exact non-truncating identity', async () => {
@@ -127,6 +127,10 @@ test('an adapter-witnessed embedder is only an experiment over a token chunker, 
   assert.throws(() => validateManifest({ ...row, embedder: { ...row.embedder, identity: { ...row.embedder.identity, dimensions: 768 } } }), /identity/);
   const legacy = (await manifest('legacy-reference-v1')).chunker;
   assert.throws(() => validateManifest({ ...row, chunker: legacy }), /token chunker/);
+  // The adapter code is pinned: a module of this repository at a committed blob, nothing else.
+  for (const adapter of [undefined, { module: '../elsewhere.mjs', git_blob: 'a'.repeat(40) }, { module: 'src/vertex-embedding.mjs', git_blob: 'short' }]) {
+    assert.throws(() => validateManifest({ ...row, embedder: { ...row.embedder, adapter } }), /embedder.adapter/, JSON.stringify(adapter));
+  }
   // Without the witness mode the old rule holds: a token policy must name the embedder deployment exactly.
   assert.throws(() => validateManifest({ ...row, embedder: { ...row.embedder, full_input_witness: undefined, tokenizer_sha256: 'x' } }), /exactly the evaluated embedder/);
 });
@@ -151,13 +155,27 @@ test('witnessed embedding sends one input per call with its purpose, credits onl
   assert.deepEqual(adapter.calls.map(call => [call.inputs.length, call.purpose]), [[1, 'document'], [1, 'document'], [1, 'document'], [1, 'query']]);
   assert.deepEqual(out.vectors.map(vector => vector !== null), [true, false, false, true]);
   assert.deepEqual([out.refusals, out.evidence_kinds], [{ embedding_full_input_unverified: 1, embedding_input_too_long: 1 }, ['vertex_predict/vertex_statistics']]);
-  // A provider failure, or a vector without a valid witness, ends the run instead of being scored.
+  // A provider failure ends the run with only its code; a vector without a valid witness ends it too.
+  await assert.rejects(embedWitnessed(fakeAdapter(() => 'model_request_failed'), [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 }),
+    { message: 'adapter failure: model_request_failed' });
+  const leaky = { async embed() { throw new Error('Bearer secret-token at https://example.invalid/?key=1'); } };
+  await assert.rejects(embedWitnessed(leaky, [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 }), { message: 'adapter failure: unclassified' });
   const row = { vector: fakeVector('x'), full_input: true, evidence: { kind: 'k', transport: 't', token_count: 10, limit: 2048 } };
-  for (const bad of ['model_request_failed', { rows: [{ ...row, full_input: false }] }, { rows: [{ ...row, evidence: undefined }] },
+  for (const bad of [{ rows: [{ ...row, full_input: false }] }, { rows: [{ ...row, evidence: undefined }] },
     { rows: [{ ...row, evidence: { ...row.evidence, token_count: 2049 } }] }, { rows: [{ ...row, evidence: { ...row.evidence, limit: 4096, token_count: 3000 } }] },
-    { rows: [row, row] }, { rows: [{ ...row, vector: [1, 2] }] }]) {
-    await assert.rejects(embedWitnessed(fakeAdapter(() => bad), [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 }), undefined, JSON.stringify(bad).slice(0, 80));
+    { rows: [{ ...row, evidence: { ...row.evidence, token_count: 0 } }] }, { rows: [{ ...row, evidence: { ...row.evidence, token_count: -5, limit: -1 } }] },
+    { rows: [{ ...row, evidence: { ...row.evidence, extra: 1 } }] }, { rows: [{ ...row, extra: 1 }] }, { rows: { length: 1, 0: row } },
+    { rows: [row], extra: 1 }, { rows: [row, row] }, { rows: [{ ...row, vector: [1, 2] }] }]) {
+    await assert.rejects(embedWitnessed(fakeAdapter(() => bad), [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 }),
+      /without a valid full-input witness/u, JSON.stringify(bad).slice(0, 80));
   }
+  await assert.rejects(embedWitnessed(fakeAdapter(), items, { dimensions: 0, context: 2048 }), /positive dimensions/);
+  // The admission hook's per-request signal reaches the adapter.
+  const signals = [];
+  const signalled = { async embed(inputs, { signal }) { signals.push(signal); return fakeAdapter().embed(inputs, { purpose: 'document' }); } };
+  const signal = AbortSignal.timeout(60_000);
+  await embedWitnessed(signalled, items.slice(0, 1), { dimensions: 64, context: 2048, admit: async () => ({ signal }) });
+  assert.deepEqual(signals, [signal]);
   // The admission hook runs before every request and can stop the run.
   let admitted = 0;
   await assert.rejects(embedWitnessed(fakeAdapter(), items, { dimensions: 64, context: 2048, admit: async () => { if (++admitted > 2) throw new Error('budget'); } }), /budget/);
@@ -186,4 +204,27 @@ test('a chunk the adapter refused is never represented, and its row fails the fu
   assert.equal(partial.score.per_query[0].gold_fully_represented, false);
   assert.equal(compareRuns(full, partial).gates.full_coverage, false);
   assert.equal(compareRuns(partial, full).gates.full_coverage, true);
+});
+
+test('a refused query fails the full-coverage gate even when the scores would pass', async t => {
+  const counter = await fictionalCounter(t);
+  const corpus = chunkEvalCorpus();
+  const derived = deriveCorpus(corpus, { ...DEFAULT_TREATMENT }, counter);
+  const chunks = derived.chunks.map(chunk => ({ ...chunk, witnessed: true }));
+  const chunkVectors = chunks.map(chunk => fakeVector(chunk.text));
+  const runWith = refused => {
+    const queryVectors = corpus.queries.map((query, index) => (refused.includes(index) ? null : fakeVector(query.text)));
+    return { eval_version: EVAL_VERSION, corpus_digest: 'c', manifest_digest: `q${refused.length}`,
+      score: scoreRun({ corpus, derived: { chunks, gaps: [] }, rankings: rank(queryVectors, chunkVectors), context: 2048, counter,
+        queryEmbedded: queryVectors.map(vector => vector !== null) }) };
+  };
+  const full = runWith([]);
+  // Refuse a query the reference already missed at rank 5, so the losses and dense gates alone would still pass.
+  const missed = full.score.per_query.findIndex(row => row.embedded_rank === null || row.embedded_rank > 5);
+  const refused = runWith([missed >= 0 ? missed : 0]);
+  const comparison = compareRuns(full, refused);
+  assert.equal(refused.score.coverage.queries_unembedded, 1);
+  assert.equal(comparison.gates.full_coverage, false);
+  assert.equal(comparison.pass, false);
+  assert.equal(full.score.coverage.queries_unembedded, 0);
 });

@@ -32,6 +32,10 @@ export function validateManifest(manifest) {
     const { identity } = embedder;
     if (!identity || typeof identity !== 'object' || identity.model !== embedder.model || identity.dimensions !== embedder.dimensions
         || identity.auto_truncate !== false || typeof identity.provider !== 'string') fail('embedder.identity');
+    // The only adapter code a run may load: a module of this repository, pinned to its committed git blob.
+    const { adapter } = embedder;
+    if (!adapter || !/^src\/[a-z0-9-]{1,64}\.mjs$/u.test(adapter.module) || !/^[0-9a-f]{40}$/u.test(adapter.git_blob)) fail('embedder.adapter');
+    if (!Number.isSafeInteger(embedder.dimensions) || embedder.dimensions < 1 || embedder.context < 1) fail('embedder');
   }
   if (!budget || !Number.isSafeInteger(budget.max_inputs) || budget.max_inputs < 1 || !Number.isSafeInteger(budget.max_seconds) || budget.max_seconds < 1) fail('budget');
   if (manifest.role === 'default' && canonical(chunker) !== canonical(DEFAULT_TREATMENT)) fail('the default row must be exactly DEFAULT_TREATMENT');
@@ -77,24 +81,31 @@ export function rank(queryVectors, chunkVectors, k = Math.max(...KS)) {
  * context; a typed refusal leaves the item without a vector and is counted. Any other failure or a malformed reply ends the run.
  * `admit()` runs before every request and may throw to stop.
  */
-export async function embedWitnessed(adapter, items, { dimensions, context, admit = async () => {}, signal } = {}) {
+export async function embedWitnessed(adapter, items, { dimensions, context, admit = async () => ({}), signal } = {}) {
+  const positive = n => Number.isSafeInteger(n) && n > 0;
+  if (!positive(dimensions) || !positive(context)) throw new Error('witnessed embedding needs positive dimensions and context');
   const vectors = [];
   const refusals = Object.fromEntries(WITNESS_REFUSALS.map(code => [code, 0]));
   const kinds = new Set();
+  const keys = value => (value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value).sort().join() : null);
   for (const { text, purpose } of items) {
-    await admit();
+    // The admission hook may stop the run, and may give a per-request signal bounded by the time remaining.
+    const admitted = await admit();
     let reply;
-    try { reply = await adapter.embed([text], { purpose, signal }); } catch (error) {
-      if (!WITNESS_REFUSALS.includes(error?.code)) throw error;
+    try { reply = await adapter.embed([text], { purpose, signal: admitted?.signal ?? signal }); } catch (error) {
+      // Only a code leaves the adapter: a message could carry request or credential detail.
+      if (!WITNESS_REFUSALS.includes(error?.code)) throw new Error(`adapter failure: ${/^[a-z_]{1,64}$/u.test(error?.code ?? '') ? error.code : 'unclassified'}`);
       refusals[error.code]++;
       vectors.push(null);
       continue;
     }
-    const row = reply?.rows?.length === 1 ? reply.rows[0] : null;
+    // Exactly one row of exactly the agreed fields, with positive counts: anything else is not a witness.
+    const row = keys(reply) === 'rows' && Array.isArray(reply.rows) && reply.rows.length === 1 ? reply.rows[0] : null;
     const evidence = row?.evidence;
-    if (row?.full_input !== true || !Array.isArray(row.vector) || row.vector.length !== dimensions || !row.vector.every(Number.isFinite)
-        || !row.vector.some(x => x !== 0) || typeof evidence?.kind !== 'string' || !Number.isSafeInteger(evidence.token_count)
-        || !Number.isSafeInteger(evidence.limit) || evidence.token_count > evidence.limit || evidence.limit > context) {
+    if (keys(row) !== 'evidence,full_input,vector' || row.full_input !== true || keys(evidence) !== 'kind,limit,token_count,transport'
+        || !Array.isArray(row.vector) || row.vector.length !== dimensions || !row.vector.every(Number.isFinite) || !row.vector.some(x => x !== 0)
+        || !/^[a-z0-9_]{1,64}$/u.test(evidence.kind) || !/^[a-z0-9_]{1,64}$/u.test(evidence.transport)
+        || !positive(evidence.token_count) || !positive(evidence.limit) || evidence.token_count > evidence.limit || evidence.limit > context) {
       throw new Error('the adapter returned a vector without a valid full-input witness');
     }
     kinds.add(`${evidence.transport}/${evidence.kind}`);
@@ -125,7 +136,7 @@ const percentile = (values, p) => {
 };
 
 /** Per-query observations and aggregates. Denominators are every query of a subset, including ones with no hit. */
-export function scoreRun({ corpus, derived, rankings, context, counter }) {
+export function scoreRun({ corpus, derived, rankings, context, counter, queryEmbedded }) {
   const perQuery = corpus.queries.map((query, q) => {
     const ranked = rankings[q];
     const stored = ranked.findIndex(index => overlaps(derived.chunks[index], query.gold));
@@ -155,7 +166,9 @@ export function scoreRun({ corpus, derived, rankings, context, counter }) {
     per_query: perQuery,
     aggregate,
     coverage: { chunks: derived.chunks.length, over_context: tokens.filter(count => count > context).length, gaps: derived.gaps.length,
+      // Under a witnessing adapter, refused chunks and refused queries are both coverage failures, counted apart.
       ...(derived.chunks.some(chunk => chunk.witnessed !== undefined) ? { unwitnessed: derived.chunks.filter(chunk => chunk.witnessed === false).length } : {}),
+      ...(queryEmbedded ? { queries_unembedded: queryEmbedded.filter(embedded => !embedded).length } : {}),
       gold_covered: perQuery.filter(row => row.gold_covered).length, gold_fully_represented: perQuery.filter(row => row.gold_fully_represented).length,
       queries: perQuery.length },
     cost: { chunks: tokens.length, mean_tokens: tokens.reduce((a, b) => a + b, 0) / Math.max(1, tokens.length),
@@ -185,7 +198,7 @@ export function compareRuns(reference, candidate) {
   const denseCandidate = candidate.score.aggregate.dense?.embedded_recall[GATE_K] ?? 0;
   const gates = {
     full_coverage: coverage.over_context === 0 && coverage.gaps === 0 && (coverage.unwitnessed ?? 0) === 0
-      && coverage.gold_fully_represented === coverage.queries,
+      && (coverage.queries_unembedded ?? 0) === 0 && coverage.gold_fully_represented === coverage.queries,
     dense_not_worse: denseCandidate >= denseReference,
     overall_losses_at_most_one: lost.length <= 1,
   };

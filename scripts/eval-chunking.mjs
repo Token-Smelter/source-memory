@@ -1,8 +1,10 @@
 // Runs one sealed chunking treatment against the fictional corpus, or compares two finished runs.
 //   node scripts/eval-chunking.mjs --treatment default-v1 --config eval.json --tokenizer /path/to/sha256-<blob> [--experiment]
-//   node scripts/eval-chunking.mjs --treatment vertex-... --config eval.json --tokenizer /path/to/sha256-<blob> --adapter module.mjs --experiment
-//     (an adapter-witnessed embedder: the module exports createAdapter(config); its identity must equal the sealed one, and
-//     each input counts as embedded only with the adapter's full-input proof)
+//   node scripts/eval-chunking.mjs --treatment remote-... --config eval.json --tokenizer /path/to/sha256-<blob> --experiment
+//     An adapter-witnessed embedder loads only the adapter module the sealed manifest names, from this repository, at the
+//     committed git blob the manifest pins, in a clean checkout: no other executable code is trusted. Its export
+//     createAdapter(config) must return an identity equal to the sealed one. Each input counts as embedded only with the
+//     adapter's full-input proof.
 //   node scripts/eval-chunking.mjs --compare reference.result.json candidate.result.json
 // Results go to .memory-local/chunk-eval/<manifest digest>/<run id>.{seal,result}.json and are never merged across digests.
 import { execFile } from 'node:child_process';
@@ -29,7 +31,7 @@ function options(argv) {
     const arg = argv[at];
     if (arg === '--experiment') values.flags.add('experiment');
     else if (arg === '--compare') values.compare = [argv[++at], argv[++at]];
-    else if (['--treatment', '--config', '--tokenizer', '--out', '--max-load5', '--adapter'].includes(arg)) values[arg.slice(2)] = argv[++at];
+    else if (['--treatment', '--config', '--tokenizer', '--out', '--max-load5'].includes(arg)) values[arg.slice(2)] = argv[++at];
     else throw new Error(`unknown argument ${arg}`);
   }
   return values;
@@ -48,10 +50,18 @@ async function run(args) {
   const embedding = config.embedding;
   const witnessed = manifest.embedder.full_input_witness === ADAPTER_WITNESS;
   let adapter = null;
+  let adapterCode = null;
   if (witnessed) {
-    if (!args.adapter) throw new Error('an adapter-witnessed embedder needs --adapter');
-    adapter = await (await import(pathToFileURL(resolve(args.adapter)).href)).createAdapter(config);
-    if (canonical(adapter.identity) !== canonical(manifest.embedder.identity)) throw new Error('the adapter identity differs from the sealed embedder');
+    // Code provenance, not self-report: the sealed module at its pinned blob, in a clean checkout of this repository.
+    const { module, git_blob: blob } = manifest.embedder.adapter;
+    const code = await codeCommit();
+    if (code.dirty) throw new Error('an adapter-witnessed run needs a clean checkout');
+    const { stdout } = await exec('git', ['-C', root, 'rev-parse', `HEAD:${module}`]);
+    if (stdout.trim() !== blob) throw new Error('the adapter module is not the sealed git blob');
+    try { adapter = await (await import(pathToFileURL(join(root, module)).href)).createAdapter(config); }
+    catch { throw new Error('adapter failure: create'); }
+    if (canonical(adapter?.identity) !== canonical(manifest.embedder.identity)) throw new Error('the adapter identity differs from the sealed embedder');
+    adapterCode = { module, git_blob: blob, commit: code.commit };
   } else if (embedding?.model?.replace(/:latest$/u, '') !== manifest.embedder.model || new URL(embedding.url).pathname !== manifest.embedder.endpoint_path
       || embedding.dimensions !== manifest.embedder.dimensions || (embedding.ollama_transport ?? 'openai_compat') !== manifest.embedder.transport
       || embedding.allow_remote === true) {
@@ -75,7 +85,8 @@ async function run(args) {
   // The seal is written before the first embedding request, so the treatment cannot be chosen after seeing results.
   const seal = { eval_version: EVAL_VERSION, run_id: runId, sealed_at: new Date().toISOString(), manifest, manifest_digest: manifest.digest,
     corpus_version: corpus.version, corpus_digest: corpusDigest, code: await codeCommit(), inputs,
-    derivation_digest: digest(derived.chunks.map(({ turn, entry_id, start, end }) => [turn, entry_id, start, end])) };
+    derivation_digest: digest(derived.chunks.map(({ turn, entry_id, start, end }) => [turn, entry_id, start, end])),
+    ...(adapterCode ? { adapter: adapterCode } : {}) };
   await write(join(dir, `${runId}.seal.json`), seal);
 
   const started = Date.now();
@@ -83,10 +94,15 @@ async function run(args) {
   let witness = null;
   const texts = [...derived.chunks.map(chunk => chunk.text), ...corpus.queries.map(query => query.text)];
   const maxLoad = Number(args['max-load5'] ?? Infinity);
+  const deadline = started + manifest.budget.max_seconds * 1000;
+  const expired = () => { if (Date.now() >= deadline) throw new Error('budget: elapsed time exceeded; no result written'); };
   const admit = async () => {
     // The host scheduler admits this run only below a load ceiling; wait between requests while it is exceeded.
     while (loadavg()[1] > maxLoad) await sleep(15000);
-    if (Date.now() - started > manifest.budget.max_seconds * 1000) throw new Error('budget: elapsed time exceeded; no result written');
+    expired();
+    // Each request is aborted at the deadline. Aborting stops waiting; it cannot prove the provider stopped work or did not
+    // receive the text.
+    return { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) };
   };
   if (witnessed) {
     const items = [...derived.chunks.map(chunk => ({ text: chunk.text, purpose: 'document' })), ...corpus.queries.map(query => ({ text: query.text, purpose: 'query' }))];
@@ -101,9 +117,13 @@ async function run(args) {
       vectors.push(...await embed(embedding, texts.slice(offset, offset + 16)));
     }
   }
+  // A last reply that arrived after the deadline does not publish a result.
+  expired();
   const chunkVectors = vectors.slice(0, derived.chunks.length);
   const queryVectors = vectors.slice(derived.chunks.length);
-  const score = scoreRun({ corpus, derived, rankings: rank(queryVectors, chunkVectors), context: manifest.embedder.context, counter });
+  const score = scoreRun({ corpus, derived, rankings: rank(queryVectors, chunkVectors), context: manifest.embedder.context, counter,
+    ...(witnessed ? { queryEmbedded: queryVectors.map(vector => vector !== null) } : {}) });
+  expired();
   const result = { eval_version: EVAL_VERSION, run_id: runId, manifest_digest: manifest.digest, name: manifest.name, role: manifest.role,
     qualification: manifest.qualification, corpus_digest: corpusDigest, seal_digest: digest(canonical(seal)),
     elapsed_ms: Date.now() - started, inputs, ...(witness ? { witness } : {}), score };
