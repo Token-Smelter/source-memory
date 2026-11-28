@@ -122,11 +122,13 @@ export function compareRuns(reference, candidate) {
   }
   const hit = row => row.embedded_rank !== null && row.embedded_rank <= GATE_K;
   const before = new Map(reference.score.per_query.map(row => [row.id, row]));
-  const lost = [], won = [];
+  const lost = [], won = [], rankChanges = [];
   for (const row of candidate.score.per_query) {
     const old = before.get(row.id);
     if (hit(old) && !hit(row)) lost.push(row.id);
     if (!hit(old) && hit(row)) won.push(row.id);
+    // Same-chunker rows (e.g. one policy over two transports) should not move any query at all.
+    if (old.stored_rank !== row.stored_rank || old.embedded_rank !== row.embedded_rank) rankChanges.push(row.id);
   }
   const coverage = candidate.score.coverage;
   const denseReference = reference.score.aggregate.dense?.embedded_recall[GATE_K] ?? 0;
@@ -136,6 +138,6 @@ export function compareRuns(reference, candidate) {
     dense_not_worse: denseCandidate >= denseReference,
     overall_losses_at_most_one: lost.length <= 1,
   };
-  return { reference: reference.manifest_digest, candidate: candidate.manifest_digest, k: GATE_K, lost, won,
+  return { reference: reference.manifest_digest, candidate: candidate.manifest_digest, k: GATE_K, lost, won, rank_changes: rankChanges,
     dense_embedded_recall: { reference: denseReference, candidate: denseCandidate }, gates, pass: Object.values(gates).every(Boolean) };
 }

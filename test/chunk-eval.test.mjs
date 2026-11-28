@@ -45,6 +45,18 @@ test('the star matrix admits exactly one default, one legacy reference, and othe
   assert.throws(() => validateManifest({ ...experiment, budget: { max_inputs: 0, max_seconds: 1 } }), /budget/);
 });
 
+test('the native-transport row is a named, unqualified experiment of the default chunker', async () => {
+  const native = validateManifest(await manifest('native-r1-v1'));
+  const fixed = validateManifest(await manifest('default-v1'));
+  assert.deepEqual([native.role, native.qualification, native.chunker.transport], ['experiment', 'unqualified', 'native_no_truncate']);
+  const { transport: _native, ...nativeRest } = native.chunker;
+  const { transport: _compat, ...defaultRest } = fixed.chunker;
+  assert.deepEqual(nativeRest, defaultRest, 'only the transport differs from the default row');
+  assert.notEqual(native.digest, fixed.digest);
+  const asDefault = { ...await manifest('native-r1-v1'), role: 'default' };
+  assert.throws(() => validateManifest(asDefault), /exactly DEFAULT_TREATMENT/);
+});
+
 test('every gold span is an exact needle inside one unchanged entry', () => {
   const corpus = chunkEvalCorpus();
   const turns = new Map(corpus.turns.map(turn => [turn.key, turn]));
@@ -91,6 +103,8 @@ test('scoring separates a hit on the stored chunk from evidence that the embedde
   assert.equal(comparison.gates.full_coverage, true);
   assert.deepEqual(Object.keys(comparison.gates).sort(), ['dense_not_worse', 'full_coverage', 'overall_losses_at_most_one']);
   assert.equal(comparison.pass, Object.values(comparison.gates).every(Boolean));
+  assert.deepEqual(compareRuns(candidate, candidate).rank_changes, [], 'a row compared with itself moves no query');
+  assert.ok(comparison.rank_changes.length > 0);
   assert.throws(() => compareRuns(reference, { ...candidate, corpus_digest: 'other' }), /cannot be compared/);
 });
 
