@@ -11,6 +11,7 @@ import { runQualification } from '../test/qualification.mjs';
 import { runNestedScopes } from '../test/nested-scopes.mjs';
 import { runList } from '../test/list-integration.mjs';
 import { runChunkCap } from '../test/chunk-cap-integration.mjs';
+import { runOneTurnRepair } from '../test/one-turn-repair-integration.mjs';
 import { integrationResources } from './integration-resources.mjs';
 
 const exec = promisify(execFile);
@@ -19,7 +20,9 @@ const exec = promisify(execFile);
 // the token-cap checks.
 const suiteIndex = process.argv.indexOf('--suite');
 const suite = suiteIndex === -1 ? 'all' : process.argv[suiteIndex + 1];
-if (!['all', 'qualification', 'scopes', 'chunk-cap'].includes(suite)) throw new Error('--suite must be qualification, scopes or chunk-cap');
+if (!['all', 'qualification', 'scopes', 'chunk-cap', 'one-turn-repair'].includes(suite)) {
+  throw new Error('--suite must be qualification, scopes, chunk-cap or one-turn-repair');
+}
 const runId = randomUUID();
 const name = `source-memory-test-${runId}`;
 const scratch = await mkdtemp(join(tmpdir(), 'source-memory-test-'));
@@ -81,6 +84,7 @@ try {
   if (suite === 'all' || suite === 'scopes') results = [...await runNestedScopes(database, scratch), ...await runList(database, scratch)];
   if (suite === 'all') results = [...results, ...await runIntegration(database, scratch)];
   if (suite === 'all' || suite === 'chunk-cap') results = [...results, ...await runChunkCap(database, scratch)];
+  if (suite === 'all' || suite === 'one-turn-repair') results = [...results, ...await runOneTurnRepair(database, scratch)];
   if (suite === 'all' || suite === 'qualification') results = [...results, ...await runQualification(database, scratch)];
 } catch (error) {
   failure = { name: error.name, code: error.code ?? null, message: String(error.message).slice(0, 2000) };
