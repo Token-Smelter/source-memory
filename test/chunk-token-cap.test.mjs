@@ -174,8 +174,9 @@ test('legacy byte chunking is unchanged by the token path', () => {
     [[0, 0, 8192], [1, 8192, 9005], [2, 0, 39], [3, 28, 48]]);
 });
 
-const SERVED = { model: 'fixture', ollama_context_revision: 'fiction-rev-1' };
-const VERIFIED = (sha256, blob = `sha256:${'f'.repeat(64)}`) => ({ [sha256]: { model: 'fixture', served_blob: blob, render: RENDER_CONTRACT,
+// A verified contract needs a configuration the embedding transport accepts: a loopback Ollama endpoint and model.
+const SERVED = { url: 'http://127.0.0.1:9/v1/embeddings', model: 'embeddinggemma', dimensions: 2, ollama_context_revision: 'fiction-rev-1' };
+const VERIFIED = (sha256, blob = `sha256:${'f'.repeat(64)}`) => ({ [sha256]: { model: 'embeddinggemma', served_blob: blob, render: RENDER_CONTRACT,
   serving_revision: 'fiction-rev-1', context: 64, parity_evidence_sha256: 'e'.repeat(64) } });
 const blobOf = async path => `sha256:${createHash('sha256').update(await readFile(path)).digest('hex')}`;
 const served = (tokenizer, extra = {}) => ({ embedding: { ...SERVED, tokenizer, ...extra } });
@@ -229,15 +230,30 @@ test('exactly the evaluated default treatment is qualified, and only under its v
   const variants = [
     [{ ...embedding, chunk_token_cap: 1536 }, verified],
     [{ ...embedding, ollama_context_revision: 'other-rev' }, { [DEFAULT_TREATMENT.tokenizer_sha256]: { ...entry, serving_revision: 'other-rev' } }],
-    [{ ...embedding, url: 'http://127.0.0.1:11434/api/embed' }, verified],
     [{ ...embedding, ollama_transport: 'native_no_truncate' }, verified],
     [{ ...embedding, dimensions: 256 }, verified],
   ];
   for (const [variant, trusted] of variants) {
     const other = chunkPolicy({ embedding: variant }, trusted);
-    assert.equal(other.descriptor.context, 2048);
+    assert.equal(other.descriptor.context, 2048, 'a valid, separately named treatment keeps verified counts');
     assert.notEqual(other.digest, policy.digest, JSON.stringify(variant));
     assert.equal(other.qualification, 'unqualified', JSON.stringify(variant));
+  }
+  // A configuration the embedding transport refuses or cannot classify is neither verified nor qualified, and never shares
+  // the evaluated digest, even when every other field matches.
+  const refused = [
+    { ...embedding, ollama_transport: 'openai_compat' },
+    { ...embedding, url: 'http://fixture.invalid/v1/embeddings' },
+    { ...embedding, url: 'http://127.0.0.1:11434/api/embed' },
+    { ...embedding, url: 'https://127.0.0.1:11434/v1/embeddings' },
+    { ...embedding, url: 'http://user:pw@127.0.0.1:11434/v1/embeddings' },
+    { ...embedding, url: 'http://127.0.0.1:11434/v1/embeddings?x=1' },
+    { ...embedding, allow_remote: true },
+  ];
+  for (const variant of refused) {
+    const other = chunkPolicy({ embedding: variant });
+    assert.deepEqual([other.descriptor.provider, other.descriptor.context, other.qualification], [null, null, 'unqualified'], JSON.stringify(variant));
+    assert.notEqual(other.digest, policy.digest, JSON.stringify(variant));
   }
   assert.equal(chunkPolicy({ embedding }, { [DEFAULT_TREATMENT.tokenizer_sha256]: { ...entry, parity_evidence_sha256: undefined } })
     .descriptor.context, null, 'a verified entry names its parity evidence');

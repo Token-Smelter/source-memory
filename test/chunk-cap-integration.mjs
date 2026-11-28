@@ -66,11 +66,11 @@ export async function runChunkCap(database, scratch) {
   await writeFile(gguf, ggufTokenizerFile(fictionalVocabulary()));
   const { sha256 } = await readGgufTokenizer(gguf);
   const blob = `sha256:${createHash('sha256').update(await readFile(gguf)).digest('hex')}`;
-  const verified = { [sha256]: { model: 'cap-fixture', served_blob: blob, render: RENDER_CONTRACT, serving_revision: 'cap-rev-1', context: 64,
+  const verified = { [sha256]: { model: 'embeddinggemma', served_blob: blob, render: RENDER_CONTRACT, serving_revision: 'cap-rev-1', context: 64,
     parity_evidence_sha256: 'e'.repeat(64) } };
   const server = await embeddingServer();
   const base = { neo4j: database, scopes: { read: SCOPES, write: SCOPES }, index_on_write: false };
-  const embedding = { url: server.url, model: 'cap-fixture', dimensions: 2, ollama_context_revision: 'cap-rev-1' };
+  const embedding = { url: server.url, model: 'embeddinggemma', dimensions: 2, ollama_context_revision: 'cap-rev-1' };
   const open = (extra = {}, trusted = verified) => {
     const memory = new Memory({ ...base, embedding: { ...embedding, tokenizer: { gguf, sha256 }, ...extra } });
     memory.verifiedTokenizers = trusted;
