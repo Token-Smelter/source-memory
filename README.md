@@ -59,7 +59,7 @@ echo '{"query":"dashboard"}' | node bin/memory.mjs recall --config config/host.j
 | `scopes.read`, `scopes.write` | Allowlists. An entry names one scope exactly, or `S/**` names `S` and every descendant (see [Nested scopes](#nested-scopes)). Every command names a scope; others are refused before storage is touched. |
 | `chunking.words`, `chunking.overlap` | Word-window size and overlap for embedding chunks (default 256 / 32). |
 | `index_on_write` | `false` makes `ingest`/`enrich` return without embedding; run `index` separately. Use it on latency-sensitive paths. |
-| `embedding` | Optional `{url, model, dimensions, timeout_ms, allow_remote}`; OpenAI-compatible `/v1/embeddings`. |
+| `embedding` | Optional `{url, model, dimensions, timeout_ms, allow_remote}`; OpenAI-compatible `/v1/embeddings`. Opt-in index limits: `index_budget_ms` (2,000–600,000) gives each index step one deadline, admits a model call only with at least 1,000 ms left, gives it at most the time remaining, and ends with `{status:'pending', partial:{reason:'index_budget_exhausted'}}`; a request the budget shortened is not deferred or marked. `index_batch` (1–16) caps each request's inputs. Unset, indexing is unchanged. |
 | `reranker` | Optional `{url, model, timeout_ms, allow_remote}`; see the rerank protocol below. |
 | `vector_scan_limit` | Legacy scan bound only when a vector index is missing (default 10,000); healthy native indexes do not use it. |
 
