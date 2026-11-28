@@ -132,6 +132,9 @@ Classes, for `ingest` and `enrich`:
 | `invalid_model_endpoint` | post-commit | `localEndpoint` during indexing |
 | `model_endpoint_must_be_loopback` | post-commit | `localEndpoint` during indexing |
 | `embedding_accounting_invalid` | post-commit | Indexing could not establish how many missing vectors remain retryable |
+| `invalid_index_budget` | post-commit | `embedding.index_budget_ms` outside 2,000–600,000 ms, refused by indexing before any model call |
+| `invalid_index_batch` | post-commit | `embedding.index_batch` outside 1–16, refused by indexing before any model call |
+| `invalid_model_timeout` | post-commit | `embedding.timeout_ms` outside 1–120,000 ms under an index budget, refused by indexing before any model call |
 | `embedding_model_mismatch` | post-commit | `embed` during indexing |
 | `invalid_embedding_response` | post-commit | `embed` during indexing |
 | `invalid_embedding` | post-commit | `validateVector` during indexing |

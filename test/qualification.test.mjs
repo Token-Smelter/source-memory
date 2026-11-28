@@ -228,6 +228,9 @@ test('every post-commit code is reported inside an ok:true CLI reply after the w
     ['embedding_model_mismatch', embedding('/other-model')],
     ['invalid_embedding_response', embedding('/short')],
     ['invalid_embedding', embedding('/bad-vector')],
+    ['invalid_index_budget', embedding('/ok', { index_budget_ms: 1999 })],
+    ['invalid_index_batch', embedding('/ok', { index_batch: 0 })],
+    ['invalid_model_timeout', embedding('/ok', { index_budget_ms: 3000, timeout_ms: 0 })],
     ['database_unavailable', embedding('/ok'), { async saveEmbeddings() { throw new TypeError('driver detail'); } }],
     ['embedding_accounting_invalid', embedding('/ok'), {
       async markOversizedChunks() { assert.fail('no oversized chunks'); },
