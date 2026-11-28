@@ -33,14 +33,22 @@ for (const [name, rows, status, body, optIn, terminal] of [
       ...(optIn ? { ollama_context_revision: 'fixture-v1' } : {}) };
     const effects = [];
     const store = { pendingEmbeddings: async () => rows,
-      markContextRejectedChunk: async (...args) => effects.push(['mark', ...args]),
-      deferEmbeddings: async (...args) => effects.push(['defer', ...args]) };
+      observeEmbeddings: async (_scope, _model, uids) => rows.filter(row => uids.includes(row.uid))
+        .map(row => ({ ...row, eligible: true, observed: { text: row.text } })),
+      markContextRejectedChunk: async (...args) => {
+        effects.push(['mark', ...args]);
+        return { applied: 1, refused: 0, uncertain: false };
+      },
+      deferEmbeddings: async (...args) => {
+        effects.push(['defer', ...args]);
+        return { applied: args[2].length, refused: 0, uncertain: false };
+      } };
     const memory = new Memory({ embedding, scopes: { write: ['test'] } }, store);
     const reply = await memory.index('test');
     if (terminal) {
       assert.equal(reply.status, 'pending');
       assert.equal(reply.indexed, 0);
-      assert.deepEqual(effects, [['mark', 'test', reply.embedding_key, embeddingContextContract(embedding), { uid: fixture.uid, text: fixture.text }]]);
+      assert.deepEqual(effects, [['mark', 'test', reply.embedding_key, embeddingContextContract(embedding), { uid: fixture.uid, observed: { text: fixture.text } }]]);
     } else {
       assert.deepEqual([reply.status, reply.reason, effects[0]?.[0], effects[0]?.[4]],
         ['unavailable', 'model_request_failed', 'defer', rows.length === 1 ? 300 : 60]);

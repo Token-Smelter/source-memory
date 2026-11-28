@@ -49,13 +49,19 @@ export async function runIntegration(database, scratch) {
   }
   let modelDown = false;
   let modelCalls = 0;
+  const nativeRequests = [];
   const model = createServer(async (req, res) => {
     modelCalls++;
     let body = '';
     for await (const part of req) body += part;
     if (modelDown) { res.writeHead(503).end(); return; }
     const input = JSON.parse(body);
-    if (req.url === '/v1/embeddings' && input.input.includes('Fictional rejected chunk.')) {
+    if (req.url === '/api/embed') {
+      nativeRequests.push(input);
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({
+        error: 'the input length exceeds the context length',
+      }));
+    } else if (req.url === '/v1/embeddings' && input.input.includes('Fictional rejected chunk.')) {
       res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: {
         type: 'invalid_request_error', message: 'the input length exceeds the context length',
       } }));
@@ -199,6 +205,26 @@ export async function runIntegration(database, scratch) {
       assert.equal((await fixture.status(scope)).unembeddable, undefined);
       assert.equal((await fixture.index(scope)).status, 'ready');
       assert.equal((await fixture.status(scope)).unindexed, 0);
+    });
+    await check('native no-truncate singleton rejection marks the observed chunk without vector credit', async () => {
+      const scope = 'embedding-native-context-fixture';
+      const embedding = { url: `${url}/v1/embeddings`, model: 'embeddinggemma', dimensions: 3,
+        ollama_transport: 'native_no_truncate', ollama_context_revision: 'fixture-v1' };
+      const fixture = new Memory({ ...config, embedding, scopes: { read: [scope], write: [scope] }, index_on_write: false }, memory.store);
+      await fixture.init(scope);
+      const text = 'Fictional native context rejection.';
+      await fixture.ingest(scope, turn('native-rejected', text));
+      assert.equal((await fixture.index(scope)).reason, 'model_request_failed');
+      await fixture.store.transaction('write', tx => tx.run(`MATCH (n:SMChunk {scope:$scope})
+        SET n.embedding_retry_after=datetime()-duration({seconds:1})`, { scope }));
+      const marked = await fixture.index(scope);
+      assert.deepEqual([marked.status, marked.indexed], ['pending', 0]);
+      const terminal = await fixture.index(scope);
+      assert.deepEqual([terminal.status, terminal.reason, terminal.indexed, terminal.unembeddable],
+        ['unavailable', 'embedding_unembeddable', 0, 1]);
+      const status = await fixture.status(scope);
+      assert.deepEqual([status.unindexed, status.unembeddable], [1, 1]);
+      assert.deepEqual(nativeRequests, Array.from({ length: 2 }, () => ({ model: embedding.model, input: [text], truncate: false })));
     });
     await check('failed vector batches remain pending without blocking fresh chunks in the same scope', async () => {
       const scope = 'embedding-retry-fixture';
