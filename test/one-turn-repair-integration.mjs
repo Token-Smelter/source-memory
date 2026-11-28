@@ -158,6 +158,12 @@ export async function runOneTurnRepair(database, scratch) {
       await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_target_changed' });
       await run(driver, 'MATCH (c:SMChunk {scope:$scope}) WHERE c.kept_key IS NOT NULL SET c.embedding_key = c.kept_key REMOVE c.kept_key',
         { scope: SCOPE });
+      // A fourth vector-less chunk under the same turn is refused at selection, before any content is read.
+      await run(driver, `MATCH (c:SMChunk {scope:$scope, turn_uid:$turn}) WHERE c.embedding IS NOT NULL WITH c LIMIT 1
+        SET c.kept_key = c.embedding_key, c.embedding_key = 'stale'`, { scope: SCOPE, turn: turnUid });
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_target_changed' });
+      await run(driver, 'MATCH (c:SMChunk {scope:$scope}) WHERE c.kept_key IS NOT NULL SET c.embedding_key = c.kept_key REMOVE c.kept_key',
+        { scope: SCOPE });
       // A partial layout witness is not a pre-manifest turn.
       await run(driver, 'MATCH (t:SMTurn {uid:$turn}) SET t.chunk_count = 3', { turn: turnUid });
       await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_turn_has_manifest' });

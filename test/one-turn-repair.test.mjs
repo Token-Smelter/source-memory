@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { canonical, digest, MemoryError } from '../src/core.mjs';
 import { embeddingIdentity } from '../src/models.mjs';
 import { readGgufTokenizer, RENDER_CONTRACT, sentencePiece } from '../src/tokenizer.mjs';
-import { apply, classify, inverse, readSnapshot, REPAIR_CONTRACT, stage, writeOnce } from '../src/one-turn-repair.mjs';
+import { apply, classify, freeze, inverse, readSnapshot, REPAIR_CONTRACT, stage, writeOnce } from '../src/one-turn-repair.mjs';
 import { fictionalVocabulary, ggufTokenizerFile } from './helpers/gguf-fixture.mjs';
 
 const words = count => Array.from({ length: count }, () => 'abcd').join(' ');
@@ -237,6 +237,25 @@ test('a stage that would finish after its deadline is refused, and the deadline 
   const slow = async (endpoint, body) => { now += 25_000; return counting(counter)(endpoint, body); };
   await assert.rejects(staged({ frozen: frozenRecord(embeddingIdentity(config.embedding)), config, verified, budget: { max_pieces: 64, max_seconds: 60 },
     request: slow, clock: () => now }), { code: 'repair_budget_exceeded' });
+});
+
+test('freeze refuses a wrong-sized or split cohort from turn ids alone, before reading any turn or chunk content', async () => {
+  const record = fields => ({ get: name => fields[name] });
+  const store = { id: 'store-1', name: 'neo4j' };
+  for (const selection of [{ turns: ['turn-1'], chunks: 4, bound: 4 }, { turns: ['turn-1'], chunks: 2, bound: 2 },
+    { turns: ['turn-1', 'turn-2'], chunks: 3, bound: 3 }, { turns: ['turn-1'], chunks: 3, bound: 2 }, { turns: [], chunks: 0, bound: 0 }]) {
+    const queries = [];
+    const tx = { run: async (query, params) => {
+      queries.push(query);
+      if (queries.length === 2) assert.equal(Number(params.lookahead), 4, 'at most one row past the cohort');
+      return { records: [record(queries.length === 1 ? store : selection)] };
+    }, isOpen: () => false, rollback: async () => {} };
+    const driver = { session: () => ({ beginTransaction: () => tx, close: async () => {} }) };
+    await assert.rejects(freeze({ driver, database: 'neo4j', expectedStore: { database_id: 'store-1', database: 'neo4j' }, scope: 'fixture',
+      embeddingKey: 'key' }), { code: 'repair_target_changed' }, JSON.stringify(selection));
+    assert.equal(queries.length, 2, 'only the store identity and the turn-id selection were read');
+    assert.ok(!/\.(text|body)\b|properties\(/u.test(queries[1]), 'the selection reads no content');
+  }
 });
 
 test('a plan for another store is refused before any lock or content read, and classified without reading content', async t => {
