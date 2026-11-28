@@ -15,7 +15,7 @@ import { embeddingIdentity } from '../src/models.mjs';
 // for the repair, the existing vector key for everything else. It needs the served blob on this host and an owner's slot.
 const exec = promisify(execFile);
 // The command under rehearsal; REPAIR_CLI may name the exact checkout the live run will use.
-const SCRIPT = process.env.REPAIR_CLI ?? fileURLToPath(new URL('../scripts/one-turn-repair.mjs', import.meta.url));
+const SCRIPT = process.env.REPAIR_CLI ?? fileURLToPath(new URL('../scripts/cohort-repair.mjs', import.meta.url));
 const SCOPE = 'repair-cli-fixture';
 const BLOB = '/usr/share/ollama/.ollama/models/blobs/sha256-0800cbac9c2064dde519420e75e512a83cb360de3ad5df176185dc69652fc515';
 const words = (count, word) => Array.from({ length: count }, (_, i) => `${word}${i % 13}`).join(' ');
@@ -53,7 +53,7 @@ async function plantOversized(driver, turnUid, entryId, text, key) {
   }
 }
 
-export async function runOneTurnRepairCli(database, scratch) {
+export async function runCohortRepairCli(database, scratch) {
   const results = [];
   const check = async (name, fn) => { await fn(); results.push({ name, pass: true }); console.log(`PASS ${name}`); };
   const journalRoot = join(scratch, 'repair-journal');
@@ -62,7 +62,9 @@ export async function runOneTurnRepairCli(database, scratch) {
   const owner = { neo4j: database, scopes: { read: [SCOPE], write: [SCOPE] }, index_on_write: false, repair_journal_dir: journalRoot,
     embedding: { ...embedding, ollama_transport: 'native_no_truncate', ollama_context_revision: DEFAULT_TREATMENT.serving_revision,
       tokenizer: { gguf: BLOB, sha256: DEFAULT_TREATMENT.tokenizer_sha256 } } };
-  const paths = { owner: join(scratch, 'OWNER.json'), frozen: join(scratch, 'FROZEN.json'), plan: join(scratch, 'PLAN.json') };
+  const paths = { owner: join(scratch, 'OWNER.json'), frozen: join(scratch, 'FROZEN.json'), plan: join(scratch, 'PLAN.json'), caps: join(scratch, 'CAPS.json') };
+  await writeFile(paths.caps, JSON.stringify({ max_rows: 1000, max_text_bytes: 10_000_000, max_pages: 50, page_size: 250, max_seconds: 600,
+    transaction_timeout_ms: 30_000, max_turns: 5, max_targets: 10, max_target_bytes: 1_000_000 }));
   await writeFile(paths.owner, JSON.stringify(owner), { mode: 0o600 });
   const memory = new Memory({ neo4j: database, scopes: owner.scopes, index_on_write: false, embedding });
   const driver = memory.store.driver;
@@ -87,14 +89,17 @@ export async function runOneTurnRepairCli(database, scratch) {
       '--custody-ref', 'rehearsal-custodian', '--quiescence-ref', 'rehearsal-quiet']);
     const reconcile = async () => (await cli(['reconcile', '--config', paths.owner, '--plan', paths.plan])).out.state;
 
-    await check('P1 freeze through the command selects the one turn, binds the three rows in the named store and prints no content', async () => {
-      const wrong = await cli(['freeze', '--config', paths.owner, '--store-id', 'another-store', '--scope', SCOPE, '--out', join(scratch, 'unused-frozen.json')]);
+    await check('P1 freeze through the command selects the cohort under caps in the named store and prints no content or identifier', async () => {
+      const freezeArgs = (storeIdValue, out) => ['freeze', '--config', paths.owner, '--store-id', storeIdValue, '--scope', SCOPE, '--over', '2048',
+        '--caps', paths.caps, '--out', out];
+      const wrong = await cli(freezeArgs('another-store', join(scratch, 'unused-frozen.json')));
       assert.equal(wrong.out.error, 'repair_store_mismatch');
-      const result = await cli(['freeze', '--config', paths.owner, '--store-id', storeId, '--scope', SCOPE, '--out', paths.frozen]);
+      const result = await cli(freezeArgs(storeId, paths.frozen));
       assert.equal(result.code, 0, JSON.stringify(result.out));
-      assert.deepEqual([result.out.targets, result.out.store_id, result.out.turn_uid], [3, storeId, turnUid]);
+      assert.deepEqual([result.out.turns, result.out.targets, result.out.targets_by_vector, result.out.store_id, result.out.over_tokens],
+        [1, 3, { absent: 3, stale: 0, current: 0 }, storeId, 2048]);
       frozenDigest = result.out.frozen_digest;
-      assert.ok(!JSON.stringify(result.out).includes('lantern'), 'no content on stdout');
+      assert.ok(!JSON.stringify(result.out).includes('lantern') && !JSON.stringify(result.out).includes(turnUid), 'no content or turn on stdout');
     });
 
     await check('P2 stage through the command embeds each piece alone on the served model with an exact count', async () => {

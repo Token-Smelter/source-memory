@@ -11,8 +11,8 @@ import { runQualification } from '../test/qualification.mjs';
 import { runNestedScopes } from '../test/nested-scopes.mjs';
 import { runList } from '../test/list-integration.mjs';
 import { runChunkCap } from '../test/chunk-cap-integration.mjs';
-import { runOneTurnRepair } from '../test/one-turn-repair-integration.mjs';
-import { runOneTurnRepairCli } from '../test/one-turn-repair-cli-integration.mjs';
+import { runCohortRepair } from '../test/cohort-repair-integration.mjs';
+import { runCohortRepairCli } from '../test/cohort-repair-cli-integration.mjs';
 import { integrationResources } from './integration-resources.mjs';
 
 const exec = promisify(execFile);
@@ -21,10 +21,10 @@ const exec = promisify(execFile);
 // the token-cap checks.
 const suiteIndex = process.argv.indexOf('--suite');
 const suite = suiteIndex === -1 ? 'all' : process.argv[suiteIndex + 1];
-// `one-turn-repair-cli` rehearses the live procedure through the command against the local Ollama, so it is never part of
+// `cohort-repair-cli` rehearses the live procedure through the command against the local Ollama, so it is never part of
 // `all`.
-if (!['all', 'qualification', 'scopes', 'chunk-cap', 'one-turn-repair', 'one-turn-repair-cli'].includes(suite)) {
-  throw new Error('--suite must be qualification, scopes, chunk-cap, one-turn-repair or one-turn-repair-cli');
+if (!['all', 'qualification', 'scopes', 'chunk-cap', 'cohort-repair', 'cohort-repair-cli'].includes(suite)) {
+  throw new Error('--suite must be qualification, scopes, chunk-cap, cohort-repair or cohort-repair-cli');
 }
 const runId = randomUUID();
 const name = `source-memory-test-${runId}`;
@@ -87,8 +87,8 @@ try {
   if (suite === 'all' || suite === 'scopes') results = [...await runNestedScopes(database, scratch), ...await runList(database, scratch)];
   if (suite === 'all') results = [...results, ...await runIntegration(database, scratch)];
   if (suite === 'all' || suite === 'chunk-cap') results = [...results, ...await runChunkCap(database, scratch)];
-  if (suite === 'all' || suite === 'one-turn-repair') results = [...results, ...await runOneTurnRepair(database, scratch)];
-  if (suite === 'one-turn-repair-cli') results = [...results, ...await runOneTurnRepairCli(database, scratch)];
+  if (suite === 'all' || suite === 'cohort-repair') results = [...results, ...await runCohortRepair(database, scratch)];
+  if (suite === 'cohort-repair-cli') results = [...results, ...await runCohortRepairCli(database, scratch)];
   if (suite === 'all' || suite === 'qualification') results = [...results, ...await runQualification(database, scratch)];
 } catch (error) {
   failure = { name: error.name, code: error.code ?? null, message: String(error.message).slice(0, 2000) };

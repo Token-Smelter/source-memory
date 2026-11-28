@@ -1,4 +1,8 @@
-// Owner-only, one-shot repair of one pre-manifest turn's three byte-oversized, vectorless derived chunks.
+// Owner-only, one-shot repair of one scope's frozen cohort: the derived chunks of pre-manifest turns whose text is over an
+// explicitly chosen token threshold (--over 1920 or 2048) or over 8,192 bytes, whatever their vector state.
+//
+// Two separate owner decisions: the approved frozen digest permits staging only; the approved plan digest, which binds the
+// replacements, their limits and the exact inverse, permits apply and inverse.
 //
 // External gates this tool records but cannot verify, and which must hold before and through apply or inverse:
 // - the owner's exclusive custody of this repair (one operator, one plan file, no copies run elsewhere), named by
@@ -14,9 +18,14 @@
 // directory or host does not, which is why custody stays an external gate.
 //
 // Private files are written 0600, fsynced, with their directory entry fsynced too, and never overwritten. Stdout carries no
-// content: digests, counts and outcomes, plus, on freeze only, the observed store ID and selected turn UID. The freeze
-// receipt is therefore private to the custodian and is never collected into a shared report.
-//   freeze    --config C --store-id ID --scope S --out FROZEN   (selects the one turn; its receipt names it, for the custodian)
+// content and no chunk or turn identifier: digests, counts and outcomes, plus, on freeze, the observed store ID. The frozen
+// record and the plan name every target and stay private to the custodian.
+//
+// Transport: stage, apply and inverse refuse unless the config sets `embedding.ollama_transport: native_no_truncate` on a
+// loopback `/v1/embeddings` URL; the freeze binds the same treatment digest, so freeze with the config you will stage with.
+//   freeze    --config C --store-id ID --scope S --over 1920|2048 --caps CAPS --out FROZEN
+//             CAPS: {max_rows, max_text_bytes, max_pages, page_size (<= 500), max_seconds, transaction_timeout_ms,
+//                    max_turns, max_targets, max_target_bytes}, all required
 //   stage     --config C --frozen FROZEN --approved-frozen DIGEST --max-pieces N --max-seconds N --out PLAN
 //   apply     --config C --plan PLAN --approved-plan DIGEST --custody-ref REF --quiescence-ref REF
 //   inverse   --config C --plan PLAN --approved-plan DIGEST --custody-ref REF --quiescence-ref REF
@@ -25,12 +34,11 @@
 import { mkdir, open, readdir, readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { authorize, integer, MemoryError, requireThat } from '../src/core.mjs';
-import { embeddingIdentity } from '../src/models.mjs';
-import { apply, freeze, inverse, reconcile, REPAIR_CONTRACT, stage } from '../src/one-turn-repair.mjs';
+import { apply, freeze, inverse, reconcile, REPAIR_CONTRACT, stage } from '../src/cohort-repair.mjs';
 import { Neo4jStore } from '../src/store.mjs';
 
 const COMMANDS = {
-  freeze: ['--config', '--store-id', '--scope', '--out'],
+  freeze: ['--config', '--store-id', '--scope', '--over', '--caps', '--out'],
   stage: ['--config', '--frozen', '--approved-frozen', '--max-pieces', '--max-seconds', '--out'],
   apply: ['--config', '--plan', '--approved-plan', '--custody-ref', '--quiescence-ref'],
   inverse: ['--config', '--plan', '--approved-plan', '--custody-ref', '--quiescence-ref'],
@@ -165,23 +173,25 @@ async function run({ command, values }) {
     grantedScope(config, scope, 'write');
     requireThat(REF.test(values['--store-id']), 'invalid_input');
     const expectedStore = { database_id: values['--store-id'], database: config.neo4j?.database ?? 'neo4j' };
+    requireThat(['1920', '2048'].includes(values['--over']), 'repair_threshold_required');
+    const caps = await readJson(values['--caps']);
     return withStore(config, async handles => {
-      const frozen = await freeze({ ...handles, expectedStore, scope, embeddingKey: embeddingIdentity(config.embedding) });
+      const frozen = await freeze({ ...handles, expectedStore, scope, embedding: config.embedding, overTokens: Number(values['--over']), caps });
       await writeOnceFile(values['--out'], frozen);
-      // The selected turn and the observed store are identifiers, not content; the custodian keeps this receipt private.
-      return { contract: REPAIR_CONTRACT, step: 'freeze', frozen_digest: frozen.frozen_digest, targets: frozen.targets.length,
-        store_id: frozen.store.database_id, turn_uid: frozen.turn_uid };
+      return { contract: REPAIR_CONTRACT, step: 'freeze', frozen_digest: frozen.frozen_digest, store_id: frozen.store.database_id,
+        over_tokens: frozen.selection.over_tokens, ...frozen.discovery };
     });
   }
   if (command === 'stage') {
     const frozen = await readJson(values['--frozen']);
     grantedScope(config, frozen.scope, 'read');
     grantedScope(config, frozen.scope, 'write');
-    const budget = { max_pieces: integer(Number(values['--max-pieces']), undefined, 1, 256), max_seconds: integer(Number(values['--max-seconds']), undefined, 1, 3600) };
+    const budget = { max_pieces: integer(Number(values['--max-pieces']), undefined, 1, 100_000),
+      max_seconds: integer(Number(values['--max-seconds']), undefined, 1, 86_400) };
     const plan = await stage({ frozen, approvedFrozen: values['--approved-frozen'], config, budget });
     await writeOnceFile(values['--out'], plan);
     return { contract: REPAIR_CONTRACT, step: 'stage', frozen_digest: plan.frozen_digest, plan_digest: plan.plan_digest,
-      targets: plan.replacements.length, replacements: plan.postimage.created.length };
+      turns: plan.frozen.turns.length, targets: plan.replacements.length, replacements: plan.replacements.reduce((sum, item) => sum + item.nodes.length, 0) };
   }
   const plan = await readJson(values['--plan']);
   // Every remaining step reads the rows' content; apply and inverse also write.
