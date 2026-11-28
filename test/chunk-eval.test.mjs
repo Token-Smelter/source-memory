@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { CHUNK_MAX_BYTES } from '../src/core.mjs';
 import { DEFAULT_TREATMENT } from '../src/chunk-policy.mjs';
 import { readGgufTokenizer, sentencePiece } from '../src/tokenizer.mjs';
-import { compareRuns, deriveCorpus, EVAL_VERSION, rank, scoreRun, validateManifest } from '../scripts/chunk-eval-core.mjs';
+import { compareRuns, deriveCorpus, embedWitnessed, EVAL_VERSION, rank, scoreRun, validateManifest } from '../scripts/chunk-eval-core.mjs';
 import { chunkEvalCorpus } from './fixtures/chunk-eval/corpus.mjs';
 import { fictionalVocabulary, ggufTokenizerFile } from './helpers/gguf-fixture.mjs';
 
@@ -106,4 +106,84 @@ test('a gold span counts as fully represented only when one fully embedded chunk
 
 test('ranking is exact cosine with a deterministic index tie-break', () => {
   assert.deepEqual(rank([[1, 0]], [[0, 1], [1, 0], [2, 0], [1, 1]], 3), [[1, 2, 3]]);
+  // A refused chunk takes no place, and a refused query ranks nothing.
+  assert.deepEqual(rank([[1, 0], null], [[0, 1], null, [2, 0]], 3), [[2, 0], []]);
+});
+
+// A remote embedder over the default local chunker, named exactly as its adapter names itself.
+const remoteRow = async () => {
+  const base = await manifest('default-v1');
+  const identity = { provider: 'vertex', model: 'gemini-embedding-001', destination: 'fixture-location', dimensions: 64,
+    task_pair: ['RETRIEVAL_DOCUMENT', 'RETRIEVAL_QUERY'], auto_truncate: false, representation: 'fixture' };
+  return { ...base, name: 'vertex-fixture', role: 'experiment', embedder: { provider: 'vertex', model: 'gemini-embedding-001', dimensions: 64,
+    context: 2048, full_input_witness: 'adapter', identity } };
+};
+
+test('an adapter-witnessed embedder is only an experiment over a token chunker, with an exact non-truncating identity', async () => {
+  const row = await remoteRow();
+  assert.equal(validateManifest(row).qualification, 'unqualified');
+  assert.throws(() => validateManifest({ ...row, role: 'default' }), /experiment over a token chunker|exactly DEFAULT_TREATMENT/);
+  assert.throws(() => validateManifest({ ...row, embedder: { ...row.embedder, identity: { ...row.embedder.identity, auto_truncate: true } } }), /identity/);
+  assert.throws(() => validateManifest({ ...row, embedder: { ...row.embedder, identity: { ...row.embedder.identity, dimensions: 768 } } }), /identity/);
+  const legacy = (await manifest('legacy-reference-v1')).chunker;
+  assert.throws(() => validateManifest({ ...row, chunker: legacy }), /token chunker/);
+  // Without the witness mode the old rule holds: a token policy must name the embedder deployment exactly.
+  assert.throws(() => validateManifest({ ...row, embedder: { ...row.embedder, full_input_witness: undefined, tokenizer_sha256: 'x' } }), /exactly the evaluated embedder/);
+});
+
+// A fake adapter in the agreed shape: one input per call, a full-input row with evidence, or a typed refusal.
+const fakeAdapter = (decide = () => 'ok') => {
+  const calls = [];
+  return { calls, async embed(inputs, { purpose }) {
+    calls.push({ inputs, purpose });
+    const outcome = decide(inputs[0], purpose);
+    if (outcome !== 'ok' && typeof outcome === 'string') throw Object.assign(new Error(outcome), { code: outcome });
+    return outcome === 'ok' ? { rows: [{ vector: fakeVector(inputs[0]), full_input: true,
+      evidence: { kind: 'vertex_statistics', transport: 'vertex_predict', token_count: 10, limit: 2048 } }] } : outcome;
+  } };
+};
+
+test('witnessed embedding sends one input per call with its purpose, credits only proven full input and counts typed refusals', async () => {
+  const items = [{ text: 'alpha', purpose: 'document' }, { text: 'too long', purpose: 'document' }, { text: 'unproven', purpose: 'document' },
+    { text: 'question', purpose: 'query' }];
+  const adapter = fakeAdapter(text => (text === 'too long' ? 'embedding_input_too_long' : text === 'unproven' ? 'embedding_full_input_unverified' : 'ok'));
+  const out = await embedWitnessed(adapter, items, { dimensions: 64, context: 2048 });
+  assert.deepEqual(adapter.calls.map(call => [call.inputs.length, call.purpose]), [[1, 'document'], [1, 'document'], [1, 'document'], [1, 'query']]);
+  assert.deepEqual(out.vectors.map(vector => vector !== null), [true, false, false, true]);
+  assert.deepEqual([out.refusals, out.evidence_kinds], [{ embedding_full_input_unverified: 1, embedding_input_too_long: 1 }, ['vertex_predict/vertex_statistics']]);
+  // A provider failure, or a vector without a valid witness, ends the run instead of being scored.
+  const row = { vector: fakeVector('x'), full_input: true, evidence: { kind: 'k', transport: 't', token_count: 10, limit: 2048 } };
+  for (const bad of ['model_request_failed', { rows: [{ ...row, full_input: false }] }, { rows: [{ ...row, evidence: undefined }] },
+    { rows: [{ ...row, evidence: { ...row.evidence, token_count: 2049 } }] }, { rows: [{ ...row, evidence: { ...row.evidence, limit: 4096, token_count: 3000 } }] },
+    { rows: [row, row] }, { rows: [{ ...row, vector: [1, 2] }] }]) {
+    await assert.rejects(embedWitnessed(fakeAdapter(() => bad), [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 }), undefined, JSON.stringify(bad).slice(0, 80));
+  }
+  // The admission hook runs before every request and can stop the run.
+  let admitted = 0;
+  await assert.rejects(embedWitnessed(fakeAdapter(), items, { dimensions: 64, context: 2048, admit: async () => { if (++admitted > 2) throw new Error('budget'); } }), /budget/);
+});
+
+test('a chunk the adapter refused is never represented, and its row fails the full-coverage gate', async t => {
+  const counter = await fictionalCounter(t);
+  const corpus = chunkEvalCorpus();
+  const derived = deriveCorpus(corpus, { ...DEFAULT_TREATMENT }, counter);
+  // Every chunk that contains the first gold span; overlapping chunks can each hold it.
+  const { gold } = corpus.queries[0];
+  const goldChunks = derived.chunks.flatMap((chunk, index) => (chunk.turn === gold.turn && chunk.entry_id === gold.entry_id
+    && chunk.start <= gold.start && gold.end <= chunk.end ? [index] : []));
+  const runWith = refused => {
+    const chunks = derived.chunks.map((chunk, index) => ({ ...chunk, witnessed: !refused.includes(index) }));
+    const chunkVectors = chunks.map(chunk => (chunk.witnessed ? fakeVector(chunk.text) : null));
+    const rankings = rank(corpus.queries.map(query => fakeVector(query.text)), chunkVectors);
+    return { eval_version: EVAL_VERSION, corpus_digest: 'c', manifest_digest: `r${refused.length}`,
+      score: scoreRun({ corpus, derived: { chunks, gaps: [] }, rankings, context: 2048, counter }) };
+  };
+  const full = runWith([]);
+  const partial = runWith(goldChunks);
+  assert.ok(goldChunks.length >= 1);
+  assert.equal(full.score.coverage.unwitnessed, 0);
+  assert.equal(partial.score.coverage.unwitnessed, goldChunks.length);
+  assert.equal(partial.score.per_query[0].gold_fully_represented, false);
+  assert.equal(compareRuns(full, partial).gates.full_coverage, false);
+  assert.equal(compareRuns(partial, full).gates.full_coverage, true);
 });

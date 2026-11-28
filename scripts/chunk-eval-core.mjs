@@ -6,6 +6,11 @@ export const EVAL_VERSION = 'source-memory.chunk-eval/1';
 export const KS = [1, 5, 10];
 export const GATE_K = 5;
 export const ROLES = ['default', 'reference', 'experiment'];
+// An embedder whose own service proves, per input, that it embedded the whole text: the chunker's local cap is then checked
+// against that proof, not against a local oracle of the server's tokenizer.
+export const ADAPTER_WITNESS = 'adapter';
+// Typed refusals an adapter raises instead of returning a vector it cannot prove full; anything else ends the run.
+export const WITNESS_REFUSALS = ['embedding_full_input_unverified', 'embedding_input_too_long'];
 
 /**
  * A treatment manifest is valid only in one of three roles. The default must carry exactly DEFAULT_TREATMENT, the reference
@@ -18,11 +23,20 @@ export function validateManifest(manifest) {
   if (!ROLES.includes(manifest.role)) fail('role');
   const { chunker, embedder, budget } = manifest;
   if (!chunker || ![LEGACY_POLICY, TOKEN_POLICY].includes(chunker.policy)) fail('chunker.policy');
-  if (!embedder || typeof embedder.model !== 'string' || !Number.isSafeInteger(embedder.context) || typeof embedder.tokenizer_sha256 !== 'string') fail('embedder');
+  const witnessed = embedder?.full_input_witness === ADAPTER_WITNESS;
+  if (!embedder || typeof embedder.model !== 'string' || !Number.isSafeInteger(embedder.context)
+      || (!witnessed && typeof embedder.tokenizer_sha256 !== 'string')) fail('embedder');
+  if (witnessed) {
+    // A remote embedder is an experiment over a local token chunker, identified exactly as its adapter names itself.
+    if (manifest.role !== 'experiment' || chunker.policy !== TOKEN_POLICY) fail('an adapter-witnessed embedder is an experiment over a token chunker');
+    const { identity } = embedder;
+    if (!identity || typeof identity !== 'object' || identity.model !== embedder.model || identity.dimensions !== embedder.dimensions
+        || identity.auto_truncate !== false || typeof identity.provider !== 'string') fail('embedder.identity');
+  }
   if (!budget || !Number.isSafeInteger(budget.max_inputs) || budget.max_inputs < 1 || !Number.isSafeInteger(budget.max_seconds) || budget.max_seconds < 1) fail('budget');
   if (manifest.role === 'default' && canonical(chunker) !== canonical(DEFAULT_TREATMENT)) fail('the default row must be exactly DEFAULT_TREATMENT');
   if (manifest.role === 'reference' && chunker.policy !== LEGACY_POLICY) fail('the reference row is the legacy byte policy');
-  if (chunker.policy === TOKEN_POLICY && ['tokenizer_sha256', 'served_blob', 'context', 'model', 'endpoint_path', 'transport', 'dimensions', 'provider']
+  if (!witnessed && chunker.policy === TOKEN_POLICY && ['tokenizer_sha256', 'served_blob', 'context', 'model', 'endpoint_path', 'transport', 'dimensions', 'provider']
     .some(key => chunker[key] !== embedder[key])) {
     fail('a token policy must name exactly the evaluated embedder deployment');
   }
@@ -48,10 +62,45 @@ export function deriveCorpus(corpus, chunker, counter) {
   return { chunks, gaps };
 }
 
-/** Top-k chunk indices per query by exact cosine; ties go to the lower index. */
+/**
+ * Top-k chunk indices per query by exact cosine; ties go to the lower index. A chunk or query without a vector (refused by a
+ * witnessing adapter) takes no place in any ranking.
+ */
 export function rank(queryVectors, chunkVectors, k = Math.max(...KS)) {
-  return queryVectors.map(query => chunkVectors.map((vector, index) => ({ index, score: cosine(query, vector) }))
-    .sort((a, b) => b.score - a.score || a.index - b.index).slice(0, k).map(row => row.index));
+  return queryVectors.map(query => (query === null ? [] : chunkVectors.flatMap((vector, index) => (vector === null ? [] : [{ index, score: cosine(query, vector) }]))
+    .sort((a, b) => b.score - a.score || a.index - b.index).slice(0, k).map(row => row.index)));
+}
+
+/**
+ * Embeds each item alone through a witnessing adapter (`embed(inputs, {purpose, signal}) -> {rows:[{vector, full_input,
+ * evidence}]}`). A vector counts only with `full_input === true` and evidence whose count is within its limit and the sealed
+ * context; a typed refusal leaves the item without a vector and is counted. Any other failure or a malformed reply ends the run.
+ * `admit()` runs before every request and may throw to stop.
+ */
+export async function embedWitnessed(adapter, items, { dimensions, context, admit = async () => {}, signal } = {}) {
+  const vectors = [];
+  const refusals = Object.fromEntries(WITNESS_REFUSALS.map(code => [code, 0]));
+  const kinds = new Set();
+  for (const { text, purpose } of items) {
+    await admit();
+    let reply;
+    try { reply = await adapter.embed([text], { purpose, signal }); } catch (error) {
+      if (!WITNESS_REFUSALS.includes(error?.code)) throw error;
+      refusals[error.code]++;
+      vectors.push(null);
+      continue;
+    }
+    const row = reply?.rows?.length === 1 ? reply.rows[0] : null;
+    const evidence = row?.evidence;
+    if (row?.full_input !== true || !Array.isArray(row.vector) || row.vector.length !== dimensions || !row.vector.every(Number.isFinite)
+        || !row.vector.some(x => x !== 0) || typeof evidence?.kind !== 'string' || !Number.isSafeInteger(evidence.token_count)
+        || !Number.isSafeInteger(evidence.limit) || evidence.token_count > evidence.limit || evidence.limit > context) {
+      throw new Error('the adapter returned a vector without a valid full-input witness');
+    }
+    kinds.add(`${evidence.transport}/${evidence.kind}`);
+    vectors.push(row.vector);
+  }
+  return { vectors, refusals, evidence_kinds: [...kinds].sort() };
 }
 
 const overlaps = (chunk, gold) => chunk.turn === gold.turn && chunk.entry_id === gold.entry_id && chunk.start < gold.end && gold.start < chunk.end;
@@ -62,6 +111,8 @@ const contains = (chunk, gold) => chunk.turn === gold.turn && chunk.entry_id ===
  * prefix through the gold span within it. The second case is an estimate of the server's truncation, labelled as such.
  */
 function represented(chunk, gold, context, counter) {
+  // Under a witnessing adapter only its proof counts: no local estimate of what a remote tokenizer kept.
+  if (chunk.witnessed !== undefined) return chunk.witnessed ? 'full' : 'truncated_away';
   if (chunk.tokens <= context) return 'full';
   const through = Math.min(gold.end, chunk.end) - chunk.start;
   return counter.count(chunk.text.slice(0, through)) <= context ? 'prefix_estimate' : 'truncated_away';
@@ -104,6 +155,7 @@ export function scoreRun({ corpus, derived, rankings, context, counter }) {
     per_query: perQuery,
     aggregate,
     coverage: { chunks: derived.chunks.length, over_context: tokens.filter(count => count > context).length, gaps: derived.gaps.length,
+      ...(derived.chunks.some(chunk => chunk.witnessed !== undefined) ? { unwitnessed: derived.chunks.filter(chunk => chunk.witnessed === false).length } : {}),
       gold_covered: perQuery.filter(row => row.gold_covered).length, gold_fully_represented: perQuery.filter(row => row.gold_fully_represented).length,
       queries: perQuery.length },
     cost: { chunks: tokens.length, mean_tokens: tokens.reduce((a, b) => a + b, 0) / Math.max(1, tokens.length),
@@ -132,7 +184,8 @@ export function compareRuns(reference, candidate) {
   const denseReference = reference.score.aggregate.dense?.embedded_recall[GATE_K] ?? 0;
   const denseCandidate = candidate.score.aggregate.dense?.embedded_recall[GATE_K] ?? 0;
   const gates = {
-    full_coverage: coverage.over_context === 0 && coverage.gaps === 0 && coverage.gold_fully_represented === coverage.queries,
+    full_coverage: coverage.over_context === 0 && coverage.gaps === 0 && (coverage.unwitnessed ?? 0) === 0
+      && coverage.gold_fully_represented === coverage.queries,
     dense_not_worse: denseCandidate >= denseReference,
     overall_losses_at_most_one: lost.length <= 1,
   };
