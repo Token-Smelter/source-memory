@@ -1,24 +1,32 @@
 import neo4j from 'neo4j-driver';
 import { canonical, CHUNK_MAX_BYTES, digest, identity, MemoryError, normalizeTurn, requireThat, validateVector } from './core.mjs';
-import { chunkPolicy, deriveChunks, TOKEN_POLICY } from './chunk-policy.mjs';
+import { chunkPolicy, DEFAULT_CHUNK_TOKEN_CAP, deriveChunks, TOKEN_POLICY } from './chunk-policy.mjs';
 import { embeddingIdentity, localEndpoint, localJson } from './models.mjs';
 
 // Names this repair's file and receipt formats. One owner-run repair of the byte-oversized, vectorless derived chunks of one
-// retained turn: freeze the exact preimage, stage token-capped replacements with full-input vectors, swap them in one
-// guarded transaction, and keep the exact inverse. The turn, its entries, spans, records and relations are not touched.
+// retained turn that predates first-retain manifests: freeze the exact preimage, stage token-capped replacements with
+// full-input vectors, swap them in one guarded transaction, and keep the exact inverse. The turn, its entries, spans, records
+// and relations are not touched.
 export const REPAIR_CONTRACT = 'source-memory.one-turn-repair/1';
+// The approved cohort: exactly three rows of one turn.
+export const REPAIR_TARGETS = 3;
 const SAFE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 const PROPERTY_TYPES = ['STRING', 'BOOLEAN', 'INTEGER', 'FLOAT', 'ZONED DATETIME', 'LIST<FLOAT>', 'LIST<INTEGER>', 'LIST<STRING>'];
+// Properties a first retain under a chunk policy writes; a turn carrying any of them has a manifest this repair would break.
+const MANIFEST_PROPERTIES = ['chunk_policy', 'chunk_policy_digest', 'chunk_manifest', 'chunk_manifest_digest', 'chunk_manifest_status'];
 
 // The property's type with nullability annotations removed, e.g. `LIST<FLOAT NOT NULL> NOT NULL` -> `LIST<FLOAT>`.
 const baseType = type => String(type).replaceAll(' NOT NULL', '');
 
-/** One node's exact stored state: labels and typed properties, in a canonical, digestible form. */
+/** One node's exact stored state: labels and typed properties, in a canonical, digestible form. Integers stay decimal strings. */
 function nodeState(labels, typed) {
   const properties = {};
   for (const { k, t, v } of typed) {
     const type = baseType(t);
     requireThat(SAFE_NAME.test(k) && PROPERTY_TYPES.includes(type), 'repair_unsupported_property');
+    // JSON keeps every finite double exactly; a non-finite one could not be restored, so it is refused before any write.
+    requireThat(type !== 'FLOAT' || Number.isFinite(v), 'repair_unsupported_property');
+    requireThat(type !== 'LIST<FLOAT>' || (Array.isArray(v) && v.every(Number.isFinite)), 'repair_unsupported_property');
     properties[k] = { type, value: v };
   }
   requireThat(labels.every(label => SAFE_NAME.test(label)), 'repair_unsupported_label');
@@ -26,21 +34,46 @@ function nodeState(labels, typed) {
 }
 const stateDigest = state => digest(canonical(state));
 const value = (state, key) => state.properties[key]?.value;
+// A numeric property as a JS number; offsets and ordinals are far inside the safe range, anything else is refused.
+const numeric = (state, key) => {
+  const n = Number(value(state, key));
+  requireThat(Number.isSafeInteger(n) && n >= 0, 'repair_target_changed');
+  return n;
+};
 
-const TYPED = node => `[k IN keys(${node}) | {k: k, t: valueType(${node}[k]),
-  v: CASE WHEN valueType(${node}[k]) STARTS WITH 'ZONED DATETIME' THEN toString(${node}[k]) ELSE ${node}[k] END}]`;
+// Values are returned in a lossless form: integers as decimal strings (the store driver would round large ones), datetimes as
+// ISO strings with their zone.
+const TYPED = node => `[k IN keys(${node}) | {k: k, t: valueType(${node}[k]), v: CASE
+  WHEN valueType(${node}[k]) STARTS WITH 'ZONED DATETIME' THEN toString(${node}[k])
+  WHEN valueType(${node}[k]) STARTS WITH 'INTEGER' THEN toString(${node}[k])
+  WHEN valueType(${node}[k]) STARTS WITH 'LIST<INTEGER' THEN [i IN ${node}[k] | toString(i)]
+  ELSE ${node}[k] END}]`;
 
 /**
- * Everything the repair binds, read in one transaction: the turn, every derived chunk linked to it with its exact state and
- * relationship count, and a scope fingerprint that changes with any retain, enrichment or vector write in the scope.
+ * Everything the repair binds, read in one transaction: the physical store, the turn, every derived chunk linked to it with
+ * its exact state and every relationship it has (type, direction, other end, property count), and a scope count fingerprint.
+ * The fingerprint detects count-changing writes in the scope; it does not detect a same-count update of another row, so
+ * writer quiescence remains a hard external requirement of the owner, not something this check provides.
  */
 export async function readSnapshot(tx, scope, turnUid, embeddingKey) {
+  const info = (await tx.run('CALL db.info() YIELD id, name RETURN id, name')).records;
+  requireThat(info.length === 1, 'repair_target_changed');
+  const store = { system: 'neo4j', database_id: info[0].get('id'), database: info[0].get('name') };
   const turns = await tx.run(`MATCH (t:SMTurn {uid:$turn, scope:$scope}) RETURN labels(t) AS labels, ${TYPED('t')} AS typed`, { scope, turn: turnUid });
   requireThat(turns.records.length === 1, 'repair_target_changed');
   const turn = nodeState(turns.records[0].get('labels'), turns.records[0].get('typed'));
-  const rows = await tx.run(`MATCH (t:SMTurn {uid:$turn, scope:$scope})-[:SM_HAS_CHUNK]->(c:SMChunk)
-    RETURN c.uid AS uid, labels(c) AS labels, ${TYPED('c')} AS typed, COUNT { (c)--() } AS links ORDER BY c.uid`, { scope, turn: turnUid });
-  const chunks = rows.records.map(record => ({ uid: record.get('uid'), links: Number(record.get('links')),
+  // A chunk linked from the turn but bound to another scope or turn is refused before any of its content is read.
+  const misbound = await tx.run(`MATCH (t:SMTurn {uid:$turn, scope:$scope})-[:SM_HAS_CHUNK]->(c)
+    WHERE NOT c:SMChunk OR c.scope IS NULL OR c.scope <> $scope OR c.turn_uid IS NULL OR c.turn_uid <> $turn RETURN count(c) AS n`,
+  { scope, turn: turnUid });
+  requireThat(Number(misbound.records[0].get('n')) === 0, 'repair_target_misbound');
+  const rows = await tx.run(`MATCH (t:SMTurn {uid:$turn, scope:$scope})-[:SM_HAS_CHUNK]->(c:SMChunk {scope:$scope, turn_uid:$turn})
+    RETURN c.uid AS uid, labels(c) AS labels, ${TYPED('c')} AS typed,
+      [(c)-[r]-(o) | {type: type(r), incoming: endNode(r) = c, from_turn: o = t, properties: size(keys(r))}] AS links
+    ORDER BY c.uid`, { scope, turn: turnUid });
+  const chunks = rows.records.map(record => ({ uid: record.get('uid'),
+    links: record.get('links').map(link => ({ ...link, properties: Number(link.properties) }))
+      .sort((a, b) => canonical(a).localeCompare(canonical(b))),
     state: nodeState(record.get('labels'), record.get('typed')) }));
   // Each count is its own ungrouped aggregate, so a zero is a row and every key is always present.
   const missing = 'n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $key';
@@ -55,8 +88,12 @@ export async function readSnapshot(tx, scope, turnUid, embeddingKey) {
   const fingerprint = Object.fromEntries(['turns', 'chunks', 'chunks_without_current_vector', 'records', 'records_without_current_vector', 'relations']
     .map(kind => [kind, Number(counts.get(kind))]));
   requireThat(Object.values(fingerprint).every(Number.isSafeInteger), 'repair_target_changed');
-  return { turn, chunks, fingerprint };
+  return { store, turn, chunks, fingerprint };
 }
+
+// The only link a repaired chunk may have: the turn's property-free SM_HAS_CHUNK edge into it.
+const TURN_LINK = [{ type: 'SM_HAS_CHUNK', incoming: true, from_turn: true, properties: 0 }];
+const onlyTurnLink = chunk => canonical(chunk.links) === canonical(TURN_LINK);
 
 const isCurrent = (state, key) => value(state, 'embedding_key') === key && Array.isArray(value(state, 'embedding'));
 
@@ -64,6 +101,7 @@ function bindings(snapshot, targetUids) {
   const targets = snapshot.chunks.filter(chunk => targetUids.includes(chunk.uid));
   const siblings = snapshot.chunks.filter(chunk => !targetUids.includes(chunk.uid));
   return {
+    store: snapshot.store,
     turn_digest: stateDigest(snapshot.turn),
     targets: targets.map(chunk => ({ uid: chunk.uid, links: chunk.links, digest: stateDigest(chunk.state) })),
     siblings_digest: digest(canonical(siblings.map(chunk => [chunk.uid, chunk.links, stateDigest(chunk.state)]))),
@@ -71,37 +109,49 @@ function bindings(snapshot, targetUids) {
   };
 }
 
-/**
- * Freezes the exact preimage of one turn's repair. The target is every derived chunk of the turn without a current-key
- * vector; there must be exactly `expectedTargets`, each over CHUNK_MAX_BYTES, linked only to the turn, and equal to its source
- * span. They must also be every chunk of the scope without a current-key vector. Returns the private frozen record.
- */
-export async function freeze({ driver, database, store, scope, turnUid, embeddingKey, expectedTargets }) {
+async function readOnly(driver, database, work) {
   const session = driver.session({ database, defaultAccessMode: neo4j.session.READ });
   try {
     const tx = session.beginTransaction({ timeout: 60_000 });
-    try {
-      const snapshot = await readSnapshot(tx, scope, turnUid, embeddingKey);
-      const body = JSON.parse(value(snapshot.turn, 'body'));
-      const entries = new Map(body.entries.map(entry => [entry.id, entry]));
-      const targets = snapshot.chunks.filter(chunk => !isCurrent(chunk.state, embeddingKey));
-      requireThat(targets.length === expectedTargets, 'repair_target_changed');
-      requireThat(snapshot.fingerprint.chunks_without_current_vector === expectedTargets, 'repair_target_changed');
-      for (const chunk of targets) {
-        const text = value(chunk.state, 'text');
-        const entry = entries.get(value(chunk.state, 'entry_id'));
-        requireThat(chunk.links === 1 && value(chunk.state, 'embedding') === undefined, 'repair_target_changed');
-        requireThat(typeof text === 'string' && Buffer.byteLength(text) > CHUNK_MAX_BYTES, 'repair_target_changed');
-        requireThat(entry && entry.role === value(chunk.state, 'role')
-          && entry.text.slice(value(chunk.state, 'start'), value(chunk.state, 'end')) === text, 'repair_target_changed');
-      }
-      const frozen = { contract: REPAIR_CONTRACT, store: await store.identity(), scope, turn_uid: turnUid, embedding_key: embeddingKey,
-        preimage: bindings(snapshot, targets.map(chunk => chunk.uid)), targets: targets.map(chunk => ({ uid: chunk.uid, state: chunk.state })) };
-      return { ...frozen, frozen_digest: digest(canonical(frozen)) };
-    } finally {
-      if (tx.isOpen()) await tx.rollback().catch(() => {});
-    }
+    try { return await work(tx); } finally { if (tx.isOpen()) await tx.rollback().catch(() => {}); }
   } finally { await session.close(); }
+}
+
+/**
+ * Freezes the exact preimage of one turn's repair, in one read transaction that also names the physical store. The turn must
+ * predate first-retain manifests. Every chunk linked to it must carry this scope and turn. The target is every such chunk
+ * without a current-key vector: exactly `expectedTargets`, each over CHUNK_MAX_BYTES, with only the turn's property-free
+ * link, equal to its source span, and together every chunk in the scope without a current-key vector.
+ */
+export async function freeze({ driver, database, scope, turnUid, embeddingKey, expectedTargets = REPAIR_TARGETS }) {
+  requireThat(expectedTargets === REPAIR_TARGETS, 'repair_target_changed');
+  return readOnly(driver, database, async tx => {
+    const snapshot = await readSnapshot(tx, scope, turnUid, embeddingKey);
+    requireThat(MANIFEST_PROPERTIES.every(key => !(key in snapshot.turn.properties)), 'repair_turn_has_manifest');
+    requireThat(snapshot.fingerprint.records_without_current_vector === 0, 'repair_target_changed');
+    const body = JSON.parse(value(snapshot.turn, 'body'));
+    const entries = new Map(body.entries.map(entry => [entry.id, entry]));
+    const targets = snapshot.chunks.filter(chunk => !isCurrent(chunk.state, embeddingKey));
+    requireThat(targets.length === expectedTargets, 'repair_target_changed');
+    requireThat(snapshot.fingerprint.chunks_without_current_vector === expectedTargets, 'repair_target_changed');
+    for (const chunk of targets) {
+      const text = value(chunk.state, 'text');
+      const entry = entries.get(value(chunk.state, 'entry_id'));
+      requireThat(onlyTurnLink(chunk), 'repair_unsupported_link');
+      requireThat(value(chunk.state, 'embedding') === undefined, 'repair_target_changed');
+      requireThat(typeof text === 'string' && Buffer.byteLength(text) > CHUNK_MAX_BYTES, 'repair_target_changed');
+      requireThat(entry && entry.role === value(chunk.state, 'role')
+        && entry.text.slice(numeric(chunk.state, 'start'), numeric(chunk.state, 'end')) === text, 'repair_target_changed');
+    }
+    requireThat(new Set(targets.map(chunk => chunk.uid)).size === targets.length, 'repair_target_changed');
+    // Replacements take new ordinals above every existing one: unique integers, so no sibling is renumbered and the
+    // evidence-span reader, which requires a unique integer ordinal per entry, stays valid.
+    const ordinalCeiling = Math.max(...snapshot.chunks.map(chunk => numeric(chunk.state, 'ordinal')));
+    const frozen = { contract: REPAIR_CONTRACT, store: snapshot.store, scope, turn_uid: turnUid, embedding_key: embeddingKey,
+      ordinal_ceiling: ordinalCeiling, preimage: bindings(snapshot, targets.map(chunk => chunk.uid)),
+      targets: targets.map(chunk => ({ uid: chunk.uid, state: chunk.state })) };
+    return { ...frozen, frozen_digest: digest(canonical(frozen)) };
+  });
 }
 
 const nativeEndpoint = embedding => {
@@ -113,72 +163,120 @@ const nativeEndpoint = embedding => {
 };
 
 /**
- * Stages the replacements: each target's exact text is re-derived under the verified token policy, and each piece is embedded
- * alone through the native no-truncate transport. The served count must equal the local count, with no retry. Replacement
- * IDs are new and collision-free; the old ordinal is kept with a `repair_part` index so no sibling is renumbered.
+ * The verified token policy and vector key a repair runs under, resolved from the current configuration. A configured cap
+ * above 1,920 tokens is refused; `apply` and `inverse` require the same policy and key as the plan at the point of use.
  */
-export async function stage({ frozen, config, verified, request = localJson }) {
-  requireThat(frozen?.contract === REPAIR_CONTRACT, 'invalid_input');
-  const { frozen_digest: frozenDigest, ...body } = frozen;
-  requireThat(digest(canonical(body)) === frozenDigest, 'repair_frozen_invalid');
-  const embedding = config.embedding;
-  requireThat(embeddingIdentity(embedding) === frozen.embedding_key, 'repair_key_mismatch');
+export function repairTreatment(config, verified) {
   const policy = verified ? chunkPolicy(config, verified) : chunkPolicy(config);
   requireThat(policy.descriptor.policy === TOKEN_POLICY && policy.descriptor.context !== null, 'repair_tokenizer_unverified');
-  const endpoint = nativeEndpoint(embedding);
-  const replacements = [];
+  requireThat(policy.descriptor.token_cap <= DEFAULT_CHUNK_TOKEN_CAP, 'repair_treatment_mismatch');
+  return { policy, key: embeddingIdentity(config.embedding), endpoint: nativeEndpoint(config.embedding) };
+}
+
+// The pieces' intervals, in order, must exactly cover the target's text: same ends and no hole. Overlap is allowed.
+function coversExactly(pieces, length) {
+  let reached = 0;
+  for (const piece of [...pieces].sort((a, b) => a.start - b.start)) {
+    if (piece.start > reached) return false;
+    reached = Math.max(reached, piece.end);
+  }
+  return pieces.length > 0 && pieces[0].start === 0 && reached === length;
+}
+
+/**
+ * Stages the replacements: each target's exact text is re-derived under the verified token policy and must be covered
+ * exactly by its pieces. Within `budget` ({max_pieces, max_seconds}, checked before any text is sent), each piece is embedded
+ * alone through the native no-truncate transport, and the served count must equal the local count, with no retry.
+ * Replacement IDs are new and collision-free, and ordinals are new integers above every existing one.
+ */
+export async function stage({ frozen, config, verified, budget, request = localJson, clock = () => Date.now() }) {
+  requireThat(frozen?.contract === REPAIR_CONTRACT, 'invalid_input');
+  requireThat(Number.isSafeInteger(budget?.max_pieces) && budget.max_pieces > 0 && Number.isSafeInteger(budget.max_seconds)
+    && budget.max_seconds > 0, 'invalid_input');
+  const { frozen_digest: frozenDigest, ...body } = frozen;
+  requireThat(digest(canonical(body)) === frozenDigest, 'repair_frozen_invalid');
+  const { policy, key, endpoint } = repairTreatment(config, verified);
+  requireThat(key === frozen.embedding_key, 'repair_key_mismatch');
+  const embedding = config.embedding;
+  const derivations = [];
   for (const target of frozen.targets) {
     const text = value(target.state, 'text');
-    const start = value(target.state, 'start');
     const turn = normalizeTurn({ source: 'repair', conversation_id: 'repair', turn_id: 'repair',
       entries: [{ id: value(target.state, 'entry_id'), role: value(target.state, 'role'), text }] });
     const derived = await deriveChunks(turn, policy);
-    requireThat(derived.gaps.length === 0 && derived.chunks.length > 0, 'repair_derivation_gap');
-    const nodes = [];
-    for (const [part, piece] of derived.chunks.entries()) {
+    requireThat(derived.gaps.length === 0 && coversExactly(derived.chunks, text.length), 'repair_coverage_incomplete');
+    for (const piece of derived.chunks) {
       requireThat(Buffer.byteLength(piece.text) <= CHUNK_MAX_BYTES && piece.token_count <= policy.descriptor.token_cap, 'repair_derivation_gap');
-      const result = await request(endpoint, { model: embedding.model, input: piece.text, truncate: false }, embedding.timeout_ms ?? 30_000);
+    }
+    derivations.push({ target, pieces: derived.chunks });
+  }
+  const total = derivations.reduce((sum, item) => sum + item.pieces.length, 0);
+  requireThat(total <= budget.max_pieces, 'repair_budget_exceeded');
+  const deadline = clock() + budget.max_seconds * 1000;
+  let ordinal = frozen.ordinal_ceiling;
+  const replacements = [];
+  for (const { target, pieces } of derivations) {
+    const start = numeric(target.state, 'start');
+    const nodes = [];
+    for (const [part, piece] of pieces.entries()) {
+      requireThat(clock() < deadline, 'repair_budget_exceeded');
+      const result = await request(endpoint, { model: embedding.model, input: piece.text, truncate: false },
+        Math.max(1, Math.min(embedding.timeout_ms ?? 30_000, deadline - clock())));
       requireThat(result?.model === embedding.model && Array.isArray(result.embeddings) && result.embeddings.length === 1, 'invalid_embedding_response');
       // The served input must be exactly what was counted locally; a different count means the contract does not hold.
       requireThat(result.prompt_eval_count === piece.token_count, 'repair_count_mismatch');
       const vector = validateVector(result.embeddings[0], embedding.dimensions);
       const uid = identity('chunk', frozen.scope, frozen.turn_uid, `${REPAIR_CONTRACT}:${frozenDigest}:${target.uid}:${part}`);
+      ordinal += 1;
       const properties = { ...Object.fromEntries(Object.entries(target.state.properties)
-        .filter(([key]) => ['entry_id', 'role', 'turn_uid', 'scope', 'scope_terms', 'ordinal'].includes(key))),
+        .filter(([name]) => ['entry_id', 'role', 'turn_uid', 'scope', 'scope_terms'].includes(name))),
+      ordinal: { type: 'FLOAT', value: ordinal },
       uid: { type: 'STRING', value: uid }, start: { type: 'FLOAT', value: start + piece.start }, end: { type: 'FLOAT', value: start + piece.end },
       text: { type: 'STRING', value: piece.text }, repair_part: { type: 'FLOAT', value: part },
       repair_of: { type: 'STRING', value: target.uid }, repair_contract: { type: 'STRING', value: REPAIR_CONTRACT },
       embedding: { type: 'LIST<FLOAT>', value: vector }, embedding_key: { type: 'STRING', value: frozen.embedding_key } };
       nodes.push({ uid, state: { labels: target.state.labels, properties } });
     }
-    // The pieces cover the target's text exactly as derived; nothing outside its span changes.
-    requireThat(nodes[0].state.properties.start.value >= start && nodes.at(-1).state.properties.end.value <= value(target.state, 'end'), 'repair_derivation_gap');
     replacements.push({ old_uid: target.uid, nodes });
   }
   const created = replacements.flatMap(item => item.nodes);
   const fingerprint = { ...frozen.preimage.fingerprint, chunks: frozen.preimage.fingerprint.chunks - frozen.targets.length + created.length,
     chunks_without_current_vector: frozen.preimage.fingerprint.chunks_without_current_vector - frozen.targets.length };
-  const postimage = { turn_digest: frozen.preimage.turn_digest, siblings_digest: frozen.preimage.siblings_digest, fingerprint,
-    created: created.map(node => ({ uid: node.uid, links: 1, digest: stateDigest(node.state) })).sort((a, b) => a.uid.localeCompare(b.uid)) };
-  const plan = { contract: REPAIR_CONTRACT, frozen_digest: frozenDigest, frozen, policy_digest: policy.digest, replacements, postimage };
+  const postimage = { store: frozen.store, turn_digest: frozen.preimage.turn_digest, siblings_digest: frozen.preimage.siblings_digest, fingerprint,
+    created: created.map(node => ({ uid: node.uid, links: TURN_LINK, digest: stateDigest(node.state) })).sort((a, b) => a.uid.localeCompare(b.uid)) };
+  requireThat(new Set(created.map(node => node.uid)).size === created.length, 'repair_derivation_gap');
+  const plan = { contract: REPAIR_CONTRACT, frozen_digest: frozenDigest, frozen, policy_digest: policy.digest, embedding_key: key,
+    budget, replacements, postimage };
   return { ...plan, plan_digest: digest(canonical(plan)) };
 }
 
-// One explicit write transaction, never retried. A refusal before commit rolled back; a commit error leaves the outcome
-// unknown, which only `reconcile` can settle.
-async function writeOnce(driver, database, work) {
+/**
+ * One explicit write transaction, never retried. `rolled_back` only when the rollback was acknowledged; a failed rollback is
+ * `rollback_unconfirmed`, and a commit error is `unknown`. Session cleanup is reported separately and never replaces the
+ * outcome. An unknown outcome is settled only by the owner, from `reconcile` plus independent evidence that writers ceased;
+ * an observed state is not authority to retry.
+ */
+export async function writeOnce(driver, database, work) {
   const session = driver.session({ database, defaultAccessMode: neo4j.session.WRITE });
-  const tx = session.beginTransaction({ timeout: 60_000 });
+  let result;
   try {
+    const tx = session.beginTransaction({ timeout: 60_000 });
     try { await work(tx); } catch (error) {
-      await tx.rollback().catch(() => {});
-      return { outcome: 'rolled_back', error: error instanceof MemoryError ? error.code : 'repair_failed' };
+      const code = error instanceof MemoryError ? error.code : 'repair_failed';
+      try { await tx.rollback(); result = { outcome: 'rolled_back', error: code }; } catch { result = { outcome: 'rollback_unconfirmed', error: code }; }
     }
-    try { await tx.commit(); } catch { return { outcome: 'unknown' }; }
-    return { outcome: 'committed' };
-  } finally { await session.close(); }
+    if (!result) {
+      try { await tx.commit(); result = { outcome: 'committed' }; } catch { result = { outcome: 'unknown' }; }
+    }
+  } catch {
+    result ??= { outcome: 'unknown' };
+  }
+  let cleanup = 'ok';
+  try { await session.close(); } catch { cleanup = 'failed'; }
+  return { ...result, cleanup };
 }
 
+// Typed values back to driver parameters: integers from their decimal strings, losslessly.
 const params = state => {
   const out = {};
   for (const [key, { type, value: v }] of Object.entries(state.properties)) {
@@ -187,7 +285,7 @@ const params = state => {
   return out;
 };
 
-// Creates one node with exactly the given labels and typed properties and links it from the turn.
+// Creates one node with exactly the given labels and typed properties and links it from the turn with a property-free edge.
 async function createNode(tx, scope, turnUid, state) {
   const labels = state.labels.map(label => `\`${label}\``).join(':');
   const values = params(state);
@@ -199,10 +297,28 @@ async function createNode(tx, scope, turnUid, state) {
   requireThat(Number(result.records[0].get('n')) === 1, 'repair_target_changed');
 }
 
-async function lockTurn(tx, scope, turnUid) {
-  const locked = await tx.run('MATCH (t:SMTurn {uid:$turn, scope:$scope}) SET t.repair_lock = true REMOVE t.repair_lock RETURN count(t) AS n',
-    { turn: turnUid, scope });
-  requireThat(Number(locked.records[0].get('n')) === 1, 'repair_target_changed');
+// Deletes exactly the verified chunks and their one property-free turn edge; any other edge makes the delete refuse.
+async function deleteVerified(tx, scope, turnUid, uids) {
+  const deleted = await tx.run(`UNWIND $uids AS uid
+    MATCH (t:SMTurn {uid:$turn, scope:$scope})-[r:SM_HAS_CHUNK]->(c:SMChunk {uid:uid, scope:$scope})
+    WHERE size(keys(r)) = 0 AND COUNT { (c)--() } = 1
+    DELETE r, c RETURN count(*) AS n`, { uids, turn: turnUid, scope });
+  requireThat(Number(deleted.records[0].get('n')) === uids.length, 'repair_target_changed');
+}
+
+// Takes write locks on the turn and the rows about to change by rewriting a property to its own value: no property is
+// added or altered, so no existing state is clobbered. The locks hold to the end of the transaction.
+async function lock(tx, scope, turnUid, uids) {
+  const turn = await tx.run('MATCH (t:SMTurn {uid:$turn, scope:$scope}) SET t.scope = t.scope RETURN count(t) AS n', { turn: turnUid, scope });
+  requireThat(Number(turn.records[0].get('n')) === 1, 'repair_target_changed');
+  const rows = await tx.run('MATCH (c:SMChunk {scope:$scope}) WHERE c.uid IN $uids SET c.scope = c.scope RETURN count(c) AS n', { uids, scope });
+  requireThat(Number(rows.records[0].get('n')) === uids.length, 'repair_target_changed');
+}
+
+// The plan may run only under the same verified token policy and vector key it was staged with.
+function requireTreatment(plan, config, verified) {
+  const { policy, key } = repairTreatment(config, verified);
+  requireThat(policy.digest === plan.policy_digest && key === plan.embedding_key && key === plan.frozen.embedding_key, 'repair_treatment_mismatch');
 }
 
 const same = (a, b) => canonical(a) === canonical(b);
@@ -216,65 +332,67 @@ function verifyPlan(plan) {
   return planDigest;
 }
 
-/** Classifies the live state against the plan: exactly the preimage, exactly the postimage, or neither. */
+/** Classifies the live state against the plan, in the caller's transaction: other_store, preimage, postimage or neither. */
 export async function classify(tx, plan) {
   const { scope, turn_uid: turnUid, embedding_key: key, preimage } = plan.frozen;
   const snapshot = await readSnapshot(tx, scope, turnUid, key);
+  if (!same(snapshot.store, plan.frozen.store)) return 'other_store';
   const targetUids = plan.frozen.targets.map(target => target.uid);
   const createdUids = plan.postimage.created.map(node => node.uid);
   const before = bindings(snapshot, targetUids);
   if (same(before, preimage) && snapshot.chunks.every(chunk => !createdUids.includes(chunk.uid))) return 'preimage';
   const after = bindings(snapshot, createdUids);
-  const postimage = { turn_digest: after.turn_digest, siblings_digest: after.siblings_digest, fingerprint: after.fingerprint, created: after.targets };
+  const postimage = { store: after.store, turn_digest: after.turn_digest, siblings_digest: after.siblings_digest,
+    fingerprint: after.fingerprint, created: after.targets };
   if (same(postimage, plan.postimage) && snapshot.chunks.every(chunk => !targetUids.includes(chunk.uid))) return 'postimage';
   return 'neither';
 }
 
+async function requireState(tx, plan, expected, changed) {
+  const state = await classify(tx, plan);
+  requireThat(state !== 'other_store', 'repair_store_mismatch');
+  requireThat(state === expected, changed);
+}
+
 /**
- * Swaps the targets for their replacements in one transaction, if and only if the store is still exactly the frozen
- * preimage, including the scope fingerprint that a concurrent retain, enrichment or vector write would change. The check
- * detects writes that the owner's quiescence should have excluded; it does not itself stop writers.
+ * Swaps the targets for their replacements in one transaction, if and only if the same physical store is still exactly the
+ * frozen preimage. Detecting a change is not stopping writers: the owner's writer quiescence must hold throughout.
  */
-export async function apply({ driver, database, store, plan }) {
+export async function apply({ driver, database, plan, config, verified }) {
   const planDigest = verifyPlan(plan);
-  requireThat(same(await store.identity(), plan.frozen.store), 'repair_store_mismatch');
+  requireTreatment(plan, config, verified);
   const { scope, turn_uid: turnUid } = plan.frozen;
   const result = await writeOnce(driver, database, async tx => {
-    await lockTurn(tx, scope, turnUid);
-    requireThat(await classify(tx, plan) === 'preimage', 'repair_preimage_changed');
-    const deleted = await tx.run('UNWIND $uids AS uid MATCH (c:SMChunk {uid:uid, scope:$scope}) DETACH DELETE c RETURN count(*) AS n',
-      { uids: plan.frozen.targets.map(target => target.uid), scope });
-    requireThat(Number(deleted.records[0].get('n')) === plan.frozen.targets.length, 'repair_preimage_changed');
+    await lock(tx, scope, turnUid, plan.frozen.targets.map(target => target.uid));
+    await requireState(tx, plan, 'preimage', 'repair_preimage_changed');
+    await deleteVerified(tx, scope, turnUid, plan.frozen.targets.map(target => target.uid));
     for (const node of plan.replacements.flatMap(item => item.nodes)) await createNode(tx, scope, turnUid, node.state);
-    requireThat(await classify(tx, plan) === 'postimage', 'repair_postimage_mismatch');
+    await requireState(tx, plan, 'postimage', 'repair_postimage_mismatch');
   });
   return { contract: REPAIR_CONTRACT, step: 'apply', plan_digest: planDigest, ...result };
 }
 
-/** Restores the exact frozen preimage, if and only if the store is still exactly the plan's postimage. */
-export async function inverse({ driver, database, store, plan }) {
+/** Restores the exact frozen preimage, if and only if the same physical store is still exactly the plan's postimage. */
+export async function inverse({ driver, database, plan, config, verified }) {
   const planDigest = verifyPlan(plan);
-  requireThat(same(await store.identity(), plan.frozen.store), 'repair_store_mismatch');
+  requireTreatment(plan, config, verified);
   const { scope, turn_uid: turnUid } = plan.frozen;
   const result = await writeOnce(driver, database, async tx => {
-    await lockTurn(tx, scope, turnUid);
-    requireThat(await classify(tx, plan) === 'postimage', 'repair_postimage_changed');
-    const deleted = await tx.run('UNWIND $uids AS uid MATCH (c:SMChunk {uid:uid, scope:$scope}) DETACH DELETE c RETURN count(*) AS n',
-      { uids: plan.postimage.created.map(node => node.uid), scope });
-    requireThat(Number(deleted.records[0].get('n')) === plan.postimage.created.length, 'repair_postimage_changed');
+    await lock(tx, scope, turnUid, plan.postimage.created.map(node => node.uid));
+    await requireState(tx, plan, 'postimage', 'repair_postimage_changed');
+    await deleteVerified(tx, scope, turnUid, plan.postimage.created.map(node => node.uid));
     for (const target of plan.frozen.targets) await createNode(tx, scope, turnUid, target.state);
-    requireThat(await classify(tx, plan) === 'preimage', 'repair_preimage_mismatch');
+    await requireState(tx, plan, 'preimage', 'repair_preimage_mismatch');
   });
   return { contract: REPAIR_CONTRACT, step: 'inverse', plan_digest: planDigest, ...result };
 }
 
-/** Read-only settlement of an unknown outcome: which side of the plan the store is on. */
+/**
+ * Read-only observation of which side of the plan the store is on, in one transaction that also names the physical store.
+ * It is evidence for the owner's settlement of an unknown outcome, not authority to retry.
+ */
 export async function reconcile({ driver, database, plan }) {
   const planDigest = verifyPlan(plan);
-  const session = driver.session({ database, defaultAccessMode: neo4j.session.READ });
-  try {
-    const tx = session.beginTransaction({ timeout: 60_000 });
-    try { return { contract: REPAIR_CONTRACT, step: 'reconcile', plan_digest: planDigest, state: await classify(tx, plan) }; }
-    finally { if (tx.isOpen()) await tx.rollback().catch(() => {}); }
-  } finally { await session.close(); }
+  const state = await readOnly(driver, database, tx => classify(tx, plan));
+  return { contract: REPAIR_CONTRACT, step: 'reconcile', plan_digest: planDigest, state };
 }
