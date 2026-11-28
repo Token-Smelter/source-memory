@@ -1,6 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import neo4j from 'neo4j-driver';
-import { authorize, integer, MemoryError, requireThat } from './core.mjs';
+import { authorize, digest, integer, MemoryError, requireThat } from './core.mjs';
 import { chunkPolicy, DEFAULT_TREATMENT, TOKEN_POLICY, verifiedCounter } from './chunk-policy.mjs';
 import { embeddingIdentity } from './models.mjs';
 
@@ -40,9 +40,9 @@ const incomplete = reason => ({ contract: OVER_CONTEXT_COUNT, status: 'incomplet
  * and no result is produced after it. Pages are separate snapshots. Any cap, read failure, malformed row, unverified
  * contract or changed total yields `incomplete`. Identifiers and texts never leave.
  */
-export async function countOverContext({ policy, reader, caps: input, clock = () => performance.now() }) {
+export async function countOverContext({ policy, reader, caps: input, clock = () => performance.now(), deadline: given }) {
   const caps = countCaps(input);
-  const deadline = clock() + caps.max_seconds * 1000;
+  const deadline = given ?? clock() + caps.max_seconds * 1000;
   const remaining = () => Math.floor(deadline - clock());
   const timeout = () => Math.min(caps.transaction_timeout_ms, remaining());
   const resolved = await verifiedCounter(policy);
@@ -113,22 +113,26 @@ export async function countOverContext({ policy, reader, caps: input, clock = ()
 }
 
 // The stored vector state of one row: current under this key, or not. Invalid or ambiguous data is refused.
-function currentVector(kind, key, embeddingKey) {
+function currentVector(kind, key) {
   if (kind === 'none') {
     requireThat(key === null || typeof key === 'string', 'count_failed');
     return false;
   }
-  requireThat(kind === 'valid' && typeof key === 'string', 'count_failed');
-  return key === embeddingKey;
+  // A stored list without a key is ambiguous, not stale.
+  requireThat((kind === 'current' || kind === 'stale') && typeof key === 'string', 'count_failed');
+  return kind === 'current';
 }
 
-// The library's vector invariant (validateVector in core.mjs), checked inside the database so only the state is returned:
-// a list of exactly `dimensions` finite numbers, not all zero.
+// Classified inside the database so no vector values are returned. Under the current key a vector must satisfy the library
+// invariant (validateVector in core.mjs): exactly `dimensions` finite numbers, not all zero. A numeric list under another key
+// is stale and need not have the current dimensions. Anything else is invalid.
 const VECTOR_STATE = `CASE WHEN c.embedding IS NULL THEN 'none'
-  WHEN (valueType(c.embedding) STARTS WITH 'LIST<FLOAT' OR valueType(c.embedding) STARTS WITH 'LIST<INTEGER')
-    AND size(c.embedding) = $dimensions AND all(x IN c.embedding WHERE x = x AND x < 1.0e308 AND x > -1.0e308)
-    AND any(x IN c.embedding WHERE x <> 0) THEN 'valid'
-  ELSE 'invalid' END`;
+  WHEN NOT (valueType(c.embedding) STARTS WITH 'LIST<FLOAT' OR valueType(c.embedding) STARTS WITH 'LIST<INTEGER')
+    OR size(c.embedding) = 0 THEN 'invalid'
+  WHEN c.embedding_key = $key THEN CASE WHEN size(c.embedding) = $dimensions
+    AND all(x IN c.embedding WHERE x = x AND x < 1.0e308 AND x > -1.0e308) AND any(x IN c.embedding WHERE x <> 0)
+    THEN 'current' ELSE 'invalid' END
+  ELSE 'stale' END`;
 
 /** A reader over one exact scope's `SMChunk` rows. It returns text and a current-key flag, never vectors. No read retries. */
 export function neo4jChunkReader(driver, database, scope, embeddingKey, dimensions) {
@@ -158,39 +162,46 @@ export function neo4jChunkReader(driver, database, scope, embeddingKey, dimensio
     async page(after, limit, timeout) {
       const result = await run(`MATCH (c:SMChunk {scope:$scope}) WHERE $after IS NULL OR c.uid > $after
         RETURN c.uid AS uid, c.text AS text, c.embedding_key AS key, ${VECTOR_STATE} AS kind
-        ORDER BY c.uid LIMIT $limit`, { scope, after, limit: neo4j.int(limit), dimensions: neo4j.int(dimensions) }, timeout);
+        ORDER BY c.uid LIMIT $limit`, { scope, after, key: embeddingKey, limit: neo4j.int(limit), dimensions: neo4j.int(dimensions) }, timeout);
       return result.records.map(record => ({ uid: record.get('uid'), text: record.get('text'),
-        current_vector: currentVector(record.get('kind'), record.get('key'), embeddingKey) }));
+        current_vector: currentVector(record.get('kind'), record.get('key')) }));
     },
   };
 }
 
 /**
- * The owner count end to end. It requires the verified default contract (cap 1920, context 2048, the qualified tokenizer and
- * served blob), so a run is exactly the stated measurement. The store is closed before any result is returned; a failed
- * close is a failure. Returns `{ok:true, report}` or `{ok:false, error}` with a closed error code.
+ * The owner count end to end, for one expressly named scope and one pinned embedding key. It requires the complete default
+ * treatment descriptor and that the configured key equals `embeddingKey`, both before any content is read. One monotonic
+ * deadline covers the whole run; the store is closed on every path, and `complete` is accepted only after the close and a
+ * final deadline check. The output carries no scope name, URL or text: `invocation_sha256` binds scope, key, caps and policy
+ * for the owner's private record. Returns `{ok:true, report}` or `{ok:false, error}` with a closed error code.
  */
-export async function runOverContextCount({ config, scope, caps, openStore, clock = () => performance.now() }) {
+export async function runOverContextCount({ config, scope, embeddingKey, caps, openStore, clock = () => performance.now() }) {
   const started = clock();
   let store = null;
   try {
     requireThat(typeof scope === 'string', 'scope_required');
     const exact = authorize(config, scope, 'read');
+    // An exceptional content read needs the scope named in the grant itself, not a subtree grant that happens to cover it.
+    requireThat(Array.isArray(config.scopes?.read) && config.scopes.read.includes(exact), 'scope_denied');
     const limits = countCaps(caps);
+    const deadline = started + limits.max_seconds * 1000;
     const policy = chunkPolicy(config);
     requireThat(policy.descriptor.policy === TOKEN_POLICY, 'token_policy_required');
-    // Dimensions, provider and endpoint path fix the embedding key the current-vector split is measured against.
-    requireThat(['token_cap', 'context', 'tokenizer_sha256', 'served_blob', 'render', 'model', 'dimensions', 'provider', 'endpoint_path']
-      .every(key => policy.descriptor[key] === DEFAULT_TREATMENT[key]), 'count_contract_mismatch');
+    requireThat(policy.digest === digest(DEFAULT_TREATMENT), 'count_contract_mismatch');
+    const key = embeddingIdentity(config.embedding);
+    requireThat(typeof embeddingKey === 'string' && key === embeddingKey, 'count_contract_mismatch');
     store = await openStore(config.neo4j);
-    const reader = neo4jChunkReader(store.driver, store.database, exact, embeddingIdentity(config.embedding), config.embedding.dimensions);
-    const report = await countOverContext({ policy, reader, caps: limits, clock });
+    const reader = neo4jChunkReader(store.driver, store.database, exact, key, config.embedding.dimensions);
+    const report = await countOverContext({ policy, reader, caps: limits, clock, deadline });
     const closing = store;
     store = null;
     await closing.close();
-    // Closing the store is inside the same cutoff: a pass that only finishes cleanup late is not reported complete.
-    const late = clock() - started > limits.max_seconds * 1000;
-    return { ok: true, report: { scope: exact, caps: limits, ...(late ? { contract: OVER_CONTEXT_COUNT, status: 'incomplete', reason: 'cap_seconds' } : report) } };
+    const late = clock() > deadline;
+    const accepted = late ? { contract: OVER_CONTEXT_COUNT, status: 'incomplete', reason: 'cap_seconds' }
+      : report.status === 'complete' ? { ...report, elapsed_ms: Math.round(clock() - started) } : report;
+    return { ok: true, report: { invocation_sha256: digest({ scope: exact, embedding_key: key, caps: limits, policy_digest: policy.digest }),
+      caps: limits, ...accepted } };
   } catch (error) {
     if (store) await store.close().catch(() => {});
     return { ok: false, error: error instanceof MemoryError && COUNT_ERRORS.includes(error.code) ? error.code : 'count_failed' };

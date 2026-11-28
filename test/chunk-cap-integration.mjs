@@ -198,10 +198,14 @@ export async function runChunkCap(database, scratch) {
       assert.deepEqual([after.over_context_with_current_vector, after.over_context_without_current_vector], [before.chunks, 0]);
       assert.ok(!JSON.stringify(after).includes('abcd') && !JSON.stringify(after).includes('chunk_'), 'no text or identifier in the report');
       assert.equal((await countOverContext({ policy, reader: reader('cap-legacy'), caps: { ...caps, max_pages: 1 } })).reason, 'cap_pages');
-      // A wrong-dimension vector at the current key is refused, not counted as current.
       const session = driver.session();
       try {
-        await session.run(`MATCH (c:SMChunk {scope:'cap-legacy'}) WITH c ORDER BY c.uid LIMIT 1 SET c.embedding=[1.0, 2.0, 3.0]`);
+        // A numeric vector under another key is stale, whatever its dimensions.
+        await session.run(`MATCH (c:SMChunk {scope:'cap-legacy'}) WITH c ORDER BY c.uid LIMIT 1 SET c.embedding=[1.0, 2.0, 3.0], c.embedding_key='stale-key'`);
+        const stale = await countOverContext({ policy, reader: reader('cap-legacy'), caps });
+        assert.deepEqual([stale.status, stale.over_context_with_current_vector, stale.over_context_without_current_vector], ['complete', before.chunks - 1, 1]);
+        // A wrong-dimension vector at the current key is refused, not counted as current.
+        await session.run(`MATCH (c:SMChunk {scope:'cap-legacy'}) WITH c ORDER BY c.uid LIMIT 1 SET c.embedding_key=$key`, { key });
       } finally { await session.close(); }
       assert.deepEqual(await countOverContext({ policy, reader: reader('cap-legacy'), caps }),
         { contract: 'source-memory.over-context-count/1', status: 'incomplete', reason: 'read_failed' });

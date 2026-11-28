@@ -8,6 +8,7 @@ import { chunkPolicy, DEFAULT_TREATMENT } from '../src/chunk-policy.mjs';
 import { MemoryError } from '../src/core.mjs';
 import { readGgufTokenizer, RENDER_CONTRACT } from '../src/tokenizer.mjs';
 import { countCaps, countOverContext, neo4jChunkReader, OVER_CONTEXT_COUNT, runOverContextCount } from '../src/over-context-count.mjs';
+import { embeddingIdentity } from '../src/models.mjs';
 import { fictionalVocabulary, ggufTokenizerFile } from './helpers/gguf-fixture.mjs';
 
 // Fictional tokenizer: "abcd" is one token and each space one token, so n words render to 2n + 1 tokens with BOS and EOS.
@@ -136,10 +137,11 @@ test('the store reader refuses an unreadable or ambiguous vector state instead o
   });
   const reader = records => neo4jChunkReader(fakeDriver(records), 'neo4j', 'fiction', 'key-1', 2);
   const read = records => reader(records).page(null, 10, 1000);
-  assert.deepEqual((await read([{ uid: 'a', text: 'x', kind: 'valid', key: 'key-1' }, { uid: 'b', text: 'y', kind: 'valid', key: 'old' },
-    { uid: 'c', text: 'z', kind: 'none', key: null }])).map(item => item.current_vector), [true, false, false]);
-  // An invalid vector at the current key (wrong type, dimension or values) is refused, never counted as current.
-  for (const bad of [{ kind: 'invalid', key: 'key-1' }, { kind: 'valid', key: null }, { kind: 'none', key: 7 }]) {
+  assert.deepEqual((await read([{ uid: 'a', text: 'x', kind: 'current', key: 'key-1' }, { uid: 'b', text: 'y', kind: 'stale', key: 'old' },
+    { uid: 'c', text: 'z', kind: 'none', key: null }, { uid: 'd', text: 'w', kind: 'none', key: 'key-1' }])).map(item => item.current_vector),
+  [true, false, false, false]);
+  // An invalid vector (wrong type, empty, or wrong shape at the current key), a keyless list or an ill-typed key is refused.
+  for (const bad of [{ kind: 'invalid', key: 'key-1' }, { kind: 'stale', key: null }, { kind: 'current', key: null }, { kind: 'none', key: 7 }, { kind: 'list', key: 'key-1' }]) {
     await assert.rejects(read([{ uid: 'a', text: 'x', ...bad }]), { code: 'count_failed' }, JSON.stringify(bad));
   }
   await assert.rejects(reader([]).total(0), { code: 'count_failed' });
@@ -159,6 +161,21 @@ test('an unverified tokenizer contract yields incomplete without reading the sto
   assert.deepEqual([report.status, report.reason, reads], ['incomplete', 'tokenizer_unavailable', 0]);
 });
 
+test('the command refuses a duplicate, missing or unknown option before reading any input', async () => {
+  const { execFile } = await import('node:child_process');
+  const script = new URL('../scripts/over-context-count.mjs', import.meta.url).pathname;
+  const invoke = argv => new Promise(resolve => execFile(process.execPath, [script, ...argv], (error, stdout, stderr) =>
+    resolve({ code: error?.code ?? 0, stdout, stderr })));
+  const full = ['--config', '/nonexistent/owner.json', '--scope', 'a', '--embedding-key', 'k', '--caps', '/nonexistent/caps.json'];
+  for (const argv of [[...full.slice(0, 6), '--scope', 'b'], full.slice(0, 6), [...full, '--verbose', 'yes'], [...full.slice(0, 6), '--cap', '/x']]) {
+    const result = await invoke(argv);
+    assert.deepEqual([result.code, result.stdout, JSON.parse(result.stderr)], [1, '', { ok: false, error: 'invalid_input' }], argv.join(' '));
+  }
+  // Well-formed options get as far as reading the (missing) files, which fails closed without a message.
+  const missing = await invoke(full);
+  assert.deepEqual([missing.code, JSON.parse(missing.stderr)], [1, { ok: false, error: 'count_failed' }]);
+});
+
 test('caps are finite, absolute and all required', () => {
   assert.deepEqual(countCaps(CAPS), CAPS);
   for (const key of Object.keys(CAPS)) {
@@ -176,33 +193,35 @@ const emptyStore = (close = async () => {}) => ({ database: 'neo4j', close, driv
   beginTransaction: () => ({ run: async () => ({ records: [] }), commit: async () => {}, isOpen: () => false, rollback: async () => {} }),
   close: async () => {} }) } });
 
-test('the owner run requires the exact default contract, closes the store before returning, and reports only closed codes', async () => {
+test('the owner run requires the exact default treatment and pinned key, closes the store first, and emits no scope', async () => {
+  const key = embeddingIdentity(DEFAULT_CONFIG.embedding);
+  const run = (overrides = {}) => runOverContextCount({ config: DEFAULT_CONFIG, scope: 'fiction', embeddingKey: key, caps: CAPS,
+    openStore: async () => { throw new Error('must not open'); }, ...overrides });
+  const embeddingWith = extra => ({ ...DEFAULT_CONFIG, embedding: { ...DEFAULT_CONFIG.embedding, ...extra } });
   const events = [];
-  const store = emptyStore(async () => { events.push('closed'); });
-  const done = await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'fiction', caps: CAPS, openStore: async () => { events.push('opened'); return store; } });
+  const done = await run({ openStore: async () => { events.push('opened'); return emptyStore(async () => { events.push('closed'); }); } });
   // The served blob is absent here, so the count is incomplete, but the run itself completes and closed the store first.
   assert.deepEqual([done.ok, done.report.status, done.report.reason, events], [true, 'incomplete', 'tokenizer_unavailable', ['opened', 'closed']]);
-  const failedClose = await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'fiction', caps: CAPS,
-    openStore: async () => emptyStore(async () => { throw new Error('close failed with stored text abcd'); }) });
-  assert.deepEqual(failedClose, { ok: false, error: 'count_failed' });
-  const thrown = await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'fiction', caps: CAPS,
-    openStore: async () => { throw Object.assign(new MemoryError('text: abcd'), { code: 'text: abcd' }); } });
-  assert.deepEqual(thrown, { ok: false, error: 'count_failed' }, 'an unknown code is never forwarded');
-  const otherCap = await runOverContextCount({ config: { ...DEFAULT_CONFIG, embedding: { ...DEFAULT_CONFIG.embedding, chunk_token_cap: 1536 } },
-    scope: 'fiction', caps: CAPS, openStore: async () => { throw new Error('must not open'); } });
-  assert.deepEqual(otherCap, { ok: false, error: 'count_contract_mismatch' });
-  // Other dimensions change the embedding key the vector split is measured against.
-  const otherDimensions = await runOverContextCount({ config: { ...DEFAULT_CONFIG, embedding: { ...DEFAULT_CONFIG.embedding, dimensions: 256 } },
-    scope: 'fiction', caps: CAPS, openStore: async () => { throw new Error('must not open'); } });
-  assert.deepEqual(otherDimensions, { ok: false, error: 'count_contract_mismatch' });
+  assert.deepEqual(Object.keys(done.report).sort(), ['caps', 'contract', 'invocation_sha256', 'reason', 'status']);
+  assert.ok(!JSON.stringify(done.report).includes('fiction') && !JSON.stringify(done.report).includes('11434'), 'no scope or URL is emitted');
+  assert.deepEqual(await run({ openStore: async () => emptyStore(async () => { throw new Error('close failed with stored text abcd'); }) }),
+    { ok: false, error: 'count_failed' });
+  assert.deepEqual(await run({ openStore: async () => { throw Object.assign(new MemoryError('text: abcd'), { code: 'text: abcd' }); } }),
+    { ok: false, error: 'count_failed' }, 'an unknown code is never forwarded');
+  // Anything but the complete default descriptor, or a configured key other than the pinned one, refuses before opening.
+  for (const config of [embeddingWith({ chunk_token_cap: 1536 }), embeddingWith({ dimensions: 256 }), embeddingWith({ ollama_transport: 'native_no_truncate' })]) {
+    assert.deepEqual(await run({ config }), { ok: false, error: 'count_contract_mismatch' }, JSON.stringify(config.embedding));
+  }
+  assert.deepEqual(await run({ embeddingKey: 'f'.repeat(64) }), { ok: false, error: 'count_contract_mismatch' });
+  assert.deepEqual(await run({ config: embeddingWith({ url: 'http://127.0.0.1:11435/v1/embeddings' }) }), { ok: false, error: 'count_contract_mismatch' },
+    'another port is another key');
   // A close that finishes after the cutoff leaves the run incomplete, whatever the count said.
   let now = 0;
-  const slowClose = await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'fiction', caps: CAPS, clock: () => now,
-    openStore: async () => emptyStore(async () => { now += 61_000; }) });
+  const slowClose = await run({ clock: () => now, openStore: async () => emptyStore(async () => { now += 61_000; }) });
   assert.deepEqual([slowClose.ok, slowClose.report.status, slowClose.report.reason], [true, 'incomplete', 'cap_seconds']);
-  assert.deepEqual(Object.keys(slowClose.report).sort(), ['caps', 'contract', 'reason', 'scope', 'status']);
-  assert.deepEqual(await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'other', caps: CAPS, openStore: async () => emptyStore() }),
+  assert.deepEqual(await run({ scope: 'other' }), { ok: false, error: 'scope_denied' });
+  // A subtree grant covering the scope is not an express grant of it.
+  assert.deepEqual(await run({ config: { ...DEFAULT_CONFIG, scopes: { read: ['team/**'], write: [] } }, scope: 'team/fiction' }),
     { ok: false, error: 'scope_denied' });
-  assert.deepEqual(await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'fiction', caps: { ...CAPS, max_rows: undefined }, openStore: async () => emptyStore() }),
-    { ok: false, error: 'invalid_input' });
+  assert.deepEqual(await run({ caps: { ...CAPS, max_rows: undefined } }), { ok: false, error: 'invalid_input' });
 });
