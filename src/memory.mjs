@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import {
   authorize, authorizeTarget, CHUNK_MAX_BYTES, cosine, fuse, identity, integer, markStage, MemoryError,
   digest, normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, RECORD_KINDS, RECORD_STATUSES, requireThat, sourceExcerpt, text,
@@ -7,6 +8,28 @@ import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, EmbeddingContextRejection, embeddingContextContract, embeddingIdentity, rerank } from './models.mjs';
 import { passthrough, scoped, tracer } from './phase-diagnostic.mjs';
 import { EMBEDDING_UNIT_MAX, Neo4jStore, selection, TREE_SCAN_LIMIT } from './store.mjs';
+
+// No new model call is admitted with less than this left of an index step's budget. It is an admission heuristic, not a
+// guaranteed service time: a call admitted at the floor gets the time remaining, never more than its configured timeout.
+export const INDEX_ADMISSION_FLOOR_MS = 1000;
+// A budget must leave room for selection and one admitted call, so it is at least twice the floor; a smaller one is refused
+// rather than accepted as a step that can never call the model.
+const INDEX_BUDGET_MIN_MS = 2 * INDEX_ADMISSION_FLOOR_MS;
+
+/**
+ * The opt-in limits of one index step. Unset `index_budget_ms` means no step deadline and today's behaviour; unset
+ * `index_batch` means groups of up to EMBEDDING_UNIT_MAX. Under a budget the configured request timeout is validated first,
+ * since each call then gets the smaller of it and the time remaining.
+ */
+function indexLimits(embedding) {
+  const { index_budget_ms: budget, index_batch: batch } = embedding;
+  requireThat(budget === undefined || (Number.isSafeInteger(budget) && budget >= INDEX_BUDGET_MIN_MS && budget <= 600_000), 'invalid_index_budget');
+  requireThat(batch === undefined || (Number.isSafeInteger(batch) && batch >= 1 && batch <= EMBEDDING_UNIT_MAX), 'invalid_index_batch');
+  // Only an absent timeout takes the transport's default; an explicit null is validated like any other value.
+  const timeout = embedding.timeout_ms === undefined ? 10_000 : embedding.timeout_ms;
+  requireThat(budget === undefined || (Number.isSafeInteger(timeout) && timeout >= 1 && timeout <= 120_000), 'invalid_model_timeout');
+  return { budget: budget ?? null, batch: batch ?? EMBEDDING_UNIT_MAX, timeout };
+}
 
 const MODE_CONTRACTS = {
   evidence_advice: 'Evidence advice: prioritizes extracted claims that cite user spans; a cited user span may be a question, so this is not user assertion or authority. May return no relevant history. Omitted material may correct shown claims. Disclosures describe retrieval and selection bounds, not detected corrections. No currentness or completeness guarantee.',
@@ -45,6 +68,8 @@ export class Memory {
     this.treeScanLimit = TREE_SCAN_LIMIT;
     // Tokenizers trusted for token-capped chunking; tests substitute fictional ones.
     this.verifiedTokenizers = VERIFIED_TOKENIZERS;
+    // The monotonic clock an index step's budget is measured on; tests substitute a controlled one.
+    this.clock = () => performance.now();
   }
 
   async close() { await this.store.close(); }
@@ -94,6 +119,10 @@ export class Memory {
 
   async #indexPending(scope, input = {}) {
     if (!this.config.embedding) return { status: 'unconfigured', indexed: 0 };
+    // An opt-in budget gives the step one deadline, started before selection. It is a cutoff for admitting another model
+    // call and for claiming readiness, not a wall-time bound on a store transaction already under way: an admitted save is
+    // always awaited to its own disposition.
+    const started = this.clock();
     // Progress counts only rows a write confirmed. A row that changed since discovery or hydration is `stale` and stays for
     // the next selection; a refusal that may be this call's own lost-reply commit is `unknown`. Neither supports ready.
     // Units commit one after another, so a failure in a later unit still reports what earlier units confirmed or refused;
@@ -103,6 +132,9 @@ export class Memory {
       ...(stale ? { stale } : {}), ...(unknown ? { unknown } : {}) });
     try {
       const key = embeddingIdentity(this.config.embedding);
+      const limits = indexLimits(this.config.embedding);
+      const deadline = limits.budget === null ? null : started + limits.budget;
+      const remaining = () => Math.floor(deadline - this.clock());
       const limit = integer(input.limit, 256, 1, 2048);
       const context = embeddingContextContract(this.config.embedding);
       // Discovery carries identity and order hints only; the extra row is look-ahead for a drain claim.
@@ -117,13 +149,20 @@ export class Memory {
       };
       const progress = () => ({ indexed, embedding_key: key, ...(stale ? { stale } : {}), ...(unknown ? { unknown } : {}) });
       const sameClass = (hint, row) => ['cooling', 'isolated', 'single'].every(name => Boolean(hint[name]) === Boolean(row[name]));
+      // Still pending, so no consumer reads it as ready; saved rows are no longer pending, so the next step continues.
+      const exhausted = () => ({ status: 'pending', ...progress(), partial: { reason: 'index_budget_exhausted', budget_ms: limits.budget } });
+      // Under a budget an uncertain write ends the step at once as an explicit failure with its `unknown` count and earlier
+      // confirmed progress: it is neither a budget cut nor ordinary pending work, so a caller that loops on `pending` does not
+      // retry it, and no later work runs before it is surfaced.
+      const uncertain = () => failed('embedding_write_unknown');
       // One work unit at a time: hydrate its exact state, decide from that observation, write, then let it go before the
       // next unit is hydrated. At most EMBEDDING_UNIT_MAX witnesses are held, whatever the caller's limit.
       for (let offset = 0; offset < selected.length;) {
+        if (deadline !== null && remaining() < INDEX_ADMISSION_FLOOR_MS) return exhausted();
         const first = selected[offset];
         const unit = [first];
         offset++;
-        const unitLimit = first.cooling || first.single ? 1 : first.isolated ? 4 : EMBEDDING_UNIT_MAX;
+        const unitLimit = first.cooling || first.single ? 1 : first.isolated ? Math.min(4, limits.batch) : limits.batch;
         while (unit.length < unitLimit && offset < selected.length && !selected[offset].cooling
             && Boolean(selected[offset].isolated) === Boolean(first.isolated) && !selected[offset].single) {
           unit.push(selected[offset++]);
@@ -142,25 +181,41 @@ export class Memory {
         }
         const oversized = current.filter(row => row.chunk && Buffer.byteLength(row.text) > CHUNK_MAX_BYTES);
         if (oversized.length) {
+          // A hydration that ran past the deadline starts no marker write either.
+          if (deadline !== null && remaining() <= 0) return exhausted();
           requireThat(typeof this.store.markOversizedChunks === 'function', 'embedding_accounting_invalid');
           marked += tally(await this.store.markOversizedChunks(scope, key, oversized.map(({ uid, observed }) => ({ uid, observed })), ...(context ? [context] : [])),
             oversized.length);
+          if (deadline !== null && unknown) return uncertain();
         }
         const batch = current.filter(row => !oversized.includes(row));
         if (!batch.length) continue;
         const candidate = batch[0];
         const isolatedChunk = Boolean(context && batch.length === 1 && candidate.chunk && candidate.isolated && candidate.single);
+        // Under a budget each call gets at most the time remaining. Whether this request was shortened is decided here, at
+        // dispatch, so a later deadline cannot excuse a failure within the full configured timeout.
+        // Hydration and any marker write were awaited since admission, so the floor is checked again here, on the same one
+        // sampled remainder the request's timeout is taken from.
+        const left = deadline === null ? null : remaining();
+        if (left !== null && left < INDEX_ADMISSION_FLOOR_MS) return exhausted();
+        const callTimeout = left === null ? null : Math.min(limits.timeout, left);
+        const shortened = callTimeout !== null && callTimeout < limits.timeout;
+        const embedding = callTimeout === null ? this.config.embedding : { ...this.config.embedding, timeout_ms: callTimeout };
         let vectors;
         try {
-          vectors = await embed(this.config.embedding, batch.map(row => row.text), { isolatedChunk });
+          vectors = await embed(embedding, batch.map(row => row.text), { isolatedChunk });
         } catch (error) {
           if (isolatedChunk && error instanceof EmbeddingContextRejection) {
             requireThat(typeof this.store.markContextRejectedChunk === 'function', 'embedding_accounting_invalid');
             tally(await this.store.markContextRejectedChunk(scope, key, context,
               { uid: candidate.uid, observed: candidate.observed }), 1);
+            if (deadline !== null && unknown) return uncertain();
+            if (deadline !== null && remaining() <= 0) return exhausted();
             return { status: 'pending', ...progress() };
           }
           const reason = safeCode(error);
+          // The budget, not the text, cut this request short: no cooldown, no isolation, no terminal mark.
+          if (shortened && reason === 'model_timeout') return exhausted();
           if (['model_timeout', 'model_request_failed', 'invalid_embedding', 'invalid_embedding_response', 'model_response_too_large'].includes(reason)) {
             // Split retries across invocations so a slow batch cannot multiply the caller's wait.
             const single = Boolean(first.isolated || batch.length === 1);
@@ -168,21 +223,33 @@ export class Memory {
             const delay = batch.length === 1 ? 300 : 60;
             if (typeof this.store.deferEmbeddings === 'function') {
               tally(await this.store.deferEmbeddings(scope, key, batch.map(({ uid, observed }) => ({ uid, observed })), delay, single, ...(context ? [context] : [])), batch.length);
+              // An unresolved deferral write takes precedence over the request failure it was recording.
+              if (deadline !== null && unknown) return uncertain();
             }
           }
           return failed(reason);
         }
         indexed += tally(await this.store.saveEmbeddings(scope, key,
           batch.map((row, index) => ({ uid: row.uid, observed: row.observed, vector: vectors[index] })), ...(context ? [context] : [])), batch.length);
+        if (deadline !== null && unknown) return uncertain();
         // One retry request per invocation protects the caller's indexing budget.
         if (first.isolated) break;
       }
+      // A step that reached its deadline yields explicitly, with its stale count, rather than as ordinary pending a caller
+      // could meet with another budget at once. No drain check starts after it, and none finished after it claims readiness.
+      if (deadline !== null && remaining() <= 0) return exhausted();
       if (stale || unknown || pending.length > indexed + marked) return { status: 'pending', ...progress() };
       if (typeof this.store.markOversizedChunks === 'function') {
         // The bounded selection cannot prove drain. Check all current-key missing vectors, including cooling rows.
         const { unindexed, unembeddable = 0 } = await this.store.status(scope, key, ...(context ? [[], context] : []));
         requireThat(Number.isSafeInteger(unindexed) && Number.isSafeInteger(unembeddable)
           && unembeddable >= 0 && unindexed >= unembeddable, 'embedding_accounting_invalid');
+        // Each drain read is admitted only before the deadline; one that ended after it yields with the budget partial, unless
+        // all it found is a terminal refusal, which a budget cut must not hide.
+        if (deadline !== null && remaining() <= 0) {
+          return unembeddable && unindexed === unembeddable
+            ? { status: 'unavailable', reason: 'embedding_unembeddable', source_retained: true, ...progress(), unembeddable } : exhausted();
+        }
         if (unindexed > unembeddable) return { status: 'pending', ...progress() };
         // Source a first retain could not chunk has no row to index, so it never clears here and is never ready.
         const gaps = typeof this.store.derivedGaps === 'function' ? await this.store.derivedGaps(scope) : 0;
@@ -191,6 +258,7 @@ export class Memory {
           ...progress(), unembeddable, ...(gaps ? { derived_gaps: gaps } : {}) };
         if (gaps) return { status: 'unavailable', reason: 'derived_chunk_gaps', source_retained: true, ...progress(), derived_gaps: gaps };
       }
+      if (deadline !== null && remaining() <= 0) return exhausted();
       return { status: 'ready', ...progress() };
     } catch (error) {
       return failed(safeCode(error));

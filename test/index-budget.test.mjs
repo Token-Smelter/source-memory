@@ -1,0 +1,280 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { INDEX_ADMISSION_FLOOR_MS, Memory } from '../src/memory.mjs';
+import { embeddingIdentity } from '../src/models.mjs';
+
+// A loopback embedder. `plan(index, input)` may return { delay } in real milliseconds and { advance } for the fake clock,
+// which moves when the request arrives, as if the model had taken that long.
+async function embedder(t, plan = () => ({})) {
+  const calls = [];
+  const clock = { now: 0 };
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const part of req) body += part;
+    const { input } = JSON.parse(body);
+    const index = calls.length;
+    calls.push(input);
+    const { delay = 0, advance = 0, reject = false, fail = false } = plan(index, input);
+    clock.now += advance;
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    if (fail) return res.writeHead(503).end();
+    if (reject) {
+      return res.writeHead(400, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'the input length exceeds the context length' } }));
+    }
+    if (!res.destroyed) res.end(JSON.stringify({ data: input.map((value, i) => ({ index: i, embedding: [value.length, 1] })) }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(done => { server.closeAllConnections(); server.close(done); }));
+  return { calls, clock, url: `http://127.0.0.1:${server.address().port}/v1/embeddings` };
+}
+
+// A store of chunk rows that answers the index step's calls and logs them in order. Saves and deferrals are confirmed in full
+// unless `saveOutcome` says otherwise; `onStatus` and `onSave` run inside those calls.
+function fakeStore(rows, { saveOutcome, onSave = () => {}, onStatus = () => {}, onSelect = () => {}, onObserve = () => {}, gaps = 0, statusOf,
+  markOutcome, onMark = () => {}, deferOutcome } = {}) {
+  const log = [];
+  const find = uid => rows.find(row => row.uid === uid);
+  const hint = row => ({ uid: row.uid, chunk: true, isolated: Boolean(row.isolated), cooling: false, single: Boolean(row.single) });
+  return {
+    log,
+    async pendingEmbeddings(_scope, _key, limit) {
+      log.push(['select']);
+      await onSelect();
+      return rows.filter(row => !row.vector && !row.deferred).slice(0, limit).map(hint);
+    },
+    async observeEmbeddings(_scope, _key, uids) {
+      log.push(['observe', uids]);
+      await onObserve(uids);
+      return uids.map(find).filter(row => row && !row.vector).map(row => ({ ...hint(row), text: row.text, observed: { text: row.text }, eligible: true }));
+    },
+    async saveEmbeddings(_scope, _key, items) {
+      log.push(['save', items.map(item => item.uid)]);
+      await onSave(items);
+      const outcome = saveOutcome?.(items) ?? { applied: items.length, refused: 0 };
+      if (!outcome.uncertain) for (const item of items.slice(0, outcome.applied)) find(item.uid).vector = item.vector;
+      return outcome;
+    },
+    async deferEmbeddings(_scope, _key, items, delay, single) {
+      log.push(['defer', items.map(item => item.uid), delay, single]);
+      for (const item of items) find(item.uid).deferred = true;
+      return deferOutcome?.(items) ?? { applied: items.length, refused: 0 };
+    },
+    async markContextRejectedChunk(_scope, _key, _context, item) {
+      log.push(['context', item.uid]);
+      await onMark();
+      return markOutcome?.() ?? { applied: 1, refused: 0 };
+    },
+    async markOversizedChunks(_scope, _key, items) { log.push(['oversized']); return { applied: items.length, refused: 0 }; },
+    async status() {
+      log.push(['status']);
+      await onStatus();
+      return statusOf?.() ?? { unindexed: rows.filter(row => !row.vector).length, unembeddable: 0 };
+    },
+    async derivedGaps() { log.push(['gaps']); return gaps; },
+    async close() {},
+  };
+}
+
+const rowsOf = (count, extra = {}) => Array.from({ length: count }, (_, index) => ({ uid: `c${String(index).padStart(2, '0')}`, text: `text ${index}`, ...extra }));
+
+function memoryWith(fixture, store, embedding = {}) {
+  const memory = new Memory({ embedding: { url: fixture.url, model: 'fixture', dimensions: 2, ...embedding }, scopes: { read: ['s'], write: ['s'] } }, store);
+  memory.clock = () => fixture.clock.now;
+  return memory;
+}
+
+test('with neither key the step is unchanged: groups of 16, one isolated group per call, no deadline and no partial', async t => {
+  const fixture = await embedder(t, () => ({ advance: 1_000_000 }));
+  const store = fakeStore(rowsOf(20));
+  const memory = memoryWith(fixture, store);
+  const key = embeddingIdentity(memory.config.embedding);
+  assert.deepEqual(await memory.index('s'), { status: 'ready', indexed: 20, embedding_key: key });
+  assert.deepEqual(fixture.calls.map(input => input.length), [16, 4]);
+  // An isolated group still ends the call after one request.
+  const isolated = fakeStore(rowsOf(6, { isolated: true }));
+  const second = await memoryWith(fixture, isolated).index('s');
+  assert.deepEqual([second.status, second.indexed, second.partial], ['pending', 4, undefined]);
+});
+
+test('index_batch alone caps every group and keeps isolation pacing, with no deadline', async t => {
+  const fixture = await embedder(t, () => ({ advance: 1_000_000 }));
+  const memory = memoryWith(fixture, fakeStore(rowsOf(7)), { index_batch: 3 });
+  assert.equal((await memory.index('s')).status, 'ready');
+  assert.deepEqual(fixture.calls.map(input => input.length), [3, 3, 1]);
+  const isolated = await memoryWith(fixture, fakeStore(rowsOf(6, { isolated: true })), { index_batch: 3 }).index('s');
+  assert.deepEqual([isolated.status, isolated.indexed], ['pending', 3]);
+});
+
+test('a budget admits calls while the floor remains, saves each group before the next, and continues on the next step', async t => {
+  // Each request takes 2,000 ms of the budget: admitted at 5,000, 3,000 and 1,000 ms left; refused at -1,000.
+  const fixture = await embedder(t, () => ({ advance: 2000 }));
+  const store = fakeStore(rowsOf(10));
+  const memory = memoryWith(fixture, store, { index_budget_ms: 5000, index_batch: 2 });
+  const first = await memory.index('s');
+  assert.deepEqual(first, { status: 'pending', indexed: 6, embedding_key: first.embedding_key,
+    partial: { reason: 'index_budget_exhausted', budget_ms: 5000 } });
+  assert.equal(INDEX_ADMISSION_FLOOR_MS, 1000);
+  assert.deepEqual(store.log.filter(([kind]) => kind !== 'select').map(([kind]) => kind),
+    ['observe', 'save', 'observe', 'save', 'observe', 'save'], 'each success is saved before the next group is observed');
+  assert.ok(!store.log.some(([kind]) => kind === 'defer' || kind === 'status'), 'no cooldown and no drain check after the deadline');
+  // The next step has its own deadline, selects only what is still pending, and starts from there.
+  const second = await memory.index('s');
+  assert.deepEqual([second.status, second.indexed], ['ready', 4], JSON.stringify(second));
+  assert.deepEqual(fixture.calls.slice(3).flat(), ['text 6', 'text 7', 'text 8', 'text 9']);
+});
+
+test('a request the budget shortened and that timed out is not the text\'s fault: no cooldown, isolation or mark, earlier saves kept', async t => {
+  // The first request leaves 1,150 ms; the second is admitted with that as its timeout and outlasts it in real time.
+  const fixture = await embedder(t, index => (index === 0 ? { advance: 850 } : { delay: 2500 }));
+  const store = fakeStore(rowsOf(4));
+  const memory = memoryWith(fixture, store, { index_budget_ms: 2000, index_batch: 2, timeout_ms: 10_000 });
+  const reply = await memory.index('s');
+  assert.deepEqual([reply.status, reply.indexed, reply.partial?.reason], ['pending', 2, 'index_budget_exhausted']);
+  assert.ok(!store.log.some(([kind]) => kind === 'defer'), 'no deferral, cooldown or isolation');
+  assert.equal(fixture.calls.length, 2);
+});
+
+test('a failure within the full configured timeout keeps today\'s deferral, budget or not', async t => {
+  const fixture = await embedder(t, () => ({ delay: 600 }));
+  const store = fakeStore(rowsOf(2));
+  const memory = memoryWith(fixture, store, { index_budget_ms: 100_000, timeout_ms: 200 });
+  const reply = await memory.index('s');
+  assert.deepEqual([reply.status, reply.reason], ['unavailable', 'model_timeout']);
+  assert.deepEqual(store.log.find(([kind]) => kind === 'defer'), ['defer', ['c00', 'c01'], 60, false]);
+});
+
+test('an admitted save is awaited past the deadline and credited, but no readiness is claimed after it', async t => {
+  const fixture = await embedder(t, () => ({ advance: 1000 }));
+  const later = { now: null };
+  const store = fakeStore(rowsOf(2), { onSave: () => { fixture.clock.now += 5000; later.now = fixture.clock.now; } });
+  const memory = memoryWith(fixture, store, { index_budget_ms: 3000 });
+  const reply = await memory.index('s');
+  assert.deepEqual([reply.status, reply.indexed, reply.partial?.reason], ['pending', 2, 'index_budget_exhausted']);
+  assert.ok(later.now > 3000 && !store.log.some(([kind]) => kind === 'status'), 'the save finished after the deadline; no drain check began');
+  // A drain read that ends after the deadline cannot earn ready, and starts no further drain read.
+  const slowStatus = fakeStore(rowsOf(2), { onStatus: () => { fixture.clock.now += 10_000; } });
+  fixture.clock.now = 0;
+  const second = await memoryWith(fixture, slowStatus, { index_budget_ms: 3000 }).index('s');
+  assert.deepEqual([second.status, second.indexed, second.partial?.reason], ['pending', 2, 'index_budget_exhausted']);
+  assert.deepEqual(slowStatus.log.slice(-1), [['status']], 'derivedGaps is not called after a status read that crossed the deadline');
+});
+
+test('a save that ends past the deadline with rows still selected yields explicitly, not as ordinary pending', async t => {
+  const fixture = await embedder(t);
+  const store = fakeStore(rowsOf(3), { onSave: () => { fixture.clock.now += 5000; } });
+  const reply = await memoryWith(fixture, store, { index_budget_ms: 3000, index_batch: 2 }).index('s', { limit: 2 });
+  assert.deepEqual([reply.status, reply.indexed, reply.partial?.reason, fixture.calls.length], ['pending', 2, 'index_budget_exhausted', 1]);
+});
+
+test('a status read that crosses the deadline yields over a backlog, keeps a terminal-only refusal, and starts no gap read', async t => {
+  const fixture = await embedder(t);
+  const late = statusOf => fakeStore(rowsOf(1), { statusOf, onStatus: () => { fixture.clock.now += 10_000; } });
+  for (const [statusOf, expected] of [[() => ({ unindexed: 3, unembeddable: 0 }), ['pending', 'index_budget_exhausted', undefined]],
+    [() => ({ unindexed: 2, unembeddable: 1 }), ['pending', 'index_budget_exhausted', undefined]],
+    [() => ({ unindexed: 1, unembeddable: 1 }), ['unavailable', undefined, 'embedding_unembeddable']]]) {
+    fixture.clock.now = 0;
+    const store = late(statusOf);
+    const reply = await memoryWith(fixture, store, { index_budget_ms: 3000 }).index('s');
+    assert.deepEqual([reply.status, reply.partial?.reason, reply.reason], expected, JSON.stringify(statusOf()));
+    assert.ok(!store.log.some(([kind]) => kind === 'gaps'), 'no derived-gap read after the deadline');
+  }
+});
+
+test('under a budget an uncertain save ends the step at once as an explicit failure, not a budget partial, keeping earlier saves', async t => {
+  const fixture = await embedder(t);
+  let saves = 0;
+  const store = fakeStore(rowsOf(6), { saveOutcome: items => (++saves === 2 ? { applied: 0, refused: items.length, uncertain: true } : undefined) });
+  const reply = await memoryWith(fixture, store, { index_budget_ms: 60_000, index_batch: 2 }).index('s');
+  assert.deepEqual([reply.status, reply.reason, reply.indexed, reply.unknown, reply.partial, fixture.calls.length],
+    ['unavailable', 'embedding_write_unknown', 2, 2, undefined, 2], 'the third group is never sent');
+});
+
+test('an uncertain save is never credited and a refused row stays for the next selection, under a budget', async t => {
+  const fixture = await embedder(t);
+  const store = fakeStore(rowsOf(2), { saveOutcome: items => ({ applied: 0, refused: items.length, uncertain: true }) });
+  const reply = await memoryWith(fixture, store, { index_budget_ms: 10_000 }).index('s');
+  assert.deepEqual([reply.status, reply.reason, reply.unknown, reply.partial], ['unavailable', 'embedding_write_unknown', 2, undefined]);
+  // Unbudgeted, the same outcome stays today's pending with its unknown count.
+  const plain = await memoryWith(fixture, fakeStore(rowsOf(2), { saveOutcome: items => ({ applied: 0, refused: items.length, uncertain: true }) })).index('s');
+  assert.deepEqual([plain.status, plain.indexed, plain.unknown], ['pending', 0, 2]);
+});
+
+test('hydration that crosses the admission floor sends nothing, and a short configured timeout is used when time remains', async t => {
+  const fixture = await embedder(t);
+  // Admitted at 3,000 ms left; hydration then takes 2,500, leaving 500, under the floor.
+  const store = fakeStore(rowsOf(2), { onObserve: () => { fixture.clock.now += 2500; } });
+  const reply = await memoryWith(fixture, store, { index_budget_ms: 3000 }).index('s');
+  assert.deepEqual([reply.status, reply.indexed, reply.partial?.reason, fixture.calls.length], ['pending', 0, 'index_budget_exhausted', 0]);
+  assert.ok(!store.log.some(([kind]) => kind === 'save' || kind === 'defer'));
+  // A configured timeout under the floor is valid while the step has time: the call is sent with that timeout.
+  const short = await memoryWith(fixture, fakeStore(rowsOf(2)), { index_budget_ms: 60_000, timeout_ms: 500 }).index('s');
+  assert.deepEqual([short.status, short.indexed, fixture.calls.length], ['ready', 2, 1]);
+});
+
+test('with no usable request time left after selection, nothing is sent', async t => {
+  const fixture = await embedder(t);
+  const store = fakeStore(rowsOf(3), { onSelect: () => { fixture.clock.now += 2500; } });
+  const reply = await memoryWith(fixture, store, { index_budget_ms: 3000 }).index('s');
+  assert.deepEqual([reply.status, reply.indexed, reply.partial?.reason], ['pending', 0, 'index_budget_exhausted']);
+  assert.deepEqual([fixture.calls.length, store.log.map(([kind]) => kind)], [0, ['select']]);
+});
+
+test('under a budget a refused save is stale, not credited, and a saved step with a derived gap keeps its progress but is not ready', async t => {
+  const fixture = await embedder(t);
+  const stale = fakeStore(rowsOf(2), { saveOutcome: items => ({ applied: items.length - 1, refused: 1 }) });
+  const reply = await memoryWith(fixture, stale, { index_budget_ms: 10_000 }).index('s');
+  assert.deepEqual([reply.status, reply.indexed, reply.stale, reply.partial], ['pending', 1, 1, undefined]);
+  const gapped = await memoryWith(fixture, fakeStore(rowsOf(2), { gaps: 1 }), { index_budget_ms: 10_000 }).index('s');
+  assert.deepEqual([gapped.status, gapped.reason, gapped.indexed, gapped.derived_gaps], ['unavailable', 'derived_chunk_gaps', 2, 1]);
+});
+
+test('under a budget an unresolved context mark or deferral write takes precedence, and a late confirmed context mark yields', async t => {
+  const context = { model: 'embeddinggemma', ollama_context_revision: 'fixture-v1' };
+  const isolatedSingle = () => rowsOf(1, { isolated: true, single: true });
+  const uncertainOutcome = () => ({ applied: 0, refused: 1, uncertain: true });
+  const rejecting = await embedder(t, () => ({ reject: true }));
+  // An uncertain context mark: explicit unknown under a budget; unbudgeted, today's pending with its unknown count.
+  const unknownMark = await memoryWith(rejecting, fakeStore(isolatedSingle(), { markOutcome: uncertainOutcome }), { ...context, index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([unknownMark.status, unknownMark.reason, unknownMark.unknown, unknownMark.partial], ['unavailable', 'embedding_write_unknown', 1, undefined]);
+  const plainMark = await memoryWith(rejecting, fakeStore(isolatedSingle(), { markOutcome: uncertainOutcome }), context).index('s');
+  assert.deepEqual([plainMark.status, plainMark.unknown], ['pending', 1]);
+  // A confirmed context mark that settles after the deadline yields explicitly; before it, today's pending.
+  const lateMark = fakeStore(isolatedSingle(), { onMark: () => { rejecting.clock.now += 120_000; } });
+  const late = await memoryWith(rejecting, lateMark, { ...context, index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([late.status, late.partial?.reason, lateMark.log.filter(([kind]) => kind === 'context').length], ['pending', 'index_budget_exhausted', 1]);
+  rejecting.clock.now = 0;
+  const onTime = await memoryWith(rejecting, fakeStore(isolatedSingle()), { ...context, index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([onTime.status, onTime.partial], ['pending', undefined]);
+  // An uncertain deferral of a failed request: explicit unknown under a budget, not the request failure; confirmed, the failure.
+  const failing = await embedder(t, () => ({ fail: true }));
+  const unknownDefer = await memoryWith(failing, fakeStore(rowsOf(2), { deferOutcome: items => ({ applied: 0, refused: items.length, uncertain: true }) }),
+    { index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([unknownDefer.status, unknownDefer.reason, unknownDefer.unknown], ['unavailable', 'embedding_write_unknown', 2]);
+  const confirmedDefer = await memoryWith(failing, fakeStore(rowsOf(2)), { index_budget_ms: 60_000 }).index('s');
+  assert.deepEqual([confirmedDefer.status, confirmedDefer.reason], ['unavailable', 'model_request_failed']);
+  const plainDefer = await memoryWith(failing, fakeStore(rowsOf(2), { deferOutcome: items => ({ applied: 0, refused: items.length, uncertain: true }) })).index('s');
+  assert.deepEqual([plainDefer.status, plainDefer.reason, plainDefer.unknown], ['unavailable', 'model_request_failed', 2], 'unbudgeted is unchanged');
+  assert.equal(failing.calls.length, 3, 'one request per step, nothing after the unresolved write');
+});
+
+test('an isolated group still ends the step after one request under a budget', async t => {
+  const fixture = await embedder(t);
+  const reply = await memoryWith(fixture, fakeStore(rowsOf(8, { isolated: true })), { index_budget_ms: 60_000, index_batch: 2 }).index('s');
+  assert.deepEqual([reply.status, reply.indexed, fixture.calls.length], ['pending', 2, 1]);
+});
+
+test('a budget that cannot admit a call, a batch out of range or an invalid timeout is refused before any model call', async t => {
+  const fixture = await embedder(t);
+  for (const [embedding, reason] of [[{ index_budget_ms: 1999 }, 'invalid_index_budget'], [{ index_budget_ms: 600_001 }, 'invalid_index_budget'],
+    [{ index_budget_ms: '3000' }, 'invalid_index_budget'], [{ index_batch: 0 }, 'invalid_index_batch'], [{ index_batch: 17 }, 'invalid_index_batch'],
+    [{ index_budget_ms: 3000, timeout_ms: 0 }, 'invalid_model_timeout'], [{ index_budget_ms: 3000, timeout_ms: 120_001 }, 'invalid_model_timeout'],
+    [{ index_budget_ms: 3000, timeout_ms: null }, 'invalid_model_timeout']]) {
+    const reply = await memoryWith(fixture, fakeStore(rowsOf(2)), embedding).index('s');
+    assert.deepEqual([reply.status, reply.reason], ['unavailable', reason], JSON.stringify(embedding));
+  }
+  assert.equal(fixture.calls.length, 0);
+});
