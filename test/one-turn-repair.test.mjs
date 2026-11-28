@@ -205,6 +205,14 @@ test('the plan-bound journal admits one attempt at a time and holds every write 
     for (const [name, content] of Object.entries(files)) await writeFile(join(journal, name), content);
     assert.deepEqual(JSON.parse((await step(plan.plan_digest)).stderr), { ok: false, error: 'repair_disposition_required' }, JSON.stringify(files));
   }
+  // A start naming another plan or attempt is foreign: a valid disposition does not settle it, and dispose refuses it.
+  for (const foreign of [{ plan_digest: other, attempt: 4, step: 'apply' }, { plan_digest: plan.plan_digest, attempt: 7, step: 'apply' }]) {
+    for (const name of ['attempt-4.json', 'attempt-4.outcome.json', 'attempt-4.disposed.json']) await rm(join(journal, name), { force: true });
+    await writeFile(join(journal, 'attempt-4.json'), JSON.stringify(foreign));
+    assert.deepEqual(JSON.parse((await dispose(4)).stderr), { ok: false, error: 'repair_attempt_foreign' }, JSON.stringify(foreign));
+    await writeFile(join(journal, 'attempt-4.disposed.json'), JSON.stringify({ plan_digest: plan.plan_digest, attempt: 4, state: 'preimage', ref: 'r' }));
+    assert.deepEqual(JSON.parse((await step(plan.plan_digest)).stderr), { ok: false, error: 'repair_disposition_required' }, JSON.stringify(foreign));
+  }
   // A well-formed start and its own outcome settle the attempt.
   for (const name of ['attempt-4.json', 'attempt-4.outcome.json', 'attempt-4.disposed.json']) await rm(join(journal, name), { force: true });
   await writeFile(join(journal, 'attempt-4.json'), JSON.stringify({ plan_digest: plan.plan_digest, attempt: 4, step: 'inverse' }));

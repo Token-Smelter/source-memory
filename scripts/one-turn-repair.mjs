@@ -90,10 +90,20 @@ const record = value => value !== null && typeof value === 'object' && !Array.is
 
 /**
  * An attempt is settled only by records bound to exactly this plan and attempt number: a well-formed start whose own
- * outcome is committed, rolled back or refused, or the owner's disposition naming this attempt with a state and a ref.
- * Anything malformed or bound elsewhere leaves it held.
+ * outcome is committed, rolled back or refused, or the owner's disposition naming this attempt with a state and a ref. A
+ * disposition can settle a crash-damaged start, but never one that names another plan or attempt. Anything malformed or
+ * bound elsewhere leaves it held.
  */
+// A start record that positively names another plan or attempt. Unlike a crash-damaged start (unreadable, empty or missing
+// fields), it can never be settled or disposed here.
+function foreignStart(attempt, planDigest) {
+  const start = attempt.start;
+  return record(start) && ((Object.hasOwn(start, 'plan_digest') && start.plan_digest !== planDigest)
+    || (Object.hasOwn(start, 'attempt') && start.attempt !== attempt.number));
+}
+
 function settled(attempt, planDigest) {
+  if (foreignStart(attempt, planDigest)) return false;
   const bound = item => record(item) && item.plan_digest === planDigest && item.attempt === attempt.number;
   const disposition = bound(attempt.disposition) && ['preimage', 'postimage'].includes(attempt.disposition.state)
     && typeof attempt.disposition.ref === 'string' && REF.test(attempt.disposition.ref);
@@ -142,6 +152,8 @@ async function run({ command, values }) {
     const attempt = (await attempts(journal)).find(item => item.number === number);
     // Only an existing, unsettled attempt of this plan can be disposed, and only once.
     requireThat(attempt && !settled(attempt, plan.plan_digest), 'repair_attempt_not_unsettled');
+    // Disposing is recovery for this plan's own attempts; a start bound to another plan or attempt is refused, not adopted.
+    requireThat(!foreignStart(attempt, plan.plan_digest), 'repair_attempt_foreign');
     await writeOnceFile(join(journal, `attempt-${number}.disposed.json`), { plan_digest: plan.plan_digest, attempt: number,
       state: values['--state'], ref: values['--ref'], at: new Date().toISOString() });
     return { contract: REPAIR_CONTRACT, step: 'dispose', plan_digest: plan.plan_digest, attempt: number, state: values['--state'] };
