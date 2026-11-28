@@ -7,7 +7,9 @@ import { join } from 'node:path';
 import neo4j from 'neo4j-driver';
 import { Memory } from '../src/memory.mjs';
 import { chunkEntries, digest, identity, normalizeTurn } from '../src/core.mjs';
-import { LEGACY_POLICY, MANIFEST_CONTRACT, TOKEN_POLICY } from '../src/chunk-policy.mjs';
+import { chunkPolicy, LEGACY_POLICY, MANIFEST_CONTRACT, TOKEN_POLICY } from '../src/chunk-policy.mjs';
+import { embeddingIdentity } from '../src/models.mjs';
+import { countOverContext, neo4jChunkReader } from '../src/over-context-count.mjs';
 import { readGgufTokenizer, RENDER_CONTRACT } from '../src/tokenizer.mjs';
 import { fictionalVocabulary, ggufTokenizerFile } from './helpers/gguf-fixture.mjs';
 
@@ -178,6 +180,24 @@ export async function runChunkCap(database, scratch) {
         const count = await session.run('MATCH (t:SMTurn {scope:$scope}) WHERE t.chunk_manifest IS NOT NULL RETURN count(t) AS n', { scope: 'cap-history' });
         assert.equal(neo4j.isInt(count.records[0].get('n')) ? count.records[0].get('n').toNumber() : count.records[0].get('n'), 0);
       } finally { await session.close(); }
+    });
+
+    await check('C7 the owner count reads one scope through the store and classifies vectors without exposing rows', async () => {
+      const policy = chunkPolicy(capped.config, verified);
+      const key = embeddingIdentity(embedding);
+      const caps = { max_rows: 100, max_text_bytes: 1_000_000, max_pages: 20, page_size: 2, max_seconds: 60, transaction_timeout_ms: 10_000 };
+      const reader = scope => neo4jChunkReader(driver, database.database, scope, key);
+      const capped21 = await countOverContext({ policy, reader: reader('cap'), caps });
+      assert.equal(capped21.status, 'complete');
+      assert.equal(capped21.chunks, capped21.within_cap, 'chunks derived under cap 21 all fit it');
+      const before = await countOverContext({ policy, reader: reader('cap-legacy'), caps });
+      assert.equal(before.status, 'complete');
+      assert.ok(before.chunks > 0 && before.over_context_without_current_vector === before.chunks, 'legacy 256-word chunks exceed context 64');
+      await capped.index('cap-legacy');
+      const after = await countOverContext({ policy, reader: reader('cap-legacy'), caps });
+      assert.deepEqual([after.over_context_with_current_vector, after.over_context_without_current_vector], [before.chunks, 0]);
+      assert.ok(!JSON.stringify(after).includes('abcd') && !JSON.stringify(after).includes('chunk_'), 'no text or identifier in the report');
+      assert.equal((await countOverContext({ policy, reader: reader('cap-legacy'), caps: { ...caps, max_pages: 1 } })).reason, 'cap_pages');
     });
   } finally {
     await capped.close();
