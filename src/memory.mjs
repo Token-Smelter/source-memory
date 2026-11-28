@@ -1,7 +1,8 @@
 import {
-  authorize, authorizeTarget, CHUNK_MAX_BYTES, chunkEntries, cosine, fuse, identity, integer, markStage, MemoryError,
+  authorize, authorizeTarget, CHUNK_MAX_BYTES, cosine, fuse, identity, integer, markStage, MemoryError,
   digest, normalizeEnrichment, normalizeTurn, RECORD_CONTRACT, RECORD_KINDS, RECORD_STATUSES, requireThat, sourceExcerpt, text,
 } from './core.mjs';
+import { chunkPolicy, deriveChunks, VERIFIED_TOKENIZERS } from './chunk-policy.mjs';
 import { POOL_MAX_CHARS, isPoolRequest } from './envelope.mjs';
 import { embed, EmbeddingContextRejection, embeddingContextContract, embeddingIdentity, rerank } from './models.mjs';
 import { passthrough, scoped, tracer } from './phase-diagnostic.mjs';
@@ -24,12 +25,26 @@ async function immutableRead(reads, scope, kind, id, load) {
   return structuredClone(snapshot);
 }
 
+// The policy new turns are chunked under. Reported only when a token contract is configured, so a legacy status is unchanged.
+function configuredChunking(config, verified) {
+  if (config.embedding?.tokenizer === undefined && config.embedding?.chunk_token_cap === undefined) return {};
+  try {
+    const policy = chunkPolicy(config, verified);
+    return { chunking: { policy: policy.descriptor, policy_digest: policy.digest, qualification: policy.qualification,
+      tokenizer_verified: policy.descriptor.context !== null } };
+  } catch (error) {
+    return { chunking: { error: safeCode(error) } };
+  }
+}
+
 export class Memory {
   constructor(config, store = null) {
     this.config = config;
     this.store = store ?? new Neo4jStore(config.neo4j);
     // Largest tree selection scored by exact scan rather than its root's ANN index; tests lower it.
     this.treeScanLimit = TREE_SCAN_LIMIT;
+    // Tokenizers trusted for token-capped chunking; tests substitute fictional ones.
+    this.verifiedTokenizers = VERIFIED_TOKENIZERS;
   }
 
   async close() { await this.store.close(); }
@@ -42,14 +57,12 @@ export class Memory {
   }
 
   async ingest(scope, input) {
-    const { turn, chunks } = beforeWrite(() => {
+    const { turn, policy } = beforeWrite(() => {
       authorize(this.config, scope, 'write');
-      const turn = normalizeTurn(input);
-      const size = integer(this.config.chunking?.words, 256, 8, 4096);
-      const overlap = integer(this.config.chunking?.overlap, Math.min(32, size - 1), 0, size - 1);
-      return { turn, chunks: chunkEntries(turn, size, overlap) };
+      return { turn: normalizeTurn(input), policy: chunkPolicy(this.config, this.verifiedTokenizers) };
     });
-    const result = await this.store.ingest(scope, turn, chunks);
+    // The store derives chunks only on a first retain, so a replay keeps its first layout and never needs the tokenizer.
+    const result = await this.store.ingest(scope, turn, () => deriveChunks(turn, policy), policy);
     return { ...result, indexing: await this.indexAfterWrite(scope) };
   }
 
@@ -171,8 +184,12 @@ export class Memory {
         requireThat(Number.isSafeInteger(unindexed) && Number.isSafeInteger(unembeddable)
           && unembeddable >= 0 && unindexed >= unembeddable, 'embedding_accounting_invalid');
         if (unindexed > unembeddable) return { status: 'pending', ...progress() };
+        // Source a first retain could not chunk has no row to index, so it never clears here and is never ready.
+        const gaps = typeof this.store.derivedGaps === 'function' ? await this.store.derivedGaps(scope) : 0;
+        requireThat(Number.isSafeInteger(gaps) && gaps >= 0, 'embedding_accounting_invalid');
         if (unembeddable) return { status: 'unavailable', reason: 'embedding_unembeddable', source_retained: true,
-          ...progress(), unembeddable };
+          ...progress(), unembeddable, ...(gaps ? { derived_gaps: gaps } : {}) };
+        if (gaps) return { status: 'unavailable', reason: 'derived_chunk_gaps', source_retained: true, ...progress(), derived_gaps: gaps };
       }
       return { status: 'ready', ...progress() };
     } catch (error) {
@@ -189,7 +206,9 @@ export class Memory {
     const tree = !selection(target).tree ? {} : { scope_tree: { pending: await this.store.treePending(target), indexes: await this.store.treeIndexStates(target) },
       ...(await this.store.legacyFlatIndex(target) ? { legacy_flat_index: true } : {}) };
     const context = embeddingContextContract(this.config.embedding);
+    const gaps = typeof this.store.derivedGaps === 'function' ? await this.store.derivedGaps(target) : 0;
     return { scope, ...(await this.store.status(target, key, ...(context ? [[], context] : []))), ...tree,
+      ...(gaps ? { derived_gaps: gaps } : {}), ...configuredChunking(this.config, this.verifiedTokenizers),
       // A changed database_id is another store, a changed record_contract another record contract: each needs a new binding.
       store: { ...(await this.store.identity()), record_contract: RECORD_CONTRACT },
       embedding: key ? { configured: true, model: this.config.embedding.model, key } : { configured: false },
@@ -528,8 +547,10 @@ export class Memory {
               result = grouped ? await this.store.admittedVectors(target, kind, key, queryVector, data.scanned, candidates, perConversation, exclude)
                 : { hits: vectorHits(kind, data.ranked.filter(row => kind === 'chunk' ? row.turn_uid : row.record_id).slice(0, candidates), sel.subtree) };
             }
-            const state = { status: result.partial || scan_truncated || unindexed > 0 ? 'partial' : 'ready',
-              scan_truncated, unindexed, embedding_key: key,
+            // Chunk vectors cannot cover source a first retain recorded as a derived gap.
+            const gaps = kind === 'chunk' && typeof this.store.derivedGaps === 'function' ? await this.store.derivedGaps(target, exclude) : 0;
+            const state = { status: result.partial || scan_truncated || unindexed > 0 || gaps > 0 ? 'partial' : 'ready',
+              scan_truncated, unindexed, embedding_key: key, ...(gaps ? { derived_gaps: gaps } : {}),
               ...(result.reason ? { reason: result.reason } : {}),
               ...(grouped && result.ran !== false ? { admitted_conversations: result.admitted_conversations, exhausted: result.exhausted } : {}) };
             return { hits: result.hits, omitted: result.omitted ?? [], state };

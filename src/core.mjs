@@ -150,33 +150,39 @@ export function normalizeTurn(input) {
 // Bound UTF-8 input independently of whitespace tokenization. This is not a model tokenizer limit.
 export const CHUNK_MAX_BYTES = 8192;
 
+// Whitespace-separated words, each split on code points into parts of at most CHUNK_MAX_BYTES.
+function byteBoundedWords(text) {
+  const words = [];
+  for (const match of text.matchAll(/\S+/gu)) {
+    const word = match[0];
+    let start = match.index;
+    const bytes = Buffer.byteLength(word);
+    if (bytes <= CHUNK_MAX_BYTES) {
+      words.push({ start, end: start + word.length, bytes });
+      continue;
+    }
+    let end = start, partBytes = 0;
+    for (const character of word) {
+      const width = Buffer.byteLength(character);
+      if (partBytes + width > CHUNK_MAX_BYTES) {
+        words.push({ start, end, bytes: partBytes });
+        start = end;
+        partBytes = 0;
+      }
+      end += character.length;
+      partBytes += width;
+    }
+    words.push({ start, end, bytes: partBytes });
+  }
+  return words;
+}
+
 export function chunkEntries(turn, size = 256, overlap = 32) {
   integer(size, 256, 8, 4096);
   integer(overlap, 32, 0, size - 1);
   const chunks = [];
   for (const entry of turn.entries) {
-    const words = [];
-    for (const match of entry.text.matchAll(/\S+/gu)) {
-      const word = match[0];
-      let start = match.index;
-      const bytes = Buffer.byteLength(word);
-      if (bytes <= CHUNK_MAX_BYTES) {
-        words.push({ start, end: start + word.length, bytes });
-        continue;
-      }
-      let end = start, partBytes = 0;
-      for (const character of word) {
-        const width = Buffer.byteLength(character);
-        if (partBytes + width > CHUNK_MAX_BYTES) {
-          words.push({ start, end, bytes: partBytes });
-          start = end;
-          partBytes = 0;
-        }
-        end += character.length;
-        partBytes += width;
-      }
-      words.push({ start, end, bytes: partBytes });
-    }
+    const words = byteBoundedWords(entry.text);
     for (let first = 0; first < words.length;) {
       let last = first;
       let bytes = words[first].bytes;
@@ -205,6 +211,118 @@ export function chunkEntries(turn, size = 256, overlap = 32) {
     }
   }
   return chunks;
+}
+
+// Most chunks or gap spans one turn may derive. A larger derivation is recorded as a whole-entry gap, never clipped.
+export const CHUNK_DERIVATION_MAX = 8192;
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+// Largest index in (low, high] whose candidate fits, given that `low` itself fits. Every accepted index was counted, so the
+// result fits even where subword counts are not monotone in prefix length.
+function largestFitting(low, high, fitsAt) {
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (fitsAt(mid)) low = mid;
+    else high = mid - 1;
+  }
+  return low;
+}
+
+// Units no larger than the token cap: byte-bounded words, with any word over the cap split on grapheme boundaries, then on
+// code points. A code point that cannot fit alone becomes a gap unit.
+function tokenBoundedUnits(text, fits) {
+  const units = [];
+  for (const word of byteBoundedWords(text)) {
+    if (fits(text.slice(word.start, word.end))) { units.push(word); continue; }
+    const cuts = [];
+    for (const { index } of graphemes.segment(text.slice(word.start, word.end))) cuts.push(word.start + index);
+    cuts.push(word.end);
+    for (let at = 0; at < cuts.length - 1;) {
+      if (!fits(text.slice(cuts[at], cuts[at + 1]))) {
+        let start = cuts[at];
+        for (const point of text.slice(cuts[at], cuts[at + 1])) {
+          const end = start + point.length;
+          units.push({ start, end, bytes: Buffer.byteLength(point), gap: !fits(point) });
+          start = end;
+        }
+        at++;
+        continue;
+      }
+      const last = largestFitting(at + 1, cuts.length - 1, next => fits(text.slice(cuts[at], cuts[next])));
+      units.push({ start: cuts[at], end: cuts[last], bytes: Buffer.byteLength(text.slice(cuts[at], cuts[last])) });
+      at = last;
+    }
+  }
+  return units;
+}
+
+/**
+ * Chunks whose exact rendered input fits `cap` tokens and CHUNK_MAX_BYTES bytes, plus typed gaps for source that cannot fit.
+ * `counter.count` is the exact rendered count; `counter.bound` an upper bound that avoids counting short text. Offsets are
+ * UTF-16 into the unchanged entry. Windows never span a gap; overlap is recounted with the final text.
+ */
+export function chunkEntriesTokenCapped(turn, size, overlap, counter, cap, max = CHUNK_DERIVATION_MAX) {
+  integer(size, 256, 8, 4096);
+  integer(overlap, 32, 0, size - 1);
+  requireThat(Number.isSafeInteger(cap) && cap >= 1, 'invalid_chunk_token_cap');
+  const fits = value => counter.bound(value) <= cap || counter.count(value) <= cap;
+  const chunks = [];
+  const gaps = [];
+  for (const entry of turn.entries) {
+    const units = tokenBoundedUnits(entry.text, fits);
+    const span = (first, last) => entry.text.slice(units[first].start, units[last].end);
+    for (let index = 0; index < units.length;) {
+      if (units[index].gap) {
+        const previous = gaps.at(-1);
+        if (previous && previous.entry_id === entry.id && previous.end === units[index].start) previous.end = units[index].end;
+        else gaps.push({ entry_id: entry.id, start: units[index].start, end: units[index].end, cause: 'unsplittable_unit' });
+        if (chunks.length + gaps.length > max) return derivationTooLarge(turn);
+        index++;
+        continue;
+      }
+      let runEnd = index;
+      while (runEnd + 1 < units.length && !units[runEnd + 1].gap) runEnd++;
+      for (let first = index; first <= runEnd;) {
+        let last = first;
+        let bytes = units[first].bytes;
+        while (last + 1 <= runEnd && last + 1 - first < size) {
+          const sinceLast = Buffer.byteLength(entry.text.slice(units[last].end, units[last + 1].start)) + units[last + 1].bytes;
+          if (bytes + sinceLast > CHUNK_MAX_BYTES) break;
+          bytes += sinceLast;
+          last++;
+        }
+        if (!fits(span(first, last))) last = largestFitting(first, last - 1, candidate => fits(span(first, candidate)));
+        const text = span(first, last);
+        chunks.push({ entry_id: entry.id, role: entry.role, ordinal: chunks.length, start: units[first].start, end: units[last].end,
+          text, token_count: counter.count(text) });
+        if (chunks.length + gaps.length > max) return derivationTooLarge(turn);
+        if (last === runEnd) break;
+        let nextFirst = last + 1;
+        let windowBytes = units[nextFirst].bytes;
+        // Overlap never exceeds half the previous window, so a short token-bound window cannot advance one unit at a time.
+        const earliest = first + Math.max(1, Math.ceil((last + 1 - first) / 2));
+        while (nextFirst > earliest && last + 1 - nextFirst < overlap) {
+          const previous = units[nextFirst - 1];
+          const extra = previous.bytes + Buffer.byteLength(entry.text.slice(previous.end, units[nextFirst].start));
+          if (windowBytes + extra > CHUNK_MAX_BYTES) break;
+          windowBytes += extra;
+          nextFirst--;
+        }
+        // The next window must still reach a new unit, or the same text would repeat.
+        while (nextFirst <= last && !fits(span(nextFirst, last + 1))) nextFirst++;
+        first = nextFirst;
+      }
+      index = runEnd + 1;
+      if (gaps.length + chunks.length > max) return derivationTooLarge(turn);
+    }
+  }
+  return { chunks, gaps };
+}
+
+function derivationTooLarge(turn) {
+  return { chunks: [], gaps: turn.entries.filter(entry => /\S/u.test(entry.text))
+    .map(entry => ({ entry_id: entry.id, start: 0, end: entry.text.length, cause: 'derivation_bound_exceeded' })) };
 }
 
 export function normalizeSpan(span) {
