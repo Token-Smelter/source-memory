@@ -160,6 +160,19 @@ test('a derivation over the row bound is one whole-entry gap per nonblank entry,
   assert.deepEqual(result, { chunks: [], gaps: [{ entry_id: 'e0', start: 0, end: turn.entries[0].text.length, cause: 'derivation_bound_exceeded' }] });
 });
 
+test('an all-gap entry over the row bound falls back to a single whole-entry gap', async t => {
+  const counter = await fixtureCounter(t);
+  const input = 'é é é';
+  const turn = turnOf(input);
+  const atBound = chunkEntriesTokenCapped(turn, 8, 0, counter, 3, 3);
+  assert.equal(atBound.chunks.length, 0);
+  assert.equal(atBound.gaps.length, 3);
+  assert.ok(atBound.gaps.every(gap => gap.cause === 'unsplittable_unit'));
+  assert.deepEqual(chunkEntriesTokenCapped(turn, 8, 0, counter, 3, 2), {
+    chunks: [], gaps: [{ entry_id: 'e0', start: 0, end: input.length, cause: 'derivation_bound_exceeded' }],
+  });
+});
+
 test('the byte cap still applies under a token cap', async t => {
   const counter = await fixtureCounter(t);
   const turn = turnOf(Array.from({ length: 3000 }, () => 'abcd').join(' '));

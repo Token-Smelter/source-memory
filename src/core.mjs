@@ -277,6 +277,7 @@ export function chunkEntriesTokenCapped(turn, size, overlap, counter, cap, max =
         const previous = gaps.at(-1);
         if (previous && previous.entry_id === entry.id && previous.end === units[index].start) previous.end = units[index].end;
         else gaps.push({ entry_id: entry.id, start: units[index].start, end: units[index].end, cause: 'unsplittable_unit' });
+        if (chunks.length + gaps.length > max) return derivationTooLarge(turn);
         index++;
         continue;
       }
