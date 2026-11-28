@@ -77,19 +77,37 @@ async function attempts(journal) {
   try { names = await readdir(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const numbers = names.map(name => /^attempt-(\d+)\.json$/u.exec(name)?.[1]).filter(Boolean).map(Number).sort((a, b) => a - b);
   return Promise.all(numbers.map(async number => {
-    const read = async suffix => { try { return await readJson(join(journal, `attempt-${number}.${suffix}.json`)); } catch { return null; } };
-    return { number, outcome: await read('outcome'), disposition: await read('disposed') };
+    // An unreadable or unparsable record is kept as malformed (false), never as absent, so it cannot settle anything.
+    const read = async suffix => {
+      try { return await readJson(join(journal, suffix ? `attempt-${number}.${suffix}.json` : `attempt-${number}.json`)); }
+      catch (error) { return error.code === 'ENOENT' ? null : false; }
+    };
+    return { number, start: await read(''), outcome: await read('outcome'), disposition: await read('disposed') };
   }));
 }
 
-const settled = attempt => (attempt.outcome && SETTLED.includes(attempt.outcome.outcome)) || attempt.disposition !== null;
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * An attempt is settled only by records bound to exactly this plan and attempt number: a well-formed start whose own
+ * outcome is committed, rolled back or refused, or the owner's disposition naming this attempt with a state and a ref.
+ * Anything malformed or bound elsewhere leaves it held.
+ */
+function settled(attempt, planDigest) {
+  const bound = item => record(item) && item.plan_digest === planDigest && item.attempt === attempt.number;
+  const disposition = bound(attempt.disposition) && ['preimage', 'postimage'].includes(attempt.disposition.state)
+    && typeof attempt.disposition.ref === 'string' && REF.test(attempt.disposition.ref);
+  const start = bound(attempt.start) && ['apply', 'inverse'].includes(attempt.start.step);
+  const outcome = bound(attempt.outcome) && SETTLED.includes(attempt.outcome.outcome);
+  return disposition || (start && outcome);
+}
 
 // Refuses while any earlier attempt is unsettled, then claims the next attempt number by exclusive create.
 async function startAttempt(journal, entry) {
   await mkdir(journal, { recursive: true, mode: 0o700 });
   await syncDirectory(dirname(journal));
   const existing = await attempts(journal);
-  requireThat(existing.every(settled), 'repair_disposition_required');
+  requireThat(existing.every(attempt => settled(attempt, entry.plan_digest)), 'repair_disposition_required');
   const number = (existing.at(-1)?.number ?? 0) + 1;
   try { await writeOnceFile(join(journal, `attempt-${number}.json`), { ...entry, attempt: number, started_at: new Date().toISOString() }); }
   catch (error) { if (error.code === 'EEXIST') throw new MemoryError('repair_attempt_concurrent'); throw error; }
@@ -123,7 +141,7 @@ async function run({ command, values }) {
     const journal = journalOf(config, plan);
     const attempt = (await attempts(journal)).find(item => item.number === number);
     // Only an existing, unsettled attempt of this plan can be disposed, and only once.
-    requireThat(attempt && !settled(attempt), 'repair_attempt_not_unsettled');
+    requireThat(attempt && !settled(attempt, plan.plan_digest), 'repair_attempt_not_unsettled');
     await writeOnceFile(join(journal, `attempt-${number}.disposed.json`), { plan_digest: plan.plan_digest, attempt: number,
       state: values['--state'], ref: values['--ref'], at: new Date().toISOString() });
     return { contract: REPAIR_CONTRACT, step: 'dispose', plan_digest: plan.plan_digest, attempt: number, state: values['--state'] };
@@ -163,10 +181,11 @@ async function run({ command, values }) {
   let receipt;
   try { receipt = await withStore(config, handles => (command === 'apply' ? apply : inverse)({ ...handles, plan, config })); }
   catch (error) {
-    await writeOnceFile(join(journal, `attempt-${number}.outcome.json`), { attempt: number, outcome: 'refused' });
+    await writeOnceFile(join(journal, `attempt-${number}.outcome.json`), { plan_digest: plan.plan_digest, attempt: number, outcome: 'refused' });
     throw error;
   }
-  await writeOnceFile(join(journal, `attempt-${number}.outcome.json`), { attempt: number, outcome: receipt.outcome, cleanup: receipt.cleanup });
+  await writeOnceFile(join(journal, `attempt-${number}.outcome.json`), { plan_digest: plan.plan_digest, attempt: number,
+    outcome: receipt.outcome, cleanup: receipt.cleanup });
   return { ...receipt, attempt: number, custody_ref: values['--custody-ref'], quiescence_ref: values['--quiescence-ref'] };
 }
 

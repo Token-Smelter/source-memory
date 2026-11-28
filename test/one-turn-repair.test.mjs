@@ -187,6 +187,30 @@ test('the plan-bound journal admits one attempt at a time and holds every write 
   assert.deepEqual(JSON.parse((await dispose(2)).stderr), { ok: false, error: 'repair_attempt_not_unsettled' }, 'disposed only once');
   await step(plan.plan_digest);
   assert.ok(JSON.parse(await readFile(join(journal, 'attempt-3.json'), 'utf8')).attempt === 3, 'the next attempt starts after the disposition');
+  // Records that are malformed, or bound to another attempt or plan, settle nothing: each of these holds the next write.
+  const other = 'e'.repeat(64);
+  const holds = [
+    { 'attempt-4.json': '{}', 'attempt-4.disposed.json': '{}' },
+    { 'attempt-4.json': '{}', 'attempt-4.disposed.json': JSON.stringify({ plan_digest: plan.plan_digest, attempt: 3, state: 'preimage', ref: 'r' }) },
+    { 'attempt-4.json': '{}', 'attempt-4.disposed.json': JSON.stringify({ plan_digest: other, attempt: 4, state: 'preimage', ref: 'r' }) },
+    { 'attempt-4.json': '{}', 'attempt-4.disposed.json': JSON.stringify({ plan_digest: plan.plan_digest, attempt: 4, state: 'gone', ref: 'r' }) },
+    { 'attempt-4.json': JSON.stringify({ plan_digest: plan.plan_digest, attempt: 4, step: 'apply' }),
+      'attempt-4.outcome.json': JSON.stringify({ plan_digest: plan.plan_digest, attempt: 3, outcome: 'committed' }) },
+    { 'attempt-4.json': JSON.stringify({ plan_digest: other, attempt: 4, step: 'apply' }),
+      'attempt-4.outcome.json': JSON.stringify({ plan_digest: plan.plan_digest, attempt: 4, outcome: 'committed' }) },
+    { 'attempt-4.json': JSON.stringify({ plan_digest: plan.plan_digest, attempt: 4, step: 'apply' }), 'attempt-4.outcome.json': 'not json' },
+  ];
+  for (const files of holds) {
+    for (const name of ['attempt-4.json', 'attempt-4.outcome.json', 'attempt-4.disposed.json']) await rm(join(journal, name), { force: true });
+    for (const [name, content] of Object.entries(files)) await writeFile(join(journal, name), content);
+    assert.deepEqual(JSON.parse((await step(plan.plan_digest)).stderr), { ok: false, error: 'repair_disposition_required' }, JSON.stringify(files));
+  }
+  // A well-formed start and its own outcome settle the attempt.
+  for (const name of ['attempt-4.json', 'attempt-4.outcome.json', 'attempt-4.disposed.json']) await rm(join(journal, name), { force: true });
+  await writeFile(join(journal, 'attempt-4.json'), JSON.stringify({ plan_digest: plan.plan_digest, attempt: 4, step: 'inverse' }));
+  await writeFile(join(journal, 'attempt-4.outcome.json'), JSON.stringify({ plan_digest: plan.plan_digest, attempt: 4, outcome: 'rolled_back' }));
+  await step(plan.plan_digest);
+  assert.equal(JSON.parse(await readFile(join(journal, 'attempt-5.json'), 'utf8')).attempt, 5);
 });
 
 test('freeze refuses a configuration that grants only write, before opening any store', async t => {
