@@ -191,6 +191,16 @@ test('the owner run requires the exact default contract, closes the store before
   const otherCap = await runOverContextCount({ config: { ...DEFAULT_CONFIG, embedding: { ...DEFAULT_CONFIG.embedding, chunk_token_cap: 1536 } },
     scope: 'fiction', caps: CAPS, openStore: async () => { throw new Error('must not open'); } });
   assert.deepEqual(otherCap, { ok: false, error: 'count_contract_mismatch' });
+  // Other dimensions change the embedding key the vector split is measured against.
+  const otherDimensions = await runOverContextCount({ config: { ...DEFAULT_CONFIG, embedding: { ...DEFAULT_CONFIG.embedding, dimensions: 256 } },
+    scope: 'fiction', caps: CAPS, openStore: async () => { throw new Error('must not open'); } });
+  assert.deepEqual(otherDimensions, { ok: false, error: 'count_contract_mismatch' });
+  // A close that finishes after the cutoff leaves the run incomplete, whatever the count said.
+  let now = 0;
+  const slowClose = await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'fiction', caps: CAPS, clock: () => now,
+    openStore: async () => emptyStore(async () => { now += 61_000; }) });
+  assert.deepEqual([slowClose.ok, slowClose.report.status, slowClose.report.reason], [true, 'incomplete', 'cap_seconds']);
+  assert.deepEqual(Object.keys(slowClose.report).sort(), ['caps', 'contract', 'reason', 'scope', 'status']);
   assert.deepEqual(await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'other', caps: CAPS, openStore: async () => emptyStore() }),
     { ok: false, error: 'scope_denied' });
   assert.deepEqual(await runOverContextCount({ config: DEFAULT_CONFIG, scope: 'fiction', caps: { ...CAPS, max_rows: undefined }, openStore: async () => emptyStore() }),
