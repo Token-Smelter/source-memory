@@ -186,7 +186,7 @@ export async function runChunkCap(database, scratch) {
       const policy = chunkPolicy(capped.config, verified);
       const key = embeddingIdentity(embedding);
       const caps = { max_rows: 100, max_text_bytes: 1_000_000, max_pages: 20, page_size: 2, max_seconds: 60, transaction_timeout_ms: 10_000 };
-      const reader = scope => neo4jChunkReader(driver, database.database, scope, key);
+      const reader = scope => neo4jChunkReader(driver, database.database, scope, key, embedding.dimensions);
       const capped21 = await countOverContext({ policy, reader: reader('cap'), caps });
       assert.equal(capped21.status, 'complete');
       assert.equal(capped21.chunks, capped21.within_cap, 'chunks derived under cap 21 all fit it');
@@ -198,6 +198,13 @@ export async function runChunkCap(database, scratch) {
       assert.deepEqual([after.over_context_with_current_vector, after.over_context_without_current_vector], [before.chunks, 0]);
       assert.ok(!JSON.stringify(after).includes('abcd') && !JSON.stringify(after).includes('chunk_'), 'no text or identifier in the report');
       assert.equal((await countOverContext({ policy, reader: reader('cap-legacy'), caps: { ...caps, max_pages: 1 } })).reason, 'cap_pages');
+      // A wrong-dimension vector at the current key is refused, not counted as current.
+      const session = driver.session();
+      try {
+        await session.run(`MATCH (c:SMChunk {scope:'cap-legacy'}) WITH c ORDER BY c.uid LIMIT 1 SET c.embedding=[1.0, 2.0, 3.0]`);
+      } finally { await session.close(); }
+      assert.deepEqual(await countOverContext({ policy, reader: reader('cap-legacy'), caps }),
+        { contract: 'source-memory.over-context-count/1', status: 'incomplete', reason: 'read_failed' });
     });
   } finally {
     await capped.close();
