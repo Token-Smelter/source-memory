@@ -87,10 +87,12 @@ export async function runOneTurnRepairCli(database, scratch) {
       '--custody-ref', 'rehearsal-custodian', '--quiescence-ref', 'rehearsal-quiet']);
     const reconcile = async () => (await cli(['reconcile', '--config', paths.owner, '--plan', paths.plan])).out.state;
 
-    await check('P1 freeze through the command binds the three rows and writes only digests to stdout', async () => {
-      const result = await cli(['freeze', '--config', paths.owner, '--store-id', storeId, '--scope', SCOPE, '--turn', turnUid, '--out', paths.frozen]);
+    await check('P1 freeze through the command selects the one turn, binds the three rows in the named store and prints no content', async () => {
+      const wrong = await cli(['freeze', '--config', paths.owner, '--store-id', 'another-store', '--scope', SCOPE, '--out', join(scratch, 'unused-frozen.json')]);
+      assert.equal(wrong.out.error, 'repair_store_mismatch');
+      const result = await cli(['freeze', '--config', paths.owner, '--store-id', storeId, '--scope', SCOPE, '--out', paths.frozen]);
       assert.equal(result.code, 0, JSON.stringify(result.out));
-      assert.equal(result.out.targets, 3);
+      assert.deepEqual([result.out.targets, result.out.store_id, result.out.turn_uid], [3, storeId, turnUid]);
       frozenDigest = result.out.frozen_digest;
       assert.ok(!JSON.stringify(result.out).includes('lantern'), 'no content on stdout');
     });

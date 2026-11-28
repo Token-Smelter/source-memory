@@ -66,6 +66,21 @@ const TYPED = node => `[k IN keys(${node}) | {k: k, t: valueType(${node}[k]), v:
  * The fingerprint detects count-changing writes in the scope; it does not detect a same-count update of another row, so
  * writer quiescence remains a hard external requirement of the owner, not something this check provides.
  */
+/**
+ * The one turn the repair may touch, selected by the census predicate rather than named by a person: the parent turn of every
+ * chunk in the scope without a current-key vector. Those chunks must all name one turn; the freeze then requires them to be
+ * exactly the approved cohort. Only turn ids are read here.
+ */
+async function selectTurn(tx, scope, embeddingKey) {
+  const result = await tx.run(`MATCH (c:SMChunk {scope:$scope})
+    WHERE c.embedding IS NULL OR c.embedding_key IS NULL OR c.embedding_key <> $key
+    RETURN collect(DISTINCT c.turn_uid) AS turns, count(c) AS chunks, count(c.turn_uid) AS bound`, { scope, key: embeddingKey });
+  const [row] = result.records;
+  const turns = row.get('turns');
+  requireThat(turns.length === 1 && typeof turns[0] === 'string' && Number(row.get('bound')) === Number(row.get('chunks')), 'repair_target_changed');
+  return turns[0];
+}
+
 export async function storeIdentity(tx) {
   const info = (await tx.run('CALL db.info() YIELD id, name RETURN id, name')).records;
   requireThat(info.length === 1, 'repair_target_changed');
@@ -146,12 +161,13 @@ async function readOnly(driver, database, work) {
  * without a current-key vector: exactly `expectedTargets`, each over CHUNK_MAX_BYTES, with only the turn's property-free
  * link, equal to its source span, and together every chunk in the scope without a current-key vector.
  */
-export async function freeze({ driver, database, expectedStore, scope, turnUid, embeddingKey, expectedTargets = REPAIR_TARGETS }) {
+export async function freeze({ driver, database, expectedStore, scope, embeddingKey, expectedTargets = REPAIR_TARGETS }) {
   requireThat(expectedTargets === REPAIR_TARGETS, 'repair_target_changed');
   requireThat(typeof expectedStore?.database_id === 'string' && typeof expectedStore.database === 'string', 'invalid_input');
   return readOnly(driver, database, async tx => {
     // The owner names the intended store; another one is refused before any target is read.
     await requireStore(tx, { system: 'neo4j', database_id: expectedStore.database_id, database: expectedStore.database });
+    const turnUid = await selectTurn(tx, scope, embeddingKey);
     const snapshot = await readSnapshot(tx, scope, turnUid, embeddingKey);
     requireThat(MANIFEST_PROPERTIES.every(key => !(key in snapshot.turn.properties)), 'repair_turn_has_manifest');
     requireThat(snapshot.fingerprint.records_without_current_vector === 0, 'repair_target_changed');

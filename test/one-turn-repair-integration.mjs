@@ -149,33 +149,45 @@ export async function runOneTurnRepair(database, scratch) {
     let plan;
 
     await check('R1 freeze binds exactly three vectorless oversized rows of a pre-manifest turn and refuses anything else', async () => {
-      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key, expectedTargets: 2 }), { code: 'repair_target_changed' });
-      await assert.rejects(freeze({ ...handles, expectedStore: { ...handles.expectedStore, database_id: 'another-store' }, scope: SCOPE, turnUid,
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key, expectedTargets: 2 }), { code: 'repair_target_changed' });
+      await assert.rejects(freeze({ ...handles, expectedStore: { ...handles.expectedStore, database_id: 'another-store' }, scope: SCOPE,
         embeddingKey: key }), { code: 'repair_store_mismatch' });
+      // The turn is selected, not named: a vector-less chunk under a second turn makes the selection ambiguous.
+      await run(driver, `MATCH (c:SMChunk {scope:$scope}) WHERE c.turn_uid <> $turn WITH c LIMIT 1
+        SET c.kept_key = c.embedding_key, c.embedding_key = 'stale'`, { scope: SCOPE, turn: turnUid });
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_target_changed' });
+      await run(driver, 'MATCH (c:SMChunk {scope:$scope}) WHERE c.kept_key IS NOT NULL SET c.embedding_key = c.kept_key REMOVE c.kept_key',
+        { scope: SCOPE });
       // A partial layout witness is not a pre-manifest turn.
       await run(driver, 'MATCH (t:SMTurn {uid:$turn}) SET t.chunk_count = 3', { turn: turnUid });
-      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key }), { code: 'repair_turn_has_manifest' });
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_turn_has_manifest' });
       await run(driver, 'MATCH (t:SMTurn {uid:$turn}) REMOVE t.chunk_count', { turn: turnUid });
       // A stated end past the entry would be clamped by a slice; it is refused.
       await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_2'}) SET c.end = c.end + 5");
-      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key }), { code: 'repair_target_changed' });
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_target_changed' });
       await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_2'}) SET c.end = c.end - 5");
       // Negative zero cannot survive the JSON inverse, so a target carrying it is refused.
       await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_1'}) SET c.weight = -0.0");
-      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key }), { code: 'repair_unsupported_property' });
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_unsupported_property' });
       await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_1'}) REMOVE c.weight");
-      await assert.rejects(freeze({ ...handles, scope: OTHER, turnUid: manifested.id, embeddingKey: key }), { code: 'repair_turn_has_manifest' });
+      // A selected turn retained with a first-retain manifest is refused.
+      await run(driver, 'MATCH (c:SMChunk {scope:$other, turn_uid:$turn}) SET c.kept_key = c.embedding_key, c.embedding_key = \'stale\'',
+        { other: OTHER, turn: manifested.id });
+      await assert.rejects(freeze({ ...handles, scope: OTHER, embeddingKey: key }), { code: 'repair_turn_has_manifest' });
+      await run(driver, 'MATCH (c:SMChunk {scope:$other}) WHERE c.kept_key IS NOT NULL SET c.embedding_key = c.kept_key REMOVE c.kept_key',
+        { other: OTHER });
       // A chunk linked from the turn but bound to another scope is refused before its content is read.
       await run(driver, `MATCH (t:SMTurn {uid:$turn}) CREATE (c:SMChunk {uid:'chunk_foreign', scope:$other, turn_uid:$turn, text:'foreign'})
         CREATE (t)-[:SM_HAS_CHUNK]->(c)`, { turn: turnUid, other: OTHER });
-      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key }), { code: 'repair_target_misbound' });
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_target_misbound' });
       await run(driver, "MATCH (c:SMChunk {uid:'chunk_foreign'}) DETACH DELETE c");
       // An edge property could not be restored by the inverse, so a target carrying one is refused.
       await run(driver, "MATCH (:SMTurn)-[r:SM_HAS_CHUNK]->(:SMChunk {uid:'chunk_planted_1'}) SET r.note = 'kept'");
-      await assert.rejects(freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key }), { code: 'repair_unsupported_link' });
+      await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_unsupported_link' });
       await run(driver, "MATCH (:SMTurn)-[r:SM_HAS_CHUNK]->(:SMChunk {uid:'chunk_planted_1'}) REMOVE r.note");
-      frozen = await freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key });
+      frozen = await freeze({ ...handles, scope: SCOPE, embeddingKey: key });
       assert.equal(frozen.targets.length, 3);
+      assert.deepEqual([frozen.turn_uid, frozen.store.database_id], [turnUid, handles.expectedStore.database_id], 'the selected turn and store are named');
       const target = frozen.targets[0].state.properties;
       assert.deepEqual([target.legacy_counter, target.embedding_retry_after.type], [{ type: 'INTEGER', value: '9007199254740993' }, 'ZONED DATETIME']);
     });
@@ -210,7 +222,7 @@ export async function runOneTurnRepair(database, scratch) {
         entries: [{ id: 'y', role: 'user', text: 'A concurrent fictional retain.' }] });
       assert.equal((await apply({ ...using, plan })).error, 'repair_preimage_changed');
       await memory.index(SCOPE, { limit: 2048 });
-      frozen = await freeze({ ...handles, scope: SCOPE, turnUid, embeddingKey: key });
+      frozen = await freeze({ ...handles, scope: SCOPE, embeddingKey: key });
       plan = await staged({ frozen, config: repairConfig, verified, budget: BUDGET });
       const elsewhere = replan(plan, copy => ({ ...copy, store: { ...copy.store, database_id: 'another-store' } }));
       assert.equal((await apply({ ...using, plan: elsewhere })).error, 'repair_store_mismatch');

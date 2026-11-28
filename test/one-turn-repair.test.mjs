@@ -151,8 +151,10 @@ const invoke = argv => new Promise(resolve => execFile(process.execPath, [script
 
 test('the command refuses an unknown step or a duplicate, missing or unknown option before reading anything', async () => {
   for (const argv of [['repair'], ['apply', '--config', 'c', '--plan', 'p'], ['reconcile', '--config', 'c', '--plan', 'p', '--plan', 'q'],
-    ['reconcile', '--config', 'c', '--plan', 'p', '--force', 'yes'], ['freeze', '--config', 'c', '--scope', 's', '--turn', 't', '--out'],
-    ['freeze', '--config', 'c', '--scope', 's', '--turn', 't', '--expected', '4', '--out', 'o']]) {
+    ['reconcile', '--config', 'c', '--plan', 'p', '--force', 'yes'], ['freeze', '--config', 'c', '--scope', 's', '--out'],
+    ['freeze', '--config', 'c', '--scope', 's', '--expected', '4', '--out', 'o'],
+    // A person does not name the turn; the freeze selects it.
+    ['freeze', '--config', 'c', '--store-id', 'i', '--scope', 's', '--turn', 't', '--out', 'o']]) {
     const result = await invoke(argv);
     assert.deepEqual([result.code, result.stdout, JSON.parse(result.stderr)], [1, '', { ok: false, error: 'invalid_input' }], argv.join(' '));
   }
@@ -225,7 +227,7 @@ test('freeze refuses a configuration that grants only write, before opening any 
   const { dir, config } = await fixture(t);
   const path = join(dir, 'write-only.json');
   await writeFile(path, JSON.stringify({ ...config, scopes: { read: [], write: ['fixture'] }, neo4j: { uri: 'bolt://127.0.0.1:1', auth: 'none' } }));
-  const result = await invoke(['freeze', '--config', path, '--store-id', 'store-1', '--scope', 'fixture', '--turn', 't', '--out', join(dir, 'f.json')]);
+  const result = await invoke(['freeze', '--config', path, '--store-id', 'store-1', '--scope', 'fixture', '--out', join(dir, 'f.json')]);
   assert.deepEqual(JSON.parse(result.stderr), { ok: false, error: 'scope_denied' });
 });
 

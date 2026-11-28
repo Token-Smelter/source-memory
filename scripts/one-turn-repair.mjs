@@ -15,7 +15,7 @@
 //
 // Private files are written 0600, fsynced, with their directory entry fsynced too, and never overwritten. Stdout carries
 // digests only.
-//   freeze    --config C --store-id ID --scope S --turn UID --out FROZEN
+//   freeze    --config C --store-id ID --scope S --out FROZEN   (selects the one turn; its receipt names it, for the custodian)
 //   stage     --config C --frozen FROZEN --approved-frozen DIGEST --max-pieces N --max-seconds N --out PLAN
 //   apply     --config C --plan PLAN --approved-plan DIGEST --custody-ref REF --quiescence-ref REF
 //   inverse   --config C --plan PLAN --approved-plan DIGEST --custody-ref REF --quiescence-ref REF
@@ -29,7 +29,7 @@ import { apply, freeze, inverse, reconcile, REPAIR_CONTRACT, stage } from '../sr
 import { Neo4jStore } from '../src/store.mjs';
 
 const COMMANDS = {
-  freeze: ['--config', '--store-id', '--scope', '--turn', '--out'],
+  freeze: ['--config', '--store-id', '--scope', '--out'],
   stage: ['--config', '--frozen', '--approved-frozen', '--max-pieces', '--max-seconds', '--out'],
   apply: ['--config', '--plan', '--approved-plan', '--custody-ref', '--quiescence-ref'],
   inverse: ['--config', '--plan', '--approved-plan', '--custody-ref', '--quiescence-ref'],
@@ -165,9 +165,11 @@ async function run({ command, values }) {
     requireThat(REF.test(values['--store-id']), 'invalid_input');
     const expectedStore = { database_id: values['--store-id'], database: config.neo4j?.database ?? 'neo4j' };
     return withStore(config, async handles => {
-      const frozen = await freeze({ ...handles, expectedStore, scope, turnUid: values['--turn'], embeddingKey: embeddingIdentity(config.embedding) });
+      const frozen = await freeze({ ...handles, expectedStore, scope, embeddingKey: embeddingIdentity(config.embedding) });
       await writeOnceFile(values['--out'], frozen);
-      return { contract: REPAIR_CONTRACT, step: 'freeze', frozen_digest: frozen.frozen_digest, targets: frozen.targets.length };
+      // The selected turn and the observed store are identifiers, not content; the custodian keeps this receipt private.
+      return { contract: REPAIR_CONTRACT, step: 'freeze', frozen_digest: frozen.frozen_digest, targets: frozen.targets.length,
+        store_id: frozen.store.database_id, turn_uid: frozen.turn_uid };
     });
   }
   if (command === 'stage') {
