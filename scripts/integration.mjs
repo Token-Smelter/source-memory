@@ -12,6 +12,7 @@ import { runNestedScopes } from '../test/nested-scopes.mjs';
 import { runList } from '../test/list-integration.mjs';
 import { runChunkCap } from '../test/chunk-cap-integration.mjs';
 import { runOneTurnRepair } from '../test/one-turn-repair-integration.mjs';
+import { runOneTurnRepairCli } from '../test/one-turn-repair-cli-integration.mjs';
 import { integrationResources } from './integration-resources.mjs';
 
 const exec = promisify(execFile);
@@ -20,8 +21,10 @@ const exec = promisify(execFile);
 // the token-cap checks.
 const suiteIndex = process.argv.indexOf('--suite');
 const suite = suiteIndex === -1 ? 'all' : process.argv[suiteIndex + 1];
-if (!['all', 'qualification', 'scopes', 'chunk-cap', 'one-turn-repair'].includes(suite)) {
-  throw new Error('--suite must be qualification, scopes, chunk-cap or one-turn-repair');
+// `one-turn-repair-cli` rehearses the live procedure through the command against the local Ollama, so it is never part of
+// `all`.
+if (!['all', 'qualification', 'scopes', 'chunk-cap', 'one-turn-repair', 'one-turn-repair-cli'].includes(suite)) {
+  throw new Error('--suite must be qualification, scopes, chunk-cap, one-turn-repair or one-turn-repair-cli');
 }
 const runId = randomUUID();
 const name = `source-memory-test-${runId}`;
@@ -85,6 +88,7 @@ try {
   if (suite === 'all') results = [...results, ...await runIntegration(database, scratch)];
   if (suite === 'all' || suite === 'chunk-cap') results = [...results, ...await runChunkCap(database, scratch)];
   if (suite === 'all' || suite === 'one-turn-repair') results = [...results, ...await runOneTurnRepair(database, scratch)];
+  if (suite === 'one-turn-repair-cli') results = [...results, ...await runOneTurnRepairCli(database, scratch)];
   if (suite === 'all' || suite === 'qualification') results = [...results, ...await runQualification(database, scratch)];
 } catch (error) {
   failure = { name: error.name, code: error.code ?? null, message: String(error.message).slice(0, 2000) };
