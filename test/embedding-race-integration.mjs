@@ -35,7 +35,7 @@ export async function runEmbeddingRace(database) {
   const scopes = ['race-text', 'race-key', 'race-repair', 'race-retry', 'race-defer', 'race-control', 'race-lock-text', 'race-lock-repair',
     'race-lock-retry', 'race-lock-terminal', 'race-lock-defer', 'race-lock-control', 'race-naive', 'race-prior', 'race-prior-control',
     'race-lock-prior', 'race-lock-prior-control', 'race-lossless', 'race-select', 'race-typed-cap', 'race-typed-retry', 'race-lock-cap',
-    'race-lock-cap-control', 'race-bounded'];
+    'race-lock-cap-control', 'race-bounded', 'race-context-marker'];
   const config = { neo4j: database, scopes: { read: scopes, write: scopes }, index_on_write: false,
     embedding: { url: `http://127.0.0.1:${model.address().port}/embed`, model: 'race-fixture', dimensions: 3 } };
   const key = embeddingIdentity(config.embedding);
