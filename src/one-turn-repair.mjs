@@ -311,8 +311,8 @@ async function deleteVerified(tx, scope, turnUid, uids) {
 async function lock(tx, scope, turnUid, uids) {
   const turn = await tx.run('MATCH (t:SMTurn {uid:$turn, scope:$scope}) SET t.scope = t.scope RETURN count(t) AS n', { turn: turnUid, scope });
   requireThat(Number(turn.records[0].get('n')) === 1, 'repair_target_changed');
-  const rows = await tx.run('MATCH (c:SMChunk {scope:$scope}) WHERE c.uid IN $uids SET c.scope = c.scope RETURN count(c) AS n', { uids, scope });
-  requireThat(Number(rows.records[0].get('n')) === uids.length, 'repair_target_changed');
+  // Rows that are absent are not locked; the classification that follows decides whether the state is the expected one.
+  await tx.run('MATCH (c:SMChunk {scope:$scope}) WHERE c.uid IN $uids SET c.scope = c.scope', { uids, scope });
 }
 
 // The plan may run only under the same verified token policy and vector key it was staged with.
