@@ -11,6 +11,10 @@ export const ROLES = ['default', 'reference', 'experiment'];
 export const ADAPTER_WITNESS = 'adapter';
 // Typed refusals an adapter raises instead of returning a vector it cannot prove full; anything else ends the run.
 export const WITNESS_REFUSALS = ['embedding_full_input_unverified', 'embedding_input_too_long'];
+// The only adapter failure codes a run reports; any other is `unclassified`, so no adapter-chosen text is printed.
+export const ADAPTER_FAILURES = ['model_request_failed', 'model_timeout', 'invalid_embedding_response', 'embedding_model_mismatch'];
+// The full-input bases the eval accepts, each as its transport and evidence kind. They stay distinct in every result.
+export const WITNESS_BASES = Object.freeze({ vertex_predict: 'vertex_statistics', gemini_embed_content: 'verified_precount_and_boundary' });
 
 /**
  * A treatment manifest is valid only in one of three roles. The default must carry exactly DEFAULT_TREATMENT, the reference
@@ -94,7 +98,7 @@ export async function embedWitnessed(adapter, items, { dimensions, context, admi
     let reply;
     try { reply = await adapter.embed([text], { purpose, signal: admitted?.signal ?? signal }); } catch (error) {
       // Only a code leaves the adapter: a message could carry request or credential detail.
-      if (!WITNESS_REFUSALS.includes(error?.code)) throw new Error(`adapter failure: ${/^[a-z_]{1,64}$/u.test(error?.code ?? '') ? error.code : 'unclassified'}`);
+      if (!WITNESS_REFUSALS.includes(error?.code)) throw new Error(`adapter failure: ${ADAPTER_FAILURES.includes(error?.code) ? error.code : 'unclassified'}`);
       refusals[error.code]++;
       vectors.push(null);
       continue;
@@ -104,7 +108,8 @@ export async function embedWitnessed(adapter, items, { dimensions, context, admi
     const evidence = row?.evidence;
     if (keys(row) !== 'evidence,full_input,vector' || row.full_input !== true || keys(evidence) !== 'kind,limit,token_count,transport'
         || !Array.isArray(row.vector) || row.vector.length !== dimensions || !row.vector.every(Number.isFinite) || !row.vector.some(x => x !== 0)
-        || !/^[a-z0-9_]{1,64}$/u.test(evidence.kind) || !/^[a-z0-9_]{1,64}$/u.test(evidence.transport)
+        || typeof evidence.transport !== 'string' || typeof evidence.kind !== 'string' || !Object.hasOwn(WITNESS_BASES, evidence.transport)
+        || WITNESS_BASES[evidence.transport] !== evidence.kind
         || !positive(evidence.token_count) || !positive(evidence.limit) || evidence.token_count > evidence.limit || evidence.limit > context) {
       throw new Error('the adapter returned a vector without a valid full-input witness');
     }

@@ -160,12 +160,21 @@ test('witnessed embedding sends one input per call with its purpose, credits onl
     { message: 'adapter failure: model_request_failed' });
   const leaky = { async embed() { throw new Error('Bearer secret-token at https://example.invalid/?key=1'); } };
   await assert.rejects(embedWitnessed(leaky, [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 }), { message: 'adapter failure: unclassified' });
-  const row = { vector: fakeVector('x'), full_input: true, evidence: { kind: 'k', transport: 't', token_count: 10, limit: 2048 } };
+  // A code shaped like a code but not in the closed list is not printed either.
+  const coded = { async embed() { throw Object.assign(new Error('x'), { code: 'secret_project_name' }); } };
+  await assert.rejects(embedWitnessed(coded, [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 }), { message: 'adapter failure: unclassified' });
+  const row = { vector: fakeVector('x'), full_input: true, evidence: { kind: 'vertex_statistics', transport: 'vertex_predict', token_count: 10, limit: 2048 } };
+  // Both closed bases are accepted, and only as their own pair.
+  const gemini = { ...row, evidence: { ...row.evidence, transport: 'gemini_embed_content', kind: 'verified_precount_and_boundary' } };
+  assert.deepEqual((await embedWitnessed(fakeAdapter(() => ({ rows: [gemini] })), [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 })).evidence_kinds,
+    ['gemini_embed_content/verified_precount_and_boundary']);
   for (const bad of [{ rows: [{ ...row, full_input: false }] }, { rows: [{ ...row, evidence: undefined }] },
     { rows: [{ ...row, evidence: { ...row.evidence, token_count: 2049 } }] }, { rows: [{ ...row, evidence: { ...row.evidence, limit: 4096, token_count: 3000 } }] },
     { rows: [{ ...row, evidence: { ...row.evidence, token_count: 0 } }] }, { rows: [{ ...row, evidence: { ...row.evidence, token_count: -5, limit: -1 } }] },
     { rows: [{ ...row, evidence: { ...row.evidence, extra: 1 } }] }, { rows: [{ ...row, extra: 1 }] }, { rows: { length: 1, 0: row } },
-    { rows: [row], extra: 1 }, { rows: [row, row] }, { rows: [{ ...row, vector: [1, 2] }] }]) {
+    { rows: [row], extra: 1 }, { rows: [row, row] }, { rows: [{ ...row, vector: [1, 2] }] },
+    { rows: [{ ...row, evidence: { ...row.evidence, kind: 'verified_precount_and_boundary' } }] }, { rows: [{ ...row, evidence: { ...row.evidence, transport: 'other' } }] },
+    { rows: [{ ...row, evidence: { ...row.evidence, kind: ['vertex_statistics'] } }] }]) {
     await assert.rejects(embedWitnessed(fakeAdapter(() => bad), [{ text: 'x', purpose: 'document' }], { dimensions: 64, context: 2048 }),
       /without a valid full-input witness/u, JSON.stringify(bad).slice(0, 80));
   }

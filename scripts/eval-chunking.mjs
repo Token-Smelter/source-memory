@@ -8,7 +8,7 @@
 //   node scripts/eval-chunking.mjs --compare reference.result.json candidate.result.json
 // Results go to .memory-local/chunk-eval/<manifest digest>/<run id>.{seal,result}.json and are never merged across digests.
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { loadavg } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -31,7 +31,7 @@ function options(argv) {
     const arg = argv[at];
     if (arg === '--experiment') values.flags.add('experiment');
     else if (arg === '--compare') values.compare = [argv[++at], argv[++at]];
-    else if (['--treatment', '--config', '--tokenizer', '--out', '--max-load5'].includes(arg)) values[arg.slice(2)] = argv[++at];
+    else if (['--treatment', '--config', '--tokenizer', '--out', '--max-load5', '--checkout-ref'].includes(arg)) values[arg.slice(2)] = argv[++at];
     else throw new Error(`unknown argument ${arg}`);
   }
   return values;
@@ -52,16 +52,20 @@ async function run(args) {
   let adapter = null;
   let adapterCode = null;
   if (witnessed) {
-    // Code provenance, not self-report: the sealed module at its pinned blob, in a clean checkout of this repository.
+    // Code provenance, not self-report, checked before any of it runs: the pinned module's actual bytes, a checkout with no
+    // changed or untracked file, and the lockfile of that commit. The checkout must also be owner-approved and immutable for
+    // the run (named by --checkout-ref); this tool cannot prove that, nor the installed dependency bytes.
+    if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(args['checkout-ref'] ?? '')) throw new Error('an adapter-witnessed run needs --checkout-ref');
     const { module, git_blob: blob } = manifest.embedder.adapter;
     const code = await codeCommit();
-    if (code.dirty) throw new Error('an adapter-witnessed run needs a clean checkout');
-    const { stdout } = await exec('git', ['-C', root, 'rev-parse', `HEAD:${module}`]);
-    if (stdout.trim() !== blob) throw new Error('the adapter module is not the sealed git blob');
-    try { adapter = await (await import(pathToFileURL(join(root, module)).href)).createAdapter(config); }
-    catch { throw new Error('adapter failure: create'); }
-    if (canonical(adapter?.identity) !== canonical(manifest.embedder.identity)) throw new Error('the adapter identity differs from the sealed embedder');
-    adapterCode = { module, git_blob: blob, commit: code.commit };
+    const { stdout: untracked } = await exec('git', ['-C', root, 'status', '--porcelain', '--untracked-files=all']);
+    if (code.dirty || untracked.trim()) throw new Error('an adapter-witnessed run needs a checkout with no changed or untracked file');
+    const bytes = await readFile(join(root, module));
+    const actual = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+    const { stdout: pinned } = await exec('git', ['-C', root, 'rev-parse', `HEAD:${module}`]);
+    if (actual !== blob || pinned.trim() !== blob) throw new Error('the adapter module is not the sealed git blob');
+    const { stdout: lock } = await exec('git', ['-C', root, 'rev-parse', 'HEAD:package-lock.json']);
+    adapterCode = { module, git_blob: blob, commit: code.commit, lockfile_blob: lock.trim(), checkout_ref: args['checkout-ref'] };
   } else if (embedding?.model?.replace(/:latest$/u, '') !== manifest.embedder.model || new URL(embedding.url).pathname !== manifest.embedder.endpoint_path
       || embedding.dimensions !== manifest.embedder.dimensions || (embedding.ollama_transport ?? 'openai_compat') !== manifest.embedder.transport
       || embedding.allow_remote === true) {
@@ -88,6 +92,12 @@ async function run(args) {
     derivation_digest: digest(derived.chunks.map(({ turn, entry_id, start, end }) => [turn, entry_id, start, end])),
     ...(adapterCode ? { adapter: adapterCode } : {}) };
   await write(join(dir, `${runId}.seal.json`), seal);
+  if (witnessed) {
+    // Loaded only after the seal. Importing and creating the adapter must do no provider work; the first send is an embed.
+    try { adapter = await (await import(pathToFileURL(join(root, adapterCode.module)).href)).createAdapter(config); }
+    catch { throw new Error('adapter failure: create'); }
+    if (canonical(adapter?.identity) !== canonical(manifest.embedder.identity)) throw new Error('the adapter identity differs from the sealed embedder');
+  }
 
   const started = Date.now();
   let vectors = [];
@@ -98,7 +108,10 @@ async function run(args) {
   const expired = () => { if (Date.now() >= deadline) throw new Error('budget: elapsed time exceeded; no result written'); };
   const admit = async () => {
     // The host scheduler admits this run only below a load ceiling; wait between requests while it is exceeded.
-    while (loadavg()[1] > maxLoad) await sleep(15000);
+    while (loadavg()[1] > maxLoad) {
+      expired();
+      await sleep(Math.min(15000, Math.max(1, deadline - Date.now())));
+    }
     expired();
     // Each request is aborted at the deadline. Aborting stops waiting; it cannot prove the provider stopped work or did not
     // receive the text.
