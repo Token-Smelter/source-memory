@@ -1,13 +1,11 @@
 import neo4j from 'neo4j-driver';
-import { authorize, isNested, requireThat } from './core.mjs';
+import { authorize, isNested, MemoryError, requireThat } from './core.mjs';
 import { embeddingContextContract, embeddingIdentity } from './models.mjs';
 import { Neo4jStore, selection } from './store.mjs';
 
-export const CENSUS_CAP = 4096;
 const health = { online: 1, populating: 2, missing: 3, failed: 4, incompatible: 5, unavailable: 6 };
 const missing = '(n.embedding IS NULL OR n.embedding_key IS NULL OR n.embedding_key <> $key)';
 const chunk = `MATCH (n:SMChunk {scope:$scope}) USING INDEX SEEK n:SMChunk(scope)
-WITH n LIMIT $limit
 WITH n, ${missing} AS missing
 OPTIONAL MATCH (t:SMTurn {uid:n.turn_uid}) USING INDEX SEEK t:SMTurn(uid)
   WHERE missing AND t.scope=$scope
@@ -29,7 +27,6 @@ RETURN count(*) AS chunks_total, count(CASE WHEN NOT missing THEN 1 END) AS chun
   count(DISTINCT t) AS turns_affected,
   count(CASE WHEN missing AND t IS NULL THEN 1 END) AS missing_chunk_turn_binding`;
 const record = `MATCH (n:SMRecord {scope:$scope}) USING INDEX SEEK n:SMRecord(scope)
-WITH n LIMIT $limit
 RETURN count(*) AS records_total, count(CASE WHEN ${missing} THEN 1 END) AS missing_record_vectors,
   count(CASE WHEN n.embedding IS NULL AND n.embedding_key=$key THEN 1 END) AS same_key_missing_records`;
 export const CENSUS_TIMEOUT_MS = 15000;
@@ -38,10 +35,29 @@ const chunkColumns = ['chunks_total', 'chunks_indexed', 'chunks_unindexed', 'ter
   'retry_marked', 'cooling', 'other', 'same_key_missing_chunks', 'turns_affected', 'missing_chunk_turn_binding'];
 const recordColumns = ['records_total', 'missing_record_vectors', 'same_key_missing_records'];
 
-async function counts(tx, statement, params, columns) {
+const optionalProperties = new Set(['embedding_oversized_key', 'embedding_oversized_cap', 'embedding_oversized_text',
+  'embedding_rejected_context', 'embedding_rejected_text', 'embedding_retry_key', 'embedding_retry_after']);
+const reportableNotifications = new Set(['Neo.ClientNotification.Statement.UnknownPropertyKeyWarning',
+  'Neo.ClientNotification.Schema.HintWarning', 'Neo.ClientNotification.Schema.HintedIndexNotFound']);
+
+export function checkCensusNotifications(notifications, unknownKeys) {
+  requireThat(Array.isArray(notifications), 'census_unverified');
+  for (const note of notifications) {
+    const key = note?.code === 'Neo.ClientNotification.Statement.UnknownPropertyKeyWarning' && typeof note.description === 'string'
+      && /\(the missing property name is: ([a-z_]+)\)\s*$/.exec(note.description)?.[1];
+    if (optionalProperties.has(key)) unknownKeys.add(key);
+    else {
+      const error = new MemoryError('census_unverified');
+      error.notification = reportableNotifications.has(note?.code) ? note.code : 'unknown';
+      throw error;
+    }
+  }
+}
+
+async function counts(tx, statement, params, columns, unknownKeys) {
   const result = await tx.run(statement, params);
-  requireThat(result.records.length === 1 && result.summary.notifications.length === 0
-    && !result.summary.counters.containsUpdates(), 'census_unverified');
+  checkCensusNotifications(result.summary.notifications, unknownKeys);
+  requireThat(result.records.length === 1 && !result.summary.counters.containsUpdates(), 'census_unverified');
   const row = result.records[0].toObject();
   requireThat(Object.keys(row).length === columns.length && columns.every(name => Object.hasOwn(row, name)
     && Number.isSafeInteger(row[name]) && row[name] >= 0), 'census_unverified');
@@ -68,7 +84,7 @@ async function indexHealth(tx, scope, dimensions) {
   }));
 }
 
-export async function indexCensus(config, scope, suppliedStore) {
+export async function indexCensus(config, scope, suppliedStore, unknownKeys = new Set()) {
   authorize(config, scope);
   requireThat(!isNested(scope) && config.scopes.read.includes(scope), 'scope_denied');
   const key = embeddingIdentity(config.embedding);
@@ -80,15 +96,13 @@ export async function indexCensus(config, scope, suppliedStore) {
     try {
       const tx = session.beginTransaction({ timeout: CENSUS_TIMEOUT_MS });
       try {
-        const params = { scope, key, context, limit: neo4j.int(CENSUS_CAP + 1) };
-        const chunks = await counts(tx, chunk, params, chunkColumns);
-        requireThat(chunks.chunks_total <= CENSUS_CAP, 'census_over_bound');
+        const params = { scope, key, context };
+        const chunks = await counts(tx, chunk, params, chunkColumns, unknownKeys);
         requireThat(chunks.chunks_indexed + chunks.chunks_unindexed === chunks.chunks_total
           && chunks.terminal_byte + chunks.terminal_context + chunks.retry_marked + chunks.other === chunks.chunks_unindexed
           && chunks.cooling <= chunks.retry_marked && chunks.same_key_missing_chunks <= chunks.chunks_unindexed
           && chunks.turns_affected + chunks.missing_chunk_turn_binding <= chunks.chunks_unindexed, 'census_unverified');
-        const records = await counts(tx, record, { ...params, limit: neo4j.int(CENSUS_CAP - chunks.chunks_total + 1) }, recordColumns);
-        requireThat(chunks.chunks_total + records.records_total <= CENSUS_CAP, 'census_over_bound');
+        const records = await counts(tx, record, params, recordColumns, unknownKeys);
         requireThat(records.same_key_missing_records <= records.missing_record_vectors
           && records.missing_record_vectors <= records.records_total, 'census_unverified');
         const health = await indexHealth(tx, scope, config.embedding.dimensions);
