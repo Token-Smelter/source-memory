@@ -176,10 +176,11 @@ export async function runOneTurnRepair(database, scratch) {
       await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_1'}) SET c.weight = -0.0");
       await assert.rejects(freeze({ ...handles, scope: SCOPE, embeddingKey: key }), { code: 'repair_unsupported_property' });
       await run(driver, "MATCH (c:SMChunk {uid:'chunk_planted_1'}) REMOVE c.weight");
-      // A selected turn retained with a first-retain manifest is refused.
+      // A manifested turn with a single vector-less chunk is a wrong-sized cohort, refused at selection before its manifest
+      // or any content is read; the partial-witness case above covers the manifest refusal itself.
       await run(driver, 'MATCH (c:SMChunk {scope:$other, turn_uid:$turn}) SET c.kept_key = c.embedding_key, c.embedding_key = \'stale\'',
         { other: OTHER, turn: manifested.id });
-      await assert.rejects(freeze({ ...handles, scope: OTHER, embeddingKey: key }), { code: 'repair_turn_has_manifest' });
+      await assert.rejects(freeze({ ...handles, scope: OTHER, embeddingKey: key }), { code: 'repair_target_changed' });
       await run(driver, 'MATCH (c:SMChunk {scope:$other}) WHERE c.kept_key IS NOT NULL SET c.embedding_key = c.kept_key REMOVE c.kept_key',
         { other: OTHER });
       // A chunk linked from the turn but bound to another scope is refused before its content is read.
