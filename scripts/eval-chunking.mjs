@@ -11,6 +11,7 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { loadavg } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -35,6 +36,15 @@ function options(argv) {
     else throw new Error(`unknown argument ${arg}`);
   }
   return values;
+}
+
+// The code record a seal carries. For a witnessed run it is the record captured when the adapter was verified, and the
+// checkout must not have moved since: any drift refuses the run.
+async function sealedCode(adapterCode) {
+  if (!adapterCode) return codeCommit();
+  const again = await codeCommit();
+  if (again.commit !== adapterCode.code.commit || again.dirty) throw new Error('the checkout changed after the adapter was verified');
+  return adapterCode.code;
 }
 
 async function codeCommit() {
@@ -62,10 +72,11 @@ async function run(args) {
     if (code.dirty || untracked.trim()) throw new Error('an adapter-witnessed run needs a checkout with no changed or untracked file');
     const bytes = await readFile(join(root, module));
     const actual = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
-    const { stdout: pinned } = await exec('git', ['-C', root, 'rev-parse', `HEAD:${module}`]);
+    // Both blobs are resolved against the one captured commit, not a HEAD that could move meanwhile.
+    const { stdout: pinned } = await exec('git', ['-C', root, 'rev-parse', `${code.commit}:${module}`]);
     if (actual !== blob || pinned.trim() !== blob) throw new Error('the adapter module is not the sealed git blob');
-    const { stdout: lock } = await exec('git', ['-C', root, 'rev-parse', 'HEAD:package-lock.json']);
-    adapterCode = { module, git_blob: blob, commit: code.commit, lockfile_blob: lock.trim(), checkout_ref: args['checkout-ref'] };
+    const { stdout: lock } = await exec('git', ['-C', root, 'rev-parse', `${code.commit}:package-lock.json`]);
+    adapterCode = { module, git_blob: blob, commit: code.commit, lockfile_blob: lock.trim(), checkout_ref: args['checkout-ref'], code };
   } else if (embedding?.model?.replace(/:latest$/u, '') !== manifest.embedder.model || new URL(embedding.url).pathname !== manifest.embedder.endpoint_path
       || embedding.dimensions !== manifest.embedder.dimensions || (embedding.ollama_transport ?? 'openai_compat') !== manifest.embedder.transport
       || embedding.allow_remote === true) {
@@ -88,9 +99,10 @@ async function run(args) {
   await mkdir(dir, { recursive: true });
   // The seal is written before the first embedding request, so the treatment cannot be chosen after seeing results.
   const seal = { eval_version: EVAL_VERSION, run_id: runId, sealed_at: new Date().toISOString(), manifest, manifest_digest: manifest.digest,
-    corpus_version: corpus.version, corpus_digest: corpusDigest, code: await codeCommit(), inputs,
+    corpus_version: corpus.version, corpus_digest: corpusDigest, code: await sealedCode(adapterCode), inputs,
     derivation_digest: digest(derived.chunks.map(({ turn, entry_id, start, end }) => [turn, entry_id, start, end])),
-    ...(adapterCode ? { adapter: adapterCode } : {}) };
+    ...(adapterCode ? { adapter: { module: adapterCode.module, git_blob: adapterCode.git_blob, commit: adapterCode.commit,
+      lockfile_blob: adapterCode.lockfile_blob, checkout_ref: adapterCode.checkout_ref } } : {}) };
   await write(join(dir, `${runId}.seal.json`), seal);
   if (witnessed) {
     // Loaded only after the seal. Importing and creating the adapter must do no provider work; the first send is an embed.
@@ -99,23 +111,25 @@ async function run(args) {
     if (canonical(adapter?.identity) !== canonical(manifest.embedder.identity)) throw new Error('the adapter identity differs from the sealed embedder');
   }
 
-  const started = Date.now();
+  // One monotonic clock for admission, each request's remainder and the final cutoff; wall time is only for timestamps.
+  const now = () => performance.now();
+  const started = now();
   let vectors = [];
   let witness = null;
   const texts = [...derived.chunks.map(chunk => chunk.text), ...corpus.queries.map(query => query.text)];
   const maxLoad = Number(args['max-load5'] ?? Infinity);
   const deadline = started + manifest.budget.max_seconds * 1000;
-  const expired = () => { if (Date.now() >= deadline) throw new Error('budget: elapsed time exceeded; no result written'); };
+  const expired = () => { if (now() >= deadline) throw new Error('budget: elapsed time exceeded; no result written'); };
   const admit = async () => {
     // The host scheduler admits this run only below a load ceiling; wait between requests while it is exceeded.
     while (loadavg()[1] > maxLoad) {
       expired();
-      await sleep(Math.min(15000, Math.max(1, deadline - Date.now())));
+      await sleep(Math.min(15000, Math.max(1, Math.floor(deadline - now()))));
     }
     expired();
     // Each request is aborted at the deadline. Aborting stops waiting; it cannot prove the provider stopped work or did not
     // receive the text.
-    return { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) };
+    return { signal: AbortSignal.timeout(Math.max(1, Math.floor(deadline - now()))) };
   };
   if (witnessed) {
     const items = [...derived.chunks.map(chunk => ({ text: chunk.text, purpose: 'document' })), ...corpus.queries.map(query => ({ text: query.text, purpose: 'query' }))];
@@ -139,7 +153,7 @@ async function run(args) {
   expired();
   const result = { eval_version: EVAL_VERSION, run_id: runId, manifest_digest: manifest.digest, name: manifest.name, role: manifest.role,
     qualification: manifest.qualification, corpus_digest: corpusDigest, seal_digest: digest(canonical(seal)),
-    elapsed_ms: Date.now() - started, inputs, ...(witness ? { witness } : {}), score };
+    elapsed_ms: Math.round(now() - started), inputs, ...(witness ? { witness } : {}), score };
   await write(join(dir, `${runId}.result.json`), result);
   return { result: join(dir, `${runId}.result.json`), summary: { name: manifest.name, qualification: manifest.qualification,
     coverage: score.coverage, all: score.aggregate.all, dense: score.aggregate.dense, elapsed_ms: result.elapsed_ms } };
